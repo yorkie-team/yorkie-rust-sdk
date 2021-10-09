@@ -17,7 +17,7 @@ impl Client {
     }
 
     pub async fn activate(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let mut client = YorkieClient::connect("http://localhost:8080").await?;
+        let mut client = YorkieClient::connect("http://[::1]:11101").await?;
         let request = tonic::Request::new(ActivateClientRequest {
             client_key: self.key.clone(),
         });
