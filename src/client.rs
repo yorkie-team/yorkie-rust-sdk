@@ -30,6 +30,10 @@ impl Client {
     }
 
     pub async fn activate(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.is_active.get() {
+            return Ok(());
+        }
+
         let mut client = YorkieClient::connect(self.rpc_address.clone()).await?;
         let request = tonic::Request::new(ActivateClientRequest {
             client_key: self.options.key.to_string(),
