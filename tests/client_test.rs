@@ -28,4 +28,19 @@ mod tests {
         assert_eq!(result.is_ok(), true);
         assert_eq!(cli.is_active, true);
     }
+
+    #[tokio::test]
+    async fn client_deactivate_test() {
+        let mut cli = Client::new("http://[::1]:11101".to_string());
+        assert_eq!(cli.is_active, false);
+
+        let result = cli.activate().await;
+        assert_eq!(result.is_ok(), true);
+        assert_eq!(cli.is_active, true);
+        assert_eq!(cli.options.key.len(), 36);
+
+        let result = cli.deactivate().await;
+        assert_eq!(result.is_ok(), true);
+        assert_eq!(cli.is_active, false);
+    }
 }

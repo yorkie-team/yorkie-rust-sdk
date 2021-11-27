@@ -1,5 +1,5 @@
 use proto::yorkie_client::YorkieClient;
-use proto::{ActivateClientRequest};
+use proto::{ActivateClientRequest, DeactivateClientRequest};
 
 use crate::clientoptions::ClientOptions;
 
@@ -47,4 +47,19 @@ impl Client {
         Ok(())
     }
 
+    pub async fn deactivate(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if !self.is_active {
+            return Ok(());
+        }
+
+        let mut client = YorkieClient::connect(self.rpc_address.clone()).await?;
+        let request = tonic::Request::new(DeactivateClientRequest {
+            client_id: self.client_id.clone().unwrap(),
+        });
+        client.deactivate_client(request).await?;
+        self.client_id = None;
+        self.is_active = false;
+
+        Ok(())
+    }
 }
