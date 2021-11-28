@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use yorkie::{Client, clientoptions::ClientOptions};
+    use yorkie::{Client, client_options::ClientOptions};
 
 
     #[tokio::test]
