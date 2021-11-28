@@ -1,4 +1,4 @@
 mod client;
-pub mod clientoptions;
+pub mod client_options;
 
 pub use client::*;

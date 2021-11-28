@@ -1,7 +1,7 @@
 use proto::yorkie_client::YorkieClient;
 use proto::{ActivateClientRequest, DeactivateClientRequest};
 
-use crate::clientoptions::ClientOptions;
+use crate::client_options::ClientOptions;
 
 pub mod proto {
     tonic::include_proto!("api");
