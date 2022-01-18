@@ -2,9 +2,15 @@
 mod tests {
     use yorkie::{Client, ClientOptions};
 
+    fn init_logger() {
+        let _ = env_logger::builder()
+            .is_test(true)
+            .try_init();
+    }
 
     #[tokio::test]
     async fn client_with_new() {
+        init_logger();
         let mut cli = Client::new("http://[::1]:11101".to_string());
         assert_eq!(cli.is_active, false);
 
@@ -16,6 +22,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_with_options_test() {
+        init_logger();
         let mut cli = Client::with_options("http://[::1]:11101".to_string(), ClientOptions {
             key: "test".to_string(),
             sync_loop_duration: 50,
@@ -31,6 +38,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_deactivate_test() {
+        init_logger();
         let mut cli = Client::new("http://[::1]:11101".to_string());
         assert_eq!(cli.is_active, false);
 
@@ -44,3 +52,4 @@ mod tests {
         assert_eq!(cli.is_active, false);
     }
 }
+
