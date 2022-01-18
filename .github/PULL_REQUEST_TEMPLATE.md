@@ -1,9 +1,9 @@
 <!--  Thanks for sending a pull request! -->
 
-#### What this PR does / why we need it?
+### What this PR does / why we need it?
 
 
-#### What are the relevant tickets?
+### What are the relevant tickets?
 <!--
 *Automatically closes linked issue when PR is merged.
 Usage: `Fixes #<issue number>`, or `Fixes (paste link of issue)`.
@@ -11,7 +11,7 @@ Usage: `Fixes #<issue number>`, or `Fixes (paste link of issue)`.
 Fixes #
 
 
-#### Any background context you want to provide?
+### Any background context you want to provide?
 
 
 ### Checklist
