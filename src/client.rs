@@ -40,7 +40,7 @@ impl Client {
         });
         let response = client.activate_client(request).await?;
         let message = response.into_inner();
-        log::debug!("{} activated, id: {:?}", &self.options.key, &message.client_id);
+        log::info!("{} activated, id: {:?}", &self.options.key, &message.client_id);
         self.client_id = Some(message.client_id);
         self.is_active = true;
 
@@ -57,7 +57,7 @@ impl Client {
             client_id: self.client_id.clone().unwrap(),
         });
         client.deactivate_client(request).await?;
-        log::debug!("{} deactivated", &self.options.key);
+        log::info!("{} deactivated", &self.options.key);
         self.client_id = None;
         self.is_active = false;
 
