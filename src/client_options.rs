@@ -7,9 +7,8 @@ pub struct ClientOptions {
     pub reconnect_stream_delay: u32,
 }
 
-
 impl ClientOptions {
-    pub fn default() -> ClientOptions{
+    pub fn default() -> ClientOptions {
         let key = Uuid::new_v4().to_hyphenated().to_string();
 
         ClientOptions {

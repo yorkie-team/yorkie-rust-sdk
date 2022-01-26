@@ -16,7 +16,6 @@ pub struct Client {
 }
 
 impl Client {
-
     pub fn new(rpc_address: String) -> Client {
         Self::with_options(rpc_address, ClientOptions::default())
     }
@@ -40,7 +39,11 @@ impl Client {
         });
         let response = client.activate_client(request).await?;
         let message = response.into_inner();
-        log::info!("{} activated, id: {:?}", &self.options.key, &message.client_id);
+        log::info!(
+            "{} activated, id: {:?}",
+            &self.options.key,
+            &message.client_id
+        );
         self.client_id = Some(message.client_id);
         self.is_active = true;
 

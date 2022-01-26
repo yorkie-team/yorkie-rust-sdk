@@ -1,7 +1,6 @@
 mod client;
-mod document;
 pub mod client_options;
+mod document;
 
-pub use client_options::*;
 pub use client::*;
-
+pub use client_options::*;

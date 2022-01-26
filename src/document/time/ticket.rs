@@ -1,6 +1,6 @@
-use std::{u32, u64};
+use crate::document::time::actor_id::ActorID;
 use std::cmp::Ordering;
-use crate::document::time::actor_id::{ActorID};
+use std::{u32, u64};
 
 const MAX_LAMPORT: u64 = u64::MAX;
 const MAX_DELIMITER: u32 = u32::MAX;
@@ -14,7 +14,11 @@ struct Ticket {
 
 impl Ticket {
     pub fn new(lamport: u64, delimiter: u32, actor_id: ActorID) -> Ticket {
-        Ticket{lamport, delimiter, actor_id}
+        Ticket {
+            lamport,
+            delimiter,
+            actor_id,
+        }
     }
 
     /// annotated_string returns a string containing the metadata of the ticket
@@ -41,14 +45,14 @@ impl Ticket {
         &self.actor_id
     }
 
-    /// compare returns an cmp::Ordering comparing two Ticket.
-    pub fn compare(&self, other: &Ticket) -> Ordering {
+    /// cmp returns an cmp::Ordering comparing two Ticket.
+    pub fn cmp(&self, other: &Ticket) -> Ordering {
         match self.lamport.cmp(&other.lamport) {
             Ordering::Equal => (),
             etc => return etc,
         }
 
-        match self.actor_id.compare(&other.actor_id) {
+        match self.actor_id.cmp(&other.actor_id) {
             Ordering::Equal => (),
             etc => return etc,
         }
@@ -63,7 +67,7 @@ impl Ticket {
 
     // after returns whether the given ticket was created later.
     pub fn after(&self, other: &Ticket) -> bool {
-        match self.compare(other) {
+        match self.cmp(other) {
             Ordering::Greater => true,
             _ => false,
         }
@@ -85,7 +89,7 @@ mod tests {
     }
 
     #[test]
-    fn compare() {
+    fn cmp() {
         let hex_str = "0123456789abcdef01234567";
         let actor_id = ActorID::from_hex(hex_str).unwrap();
 
@@ -93,9 +97,9 @@ mod tests {
         let before_ticket = Ticket::new(0, 0, actor_id.clone());
         let after_ticket = Ticket::new(1, 0, actor_id.clone());
 
-        assert_eq!(Ordering::Less, before_ticket.compare(&after_ticket));
-        assert_eq!(Ordering::Greater, after_ticket.compare(&before_ticket));
-        assert_eq!(Ordering::Equal, after_ticket.compare(&after_ticket));
+        assert_eq!(Ordering::Less, before_ticket.cmp(&after_ticket));
+        assert_eq!(Ordering::Greater, after_ticket.cmp(&before_ticket));
+        assert_eq!(Ordering::Equal, after_ticket.cmp(&after_ticket));
 
         // compare for actor_id
         let hex_str = "0000000000abcdef01234567";
@@ -103,17 +107,17 @@ mod tests {
         let before_ticket = Ticket::new(0, 0, before_actor_id);
         let after_ticket = Ticket::new(0, 0, actor_id.clone());
 
-        assert_eq!(Ordering::Less, before_ticket.compare(&after_ticket));
-        assert_eq!(Ordering::Greater, after_ticket.compare(&before_ticket));
-        assert_eq!(Ordering::Equal, after_ticket.compare(&after_ticket));
+        assert_eq!(Ordering::Less, before_ticket.cmp(&after_ticket));
+        assert_eq!(Ordering::Greater, after_ticket.cmp(&before_ticket));
+        assert_eq!(Ordering::Equal, after_ticket.cmp(&after_ticket));
 
         // compare for delimiter
         let before_ticket = Ticket::new(0, 0, actor_id.clone());
         let after_ticket = Ticket::new(0, 1, actor_id.clone());
 
-        assert_eq!(Ordering::Less, before_ticket.compare(&after_ticket));
-        assert_eq!(Ordering::Greater, after_ticket.compare(&before_ticket));
-        assert_eq!(Ordering::Equal, after_ticket.compare(&after_ticket));
+        assert_eq!(Ordering::Less, before_ticket.cmp(&after_ticket));
+        assert_eq!(Ordering::Greater, after_ticket.cmp(&before_ticket));
+        assert_eq!(Ordering::Equal, after_ticket.cmp(&after_ticket));
     }
 
     #[test]

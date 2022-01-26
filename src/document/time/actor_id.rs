@@ -1,5 +1,5 @@
-use std::cmp;
 use hex::{FromHex, FromHexError};
+use std::cmp::Ordering;
 
 const ACTOR_ID_SIZE: usize = 12;
 
@@ -12,7 +12,7 @@ pub struct ActorID {
 
 impl ActorID {
     pub fn new(bytes: [u8; ACTOR_ID_SIZE]) -> ActorID {
-        ActorID{bytes}
+        ActorID { bytes }
     }
 
     /// from_hex returns the ActorID represented by the hexadecimal string str.
@@ -23,7 +23,7 @@ impl ActorID {
 
         let bytes = <[u8; 12]>::from_hex(hex_str)?;
 
-        Ok(ActorID{bytes})
+        Ok(ActorID { bytes })
     }
 
     /// to_string returns the hexadecimal encoding of ActorID.
@@ -35,17 +35,14 @@ impl ActorID {
         &self.bytes
     }
 
-    /// compare returns an cmp::Ordering comparing two ActorID lexicographically.
-    pub fn compare(&self, other: &ActorID) -> cmp::Ordering {
-        self.bytes.iter()
+    /// cmp returns an Ordering comparing two ActorID lexicographically.
+    pub fn cmp(&self, other: &ActorID) -> Ordering {
+        self.bytes
+            .iter()
             .zip(other.bytes())
             .map(|(x, y)| x.cmp(y))
-            .find(|&ord| ord != cmp::Ordering::Equal)
-            .unwrap_or(
-                self.bytes
-                    .len()
-                    .cmp(&other.bytes().len())
-            )
+            .find(|&ord| ord != Ordering::Equal)
+            .unwrap_or(self.bytes.len().cmp(&other.bytes().len()))
     }
 }
 
@@ -69,12 +66,12 @@ mod tests {
     }
 
     #[test]
-    fn compare() {
+    fn cmp() {
         let before_actor_id = ActorID::from_hex("0000000000abcdef01234567").unwrap();
-        let after_actor_id  = ActorID::from_hex("0123456789abcdef01234567").unwrap();
+        let after_actor_id = ActorID::from_hex("0123456789abcdef01234567").unwrap();
 
-        assert_eq!(cmp::Ordering::Less, before_actor_id.compare(&after_actor_id));
-        assert_eq!(cmp::Ordering::Greater, after_actor_id.compare(&before_actor_id));
-        assert_eq!(cmp::Ordering::Equal, before_actor_id.compare(&before_actor_id));
+        assert_eq!(Ordering::Less, before_actor_id.cmp(&after_actor_id));
+        assert_eq!(Ordering::Greater, after_actor_id.cmp(&before_actor_id));
+        assert_eq!(Ordering::Equal, before_actor_id.cmp(&before_actor_id));
     }
 }
