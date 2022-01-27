@@ -18,6 +18,9 @@ jobs:
     steps:
     - uses: actions/checkout@v2
 
+    - name: RustFmt
+      run: cargo fmt --all -- --check
+
     - name: Stack
       run: docker-compose -f docker/docker-compose.yml up --build -d
 
