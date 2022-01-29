@@ -6,7 +6,8 @@ const MAX_LAMPORT: u64 = u64::MAX;
 const MAX_DELIMITER: u32 = u32::MAX;
 
 /// Ticket is a timestamp of the logical clock. Ticket is immutable.
-struct Ticket {
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ticket {
     lamport: u64,
     delimiter: u32,
     actor_id: ActorID,
