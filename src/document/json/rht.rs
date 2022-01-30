@@ -92,6 +92,7 @@ impl RHT {
 
     pub fn get(&self, key: &str) -> String {
         if let Some(node) = &self.node_map_by_key.get(key) {
+            println!("self= {:p}, node1 = {:p}", self, node.as_ptr());
             let node = node.borrow();
             if node.is_removed() {
                 return String::from("");
@@ -132,6 +133,21 @@ impl RHT {
             .iter()
             .map(|(key, node)| (key.clone(), node.borrow().value().to_string()))
             .collect()
+    }
+
+    pub fn clone(&self) -> RHT {
+        let mut rht = RHT::new();
+
+        self.node_map_by_key.iter().for_each(|(_, node)| {
+            let node = node.borrow();
+            rht.insert(
+                node.key().to_string(),
+                node.value().to_string(),
+                node.updated_at().clone(),
+            )
+        });
+
+        rht
     }
 }
 
