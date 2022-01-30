@@ -1,7 +1,7 @@
 use crate::document::time::ticket;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::cell::RefCell;
 
 struct RHTNode {
     key: String,
@@ -33,28 +33,28 @@ impl RHTNode {
     }
 
     pub fn removed_at(&self) -> Option<&ticket::Ticket> {
-        match &self.removed_at {
-            Some(removed_at) => Some(&removed_at),
-            _ => None,
+        if let Some(removed_at) = &self.removed_at {
+            return Some(&removed_at);
         }
+
+        return None;
     }
 
     pub fn remove(&mut self, removed_at: ticket::Ticket) {
-        match &self.removed_at {
-            Some(v) => {
-                if removed_at.after(v) {
-                    self.removed_at = Some(removed_at)
-                }
-            },
-            _ => self.removed_at = Some(removed_at),
+        if let Some(v) = &self.removed_at {
+            if removed_at.after(v) {
+                self.removed_at = Some(removed_at)
+            }
+            return;
         }
+        self.removed_at = Some(removed_at);
     }
 
     pub fn is_removed(&self) -> bool {
-        match self.removed_at {
-            None => false,
-            _ => true,
+        if let None = self.removed_at {
+            return false;
         }
+        true
     }
 }
 
@@ -86,10 +86,8 @@ impl RHT {
         let node = RHTNode::new(key.clone(), val, executed_at.clone());
 
         let node = Rc::new(RefCell::new(node));
-        self.node_map_by_key
-            .insert(key, Rc::clone(&node));
-        self.node_map_by_created_at
-            .insert(executed_at.key(), node);
+        self.node_map_by_key.insert(key, Rc::clone(&node));
+        self.node_map_by_created_at.insert(executed_at.key(), node);
     }
 
     pub fn get(&self, key: &str) -> String {
