@@ -126,6 +126,13 @@ impl RHT {
 
         String::from("")
     }
+
+    pub fn elements(&self) -> HashMap<String, String> {
+        self.node_map_by_key
+            .iter()
+            .map(|(key, node)| (key.clone(), node.borrow().value().to_string()))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -217,5 +224,23 @@ mod rht_tests {
         let executed_at = ticket::Ticket::new(0, 1, id.clone());
         assert_eq!(rht.remove(key, executed_at.clone()), val);
         assert!(!rht.has(key));
+    }
+
+    #[test]
+    fn elements() {
+        let mut rht = RHT::new();
+        let keys = vec!["key", "key2"];
+        let values = vec!["value", "value2"];
+        let id = actor_id::ActorID::from_hex("0000000000abcdef01234567").unwrap();
+        let executed_at = ticket::Ticket::new(0, 0, id.clone());
+
+        for (i, key) in keys.iter().enumerate() {
+            rht.insert(key.to_string(), values[i].to_string(), executed_at.clone());
+        }
+
+        let elements = rht.elements();
+        for i in 0..keys.len() {
+            assert_eq!(elements.get(keys[i]).unwrap(), values[i]);
+        }
     }
 }
