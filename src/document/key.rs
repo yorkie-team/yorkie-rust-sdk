@@ -29,11 +29,14 @@ impl Key {
 
         let collection = splits[0].to_string();
         let document = splits[1].to_string();
-        Ok(Key{ collection, document })
+        Ok(Key {
+            collection,
+            document,
+        })
     }
 
     /// bson_key returns the string of this key.
-    fn bson_key(&self) -> String {
+    pub fn bson_key(&self) -> String {
         format!("{}{}{}", self.collection, BSON_SPLITTER, self.document)
     }
 
