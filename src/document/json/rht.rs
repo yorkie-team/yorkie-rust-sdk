@@ -149,6 +149,24 @@ impl RHT {
 
         rht
     }
+
+    pub fn marshal(&self) -> String {
+        let members = self.elements();
+
+        let mut result = String::from("{");
+        let mut keys = members.keys().collect::<Vec<_>>();
+        keys.sort();
+        for (i, key) in keys.iter().enumerate() {
+            if i > 0 {
+                result.push(',');
+            }
+            let value = members.get(key as &str).unwrap();
+            result.push_str(&format!("{}:{}", key, value));
+        }
+        result.push('}');
+
+        result
+    }
 }
 
 #[cfg(test)]
@@ -258,5 +276,19 @@ mod rht_tests {
         for i in 0..keys.len() {
             assert_eq!(elements.get(keys[i]).unwrap(), values[i]);
         }
+    }
+
+    #[test]
+    fn marshal() {
+        let mut rht = RHT::new();
+        assert_eq!(rht.marshal(), "{}");
+
+        let id = actor_id::ActorID::from_hex("0000000000abcdef01234567").unwrap();
+        let executed_at = ticket::Ticket::new(0, 0, id.clone());
+        rht.insert("b".to_string(), "2".to_string(), executed_at.clone());
+        rht.insert("c".to_string(), "3".to_string(), executed_at.clone());
+        rht.insert("a".to_string(), "1".to_string(), executed_at);
+
+        assert_eq!(rht.marshal(), "{a:1,b:2,c:3}");
     }
 }
