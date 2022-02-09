@@ -3,6 +3,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+/// RHTNode is a node of RHT(Replicated Hashtable).
 struct RHTNode {
     key: String,
     val: String,
@@ -20,18 +21,22 @@ impl RHTNode {
         }
     }
 
+    /// key returns the key of this node.
     pub fn key(&self) -> &str {
         &self.key
     }
 
+    /// value returns the value of this node.
     pub fn value(&self) -> &str {
         &self.val
     }
 
+    /// updated_at returns the last update time.
     pub fn updated_at(&self) -> &ticket::Ticket {
         &self.updated_at
     }
 
+    /// removed_at returns the deletion time of this node.
     pub fn removed_at(&self) -> Option<&ticket::Ticket> {
         if let Some(removed_at) = &self.removed_at {
             return Some(&removed_at);
@@ -40,6 +45,7 @@ impl RHTNode {
         return None;
     }
 
+    /// remove removes this node. It only marks the deleted time (tombstone).
     pub fn remove(&mut self, removed_at: ticket::Ticket) {
         if let Some(v) = &self.removed_at {
             if removed_at.after(v) {
@@ -58,6 +64,8 @@ impl RHTNode {
     }
 }
 
+/// RHT is a hashtable with logical clock(Replicated hashtable).
+/// For more details about RHT: http://csl.skku.edu/papers/jpdc11.pdf
 pub struct RHT {
     node_map_by_key: HashMap<String, Rc<RefCell<RHTNode>>>,
     node_map_by_created_at: HashMap<String, Rc<RefCell<RHTNode>>>,
@@ -71,6 +79,7 @@ impl RHT {
         }
     }
 
+    /// insert sets the value of the given key.
     pub fn insert(&mut self, key: String, val: String, executed_at: ticket::Ticket) {
         if let Some(node) = self.node_map_by_key.get(&key) {
             if executed_at.after(&node.borrow().updated_at) {
@@ -90,6 +99,7 @@ impl RHT {
         self.node_map_by_created_at.insert(executed_at.key(), node);
     }
 
+    /// get returns the value of the given key.
     pub fn get(&self, key: &str) -> String {
         if let Some(node) = &self.node_map_by_key.get(key) {
             println!("self= {:p}, node1 = {:p}", self, node.as_ptr());
@@ -103,6 +113,7 @@ impl RHT {
         String::from("")
     }
 
+    /// has returns whether the element exists of the given key or not.
     pub fn has(&self, key: &str) -> bool {
         if let Some(node) = self.node_map_by_key.get(key) {
             return !node.borrow().is_removed();
@@ -111,6 +122,7 @@ impl RHT {
         false
     }
 
+    /// remove removes the Element of the given key.
     pub fn remove(&mut self, key: &str, executed_at: ticket::Ticket) -> String {
         if let Some(node) = self.node_map_by_key.get(key) {
             let mut node = node.borrow_mut();
@@ -128,6 +140,7 @@ impl RHT {
         String::from("")
     }
 
+    /// elements returns a map of elements because the map easy to use for loop.
     pub fn elements(&self) -> HashMap<String, String> {
         self.node_map_by_key
             .iter()
