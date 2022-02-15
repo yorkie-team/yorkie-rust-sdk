@@ -68,7 +68,7 @@ impl RHTNode {
 /// For more details about RHT: http://csl.skku.edu/papers/jpdc11.pdf
 pub struct RHT {
     node_map_by_key: HashMap<String, Rc<RefCell<RHTNode>>>,
-    node_map_by_created_at: HashMap<String, Rc<RefCell<RHTNode>>>,
+    node_map_by_created_at: HashMap<ticket::Ticket, Rc<RefCell<RHTNode>>>,
 }
 
 impl RHT {
@@ -96,7 +96,7 @@ impl RHT {
 
         let node = Rc::new(RefCell::new(node));
         self.node_map_by_key.insert(key, Rc::clone(&node));
-        self.node_map_by_created_at.insert(executed_at.key(), node);
+        self.node_map_by_created_at.insert(executed_at, node);
     }
 
     /// get returns the value of the given key.
