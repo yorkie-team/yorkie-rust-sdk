@@ -163,7 +163,7 @@ impl RHT {
         rht
     }
 
-    pub fn marshal(&self) -> String {
+    pub fn to_string(&self) -> String {
         let members = self.elements();
 
         let mut result = String::from("{");
@@ -294,9 +294,9 @@ mod rht_tests {
     }
 
     #[test]
-    fn marshal() {
+    fn to_string() {
         let mut rht = RHT::new();
-        assert_eq!(rht.marshal(), "{}");
+        assert_eq!(rht.to_string(), "{}");
 
         let id = ActorID::from_hex("0000000000abcdef01234567").unwrap();
         let executed_at = Ticket::new(0, 0, id.clone());
@@ -304,6 +304,6 @@ mod rht_tests {
         rht.insert("c".to_string(), "3".to_string(), executed_at.clone());
         rht.insert("a".to_string(), "1".to_string(), executed_at);
 
-        assert_eq!(rht.marshal(), "{a:1,b:2,c:3}");
+        assert_eq!(rht.to_string(), "{a:1,b:2,c:3}");
     }
 }
