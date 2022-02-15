@@ -1,6 +1,5 @@
 use crate::document::time::actor_id::ActorID;
 use std::cmp::Ordering;
-use std::{u32, u64};
 
 const MAX_LAMPORT: u64 = u64::MAX;
 const MAX_DELIMITER: u32 = u32::MAX;

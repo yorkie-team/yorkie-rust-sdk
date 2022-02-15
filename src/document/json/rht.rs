@@ -1,4 +1,4 @@
-use crate::document::time::ticket;
+use crate::document::time::ticket::Ticket;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -7,12 +7,12 @@ use std::rc::Rc;
 struct RHTNode {
     key: String,
     val: String,
-    updated_at: ticket::Ticket,
-    removed_at: Option<ticket::Ticket>,
+    updated_at: Ticket,
+    removed_at: Option<Ticket>,
 }
 
 impl RHTNode {
-    pub fn new(key: String, val: String, updated_at: ticket::Ticket) -> RHTNode {
+    pub fn new(key: String, val: String, updated_at: Ticket) -> RHTNode {
         RHTNode {
             key,
             val,
@@ -32,12 +32,12 @@ impl RHTNode {
     }
 
     /// updated_at returns the last update time.
-    pub fn updated_at(&self) -> &ticket::Ticket {
+    pub fn updated_at(&self) -> &Ticket {
         &self.updated_at
     }
 
     /// removed_at returns the deletion time of this node.
-    pub fn removed_at(&self) -> Option<&ticket::Ticket> {
+    pub fn removed_at(&self) -> Option<&Ticket> {
         if let Some(removed_at) = &self.removed_at {
             return Some(&removed_at);
         }
@@ -46,7 +46,7 @@ impl RHTNode {
     }
 
     /// remove removes this node. It only marks the deleted time (tombstone).
-    pub fn remove(&mut self, removed_at: ticket::Ticket) {
+    pub fn remove(&mut self, removed_at: Ticket) {
         if let Some(v) = &self.removed_at {
             if removed_at.after(v) {
                 self.removed_at = Some(removed_at)
@@ -68,7 +68,7 @@ impl RHTNode {
 /// For more details about RHT: http://csl.skku.edu/papers/jpdc11.pdf
 pub struct RHT {
     node_map_by_key: HashMap<String, Rc<RefCell<RHTNode>>>,
-    node_map_by_created_at: HashMap<ticket::Ticket, Rc<RefCell<RHTNode>>>,
+    node_map_by_created_at: HashMap<Ticket, Rc<RefCell<RHTNode>>>,
 }
 
 impl RHT {
@@ -80,7 +80,7 @@ impl RHT {
     }
 
     /// insert sets the value of the given key.
-    pub fn insert(&mut self, key: String, val: String, executed_at: ticket::Ticket) {
+    pub fn insert(&mut self, key: String, val: String, executed_at: Ticket) {
         if let Some(node) = self.node_map_by_key.get(&key) {
             if executed_at.after(&node.borrow().updated_at) {
                 self.insert_exec(key, val, executed_at);
@@ -91,7 +91,7 @@ impl RHT {
         self.insert_exec(key, val, executed_at);
     }
 
-    fn insert_exec(&mut self, key: String, val: String, executed_at: ticket::Ticket) {
+    fn insert_exec(&mut self, key: String, val: String, executed_at: Ticket) {
         let node = RHTNode::new(key.clone(), val, executed_at.clone());
 
         let node = Rc::new(RefCell::new(node));
@@ -123,7 +123,7 @@ impl RHT {
     }
 
     /// remove removes the Element of the given key.
-    pub fn remove(&mut self, key: &str, executed_at: ticket::Ticket) -> String {
+    pub fn remove(&mut self, key: &str, executed_at: Ticket) -> String {
         if let Some(node) = self.node_map_by_key.get(key) {
             let mut node = node.borrow_mut();
             if let Some(removed_at) = &node.removed_at {
@@ -185,25 +185,26 @@ impl RHT {
 #[cfg(test)]
 mod rht_node_tests {
     use super::*;
-    use crate::document::time::{actor_id, ticket};
+    use crate::document::time::actor_id::ActorID;
+    use crate::document::time::ticket::Ticket;
 
     #[test]
     fn remove() {
-        let id = actor_id::ActorID::from_hex("0000000000abcdef01234567").unwrap();
+        let id = ActorID::from_hex("0000000000abcdef01234567").unwrap();
 
         let mut node = RHTNode::new(
             String::from("key"),
             String::from("value"),
-            ticket::Ticket::new(0, 0, id.clone()),
+            Ticket::new(0, 0, id.clone()),
         );
         assert!(!node.is_removed());
 
-        let removed_at = ticket::Ticket::new(0, 1, id.clone());
+        let removed_at = Ticket::new(0, 1, id.clone());
         node.remove(removed_at.clone());
         assert_eq!(node.removed_at().unwrap(), &removed_at);
         assert!(node.is_removed());
 
-        let before_removed_at = ticket::Ticket::new(0, 0, id.clone());
+        let before_removed_at = Ticket::new(0, 0, id.clone());
         node.remove(before_removed_at);
         assert_eq!(node.removed_at().unwrap(), &removed_at);
         assert!(node.is_removed());
@@ -213,15 +214,16 @@ mod rht_node_tests {
 #[cfg(test)]
 mod rht_tests {
     use super::*;
-    use crate::document::time::{actor_id, ticket};
+    use crate::document::time::actor_id::ActorID;
+    use crate::document::time::ticket::Ticket;
 
     #[test]
     fn insert() {
         let mut rht = RHT::new();
         let key = "key";
         let val = "value";
-        let id = actor_id::ActorID::from_hex("0000000000abcdef01234567").unwrap();
-        let executed_at = ticket::Ticket::new(0, 0, id.clone());
+        let id = ActorID::from_hex("0000000000abcdef01234567").unwrap();
+        let executed_at = Ticket::new(0, 0, id.clone());
 
         rht.insert(key.to_string(), val.to_string(), executed_at);
         assert_eq!(rht.get(key), val);
@@ -229,14 +231,14 @@ mod rht_tests {
 
         // when after ticket
         let val = "value2";
-        let executed_at = ticket::Ticket::new(0, 1, id.clone());
+        let executed_at = Ticket::new(0, 1, id.clone());
         rht.insert(key.to_string(), val.to_string(), executed_at);
         assert_eq!(rht.get(key), val);
         assert!(rht.has(key));
 
         // when before ticket
         let val = "value3";
-        let executed_at = ticket::Ticket::new(0, 0, id.clone());
+        let executed_at = Ticket::new(0, 0, id.clone());
         rht.insert(key.to_string(), val.to_string(), executed_at);
         assert_ne!(rht.get(key), val);
         assert!(rht.has(key));
@@ -255,8 +257,8 @@ mod rht_tests {
         let mut rht = RHT::new();
         let key = "key";
         let val = "value";
-        let id = actor_id::ActorID::from_hex("0000000000abcdef01234567").unwrap();
-        let executed_at = ticket::Ticket::new(0, 0, id.clone());
+        let id = ActorID::from_hex("0000000000abcdef01234567").unwrap();
+        let executed_at = Ticket::new(0, 0, id.clone());
 
         // when removed_at is None
         rht.insert(key.to_string(), val.to_string(), executed_at.clone());
@@ -268,7 +270,7 @@ mod rht_tests {
 
         // when after executed_at
         // TODO: Is this the intended behavior?
-        let executed_at = ticket::Ticket::new(0, 1, id.clone());
+        let executed_at = Ticket::new(0, 1, id.clone());
         assert_eq!(rht.remove(key, executed_at.clone()), val);
         assert!(!rht.has(key));
     }
@@ -278,8 +280,8 @@ mod rht_tests {
         let mut rht = RHT::new();
         let keys = vec!["key", "key2"];
         let values = vec!["value", "value2"];
-        let id = actor_id::ActorID::from_hex("0000000000abcdef01234567").unwrap();
-        let executed_at = ticket::Ticket::new(0, 0, id.clone());
+        let id = ActorID::from_hex("0000000000abcdef01234567").unwrap();
+        let executed_at = Ticket::new(0, 0, id.clone());
 
         for (i, key) in keys.iter().enumerate() {
             rht.insert(key.to_string(), values[i].to_string(), executed_at.clone());
@@ -296,8 +298,8 @@ mod rht_tests {
         let mut rht = RHT::new();
         assert_eq!(rht.marshal(), "{}");
 
-        let id = actor_id::ActorID::from_hex("0000000000abcdef01234567").unwrap();
-        let executed_at = ticket::Ticket::new(0, 0, id.clone());
+        let id = ActorID::from_hex("0000000000abcdef01234567").unwrap();
+        let executed_at = Ticket::new(0, 0, id.clone());
         rht.insert("b".to_string(), "2".to_string(), executed_at.clone());
         rht.insert("c".to_string(), "3".to_string(), executed_at.clone());
         rht.insert("a".to_string(), "1".to_string(), executed_at);
