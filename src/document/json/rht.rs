@@ -141,6 +141,7 @@ impl RHT {
     }
 
     /// elements returns a map of elements because the map easy to use for loop.
+    /// Deleted nodes are filtered out.
     pub fn elements(&self) -> HashMap<String, String> {
         self.node_map_by_key
             .iter()
