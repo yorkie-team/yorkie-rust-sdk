@@ -144,6 +144,7 @@ impl RHT {
     pub fn elements(&self) -> HashMap<String, String> {
         self.node_map_by_key
             .iter()
+            .filter(|(_, node)| !node.borrow().is_removed())
             .map(|(key, node)| (key.clone(), node.borrow().value().to_string()))
             .collect()
     }
@@ -290,6 +291,15 @@ mod rht_tests {
         let elements = rht.elements();
         for i in 0..keys.len() {
             assert_eq!(elements.get(keys[i]).unwrap(), values[i]);
+        }
+
+        // when include removed_node
+        let executed_at = Ticket::new(0, 0, id.clone());
+        rht.remove(keys[0], executed_at);
+        let elements = rht.elements();
+        match elements.get(keys[0]) {
+            Some(_) => assert!(false),
+            _ => assert!(true),
         }
     }
 
