@@ -1,11 +1,10 @@
 use crate::document::json::element::Element;
 use crate::document::time::ticket::Ticket;
 
-use std::collections::{HashMap, BinaryHeap};
 use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 
 use thiserror::Error;
-
 
 type BoxedElement = Box<dyn Element>;
 
@@ -18,7 +17,7 @@ impl Clone for BoxedElement {
 #[derive(Debug, Error)]
 enum RHTPQMapError {
     #[error("fail to find : {0}")]
-    ElementNotFound(String)
+    ElementNotFound(String),
 }
 
 struct RHTPQMapNode {
@@ -60,10 +59,7 @@ impl Clone for RHTPQMapNode {
 
 impl RHTPQMapNode {
     pub fn new(key: String, element: BoxedElement) -> RHTPQMapNode {
-        RHTPQMapNode {
-            key,
-            element,
-        }
+        RHTPQMapNode { key, element }
     }
 
     pub fn remove(&self, ticket: Ticket) -> bool {
@@ -97,57 +93,44 @@ impl RHTPriorityQueueMap {
 
     pub fn get(&self, key: &str) -> Option<BoxedElement> {
         match self.node_queue_map_by_key.get(key) {
-            Some(queue) => {
-                match queue.peek() {
-                    Some(node) => {
-                        match node.is_removed() {
-                            false => Some(node.element.clone()),
-                            true => None,
-                        }
-                        
-                    },
-                    _ => None,
-                }
-            }
+            Some(queue) => match queue.peek() {
+                Some(node) => match node.is_removed() {
+                    false => Some(node.element.clone()),
+                    true => None,
+                },
+                _ => None,
+            },
             _ => None,
         }
     }
 
     pub fn has(&self, key: &str) -> bool {
         match self.node_queue_map_by_key.get(key) {
-            Some(queue) => {
-                match queue.peek() {
-                    Some(node) => {
-                        match node.is_removed() {
-                            false => true,
-                            true => false,
-                        }
-                    },
-                    _ => false,
-                }
-            }
+            Some(queue) => match queue.peek() {
+                Some(node) => match node.is_removed() {
+                    false => true,
+                    true => false,
+                },
+                _ => false,
+            },
             _ => false,
         }
     }
 
     pub fn set(&self, key: String, value: BoxedElement) -> Option<BoxedElement> {
         match self.node_queue_map_by_key.get(&key) {
-            Some(queue) => {
-                match queue.peek() {
-                    Some(node) => {
-                        match node.is_removed() {
-                            true => None,
-                            false => {
-                                if node.remove(value.created_at()) {
-                                    return Some(node.element.clone());
-                                } else {
-                                    return None;
-                                }
-                            }
+            Some(queue) => match queue.peek() {
+                Some(node) => match node.is_removed() {
+                    true => None,
+                    false => {
+                        if node.remove(value.created_at()) {
+                            return Some(node.element.clone());
+                        } else {
+                            return None;
                         }
-                    },
-                    _ => None,
-                }
+                    }
+                },
+                _ => None,
             },
             _ => None,
         }
@@ -157,41 +140,42 @@ impl RHTPriorityQueueMap {
         let node = RHTPQMapNode::new(key.clone(), value.clone());
         self.node_map_by_created_at.insert(key, node.clone());
 
-        let queue = self.node_queue_map_by_key.entry(value.created_at().key()).or_insert(BinaryHeap::new());
+        let queue = self
+            .node_queue_map_by_key
+            .entry(value.created_at().key())
+            .or_insert(BinaryHeap::new());
         queue.push(node);
     }
 
     pub fn delete(&self, key: String, deleted_at: Ticket) -> Option<&BoxedElement> {
         match self.node_queue_map_by_key.get(&key) {
-            Some(queue) => {
-                match queue.peek() {
-                    Some(node) => {
-                        match node.remove(deleted_at) {
-                            true => None,
-                            false => Some(&node.element),
-                        }
-                    },
-                    _ => None,
-                }
+            Some(queue) => match queue.peek() {
+                Some(node) => match node.remove(deleted_at) {
+                    true => None,
+                    false => Some(&node.element),
+                },
+                _ => None,
             },
             _ => None,
         }
     }
 
-    pub fn delete_by_created_at(&self, created_at: Ticket, deleted_at: Ticket) -> Option<BoxedElement> {
+    pub fn delete_by_created_at(
+        &self,
+        created_at: Ticket,
+        deleted_at: Ticket,
+    ) -> Option<BoxedElement> {
         match self.node_map_by_created_at.get(&created_at.key()) {
-            Some(node) => {
-                match node.is_removed() {
-                    true => None,
-                    false => {
-                        if !node.remove(deleted_at) {
-                            return None;
-                        }
-                        Some(node.element.clone())
+            Some(node) => match node.is_removed() {
+                true => None,
+                false => {
+                    if !node.remove(deleted_at) {
+                        return None;
                     }
+                    Some(node.element.clone())
                 }
             },
-            _ => None
+            _ => None,
         }
     }
 
@@ -220,30 +204,32 @@ impl RHTPriorityQueueMap {
 
     fn purge(&mut self, element: BoxedElement) -> Result<(), Box<RHTPQMapError>> {
         match &self.node_map_by_created_at.get(&element.created_at().key()) {
-            None => Err(Box::new(RHTPQMapError::ElementNotFound(element.created_at().key().to_string()))),
-            Some(node) => {
-                match self.node_queue_map_by_key.get_mut(&node.key()) {
-                    None => Err(Box::new(RHTPQMapError::ElementNotFound(element.created_at().key().to_string()))),
-                    Some(queue) => {
-                        let mut subqueue = BinaryHeap::new();
-                        while !queue.is_empty() {
-                            let item = queue.pop().unwrap();
-                            if item.key() == node.key() {
-                                continue;
-                            }
-                            subqueue.push(item);
-                        };
-                        while !subqueue.is_empty() {
-                            queue.push(subqueue.pop().unwrap());
+            None => Err(Box::new(RHTPQMapError::ElementNotFound(
+                element.created_at().key().to_string(),
+            ))),
+            Some(node) => match self.node_queue_map_by_key.get_mut(&node.key()) {
+                None => Err(Box::new(RHTPQMapError::ElementNotFound(
+                    element.created_at().key().to_string(),
+                ))),
+                Some(queue) => {
+                    let mut subqueue = BinaryHeap::new();
+                    while !queue.is_empty() {
+                        let item = queue.pop().unwrap();
+                        if item.key() == node.key() {
+                            continue;
                         }
-                        node.remove(node.element.created_at());
-                        Ok(())
-                    },
+                        subqueue.push(item);
+                    }
+                    while !subqueue.is_empty() {
+                        queue.push(subqueue.pop().unwrap());
+                    }
+                    node.remove(node.element.created_at());
+                    Ok(())
                 }
-            }
+            },
         }
     }
-    
+
     pub fn to_string(&self) -> String {
         let members = self.elements();
 
