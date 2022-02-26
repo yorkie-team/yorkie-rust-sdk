@@ -8,12 +8,6 @@ use thiserror::Error;
 
 type BoxedElement = Box<dyn Element>;
 
-impl Clone for BoxedElement {
-    fn clone(&self) -> BoxedElement {
-        self.deepcopy()
-    }
-}
-
 #[derive(Debug, Error)]
 enum RHTPQMapError {
     #[error("fail to find : {0}")]
@@ -52,7 +46,7 @@ impl Clone for RHTPQMapNode {
     fn clone(&self) -> RHTPQMapNode {
         RHTPQMapNode {
             key: self.key.clone(),
-            element: self.element.deepcopy(),
+            element: self.element.clone(),
         }
     }
 }
@@ -142,7 +136,8 @@ impl RHTPriorityQueueMap {
 
     pub fn set_internal(&mut self, key: String, value: BoxedElement) {
         let node = RHTPQMapNode::new(key.clone(), value.clone());
-        self.node_map_by_created_at.insert(value.created_at(), node.clone());
+        self.node_map_by_created_at
+            .insert(value.created_at(), node.clone());
 
         let queue = self
             .node_queue_map_by_key
@@ -151,12 +146,12 @@ impl RHTPriorityQueueMap {
         queue.push(node);
     }
 
-    pub fn delete(&self, key: String, deleted_at: Ticket) -> Option<&BoxedElement> {
+    pub fn delete(&self, key: String, deleted_at: Ticket) -> Option<BoxedElement> {
         match self.node_queue_map_by_key.get(&key) {
             Some(queue) => match queue.peek() {
                 Some(node) => match node.remove(deleted_at) {
-                    true => None,
-                    false => Some(&node.element),
+                    true => Some(node.element.clone()),
+                    false => None,
                 },
                 _ => None,
             },
