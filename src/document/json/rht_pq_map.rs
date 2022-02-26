@@ -80,7 +80,7 @@ impl RHTPQMapNode {
 
 pub struct RHTPriorityQueueMap {
     node_queue_map_by_key: HashMap<String, BinaryHeap<RHTPQMapNode>>,
-    node_map_by_created_at: HashMap<String, RHTPQMapNode>,
+    node_map_by_created_at: HashMap<Ticket, RHTPQMapNode>,
 }
 
 impl RHTPriorityQueueMap {
