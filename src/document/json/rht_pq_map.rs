@@ -117,8 +117,8 @@ impl RHTPriorityQueueMap {
         }
     }
 
-    pub fn set(&self, key: String, value: BoxedElement) -> Option<BoxedElement> {
-        match self.node_queue_map_by_key.get(&key) {
+    pub fn set(&mut self, key: String, value: BoxedElement) -> Option<BoxedElement> {
+        let removed = match self.node_queue_map_by_key.get(&key) {
             Some(queue) => match queue.peek() {
                 Some(node) => match node.is_removed() {
                     true => None,
@@ -133,10 +133,14 @@ impl RHTPriorityQueueMap {
                 _ => None,
             },
             _ => None,
-        }
+        };
+
+        self.set_internal(key, value);
+
+        removed
     }
 
-    fn set_internal(&mut self, key: String, value: BoxedElement) {
+    pub fn set_internal(&mut self, key: String, value: BoxedElement) {
         let node = RHTPQMapNode::new(key.clone(), value.clone());
         self.node_map_by_created_at.insert(key, node.clone());
 
