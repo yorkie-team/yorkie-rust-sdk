@@ -1,8 +1,10 @@
 use crate::document::json::element::Element;
 use crate::document::time::ticket::Ticket;
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
+use std::rc::Rc;
 
 use thiserror::Error;
 
@@ -73,8 +75,8 @@ impl RHTPQMapNode {
 }
 
 pub struct RHTPriorityQueueMap {
-    node_queue_map_by_key: HashMap<String, BinaryHeap<RHTPQMapNode>>,
-    node_map_by_created_at: HashMap<Ticket, RHTPQMapNode>,
+    node_queue_map_by_key: HashMap<String, BinaryHeap<Rc<RefCell<RHTPQMapNode>>>>,
+    node_map_by_created_at: HashMap<Ticket, Rc<RefCell<RHTPQMapNode>>>,
 }
 
 impl RHTPriorityQueueMap {
@@ -86,25 +88,29 @@ impl RHTPriorityQueueMap {
     }
 
     pub fn get(&self, key: &str) -> Option<BoxedElement> {
-        match self.node_queue_map_by_key.get(key) {
+        let node = match self.node_queue_map_by_key.get(key) {
             Some(queue) => match queue.peek() {
-                Some(node) => match node.is_removed() {
-                    false => Some(node.element.clone()),
-                    true => None,
-                },
+                Some(node) => Some(node),
                 _ => None,
             },
             _ => None,
+        };
+
+        if node.is_none() {
+            return None;
+        }
+
+        let node = node.unwrap().borrow();
+        match node.is_removed() {
+            false => Some(node.element.clone()),
+            true => None,
         }
     }
 
     pub fn has(&self, key: &str) -> bool {
         match self.node_queue_map_by_key.get(key) {
             Some(queue) => match queue.peek() {
-                Some(node) => match node.is_removed() {
-                    false => true,
-                    true => false,
-                },
+                Some(node) => !node.borrow().is_removed(),
                 _ => false,
             },
             _ => false,
@@ -112,20 +118,27 @@ impl RHTPriorityQueueMap {
     }
 
     pub fn set(&mut self, key: String, value: BoxedElement) -> Option<BoxedElement> {
-        let removed = match self.node_queue_map_by_key.get(&key) {
+        let node = match self.node_queue_map_by_key.get(&key) {
             Some(queue) => match queue.peek() {
-                Some(node) => match node.is_removed() {
-                    true => None,
-                    false => {
-                        if node.remove(value.created_at()) {
-                            return Some(node.element.clone());
-                        } else {
-                            return None;
-                        }
-                    }
-                },
+                Some(node) => Some(node),
                 _ => None,
             },
+            _ => None,
+        };
+
+        let removed = match node {
+            Some(node) => {
+                let node = node.borrow();
+                if node.is_removed() {
+                    return None;
+                }
+
+                if node.remove(value.created_at()) {
+                    return Some(node.element.clone());
+                } else {
+                    return None;
+                }
+            }
             _ => None,
         };
 
@@ -136,6 +149,7 @@ impl RHTPriorityQueueMap {
 
     pub fn set_internal(&mut self, key: String, value: BoxedElement) {
         let node = RHTPQMapNode::new(key.clone(), value.clone());
+        let node = Rc::new(RefCell::new(node));
         self.node_map_by_created_at
             .insert(value.created_at(), node.clone());
 
@@ -149,10 +163,13 @@ impl RHTPriorityQueueMap {
     pub fn delete(&self, key: String, deleted_at: Ticket) -> Option<BoxedElement> {
         match self.node_queue_map_by_key.get(&key) {
             Some(queue) => match queue.peek() {
-                Some(node) => match node.remove(deleted_at) {
-                    true => Some(node.element.clone()),
-                    false => None,
-                },
+                Some(node) => {
+                    let node = node.borrow();
+                    match node.remove(deleted_at) {
+                        true => Some(node.element.clone()),
+                        false => None,
+                    }
+                }
                 _ => None,
             },
             _ => None,
@@ -164,12 +181,14 @@ impl RHTPriorityQueueMap {
         created_at: Ticket,
         deleted_at: Ticket,
     ) -> Option<BoxedElement> {
-        match self.node_map_by_created_at.get(&created_at) {
-            Some(node) => match node.remove(deleted_at) {
+        if let Some(node) = self.node_map_by_created_at.get(&created_at) {
+            let node = node.borrow();
+            match node.remove(deleted_at) {
                 true => Some(node.element.clone()),
                 false => None,
-            },
-            _ => None,
+            }
+        } else {
+            None
         }
     }
 
@@ -177,6 +196,7 @@ impl RHTPriorityQueueMap {
         let mut elements = HashMap::new();
         for (_, queue) in self.node_queue_map_by_key.iter() {
             for node in queue.iter() {
+                let node = node.borrow();
                 if node.is_removed() {
                     continue;
                 }
@@ -186,7 +206,7 @@ impl RHTPriorityQueueMap {
         elements
     }
 
-    pub fn nodes(&self) -> Vec<RHTPQMapNode> {
+    pub fn nodes(&self) -> Vec<Rc<RefCell<RHTPQMapNode>>> {
         let mut nodes = vec![];
         for (_, queue) in self.node_queue_map_by_key.iter() {
             for node in queue.iter() {
@@ -201,26 +221,29 @@ impl RHTPriorityQueueMap {
             None => Err(Box::new(RHTPQMapError::ElementNotFound(
                 element.created_at().key().to_string(),
             ))),
-            Some(node) => match self.node_queue_map_by_key.get_mut(&node.key()) {
-                None => Err(Box::new(RHTPQMapError::ElementNotFound(
-                    element.created_at().key().to_string(),
-                ))),
-                Some(queue) => {
-                    let mut subqueue = BinaryHeap::new();
-                    while !queue.is_empty() {
-                        let item = queue.pop().unwrap();
-                        if item.key() == node.key() {
-                            continue;
+            Some(node) => {
+                let node = node.borrow();
+                match self.node_queue_map_by_key.get_mut(&node.key()) {
+                    None => Err(Box::new(RHTPQMapError::ElementNotFound(
+                        element.created_at().key().to_string(),
+                    ))),
+                    Some(queue) => {
+                        let mut subqueue = BinaryHeap::new();
+                        while !queue.is_empty() {
+                            let item = queue.pop().unwrap();
+                            if item.borrow().key() == node.key() {
+                                continue;
+                            }
+                            subqueue.push(item);
                         }
-                        subqueue.push(item);
+                        while !subqueue.is_empty() {
+                            queue.push(subqueue.pop().unwrap());
+                        }
+                        node.remove(node.element.created_at());
+                        Ok(())
                     }
-                    while !subqueue.is_empty() {
-                        queue.push(subqueue.pop().unwrap());
-                    }
-                    node.remove(node.element.created_at());
-                    Ok(())
                 }
-            },
+            }
         }
     }
 
