@@ -142,11 +142,11 @@ impl RHTPriorityQueueMap {
 
     pub fn set_internal(&mut self, key: String, value: BoxedElement) {
         let node = RHTPQMapNode::new(key.clone(), value.clone());
-        self.node_map_by_created_at.insert(key, node.clone());
+        self.node_map_by_created_at.insert(value.created_at(), node.clone());
 
         let queue = self
             .node_queue_map_by_key
-            .entry(value.created_at().key())
+            .entry(key)
             .or_insert(BinaryHeap::new());
         queue.push(node);
     }
@@ -169,7 +169,7 @@ impl RHTPriorityQueueMap {
         created_at: Ticket,
         deleted_at: Ticket,
     ) -> Option<BoxedElement> {
-        match self.node_map_by_created_at.get(&created_at.key()) {
+        match self.node_map_by_created_at.get(&created_at) {
             Some(node) => match node.is_removed() {
                 true => None,
                 false => {
@@ -207,7 +207,7 @@ impl RHTPriorityQueueMap {
     }
 
     fn purge(&mut self, element: BoxedElement) -> Result<(), Box<RHTPQMapError>> {
-        match &self.node_map_by_created_at.get(&element.created_at().key()) {
+        match &self.node_map_by_created_at.get(&element.created_at()) {
             None => Err(Box::new(RHTPQMapError::ElementNotFound(
                 element.created_at().key().to_string(),
             ))),
