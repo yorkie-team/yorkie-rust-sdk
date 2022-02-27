@@ -110,27 +110,47 @@ impl<K: Key, V: Value> Tree<K, V> {
             return Some(Rc::new(RefCell::new(Node::new(key, value, true))));
         }
 
-        let mut node_rc = node.as_ref().unwrap();
-        let mut node = node_rc.borrow_mut();
-        match key.cmp(node.key()) {
-            Ordering::Less => node.left = self.insert_fix_up(node.clone_left(), key, value),
-            Ordering::Greater => node.right = self.insert_fix_up(node.clone_right(), key, value),
-            _ => node.value = value,
-        }
-
-        if is_red(&node.right) && !is_red(&node.left) {
-            let node_rc = &rotate_left(node_rc);
-        }
-
-        if is_red(&node.left) {
-            if let Some(l) = &node.left {
-                if is_red(&l.borrow().left) {
-                    let node_rc = &rotate_right(node_rc);
-                }
+        let node_rc = node.as_ref().unwrap();
+        {
+            let mut node = node_rc.borrow_mut();
+            match key.cmp(node.key()) {
+                Ordering::Less => node.left = self.insert_fix_up(node.clone_left(), key, value),
+                Ordering::Greater => node.right = self.insert_fix_up(node.clone_right(), key, value),
+                _ => node.value = value,
             }
         }
 
-        if is_red(&node.left) && is_red(&node.right) {
+        // when rotate left
+        if need_rotate_left(node_rc) {
+            let right_node = rotate_left(node_rc);
+
+            if need_rotate_right(&right_node) {
+                let left_node = rotate_right(&right_node);
+                if need_flip_colors(&left_node) {
+                    flip_colors(&left_node);
+                }
+
+                return Some(Rc::clone(&left_node));
+            }
+
+            if need_flip_colors(&right_node) {
+                flip_colors(&right_node);
+            }
+
+            return Some(Rc::clone(&right_node));
+        }
+
+        // when rotate right
+        if need_rotate_right(node_rc) {
+            let left_node = rotate_right(&node_rc);
+            if need_flip_colors(&left_node) {
+                flip_colors(&left_node);
+            }
+
+            return Some(Rc::clone(&left_node));
+        }
+
+        if need_flip_colors(node_rc) {
             flip_colors(node_rc);
         }
 
@@ -151,6 +171,27 @@ fn is_red<K: Key, V: Value>(node: &Option<Rc<RefCell<Node<K, V>>>>) -> bool {
         Some(n) => n.borrow().is_red,
         _ => false,
     }
+}
+
+fn need_rotate_left<K: Key, V: Value>(node_rc: &Rc<RefCell<Node<K, V>>>) -> bool {
+    let mut node = node_rc.borrow();
+    is_red(&node.right) && !is_red(&node.left)
+}
+
+fn need_rotate_right<K: Key, V: Value>(node_rc: &Rc<RefCell<Node<K, V>>>) -> bool {
+    let mut node = node_rc.borrow();
+    if is_red(&node.left) {
+        if let Some(l) = &node.left {
+            return is_red(&l.borrow().left);
+        }
+    }
+
+    false
+}
+
+fn need_flip_colors<K: Key, V: Value>(node_rc: &Rc<RefCell<Node<K, V>>>) -> bool {
+    let mut node = node_rc.borrow();
+    is_red(&node.left) && is_red(&node.right)
 }
 
 fn rotate_left<K: Key, V: Value>(node_rc: &Rc<RefCell<Node<K, V>>>) -> Rc<RefCell<Node<K, V>>> {
@@ -257,9 +298,17 @@ mod test {
     }
 
     #[test]
-    fn insert() {
+    fn keeping_order() {
         let mut tree = Tree::<TestKey, TestValue>::new();
         let (key, value) = create_key_value(1, "he".to_string());
         tree.insert(key, value);
+
+        let (key, value) = create_key_value(3, "lo".to_string());
+        tree.insert(key, value);
+
+        let (key, value) = create_key_value(2, "l".to_string());
+        tree.insert(key, value);
+
+        assert_eq!("he,l,lo", tree.to_string());
     }
 }
