@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 /// Key represents key of Tree.
 pub trait Key {
-    fn cmp(&self, other: &dyn Key) -> Ordering;
+    fn cmp(&self, other: &Self) -> Ordering;
 }
 
 /// Value represents the data stored in the nodes of Tree.
@@ -13,17 +13,17 @@ pub trait Value {
 }
 
 /// Node is a node of Tree.
-pub struct Node {
-    key: Box<dyn Key>,
-    value: Box<dyn Value>,
-    parent: Option<Rc<RefCell<Node>>>,
-    left: Option<Rc<RefCell<Node>>>,
-    right: Option<Rc<RefCell<Node>>>,
+pub struct Node<K: Key, V: Value> {
+    key: K,
+    value: V,
+    parent: Option<Rc<RefCell<Node<K, V>>>>,
+    left: Option<Rc<RefCell<Node<K, V>>>>,
+    right: Option<Rc<RefCell<Node<K, V>>>>,
     is_red: bool,
 }
 
-impl Node {
-    pub fn new(key: Box<dyn Key>, value: Box<dyn Value>, is_red: bool) -> Node {
+impl<K: Key, V: Value> Node<K, V> {
+    pub fn new(key: K, value: V, is_red: bool) -> Self {
         Node {
             key,
             value,
@@ -34,32 +34,32 @@ impl Node {
         }
     }
 
-    fn key(&self) -> &dyn Key {
-        &*self.key
+    fn key(&self) -> &K {
+        &self.key
     }
 
-    fn clone_left(&self) -> Option<Rc<RefCell<Node>>> {
+    fn clone_left(&self) -> Option<Rc<RefCell<Node<K, V>>>> {
         match &self.left {
             Some(l) => Some(Rc::clone(&l)),
             _ => None,
         }
     }
 
-    fn clone_right(&self) -> Option<Rc<RefCell<Node>>> {
+    fn clone_right(&self) -> Option<Rc<RefCell<Node<K, V>>>> {
         match &self.right {
             Some(r) => Some(Rc::clone(&r)),
             _ => None,
         }
     }
 
-    fn left_mut(&self) -> Option<RefMut<Node>> {
+    fn left_mut(&self) -> Option<RefMut<Node<K, V>>> {
         match &self.left {
             Some(l) => Some(l.borrow_mut()),
             _ => None,
         }
     }
 
-    fn right_mut(&self) -> Option<RefMut<Node>> {
+    fn right_mut(&self) -> Option<RefMut<Node<K, V>>> {
         match &self.right {
             Some(r) => Some(r.borrow_mut()),
             _ => None,
@@ -74,20 +74,20 @@ impl Node {
 /// Invariant 1: No red node has a red child
 /// Invariant 2: Every leaf path has the same number of black nodes
 /// Invariant 3: Only the left child can be red (left leaning)
-pub struct Tree {
-    root: Option<Rc<RefCell<Node>>>,
+pub struct Tree<K: Key, V: Value> {
+    root: Option<Rc<RefCell<Node<K, V>>>>,
     size: u64,
 }
 
-impl Tree {
-    pub fn new() -> Tree {
+impl<K: Key, V: Value> Tree<K, V> {
+    pub fn new() -> Self {
         Tree {
             root: None,
             size: 0,
         }
     }
 
-    pub fn insert(&mut self, k: Box<dyn Key>, v: Box<dyn Value>) {
+    pub fn insert(&mut self, k: K, v: V) {
         let root = match &self.root {
             Some(rc) => Some(Rc::clone(&rc)),
             _ => None,
@@ -101,10 +101,10 @@ impl Tree {
 
     fn insert_fix_up(
         &mut self,
-        node: Option<Rc<RefCell<Node>>>,
-        key: Box<dyn Key>,
-        value: Box<dyn Value>,
-    ) -> Option<Rc<RefCell<Node>>> {
+        node: Option<Rc<RefCell<Node<K, V>>>>,
+        key: K,
+        value: V,
+    ) -> Option<Rc<RefCell<Node<K, V>>>> {
         if let None = node {
             self.size += 1;
             return Some(Rc::new(RefCell::new(Node::new(key, value, true))));
@@ -139,21 +139,21 @@ impl Tree {
 
     pub fn to_string(&self) -> String {
         let mut strings: Vec<String> = Vec::new();
-        traverse_in_order(&self.root.as_ref(), &mut |node: &Node| {
+        traverse_in_order(&self.root.as_ref(), &mut |node: &Node<K, V>| {
             strings.push(node.value.to_string())
         });
         strings.join(",")
     }
 }
 
-fn is_red(node: &Option<Rc<RefCell<Node>>>) -> bool {
+fn is_red<K: Key, V: Value>(node: &Option<Rc<RefCell<Node<K, V>>>>) -> bool {
     match node {
         Some(n) => n.borrow().is_red,
         _ => false,
     }
 }
 
-fn rotate_left(node_rc: &Rc<RefCell<Node>>) -> Rc<RefCell<Node>> {
+fn rotate_left<K: Key, V: Value>(node_rc: &Rc<RefCell<Node<K, V>>>) -> Rc<RefCell<Node<K, V>>> {
     let mut node = node_rc.borrow_mut();
 
     let right = node.clone_right();
@@ -168,7 +168,7 @@ fn rotate_left(node_rc: &Rc<RefCell<Node>>) -> Rc<RefCell<Node>> {
     Rc::clone(&right_rc)
 }
 
-fn rotate_right(node_rc: &Rc<RefCell<Node>>) -> Rc<RefCell<Node>> {
+fn rotate_right<K: Key, V: Value>(node_rc: &Rc<RefCell<Node<K, V>>>) -> Rc<RefCell<Node<K, V>>> {
     let mut node = node_rc.borrow_mut();
 
     let left = node.clone_left();
@@ -183,7 +183,7 @@ fn rotate_right(node_rc: &Rc<RefCell<Node>>) -> Rc<RefCell<Node>> {
     Rc::clone(&left_rc)
 }
 
-fn flip_colors(node_rc: &Rc<RefCell<Node>>) {
+fn flip_colors<K: Key, V: Value>(node_rc: &Rc<RefCell<Node<K, V>>>) {
     let mut node = node_rc.borrow_mut();
     node.is_red = !node.is_red;
 
@@ -196,7 +196,10 @@ fn flip_colors(node_rc: &Rc<RefCell<Node>>) {
     };
 }
 
-fn traverse_in_order(node: &Option<&Rc<RefCell<Node>>>, callback: &mut dyn FnMut(&Node)) {
+fn traverse_in_order<K: Key, V: Value>(
+    node: &Option<&Rc<RefCell<Node<K, V>>>>,
+    callback: &mut dyn FnMut(&Node<K, V>),
+) {
     match node {
         Some(node_rc) => {
             let node = node_rc.borrow();
@@ -222,7 +225,7 @@ mod test {
     }
 
     impl Key for TestKey {
-        fn cmp(&self, other: &dyn Key) -> Ordering {
+        fn cmp(&self, other: &Self) -> Ordering {
             let other = other as &TestKey;
             if self.time < other.time {
                 return Ordering::Less;
@@ -249,13 +252,13 @@ mod test {
         }
     }
 
-    fn create_key_value(key_time: u32, value: String) -> (Box<TestKey>, Box<TestValue>) {
-        (Box::new(TestKey::new(key_time)), Box::new(TestValue::new(value)))
+    fn create_key_value(key_time: u32, value: String) -> (TestKey, TestValue) {
+        (TestKey::new(key_time), TestValue::new(value))
     }
 
     #[test]
     fn insert() {
-        let tree = Tree::new();
+        let mut tree = Tree::<TestKey, TestValue>::new();
         let (key, value) = create_key_value(1, "he".to_string());
         tree.insert(key, value);
     }
