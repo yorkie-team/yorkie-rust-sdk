@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 /// Key represents key of Tree.
 pub trait Key {
-    fn cmp(&self, k: &dyn Key) -> Ordering;
+    fn cmp(&self, other: &dyn Key) -> Ordering;
 }
 
 /// Value represents the data stored in the nodes of Tree.
@@ -136,6 +136,14 @@ impl Tree {
 
         Some(Rc::clone(node_rc))
     }
+
+    pub fn to_string(&self) -> String {
+        let mut strings: Vec<String> = Vec::new();
+        traverse_in_order(&self.root.as_ref(), &mut |node: &Node| {
+            strings.push(node.value.to_string())
+        });
+        strings.join(",")
+    }
 }
 
 fn is_red(node: &Option<Rc<RefCell<Node>>>) -> bool {
@@ -188,28 +196,67 @@ fn flip_colors(node_rc: &Rc<RefCell<Node>>) {
     };
 }
 
+fn traverse_in_order(node: &Option<&Rc<RefCell<Node>>>, callback: &mut dyn FnMut(&Node)) {
+    match node {
+        Some(node_rc) => {
+            let node = node_rc.borrow();
+            traverse_in_order(&node.left.as_ref(), callback);
+            callback(&node);
+            traverse_in_order(&node.right.as_ref(), callback);
+        }
+        _ => (),
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
-    struct TestKey {}
+    struct TestKey {
+        time: u32,
+    }
 
     impl TestKey {
-        pub fn cmp(&self, k: &dyn Key) -> Ordering {
-            Ordering::Less
+        pub fn new(time: u32) -> TestKey {
+            TestKey { time }
         }
     }
 
-    struct TestValue {}
+    impl Key for TestKey {
+        fn cmp(&self, other: &dyn Key) -> Ordering {
+            let other = other as &TestKey;
+            if self.time < other.time {
+                return Ordering::Less;
+            } else if self.time > other.time {
+                return Ordering::Greater;
+            }
+            Ordering::Equal
+        }
+    }
+
+    struct TestValue {
+        value: String,
+    }
 
     impl TestValue {
-        pub fn to_string(&self) -> String {
-            String::new()
+        pub fn new(value: String) -> TestValue {
+            TestValue { value }
         }
+    }
+
+    impl Value for TestValue {
+        fn to_string(&self) -> String {
+            self.value.clone()
+        }
+    }
+
+    fn create_key_value(key_time: u32, value: String) -> (Box<TestKey>, Box<TestValue>) {
+        (Box::new(TestKey::new(key_time)), Box::new(TestValue::new(value)))
     }
 
     #[test]
     fn insert() {
         let tree = Tree::new();
-        // tree.put();
+        let (key, value) = create_key_value(1, "he".to_string());
+        tree.insert(key, value);
     }
 }
