@@ -2,13 +2,15 @@ use std::cell::{RefCell, RefMut};
 use std::cmp::Ordering;
 use std::rc::Rc;
 
+type OptionNode<K, V> = Option<Rc<RefCell<Node<K, V>>>>;
+
 /// Key represents key of Tree.
-pub trait Key {
+pub trait Key: Clone {
     fn cmp(&self, other: &Self) -> Ordering;
 }
 
 /// Value represents the data stored in the nodes of Tree.
-pub trait Value {
+pub trait Value: Clone {
     fn to_string(&self) -> String;
 }
 
@@ -115,7 +117,9 @@ impl<K: Key, V: Value> Tree<K, V> {
             let mut node = node_rc.borrow_mut();
             match key.cmp(node.key()) {
                 Ordering::Less => node.left = self.insert_fix_up(node.clone_left(), key, value),
-                Ordering::Greater => node.right = self.insert_fix_up(node.clone_right(), key, value),
+                Ordering::Greater => {
+                    node.right = self.insert_fix_up(node.clone_right(), key, value)
+                }
                 _ => node.value = value,
             }
         }
@@ -157,6 +161,99 @@ impl<K: Key, V: Value> Tree<K, V> {
         Some(Rc::clone(node_rc))
     }
 
+    /// remove removes the value of the given key.
+    pub fn remove(&mut self, key: K) {
+        if let None = self.root {
+            return;
+        }
+
+        let root = self.root.as_ref().unwrap();
+        {
+            let mut root_mut = root.borrow_mut();
+            if !is_red(&root_mut.left) && !is_red(&root_mut.right) {
+                root_mut.is_red = true;
+            }
+        }
+
+        self.root = self.remove_internal(Rc::clone(&root), key)
+    }
+
+    pub fn remove_internal(
+        &mut self,
+        mut node_rc: Rc<RefCell<Node<K, V>>>,
+        key: K,
+    ) -> Option<Rc<RefCell<Node<K, V>>>> {
+        let mut compared = Ordering::Less;
+        {
+            compared = key.cmp(&node_rc.borrow_mut().key);
+        }
+
+        match compared {
+            Ordering::Less => {
+                {
+                    let node = node_rc.borrow_mut();
+                    if !is_red(&node.left) {
+                        let left = node.left.as_ref().unwrap();
+                        let left = left.borrow_mut();
+                        if !is_red(&left.left) {
+                            drop(left);
+                            drop(node);
+                            node_rc = move_red_left(Rc::clone(&node_rc));
+                        }
+                    }
+                }
+                let mut node = node_rc.borrow_mut();
+                node.left = self.remove_internal(Rc::clone(node.left.as_ref().unwrap()), key);
+            }
+            _ => {
+                {
+                    let node = node_rc.borrow_mut();
+                    if is_red(&node.left) {
+                        drop(node);
+                        node_rc = rotate_right(&node_rc);
+                    }
+                }
+
+                {
+                    let node = node_rc.borrow_mut();
+                    if let Ordering::Equal = key.cmp(&node.key) {
+                        if let None = node.right {
+                            self.size -= 1;
+                            return None;
+                        }
+                    }
+
+                    if !is_red(&node.right) {
+                        let right_rc = node.right.as_ref().unwrap();
+                        let right = right_rc.borrow_mut();
+                        if !is_red(&right.left) {
+                            drop(right);
+                            drop(node);
+                            node_rc = move_red_right(Rc::clone(&node_rc));
+                        }
+                    }
+                }
+
+                let mut node = node_rc.borrow_mut();
+                if let Ordering::Equal = key.cmp(&node.key) {
+                    self.size -= 1;
+                    let right_rc = node.right.as_ref().unwrap();
+                    let smallest = min(&right_rc);
+                    let smallest = smallest.borrow_mut();
+                    node.value = smallest.value.clone();
+                    node.key = smallest.key.clone();
+
+                    let right_rc = node.right.as_ref().unwrap();
+                    node.right = remove_min(Rc::clone(right_rc));
+                } else {
+                    let right_rc = node.right.as_ref().unwrap();
+                    node.right = self.remove_internal(Rc::clone(right_rc), key);
+                }
+            }
+        }
+        Some(fix_up(Rc::clone(&node_rc)))
+    }
+
     pub fn to_string(&self) -> String {
         let mut strings: Vec<String> = Vec::new();
         traverse_in_order(&self.root.as_ref(), &mut |node: &Node<K, V>| {
@@ -168,21 +265,21 @@ impl<K: Key, V: Value> Tree<K, V> {
 
 fn is_red<K: Key, V: Value>(node: &Option<Rc<RefCell<Node<K, V>>>>) -> bool {
     match node {
-        Some(n) => n.borrow().is_red,
+        Some(n) => n.borrow_mut().is_red,
         _ => false,
     }
 }
 
 fn need_rotate_left<K: Key, V: Value>(node_rc: &Rc<RefCell<Node<K, V>>>) -> bool {
-    let mut node = node_rc.borrow();
+    let node = node_rc.borrow_mut();
     is_red(&node.right) && !is_red(&node.left)
 }
 
 fn need_rotate_right<K: Key, V: Value>(node_rc: &Rc<RefCell<Node<K, V>>>) -> bool {
-    let mut node = node_rc.borrow();
+    let node = node_rc.borrow_mut();
     if is_red(&node.left) {
         if let Some(l) = &node.left {
-            return is_red(&l.borrow().left);
+            return is_red(&l.borrow_mut().left);
         }
     }
 
@@ -190,7 +287,7 @@ fn need_rotate_right<K: Key, V: Value>(node_rc: &Rc<RefCell<Node<K, V>>>) -> boo
 }
 
 fn need_flip_colors<K: Key, V: Value>(node_rc: &Rc<RefCell<Node<K, V>>>) -> bool {
-    let mut node = node_rc.borrow();
+    let node = node_rc.borrow_mut();
     is_red(&node.left) && is_red(&node.right)
 }
 
@@ -237,13 +334,125 @@ fn flip_colors<K: Key, V: Value>(node_rc: &Rc<RefCell<Node<K, V>>>) {
     };
 }
 
+fn move_red_left<K: Key, V: Value>(
+    mut node_rc: Rc<RefCell<Node<K, V>>>,
+) -> Rc<RefCell<Node<K, V>>> {
+    flip_colors(&node_rc);
+
+    let mut node = node_rc.borrow_mut();
+    let right_rc = node.right.as_ref().unwrap();
+    let right = right_rc.borrow_mut();
+
+    if is_red(&right.left) {
+        drop(right);
+        drop(right_rc);
+        node.right = Some(rotate_right(node.right.as_ref().unwrap()));
+        drop(node);
+        node_rc = rotate_left(&node_rc);
+        flip_colors(&node_rc);
+    }
+
+    Rc::clone(&node_rc)
+}
+
+fn move_red_right<K: Key, V: Value>(
+    mut node_rc: Rc<RefCell<Node<K, V>>>,
+) -> Rc<RefCell<Node<K, V>>> {
+    flip_colors(&node_rc);
+
+    let mut node = node_rc.borrow_mut();
+    let left_rc = node.left.as_ref().unwrap();
+    let left = left_rc.borrow_mut();
+
+    if is_red(&left.left) {
+        drop(left);
+        drop(node);
+        node_rc = rotate_right(&node_rc);
+        flip_colors(&node_rc);
+    }
+
+    Rc::clone(&node_rc)
+}
+
+fn fix_up<K: Key, V: Value>(mut node_rc: Rc<RefCell<Node<K, V>>>) -> Rc<RefCell<Node<K, V>>> {
+    {
+        let node = node_rc.borrow_mut();
+        if is_red(&node.right) {
+            drop(node);
+            node_rc = rotate_left(&node_rc);
+        }
+    }
+
+    {
+        let node = node_rc.borrow_mut();
+        if is_red(&node.left) {
+            let left = &node.left.as_ref().unwrap();
+            if is_red(&left.borrow_mut().left) {
+                drop(node);
+                node_rc = rotate_right(&node_rc);
+            }
+        }
+    }
+
+    let mut node = node_rc.borrow_mut();
+    if is_red(&node.left) {
+        let left = &node.left.as_ref().unwrap();
+        if is_red(&left.borrow_mut().right) {
+            drop(node);
+            flip_colors(&node_rc);
+        }
+    }
+
+    Rc::clone(&node_rc)
+}
+
+fn min<K: Key, V: Value>(node_rc: &Rc<RefCell<Node<K, V>>>) -> Rc<RefCell<Node<K, V>>> {
+    let node = node_rc.borrow_mut();
+    if let None = node.left {
+        return Rc::clone(node_rc);
+    }
+
+    min(node.left.as_ref().unwrap())
+}
+
+fn remove_min<K: Key, V: Value>(
+    mut node_rc: Rc<RefCell<Node<K, V>>>,
+) -> Option<Rc<RefCell<Node<K, V>>>> {
+    {
+        let node = node_rc.borrow_mut();
+        if let None = node.left {
+            return None;
+        }
+    }
+
+    {
+        let node = node_rc.borrow_mut();
+        if !is_red(&node.left) {
+            let left_rc = node.left.as_ref().unwrap();
+            let left = left_rc.borrow_mut();
+            if !is_red(&left.left) {
+                drop(left);
+                drop(node);
+                node_rc = move_red_left(Rc::clone(&node_rc));
+            }
+        }
+    }
+
+    {
+        let mut node = node_rc.borrow_mut();
+        let left = node.left.as_ref().unwrap();
+        node.left = remove_min(Rc::clone(left));
+    }
+    Some(fix_up(Rc::clone(&node_rc)))
+}
+
 fn traverse_in_order<K: Key, V: Value>(
     node: &Option<&Rc<RefCell<Node<K, V>>>>,
     callback: &mut dyn FnMut(&Node<K, V>),
 ) {
     match node {
         Some(node_rc) => {
-            let node = node_rc.borrow();
+            let node = node_rc.borrow_mut();
             traverse_in_order(&node.left.as_ref(), callback);
             callback(&node);
             traverse_in_order(&node.right.as_ref(), callback);
@@ -255,12 +464,13 @@ fn traverse_in_order<K: Key, V: Value>(
 #[cfg(test)]
 mod test {
     use super::*;
+    #[derive(Clone)]
     struct TestKey {
-        time: u32,
+        time: u8,
     }
 
     impl TestKey {
-        pub fn new(time: u32) -> TestKey {
+        pub fn new(time: u8) -> TestKey {
             TestKey { time }
         }
     }
@@ -277,38 +487,56 @@ mod test {
         }
     }
 
+    #[derive(Clone)]
     struct TestValue {
-        value: String,
+        value: u8,
     }
 
     impl TestValue {
-        pub fn new(value: String) -> TestValue {
+        pub fn new(value: u8) -> TestValue {
             TestValue { value }
         }
     }
 
     impl Value for TestValue {
         fn to_string(&self) -> String {
-            self.value.clone()
+            self.value.to_string()
         }
     }
 
-    fn create_key_value(key_time: u32, value: String) -> (TestKey, TestValue) {
+    fn create_key_value(key_time: u8, value: u8) -> (TestKey, TestValue) {
         (TestKey::new(key_time), TestValue::new(value))
     }
 
     #[test]
     fn keeping_order() {
-        let mut tree = Tree::<TestKey, TestValue>::new();
-        let (key, value) = create_key_value(1, "he".to_string());
-        tree.insert(key, value);
+        let cases = vec![
+            vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+            vec![8, 5, 7, 9, 1, 3, 6, 0, 4, 2],
+            vec![7, 2, 0, 3, 1, 9, 8, 4, 6, 5],
+            vec![2, 0, 3, 5, 8, 6, 4, 1, 9, 7],
+            vec![8, 4, 7, 9, 2, 6, 0, 3, 1, 5],
+            vec![7, 1, 5, 2, 8, 6, 3, 4, 0, 9],
+            vec![9, 8, 7, 6, 5, 4, 3, 2, 1, 0],
+        ];
 
-        let (key, value) = create_key_value(3, "lo".to_string());
-        tree.insert(key, value);
+        for case in cases {
+            let mut tree: Tree<TestKey, TestValue> = Tree::new();
+            for num in case {
+                let (key, value) = create_key_value(num, num);
+                tree.insert(key, value);
+            }
 
-        let (key, value) = create_key_value(2, "l".to_string());
-        tree.insert(key, value);
+            assert_eq!("0,1,2,3,4,5,6,7,8,9", tree.to_string());
 
-        assert_eq!("he,l,lo", tree.to_string());
+            tree.remove(TestKey::new(8));
+            assert_eq!("0,1,2,3,4,5,6,7,9", tree.to_string());
+
+            tree.remove(TestKey::new(2));
+            assert_eq!("0,1,3,4,5,6,7,9", tree.to_string());
+
+            tree.remove(TestKey::new(5));
+            assert_eq!("0,1,3,4,6,7,9", tree.to_string());
+        }
     }
 }
