@@ -112,7 +112,8 @@ impl<K: Key, V: Value> Tree<K, V> {
             return Some(Rc::new(RefCell::new(Node::new(key, value, true))));
         }
 
-        let node_rc = node.as_ref().unwrap();
+        let mut node_rc = node.unwrap();
+        // let mut node_rc = Rc::clone(node.as_ref().unwrap());
         {
             let mut node = node_rc.borrow_mut();
             match key.cmp(node.key()) {
@@ -124,41 +125,19 @@ impl<K: Key, V: Value> Tree<K, V> {
             }
         }
 
-        // when rotate left
-        if need_rotate_left(node_rc) {
-            let right_node = rotate_left(node_rc);
-
-            if need_rotate_right(&right_node) {
-                let left_node = rotate_right(&right_node);
-                if need_flip_colors(&left_node) {
-                    flip_colors(&left_node);
-                }
-
-                return Some(Rc::clone(&left_node));
-            }
-
-            if need_flip_colors(&right_node) {
-                flip_colors(&right_node);
-            }
-
-            return Some(Rc::clone(&right_node));
+        if need_rotate_left(&node_rc) {
+            node_rc = rotate_left(&node_rc);
         }
 
-        // when rotate right
-        if need_rotate_right(node_rc) {
-            let left_node = rotate_right(&node_rc);
-            if need_flip_colors(&left_node) {
-                flip_colors(&left_node);
-            }
-
-            return Some(Rc::clone(&left_node));
+        if need_rotate_right(&node_rc) {
+            node_rc = rotate_right(&node_rc);
         }
 
-        if need_flip_colors(node_rc) {
-            flip_colors(node_rc);
+        if need_flip_colors(&node_rc) {
+            flip_colors(&node_rc);
         }
 
-        Some(Rc::clone(node_rc))
+        Some(Rc::clone(&node_rc))
     }
 
     /// remove removes the value of the given key.
@@ -239,9 +218,11 @@ impl<K: Key, V: Value> Tree<K, V> {
                     self.size -= 1;
                     let right_rc = node.right.as_ref().unwrap();
                     let smallest = min(&right_rc);
-                    let smallest = smallest.borrow_mut();
-                    node.value = smallest.value.clone();
-                    node.key = smallest.key.clone();
+                    {
+                        let smallest = smallest.borrow_mut();
+                        node.value = smallest.value.clone();
+                        node.key = smallest.key.clone();
+                    }
 
                     let right_rc = node.right.as_ref().unwrap();
                     node.right = remove_min(Rc::clone(right_rc));
