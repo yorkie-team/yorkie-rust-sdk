@@ -3,6 +3,7 @@ use std::cmp::Ordering;
 use std::rc::Rc;
 
 type OptionNode<K, V> = Option<Rc<RefCell<Node<K, V>>>>;
+type RcNode<K, V> = Rc<RefCell<Node<K, V>>>;
 
 /// Key represents key of Tree.
 pub trait Key: Clone {
@@ -18,9 +19,9 @@ pub trait Value: Clone {
 pub struct Node<K: Key, V: Value> {
     key: K,
     value: V,
-    parent: Option<Rc<RefCell<Node<K, V>>>>,
-    left: Option<Rc<RefCell<Node<K, V>>>>,
-    right: Option<Rc<RefCell<Node<K, V>>>>,
+    parent: OptionNode<K, V>,
+    left: OptionNode<K, V>,
+    right: OptionNode<K, V>,
     is_red: bool,
 }
 
@@ -40,14 +41,14 @@ impl<K: Key, V: Value> Node<K, V> {
         &self.key
     }
 
-    fn clone_left(&self) -> Option<Rc<RefCell<Node<K, V>>>> {
+    fn clone_left(&self) -> OptionNode<K, V> {
         match &self.left {
             Some(l) => Some(Rc::clone(&l)),
             _ => None,
         }
     }
 
-    fn clone_right(&self) -> Option<Rc<RefCell<Node<K, V>>>> {
+    fn clone_right(&self) -> OptionNode<K, V> {
         match &self.right {
             Some(r) => Some(Rc::clone(&r)),
             _ => None,
@@ -77,7 +78,7 @@ impl<K: Key, V: Value> Node<K, V> {
 /// Invariant 2: Every leaf path has the same number of black nodes
 /// Invariant 3: Only the left child can be red (left leaning)
 pub struct Tree<K: Key, V: Value> {
-    root: Option<Rc<RefCell<Node<K, V>>>>,
+    root: OptionNode<K, V>,
     size: u64,
 }
 
@@ -101,19 +102,13 @@ impl<K: Key, V: Value> Tree<K, V> {
         }
     }
 
-    fn insert_fix_up(
-        &mut self,
-        node: Option<Rc<RefCell<Node<K, V>>>>,
-        key: K,
-        value: V,
-    ) -> Option<Rc<RefCell<Node<K, V>>>> {
+    fn insert_fix_up(&mut self, node: OptionNode<K, V>, key: K, value: V) -> OptionNode<K, V> {
         if let None = node {
             self.size += 1;
             return Some(Rc::new(RefCell::new(Node::new(key, value, true))));
         }
 
         let mut node_rc = node.unwrap();
-        // let mut node_rc = Rc::clone(node.as_ref().unwrap());
         {
             let mut node = node_rc.borrow_mut();
             match key.cmp(node.key()) {
@@ -157,11 +152,7 @@ impl<K: Key, V: Value> Tree<K, V> {
         self.root = self.remove_internal(Rc::clone(&root), key)
     }
 
-    pub fn remove_internal(
-        &mut self,
-        mut node_rc: Rc<RefCell<Node<K, V>>>,
-        key: K,
-    ) -> Option<Rc<RefCell<Node<K, V>>>> {
+    pub fn remove_internal(&mut self, mut node_rc: RcNode<K, V>, key: K) -> OptionNode<K, V> {
         let mut compared = Ordering::Less;
         {
             compared = key.cmp(&node_rc.borrow_mut().key);
@@ -244,19 +235,19 @@ impl<K: Key, V: Value> Tree<K, V> {
     }
 }
 
-fn is_red<K: Key, V: Value>(node: &Option<Rc<RefCell<Node<K, V>>>>) -> bool {
+fn is_red<K: Key, V: Value>(node: &OptionNode<K, V>) -> bool {
     match node {
         Some(n) => n.borrow_mut().is_red,
         _ => false,
     }
 }
 
-fn need_rotate_left<K: Key, V: Value>(node_rc: &Rc<RefCell<Node<K, V>>>) -> bool {
+fn need_rotate_left<K: Key, V: Value>(node_rc: &RcNode<K, V>) -> bool {
     let node = node_rc.borrow_mut();
     is_red(&node.right) && !is_red(&node.left)
 }
 
-fn need_rotate_right<K: Key, V: Value>(node_rc: &Rc<RefCell<Node<K, V>>>) -> bool {
+fn need_rotate_right<K: Key, V: Value>(node_rc: &RcNode<K, V>) -> bool {
     let node = node_rc.borrow_mut();
     if is_red(&node.left) {
         if let Some(l) = &node.left {
@@ -267,12 +258,12 @@ fn need_rotate_right<K: Key, V: Value>(node_rc: &Rc<RefCell<Node<K, V>>>) -> boo
     false
 }
 
-fn need_flip_colors<K: Key, V: Value>(node_rc: &Rc<RefCell<Node<K, V>>>) -> bool {
+fn need_flip_colors<K: Key, V: Value>(node_rc: &RcNode<K, V>) -> bool {
     let node = node_rc.borrow_mut();
     is_red(&node.left) && is_red(&node.right)
 }
 
-fn rotate_left<K: Key, V: Value>(node_rc: &Rc<RefCell<Node<K, V>>>) -> Rc<RefCell<Node<K, V>>> {
+fn rotate_left<K: Key, V: Value>(node_rc: &RcNode<K, V>) -> RcNode<K, V> {
     let mut node = node_rc.borrow_mut();
 
     let right = node.clone_right();
@@ -287,7 +278,7 @@ fn rotate_left<K: Key, V: Value>(node_rc: &Rc<RefCell<Node<K, V>>>) -> Rc<RefCel
     Rc::clone(&right_rc)
 }
 
-fn rotate_right<K: Key, V: Value>(node_rc: &Rc<RefCell<Node<K, V>>>) -> Rc<RefCell<Node<K, V>>> {
+fn rotate_right<K: Key, V: Value>(node_rc: &RcNode<K, V>) -> RcNode<K, V> {
     let mut node = node_rc.borrow_mut();
 
     let left = node.clone_left();
@@ -302,7 +293,7 @@ fn rotate_right<K: Key, V: Value>(node_rc: &Rc<RefCell<Node<K, V>>>) -> Rc<RefCe
     Rc::clone(&left_rc)
 }
 
-fn flip_colors<K: Key, V: Value>(node_rc: &Rc<RefCell<Node<K, V>>>) {
+fn flip_colors<K: Key, V: Value>(node_rc: &RcNode<K, V>) {
     let mut node = node_rc.borrow_mut();
     node.is_red = !node.is_red;
 
@@ -315,9 +306,7 @@ fn flip_colors<K: Key, V: Value>(node_rc: &Rc<RefCell<Node<K, V>>>) {
     };
 }
 
-fn move_red_left<K: Key, V: Value>(
-    mut node_rc: Rc<RefCell<Node<K, V>>>,
-) -> Rc<RefCell<Node<K, V>>> {
+fn move_red_left<K: Key, V: Value>(mut node_rc: RcNode<K, V>) -> RcNode<K, V> {
     flip_colors(&node_rc);
 
     let mut node = node_rc.borrow_mut();
@@ -336,9 +325,7 @@ fn move_red_left<K: Key, V: Value>(
     Rc::clone(&node_rc)
 }
 
-fn move_red_right<K: Key, V: Value>(
-    mut node_rc: Rc<RefCell<Node<K, V>>>,
-) -> Rc<RefCell<Node<K, V>>> {
+fn move_red_right<K: Key, V: Value>(mut node_rc: RcNode<K, V>) -> RcNode<K, V> {
     flip_colors(&node_rc);
 
     let mut node = node_rc.borrow_mut();
@@ -355,7 +342,7 @@ fn move_red_right<K: Key, V: Value>(
     Rc::clone(&node_rc)
 }
 
-fn fix_up<K: Key, V: Value>(mut node_rc: Rc<RefCell<Node<K, V>>>) -> Rc<RefCell<Node<K, V>>> {
+fn fix_up<K: Key, V: Value>(mut node_rc: RcNode<K, V>) -> RcNode<K, V> {
     {
         let node = node_rc.borrow_mut();
         if is_red(&node.right) {
@@ -387,7 +374,7 @@ fn fix_up<K: Key, V: Value>(mut node_rc: Rc<RefCell<Node<K, V>>>) -> Rc<RefCell<
     Rc::clone(&node_rc)
 }
 
-fn min<K: Key, V: Value>(node_rc: &Rc<RefCell<Node<K, V>>>) -> Rc<RefCell<Node<K, V>>> {
+fn min<K: Key, V: Value>(node_rc: &RcNode<K, V>) -> RcNode<K, V> {
     let node = node_rc.borrow_mut();
     if let None = node.left {
         return Rc::clone(node_rc);
@@ -396,9 +383,7 @@ fn min<K: Key, V: Value>(node_rc: &Rc<RefCell<Node<K, V>>>) -> Rc<RefCell<Node<K
     min(node.left.as_ref().unwrap())
 }
 
-fn remove_min<K: Key, V: Value>(
-    mut node_rc: Rc<RefCell<Node<K, V>>>,
-) -> Option<Rc<RefCell<Node<K, V>>>> {
+fn remove_min<K: Key, V: Value>(mut node_rc: RcNode<K, V>) -> OptionNode<K, V> {
     {
         let node = node_rc.borrow_mut();
         if let None = node.left {
@@ -428,7 +413,7 @@ fn remove_min<K: Key, V: Value>(
 }
 
 fn traverse_in_order<K: Key, V: Value>(
-    node: &Option<&Rc<RefCell<Node<K, V>>>>,
+    node: &Option<&RcNode<K, V>>,
     callback: &mut dyn FnMut(&Node<K, V>),
 ) {
     match node {
