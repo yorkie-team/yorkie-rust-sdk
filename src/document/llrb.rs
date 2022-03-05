@@ -143,16 +143,16 @@ impl<K: Key, V: Value> Tree<K, V> {
 
         let root = self.root.as_ref().unwrap();
         {
-            let mut root_mut = root.borrow_mut();
-            if !is_red(&root_mut.left) && !is_red(&root_mut.right) {
-                root_mut.is_red = true;
+            let mut root = root.borrow_mut();
+            if !is_red(&root.left) && !is_red(&root.right) {
+                root.is_red = true;
             }
         }
 
-        self.root = self.remove_internal(Rc::clone(&root), key)
+        self.root = self.remove_fix_up(Rc::clone(&root), key)
     }
 
-    pub fn remove_internal(&mut self, mut node_rc: RcNode<K, V>, key: K) -> OptionNode<K, V> {
+    fn remove_fix_up(&mut self, mut node_rc: RcNode<K, V>, key: K) -> OptionNode<K, V> {
         let mut compared = Ordering::Less;
         {
             compared = key.cmp(&node_rc.borrow_mut().key);
@@ -163,8 +163,8 @@ impl<K: Key, V: Value> Tree<K, V> {
                 {
                     let node = node_rc.borrow_mut();
                     if !is_red(&node.left) {
-                        let left = node.left.as_ref().unwrap();
-                        let left = left.borrow_mut();
+                        let left_rc = node.left.as_ref().unwrap();
+                        let left = left_rc.borrow_mut();
                         if !is_red(&left.left) {
                             drop(left);
                             drop(node);
@@ -173,7 +173,7 @@ impl<K: Key, V: Value> Tree<K, V> {
                     }
                 }
                 let mut node = node_rc.borrow_mut();
-                node.left = self.remove_internal(Rc::clone(node.left.as_ref().unwrap()), key);
+                node.left = self.remove_fix_up(Rc::clone(node.left.as_ref().unwrap()), key);
             }
             _ => {
                 {
@@ -219,7 +219,7 @@ impl<K: Key, V: Value> Tree<K, V> {
                     node.right = remove_min(Rc::clone(right_rc));
                 } else {
                     let right_rc = node.right.as_ref().unwrap();
-                    node.right = self.remove_internal(Rc::clone(right_rc), key);
+                    node.right = self.remove_fix_up(Rc::clone(right_rc), key);
                 }
             }
         }
@@ -328,7 +328,7 @@ fn move_red_left<K: Key, V: Value>(mut node_rc: RcNode<K, V>) -> RcNode<K, V> {
 fn move_red_right<K: Key, V: Value>(mut node_rc: RcNode<K, V>) -> RcNode<K, V> {
     flip_colors(&node_rc);
 
-    let mut node = node_rc.borrow_mut();
+    let node = node_rc.borrow_mut();
     let left_rc = node.left.as_ref().unwrap();
     let left = left_rc.borrow_mut();
 
@@ -362,7 +362,7 @@ fn fix_up<K: Key, V: Value>(mut node_rc: RcNode<K, V>) -> RcNode<K, V> {
         }
     }
 
-    let mut node = node_rc.borrow_mut();
+    let node = node_rc.borrow_mut();
     if is_red(&node.left) {
         let left = &node.left.as_ref().unwrap();
         if is_red(&left.borrow_mut().right) {
