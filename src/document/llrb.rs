@@ -1,4 +1,4 @@
-use std::cell::{RefCell, RefMut};
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::rc::Rc;
 
@@ -51,20 +51,6 @@ impl<K: Key, V: Value> Node<K, V> {
     fn clone_right(&self) -> OptionNode<K, V> {
         match &self.right {
             Some(r) => Some(Rc::clone(&r)),
-            _ => None,
-        }
-    }
-
-    fn left_mut(&self) -> Option<RefMut<Node<K, V>>> {
-        match &self.left {
-            Some(l) => Some(l.borrow_mut()),
-            _ => None,
-        }
-    }
-
-    fn right_mut(&self) -> Option<RefMut<Node<K, V>>> {
-        match &self.right {
-            Some(r) => Some(r.borrow_mut()),
             _ => None,
         }
     }
@@ -371,11 +357,13 @@ fn flip_colors<K: Key, V: Value>(node_rc: &RcNode<K, V>) {
     let mut node = node_rc.borrow_mut();
     node.is_red = !node.is_red;
 
-    if let Some(mut left) = node.left_mut() {
+    if let Some(left) = node.left.as_ref() {
+        let mut left = left.borrow_mut();
         left.is_red = !left.is_red;
     };
 
-    if let Some(mut right) = node.right_mut() {
+    if let Some(right) = node.right.as_ref() {
+        let mut right = right.borrow_mut();
         right.is_red = !right.is_red;
     };
 }
@@ -566,7 +554,7 @@ mod test {
                 let (key, value) = create_key_value(num, num);
                 tree.insert(key, value);
             }
-            
+
             assert_eq!("0,1,2,3,4,5,6,7,8,9", tree.to_string());
 
             tree.remove(TestKey::new(8));
