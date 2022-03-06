@@ -233,6 +233,78 @@ impl<K: Key, V: Value> Tree<K, V> {
         });
         strings.join(",")
     }
+
+    /// floor returns the greatest key less than or equal to the given key.
+    pub fn floor(&self, key: K) -> Option<(K, V)> {
+        let root = &self.root;
+        if let None = root {
+            return None;
+        }
+
+        let node_rc = root.as_ref().unwrap();
+        let mut node_option = Some(Rc::clone(node_rc));
+
+        while let Some(node_rc) = node_option {
+            let node = node_rc.borrow_mut();
+            match key.cmp(&node.key) {
+                Ordering::Greater => {
+                    if let Some(right_rc) = &node.right {
+                        let mut right = right_rc.borrow_mut();
+                        right.parent = Some(Rc::clone(&node_rc));
+                        node_option = Some(Rc::clone(right_rc));
+                    } else {
+                        return Some((node.key.clone(), node.value.clone()));
+                    }
+                }
+                Ordering::Less => {
+                    if let Some(left_rc) = &node.left {
+                        let mut left = left_rc.borrow_mut();
+                        left.parent = Some(Rc::clone(&node_rc));
+                        node_option = Some(Rc::clone(left_rc));
+                    } else {
+                        let parent_rc = node.parent.as_ref().unwrap();
+                        let mut parent = Some(Rc::clone(parent_rc));
+                        let mut child = Some(Rc::clone(&node_rc));
+
+                        loop {
+                            if let None = parent {
+                                return None;
+                            }
+
+                            if let None = child {
+                                return None;
+                            }
+
+                            let parent_rc = parent.as_ref().unwrap();
+                            let child_rc = child.as_ref().unwrap();
+                            if !Rc::ptr_eq(parent_rc, child_rc) {
+                                break;
+                            }
+                            drop(parent_rc);
+                            drop(child_rc);
+
+                            child = parent;
+                            let child_rc = child.as_ref().unwrap();
+                            let child = child_rc.borrow_mut();
+                            let parent_rc = &child.parent.as_ref().unwrap();
+                            parent = Some(Rc::clone(&parent_rc));
+                        }
+
+                        match parent {
+                            Some(parent_rc) => {
+                                let parent = parent_rc.borrow_mut();
+                                return Some((parent.key.clone(), parent.value.clone()));
+                            }
+                            _ => return None,
+                        }
+                    }
+                }
+                _ => return Some((node.key.clone(), node.value.clone())),
+            }
+        }
+
+        return None;
+    }
 }
 
 fn is_red<K: Key, V: Value>(node: &OptionNode<K, V>) -> bool {
@@ -503,6 +575,50 @@ mod test {
 
             tree.remove(TestKey::new(5));
             assert_eq!("0,1,3,4,6,7,9", tree.to_string());
+        }
+    }
+
+    #[test]
+    fn floor() {
+        let mut tree: Tree<TestKey, TestValue> = Tree::new();
+
+        match tree.floor(TestKey::new(1)) {
+            Some(_) => assert!(false),
+            None => assert!(true),
+        }
+
+        //   2
+        //  / |
+        // 1   4
+        let (key, value) = create_key_value(2, 2);
+        tree.insert(key, value);
+        let (key, value) = create_key_value(4, 4);
+        tree.insert(key, value);
+        let (key, value) = create_key_value(1, 1);
+        tree.insert(key, value);
+
+        // return equal key
+        match tree.floor(TestKey::new(4)) {
+            Some((_, value)) => assert_eq!("4", value.to_string()),
+            _ => assert!(false),
+        }
+        // return greatest key
+        match tree.floor(TestKey::new(5)) {
+            Some((_, value)) => assert_eq!("4", value.to_string()),
+            _ => assert!(false),
+        }
+
+        match tree.floor(TestKey::new(2)) {
+            Some((_, value)) => assert_eq!("2", value.to_string()),
+            _ => assert!(false),
+        }
+        match tree.floor(TestKey::new(1)) {
+            Some((_, value)) => assert_eq!("1", value.to_string()),
+            _ => assert!(false),
+        }
+        match tree.floor(TestKey::new(0)) {
+            Some((_, value)) => assert_eq!("2", value.to_string()),
+            _ => assert!(false),
         }
     }
 }
