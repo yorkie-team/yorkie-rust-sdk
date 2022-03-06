@@ -90,6 +90,7 @@ impl<K: Key, V: Value> Tree<K, V> {
         }
     }
 
+    /// insert inserts the value of the given key.
     pub fn insert(&mut self, k: K, v: V) {
         let root = match &self.root {
             Some(rc) => Some(Rc::clone(&rc)),
@@ -226,6 +227,7 @@ impl<K: Key, V: Value> Tree<K, V> {
         Some(fix_up(Rc::clone(&node_rc)))
     }
 
+    /// to_string returns a data string sorted in ascending key order.
     pub fn to_string(&self) -> String {
         let mut strings: Vec<String> = Vec::new();
         traverse_in_order(&self.root.as_ref(), &mut |node: &Node<K, V>| {
@@ -564,7 +566,7 @@ mod test {
                 let (key, value) = create_key_value(num, num);
                 tree.insert(key, value);
             }
-
+            
             assert_eq!("0,1,2,3,4,5,6,7,8,9", tree.to_string());
 
             tree.remove(TestKey::new(8));
