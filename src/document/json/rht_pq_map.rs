@@ -147,7 +147,7 @@ impl RHTPriorityQueueMap {
         removed
     }
 
-    pub fn set_internal(&mut self, key: String, value: BoxedElement) {
+    fn set_internal(&mut self, key: String, value: BoxedElement) {
         let node = RHTPQMapNode::new(key.clone(), value.clone());
         let node = Rc::new(RefCell::new(node));
         self.node_map_by_created_at
