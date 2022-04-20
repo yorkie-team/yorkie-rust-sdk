@@ -174,11 +174,7 @@ impl<E: Clone + Element> RHTPriorityQueueMap<E> {
         }
     }
 
-    pub fn delete_by_created_at(
-        &self,
-        created_at: Ticket,
-        deleted_at: Ticket,
-    ) -> Option<E> {
+    pub fn delete_by_created_at(&self, created_at: Ticket, deleted_at: Ticket) -> Option<E> {
         if let Some(node) = self.node_map_by_created_at.get(&created_at) {
             let mut node = node.borrow_mut();
             match node.remove(deleted_at) {
