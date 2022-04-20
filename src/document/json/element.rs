@@ -7,7 +7,7 @@ pub trait Element {
     fn moved_at(&self) -> Option<Ticket>;
     fn set_moved_at(&self, ticket: Ticket);
     fn removed_at(&self) -> Option<Ticket>;
-    fn remove(&self, ticket: Ticket) -> bool;
+    fn remove(&mut self, ticket: Ticket) -> bool;
 }
 
 impl Clone for Box<dyn Element> {
