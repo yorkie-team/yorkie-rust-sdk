@@ -164,7 +164,7 @@ impl RHTPriorityQueueMap {
         match self.node_queue_map_by_key.get(&key) {
             Some(queue) => match queue.peek() {
                 Some(node) => {
-                    let node = node.borrow();
+                    let mut node = node.borrow_mut();
                     match node.remove(deleted_at) {
                         true => Some(node.element.clone()),
                         false => None,
