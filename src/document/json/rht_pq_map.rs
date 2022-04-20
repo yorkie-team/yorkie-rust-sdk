@@ -8,8 +8,6 @@ use std::rc::Rc;
 
 use thiserror::Error;
 
-type BoxedElement = Box<dyn Element>;
-
 #[derive(Debug, Error)]
 enum RHTPQMapError {
     #[error("fail to find : {0}")]
@@ -21,7 +19,7 @@ struct RHTPQMapNode<E: Element> {
     element: E,
 }
 
-impl Ord for RHTPQMapNode {
+impl<E: Element> Ord for RHTPQMapNode<E> {
     fn cmp(&self, other: &Self) -> Ordering {
         match self.element.created_at().after(&other.element.created_at()) {
             true => Ordering::Greater,
@@ -30,22 +28,22 @@ impl Ord for RHTPQMapNode {
     }
 }
 
-impl PartialOrd for RHTPQMapNode {
+impl<E: Element> PartialOrd for RHTPQMapNode<E> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl PartialEq for RHTPQMapNode {
+impl<E: Element> PartialEq for RHTPQMapNode<E> {
     fn eq(&self, other: &Self) -> bool {
         self.key == other.key
     }
 }
 
-impl Eq for RHTPQMapNode {}
+impl<E: Element> Eq for RHTPQMapNode<E> {}
 
-impl Clone for RHTPQMapNode {
-    fn clone(&self) -> RHTPQMapNode {
+impl<E: Clone + Element> Clone for RHTPQMapNode<E> {
+    fn clone(&self) -> RHTPQMapNode<E> {
         RHTPQMapNode {
             key: self.key.clone(),
             element: self.element.clone(),
@@ -53,12 +51,12 @@ impl Clone for RHTPQMapNode {
     }
 }
 
-impl RHTPQMapNode {
-    pub fn new(key: String, element: BoxedElement) -> RHTPQMapNode {
+impl<E: Element> RHTPQMapNode<E> {
+    pub fn new(key: String, element: E) -> RHTPQMapNode<E> {
         RHTPQMapNode { key, element }
     }
 
-    pub fn remove(&self, ticket: Ticket) -> bool {
+    pub fn remove(&mut self, ticket: Ticket) -> bool {
         return self.element.remove(ticket);
     }
 
@@ -74,20 +72,20 @@ impl RHTPQMapNode {
     }
 }
 
-pub struct RHTPriorityQueueMap {
-    node_queue_map_by_key: HashMap<String, BinaryHeap<Rc<RefCell<RHTPQMapNode>>>>,
-    node_map_by_created_at: HashMap<Ticket, Rc<RefCell<RHTPQMapNode>>>,
+pub struct RHTPriorityQueueMap<E: Element> {
+    node_queue_map_by_key: HashMap<String, BinaryHeap<Rc<RefCell<RHTPQMapNode<E>>>>>,
+    node_map_by_created_at: HashMap<Ticket, Rc<RefCell<RHTPQMapNode<E>>>>,
 }
 
-impl RHTPriorityQueueMap {
-    pub fn new() -> RHTPriorityQueueMap {
+impl<E: Clone + Element> RHTPriorityQueueMap<E> {
+    pub fn new() -> RHTPriorityQueueMap<E> {
         RHTPriorityQueueMap {
             node_queue_map_by_key: HashMap::new(),
             node_map_by_created_at: HashMap::new(),
         }
     }
 
-    pub fn get(&self, key: &str) -> Option<BoxedElement> {
+    pub fn get(&self, key: &str) -> Option<E> {
         let node = match self.node_queue_map_by_key.get(key) {
             Some(queue) => match queue.peek() {
                 Some(node) => Some(node),
@@ -117,7 +115,7 @@ impl RHTPriorityQueueMap {
         }
     }
 
-    pub fn set(&mut self, key: String, value: BoxedElement) -> Option<BoxedElement> {
+    pub fn set(&mut self, key: String, value: E) -> Option<E> {
         let node = match self.node_queue_map_by_key.get(&key) {
             Some(queue) => match queue.peek() {
                 Some(node) => Some(node),
@@ -147,7 +145,7 @@ impl RHTPriorityQueueMap {
         removed
     }
 
-    fn set_internal(&mut self, key: String, value: BoxedElement) {
+    fn set_internal(&mut self, key: String, value: E) {
         let node = RHTPQMapNode::new(key.clone(), value.clone());
         let node = Rc::new(RefCell::new(node));
         self.node_map_by_created_at
@@ -160,7 +158,7 @@ impl RHTPriorityQueueMap {
         queue.push(node);
     }
 
-    pub fn delete(&self, key: String, deleted_at: Ticket) -> Option<BoxedElement> {
+    pub fn delete(&self, key: String, deleted_at: Ticket) -> Option<E> {
         match self.node_queue_map_by_key.get(&key) {
             Some(queue) => match queue.peek() {
                 Some(node) => {
@@ -180,7 +178,7 @@ impl RHTPriorityQueueMap {
         &self,
         created_at: Ticket,
         deleted_at: Ticket,
-    ) -> Option<BoxedElement> {
+    ) -> Option<E> {
         if let Some(node) = self.node_map_by_created_at.get(&created_at) {
             let mut node = node.borrow_mut();
             match node.remove(deleted_at) {
@@ -192,7 +190,7 @@ impl RHTPriorityQueueMap {
         }
     }
 
-    pub fn elements(&self) -> HashMap<String, BoxedElement> {
+    pub fn elements(&self) -> HashMap<String, E> {
         let mut elements = HashMap::new();
         for (_, queue) in self.node_queue_map_by_key.iter() {
             for node in queue.iter() {
@@ -206,7 +204,7 @@ impl RHTPriorityQueueMap {
         elements
     }
 
-    pub fn nodes(&self) -> Vec<Rc<RefCell<RHTPQMapNode>>> {
+    pub fn nodes(&self) -> Vec<Rc<RefCell<RHTPQMapNode<E>>>> {
         let mut nodes = vec![];
         for (_, queue) in self.node_queue_map_by_key.iter() {
             for node in queue.iter() {
@@ -216,13 +214,13 @@ impl RHTPriorityQueueMap {
         nodes
     }
 
-    fn purge(&mut self, element: BoxedElement) -> Result<(), Box<RHTPQMapError>> {
+    fn purge(&mut self, element: E) -> Result<(), Box<RHTPQMapError>> {
         match &self.node_map_by_created_at.get(&element.created_at()) {
             None => Err(Box::new(RHTPQMapError::ElementNotFound(
                 element.created_at().key().to_string(),
             ))),
             Some(node) => {
-                let node = node.borrow();
+                let mut node = node.borrow_mut();
                 match self.node_queue_map_by_key.get_mut(&node.key()) {
                     None => Err(Box::new(RHTPQMapError::ElementNotFound(
                         element.created_at().key().to_string(),
