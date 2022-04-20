@@ -128,7 +128,7 @@ impl RHTPriorityQueueMap {
 
         let removed = match node {
             Some(node) => {
-                let node = node.borrow();
+                let mut node = node.borrow_mut();
                 if node.is_removed() {
                     return None;
                 }
