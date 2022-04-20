@@ -239,7 +239,8 @@ impl RHTPriorityQueueMap {
                         while !subqueue.is_empty() {
                             queue.push(subqueue.pop().unwrap());
                         }
-                        node.remove(node.element.created_at());
+                        let created_at = node.element.created_at();
+                        node.remove(created_at);
                         Ok(())
                     }
                 }
