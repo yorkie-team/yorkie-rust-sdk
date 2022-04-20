@@ -16,9 +16,9 @@ enum RHTPQMapError {
     ElementNotFound(String),
 }
 
-struct RHTPQMapNode {
+struct RHTPQMapNode<E: Element> {
     key: String,
-    element: BoxedElement,
+    element: E,
 }
 
 impl Ord for RHTPQMapNode {
