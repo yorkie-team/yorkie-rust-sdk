@@ -182,7 +182,7 @@ impl RHTPriorityQueueMap {
         deleted_at: Ticket,
     ) -> Option<BoxedElement> {
         if let Some(node) = self.node_map_by_created_at.get(&created_at) {
-            let node = node.borrow();
+            let mut node = node.borrow_mut();
             match node.remove(deleted_at) {
                 true => Some(node.element.clone()),
                 false => None,
