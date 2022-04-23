@@ -142,16 +142,16 @@ impl<K: Key, V: Value> Tree<K, V> {
     fn remove_fix_up(&mut self, mut node_rc: RcNode<K, V>, key: K) -> OptionNode<K, V> {
         let mut compared = Ordering::Less;
         {
-            compared = key.cmp(&node_rc.borrow_mut().key);
+            compared = key.cmp(&node_rc.borrow().key);
         }
 
         match compared {
             Ordering::Less => {
                 {
-                    let node = node_rc.borrow_mut();
+                    let node = node_rc.borrow();
                     if !is_red(&node.left) {
                         let left_rc = node.left.as_ref().unwrap();
-                        let left = left_rc.borrow_mut();
+                        let left = left_rc.borrow();
                         if !is_red(&left.left) {
                             drop(left);
                             drop(node);
@@ -164,7 +164,7 @@ impl<K: Key, V: Value> Tree<K, V> {
             }
             _ => {
                 {
-                    let node = node_rc.borrow_mut();
+                    let node = node_rc.borrow();
                     if is_red(&node.left) {
                         drop(node);
                         node_rc = rotate_right(&node_rc);
@@ -172,7 +172,7 @@ impl<K: Key, V: Value> Tree<K, V> {
                 }
 
                 {
-                    let node = node_rc.borrow_mut();
+                    let node = node_rc.borrow();
                     if let Ordering::Equal = key.cmp(&node.key) {
                         if let None = node.right {
                             self.size -= 1;
@@ -182,7 +182,7 @@ impl<K: Key, V: Value> Tree<K, V> {
 
                     if !is_red(&node.right) {
                         let right_rc = node.right.as_ref().unwrap();
-                        let right = right_rc.borrow_mut();
+                        let right = right_rc.borrow();
                         if !is_red(&right.left) {
                             drop(right);
                             drop(node);
@@ -197,7 +197,7 @@ impl<K: Key, V: Value> Tree<K, V> {
                     let right_rc = node.right.as_ref().unwrap();
                     let smallest = min(&right_rc);
                     {
-                        let smallest = smallest.borrow_mut();
+                        let smallest = smallest.borrow();
                         node.value = smallest.value.clone();
                         node.key = smallest.key.clone();
                     }
@@ -233,7 +233,7 @@ impl<K: Key, V: Value> Tree<K, V> {
         let mut node_option = Some(Rc::clone(node_rc));
 
         while let Some(node_rc) = node_option {
-            let node = node_rc.borrow_mut();
+            let node = node_rc.borrow();
             match key.cmp(&node.key) {
                 Ordering::Greater => {
                     if let Some(right_rc) = &node.right {
@@ -273,14 +273,14 @@ impl<K: Key, V: Value> Tree<K, V> {
 
                             child = parent;
                             let child_rc = child.as_ref().unwrap();
-                            let child = child_rc.borrow_mut();
+                            let child = child_rc.borrow();
                             let parent_rc = &child.parent.as_ref().unwrap();
                             parent = Some(Rc::clone(&parent_rc));
                         }
 
                         match parent {
                             Some(parent_rc) => {
-                                let parent = parent_rc.borrow_mut();
+                                let parent = parent_rc.borrow();
                                 return Some((parent.key.clone(), parent.value.clone()));
                             }
                             _ => return None,
@@ -297,21 +297,21 @@ impl<K: Key, V: Value> Tree<K, V> {
 
 fn is_red<K: Key, V: Value>(node: &OptionNode<K, V>) -> bool {
     match node {
-        Some(n) => n.borrow_mut().is_red,
+        Some(n) => n.borrow().is_red,
         _ => false,
     }
 }
 
 fn need_rotate_left<K: Key, V: Value>(node_rc: &RcNode<K, V>) -> bool {
-    let node = node_rc.borrow_mut();
+    let node = node_rc.borrow();
     is_red(&node.right) && !is_red(&node.left)
 }
 
 fn need_rotate_right<K: Key, V: Value>(node_rc: &RcNode<K, V>) -> bool {
-    let node = node_rc.borrow_mut();
+    let node = node_rc.borrow();
     if is_red(&node.left) {
         if let Some(l) = &node.left {
-            return is_red(&l.borrow_mut().left);
+            return is_red(&l.borrow().left);
         }
     }
 
@@ -319,7 +319,7 @@ fn need_rotate_right<K: Key, V: Value>(node_rc: &RcNode<K, V>) -> bool {
 }
 
 fn need_flip_colors<K: Key, V: Value>(node_rc: &RcNode<K, V>) -> bool {
-    let node = node_rc.borrow_mut();
+    let node = node_rc.borrow();
     is_red(&node.left) && is_red(&node.right)
 }
 
@@ -373,7 +373,7 @@ fn move_red_left<K: Key, V: Value>(mut node_rc: RcNode<K, V>) -> RcNode<K, V> {
 
     let mut node = node_rc.borrow_mut();
     let right_rc = node.right.as_ref().unwrap();
-    let right = right_rc.borrow_mut();
+    let right = right_rc.borrow();
 
     if is_red(&right.left) {
         drop(right);
@@ -390,9 +390,9 @@ fn move_red_left<K: Key, V: Value>(mut node_rc: RcNode<K, V>) -> RcNode<K, V> {
 fn move_red_right<K: Key, V: Value>(mut node_rc: RcNode<K, V>) -> RcNode<K, V> {
     flip_colors(&node_rc);
 
-    let node = node_rc.borrow_mut();
+    let node = node_rc.borrow();
     let left_rc = node.left.as_ref().unwrap();
-    let left = left_rc.borrow_mut();
+    let left = left_rc.borrow();
 
     if is_red(&left.left) {
         drop(left);
@@ -406,7 +406,7 @@ fn move_red_right<K: Key, V: Value>(mut node_rc: RcNode<K, V>) -> RcNode<K, V> {
 
 fn fix_up<K: Key, V: Value>(mut node_rc: RcNode<K, V>) -> RcNode<K, V> {
     {
-        let node = node_rc.borrow_mut();
+        let node = node_rc.borrow();
         if is_red(&node.right) {
             drop(node);
             node_rc = rotate_left(&node_rc);
@@ -414,20 +414,20 @@ fn fix_up<K: Key, V: Value>(mut node_rc: RcNode<K, V>) -> RcNode<K, V> {
     }
 
     {
-        let node = node_rc.borrow_mut();
+        let node = node_rc.borrow();
         if is_red(&node.left) {
             let left = &node.left.as_ref().unwrap();
-            if is_red(&left.borrow_mut().left) {
+            if is_red(&left.borrow().left) {
                 drop(node);
                 node_rc = rotate_right(&node_rc);
             }
         }
     }
 
-    let node = node_rc.borrow_mut();
+    let node = node_rc.borrow();
     if is_red(&node.left) {
         let left = &node.left.as_ref().unwrap();
-        if is_red(&left.borrow_mut().right) {
+        if is_red(&left.borrow().right) {
             drop(node);
             flip_colors(&node_rc);
         }
@@ -437,7 +437,7 @@ fn fix_up<K: Key, V: Value>(mut node_rc: RcNode<K, V>) -> RcNode<K, V> {
 }
 
 fn min<K: Key, V: Value>(node_rc: &RcNode<K, V>) -> RcNode<K, V> {
-    let node = node_rc.borrow_mut();
+    let node = node_rc.borrow();
     if let None = node.left {
         return Rc::clone(node_rc);
     }
@@ -447,17 +447,17 @@ fn min<K: Key, V: Value>(node_rc: &RcNode<K, V>) -> RcNode<K, V> {
 
 fn remove_min<K: Key, V: Value>(mut node_rc: RcNode<K, V>) -> OptionNode<K, V> {
     {
-        let node = node_rc.borrow_mut();
+        let node = node_rc.borrow();
         if let None = node.left {
             return None;
         }
     }
 
     {
-        let node = node_rc.borrow_mut();
+        let node = node_rc.borrow();
         if !is_red(&node.left) {
             let left_rc = node.left.as_ref().unwrap();
-            let left = left_rc.borrow_mut();
+            let left = left_rc.borrow();
             if !is_red(&left.left) {
                 drop(left);
                 drop(node);
@@ -480,7 +480,7 @@ fn traverse_in_order<K: Key, V: Value>(
 ) {
     match node {
         Some(node_rc) => {
-            let node = node_rc.borrow_mut();
+            let node = node_rc.borrow();
             traverse_in_order(&node.left.as_ref(), callback);
             callback(&node);
             traverse_in_order(&node.right.as_ref(), callback);
