@@ -42,7 +42,7 @@ impl<E: Element> PartialEq for RHTPQMapNode<E> {
 
 impl<E: Element> Eq for RHTPQMapNode<E> {}
 
-impl<E: Clone + Element> Clone for RHTPQMapNode<E> {
+impl<E: Element> Clone for RHTPQMapNode<E> {
     fn clone(&self) -> RHTPQMapNode<E> {
         RHTPQMapNode {
             key: self.key.clone(),
@@ -77,7 +77,7 @@ pub struct RHTPriorityQueueMap<E: Element> {
     node_map_by_created_at: HashMap<Ticket, Rc<RefCell<RHTPQMapNode<E>>>>,
 }
 
-impl<E: Clone + Element> RHTPriorityQueueMap<E> {
+impl<E: Element> RHTPriorityQueueMap<E> {
     pub fn new() -> RHTPriorityQueueMap<E> {
         RHTPriorityQueueMap {
             node_queue_map_by_key: HashMap::new(),

@@ -1,6 +1,6 @@
 use crate::document::time::ticket::Ticket;
 
-pub trait Element {
+pub trait Element: Clone {
     fn to_string(&self) -> String;
     fn created_at(&self) -> Ticket;
     fn moved_at(&self) -> Option<Ticket>;
