@@ -210,17 +210,17 @@ impl<E: Clone + Element> RHTPriorityQueueMap<E> {
         nodes
     }
 
-    fn purge(&mut self, element: E) -> Result<(), Box<RHTPQMapError>> {
+    fn purge(&mut self, element: E) -> Result<(), RHTPQMapError> {
         match &self.node_map_by_created_at.get(&element.created_at()) {
-            None => Err(Box::new(RHTPQMapError::ElementNotFound(
+            None => Err(RHTPQMapError::ElementNotFound(
                 element.created_at().key().to_string(),
-            ))),
+            )),
             Some(node) => {
                 let mut node = node.borrow_mut();
                 match self.node_queue_map_by_key.get_mut(&node.key()) {
-                    None => Err(Box::new(RHTPQMapError::ElementNotFound(
+                    None => Err(RHTPQMapError::ElementNotFound(
                         element.created_at().key().to_string(),
-                    ))),
+                    )),
                     Some(queue) => {
                         let mut subqueue = BinaryHeap::new();
                         while !queue.is_empty() {
