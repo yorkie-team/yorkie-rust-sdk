@@ -265,3 +265,121 @@ impl<E: Clone + Element> RHTPriorityQueueMap<E> {
         ret
     }
 }
+
+#[cfg(test)]
+mod rht_pq_map_tests {
+    use super::*;
+    use crate::document::json::element::Element;
+    use crate::document::time::actor_id::ActorID;
+    use crate::document::time::ticket::Ticket;
+
+    struct MockElement {
+        value: u32,
+        created_at: Ticket,
+        moved_at: Option<Ticket>,
+        removed_at: Option<Ticket>,
+    }
+
+    impl MockElement {
+        fn new(value: u32, created_at: Ticket) -> MockElement {
+            return MockElement {
+                value,
+                created_at,
+                moved_at: None,
+                removed_at: None,
+            };
+        }
+    }
+
+    impl Element for MockElement {
+        fn to_string(&self) -> String {
+            self.value.to_string()
+        }
+
+        fn created_at(&self) -> Ticket {
+            self.created_at.clone()
+        }
+
+        fn moved_at(&self) -> Option<Ticket> {
+            if let Some(moved_at) = &self.moved_at {
+                return Some(moved_at.clone());
+            }
+
+            None
+        }
+
+        fn set_moved_at(&mut self, ticket: Ticket) {
+            self.moved_at = Some(ticket);
+        }
+
+        fn removed_at(&self) -> Option<Ticket> {
+            if let Some(removed_at) = &self.removed_at {
+                return Some(removed_at.clone());
+            }
+
+            None
+        }
+
+        fn remove(&mut self, ticket: Ticket) -> bool {
+            if ticket.after(&self.created_at) {
+                match &self.removed_at {
+                    Some(removed_at) => {
+                        if ticket.after(removed_at) {
+                            self.removed_at = Some(ticket);
+                            return true;
+                        }
+                    }
+                    _ => {
+                        self.removed_at = Some(ticket);
+                        return true;
+                    }
+                }
+            }
+
+            false
+        }
+    }
+
+    impl Clone for MockElement {
+        fn clone(&self) -> Self {
+            let moved_at = match &self.moved_at {
+                Some(moved_at) => Some(moved_at.clone()),
+                _ => None,
+            };
+
+            let removed_at = match &self.removed_at {
+                Some(removed_at) => Some(removed_at.clone()),
+                _ => None,
+            };
+
+            MockElement {
+                value: self.value,
+                created_at: self.created_at.clone(),
+                moved_at: moved_at,
+                removed_at: removed_at,
+            }
+        }
+    }
+
+    #[test]
+    fn data_handle() {
+        let mut map = RHTPriorityQueueMap::<MockElement>::new();
+        let hex_str = "0123456789abcdef01234567";
+        let actor_id = ActorID::from_hex(hex_str).unwrap();
+        let created_at = Ticket::new(0, 0, actor_id.clone());
+
+        // set return None
+        let result = map.set("data".to_string(), MockElement::new(1, created_at));
+        if let Some(_) = result {
+            assert!(false);
+        };
+
+        // set return removed element
+        let created_at = Ticket::new(0, 1, actor_id.clone());
+        let result = map.set("data".to_string(), MockElement::new(2, created_at));
+        match result {
+            Some(element) => assert_eq!(element.to_string(), "1"),
+            _ => assert!(false),
+        }
+    }
+}
