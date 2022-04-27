@@ -2,8 +2,8 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::rc::Rc;
 
-type OptionNode<K, V> = Option<Rc<RefCell<Node<K, V>>>>;
 type RcNode<K, V> = Rc<RefCell<Node<K, V>>>;
+type OptionNode<K, V> = Option<RcNode<K, V>>;
 
 /// Key represents key of Tree.
 pub trait Key: Clone {
@@ -128,7 +128,7 @@ impl<K: Key, V: Value> Tree<K, V> {
             return;
         }
 
-        let root = self.root.as_ref().unwrap();
+        let root = Rc::clone(self.root.as_ref().unwrap());
         {
             let mut root = root.borrow_mut();
             if !is_red(&root.left) && !is_red(&root.right) {
@@ -136,15 +136,11 @@ impl<K: Key, V: Value> Tree<K, V> {
             }
         }
 
-        self.root = self.remove_fix_up(Rc::clone(&root), key)
+        self.root = self.remove_fix_up(root, key)
     }
 
     fn remove_fix_up(&mut self, mut node_rc: RcNode<K, V>, key: K) -> OptionNode<K, V> {
-        let mut compared = Ordering::Less;
-        {
-            compared = key.cmp(&node_rc.borrow().key);
-        }
-
+        let compared = key.cmp(&node_rc.borrow().key);
         match compared {
             Ordering::Less => {
                 {
