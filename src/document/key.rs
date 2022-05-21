@@ -22,7 +22,7 @@ pub struct Key {
 impl Key {
     /// from_combined_key creates an instance of Key from the received combined key.
     pub fn from_combined_key(combined_key: &str) -> Result<Key, InvalidCombinedKeyError> {
-        let mut splits = combined_key.split(SPLITTER).collect::<Vec<_>>();
+        let splits = combined_key.split(SPLITTER).collect::<Vec<_>>();
         if splits.len() != TOKEN_LEN {
             return Err(InvalidCombinedKeyError);
         }
