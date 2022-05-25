@@ -57,7 +57,7 @@ impl RHTNode {
     }
 
     pub fn is_removed(&self) -> bool {
-        if let None = self.removed_at {
+        if self.removed_at.is_none() {
             return false;
         }
         true
