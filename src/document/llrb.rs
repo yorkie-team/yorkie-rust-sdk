@@ -90,7 +90,7 @@ impl<K: Key, V: Value> Tree<K, V> {
     }
 
     fn insert_fix_up(&mut self, node: OptionNode<K, V>, key: K, value: V) -> OptionNode<K, V> {
-        if let None = node {
+        if node.is_none() {
             self.size += 1;
             return Some(Rc::new(RefCell::new(Node::new(key, value, true))));
         }
@@ -124,7 +124,7 @@ impl<K: Key, V: Value> Tree<K, V> {
 
     /// remove removes the value of the given key.
     pub fn remove(&mut self, key: K) {
-        if let None = self.root {
+        if self.root.is_none() {
             return;
         }
 
@@ -170,7 +170,7 @@ impl<K: Key, V: Value> Tree<K, V> {
                 {
                     let node = node_rc.borrow();
                     if let Ordering::Equal = key.cmp(&node.key) {
-                        if let None = node.right {
+                        if node.right.is_none() {
                             self.size -= 1;
                             return None;
                         }
@@ -221,7 +221,7 @@ impl<K: Key, V: Value> Tree<K, V> {
     /// floor returns the greatest key less than or equal to the given key.
     pub fn floor(&self, key: K) -> Option<(K, V)> {
         let root = &self.root;
-        if let None = root {
+        if root.is_none() {
             return None;
         }
 
@@ -251,11 +251,11 @@ impl<K: Key, V: Value> Tree<K, V> {
                         let mut child = Some(Rc::clone(&node_rc));
 
                         loop {
-                            if let None = parent {
+                            if parent.is_none() {
                                 return None;
                             }
 
-                            if let None = child {
+                            if child.is_none() {
                                 return None;
                             }
 
@@ -434,7 +434,7 @@ fn fix_up<K: Key, V: Value>(mut node_rc: RcNode<K, V>) -> RcNode<K, V> {
 
 fn min<K: Key, V: Value>(node_rc: &RcNode<K, V>) -> RcNode<K, V> {
     let node = node_rc.borrow();
-    if let None = node.left {
+    if node.left.is_none() {
         return Rc::clone(node_rc);
     }
 
@@ -444,7 +444,7 @@ fn min<K: Key, V: Value>(node_rc: &RcNode<K, V>) -> RcNode<K, V> {
 fn remove_min<K: Key, V: Value>(mut node_rc: RcNode<K, V>) -> OptionNode<K, V> {
     {
         let node = node_rc.borrow();
-        if let None = node.left {
+        if node.left.is_none() {
             return None;
         }
     }
