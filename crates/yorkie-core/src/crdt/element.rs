@@ -1,3 +1,4 @@
+use super::object::CrdtObject;
 use super::primitive::CrdtPrimitive;
 use crate::{TimeTicket, TIME_TICKET_SIZE};
 
@@ -105,6 +106,7 @@ impl CrdtElementMeta {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum CrdtElement {
     Primitive(CrdtPrimitive),
+    Object(Box<CrdtObject>),
 }
 
 impl CrdtElement {
@@ -112,87 +114,105 @@ impl CrdtElement {
         Self::Primitive(value)
     }
 
+    pub(crate) fn object(value: CrdtObject) -> Self {
+        Self::Object(Box::new(value))
+    }
+
     pub(crate) fn created_at(&self) -> &TimeTicket {
         match self {
             Self::Primitive(value) => value.created_at(),
+            Self::Object(value) => value.created_at(),
         }
     }
 
     pub(crate) fn id(&self) -> &TimeTicket {
         match self {
             Self::Primitive(value) => value.id(),
+            Self::Object(value) => value.id(),
         }
     }
 
     pub(crate) fn moved_at(&self) -> Option<&TimeTicket> {
         match self {
             Self::Primitive(value) => value.moved_at(),
+            Self::Object(value) => value.moved_at(),
         }
     }
 
     pub(crate) fn removed_at(&self) -> Option<&TimeTicket> {
         match self {
             Self::Primitive(value) => value.removed_at(),
+            Self::Object(value) => value.removed_at(),
         }
     }
 
     pub(crate) fn positioned_at(&self) -> &TimeTicket {
         match self {
             Self::Primitive(value) => value.positioned_at(),
+            Self::Object(value) => value.positioned_at(),
         }
     }
 
     pub(crate) fn set_moved_at(&mut self, moved_at: Option<TimeTicket>) -> bool {
         match self {
             Self::Primitive(value) => value.set_moved_at(moved_at),
+            Self::Object(value) => value.set_moved_at(moved_at),
         }
     }
 
     pub(crate) fn set_removed_at(&mut self, removed_at: Option<TimeTicket>) {
         match self {
             Self::Primitive(value) => value.set_removed_at(removed_at),
+            Self::Object(value) => value.set_removed_at(removed_at),
         }
     }
 
     pub(crate) fn remove(&mut self, removed_at: Option<TimeTicket>) -> bool {
         match self {
             Self::Primitive(value) => value.remove(removed_at),
+            Self::Object(value) => value.remove(removed_at),
         }
     }
 
     pub(crate) fn is_removed(&self) -> bool {
         match self {
             Self::Primitive(value) => value.is_removed(),
+            Self::Object(value) => value.is_removed(),
         }
     }
 
     pub(crate) fn meta_usage(&self) -> usize {
         match self {
             Self::Primitive(value) => value.meta_usage(),
+            Self::Object(value) => value.meta_usage(),
         }
     }
 
     pub(crate) fn data_size(&self) -> DataSize {
         match self {
             Self::Primitive(value) => value.data_size(),
+            Self::Object(value) => value.data_size(),
         }
     }
 
     pub(crate) fn to_json(&self) -> String {
         match self {
             Self::Primitive(value) => value.to_json(),
+            Self::Object(value) => value.to_json(),
         }
     }
 
     pub(crate) fn to_sorted_json(&self) -> String {
         match self {
             Self::Primitive(value) => value.to_sorted_json(),
+            Self::Object(value) => value.to_sorted_json(),
         }
     }
 
     pub(crate) fn deepcopy(&self) -> Self {
         match self {
             Self::Primitive(value) => Self::Primitive(value.deepcopy()),
+            Self::Object(value) => Self::Object(Box::new(value.deepcopy())),
         }
     }
 }
