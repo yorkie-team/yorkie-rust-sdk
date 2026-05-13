@@ -35,3 +35,25 @@ fn preserves_document_key_as_given() {
 
     assert_eq!("invalid key", doc.key());
 }
+
+#[test]
+fn removes_object_member() -> Result<()> {
+    let mut doc = Document::new("test-doc");
+
+    doc.update(|root| {
+        let mut profile = JsonObject::new();
+        profile.set("name", "yorkie")?;
+        profile.set("active", true)?;
+        root.set("profile", profile)?;
+
+        let profile = root.get_object_mut("profile")?;
+        assert!(profile.remove("name").is_some());
+        assert!(profile.remove("missing").is_none());
+
+        Ok(())
+    })?;
+
+    assert_eq!(r#"{"profile":{"active":true}}"#, doc.to_sorted_json());
+
+    Ok(())
+}

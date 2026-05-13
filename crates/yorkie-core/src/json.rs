@@ -65,6 +65,10 @@ impl JsonObject {
         self.members.get_mut(key)
     }
 
+    pub fn remove(&mut self, key: &str) -> Option<JsonValue> {
+        self.members.remove(key)
+    }
+
     pub fn get_array_mut(&mut self, key: &str) -> Result<&mut JsonArray> {
         match self.members.get_mut(key) {
             Some(JsonValue::Array(value)) => Ok(value),
