@@ -75,6 +75,7 @@ it has:
 | `CrdtPrimitive` | `packages/sdk/src/document/crdt/primitive.ts` | Internal CRDT element for leaf primitive values. |
 | `ElementRht` | `packages/sdk/src/document/crdt/element_rht.ts` | Internal replicated hash table for object members, keyed by visible key and element creation time. |
 | `CrdtObject` | `packages/sdk/src/document/crdt/object.ts` | Internal CRDT container for object members stored in `ElementRht`. |
+| `CrdtRoot` | `packages/sdk/src/document/crdt/root.ts` | Internal root that indexes CRDT elements by creation time and creates element paths. |
 | `JsonObject` | `packages/sdk/src/document/json/object.ts` | Public JSON-like object API must map to JS object behavior. |
 | `JsonObject::set` | `ObjectProxy.setInternal()` | Reject object keys containing `.` and store the new member value. |
 | `JsonObject::remove` | `ObjectProxy.deleteInternal()` | Rust method for deleting an object member. Missing keys must be a no-op. |

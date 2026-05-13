@@ -1,0 +1,402 @@
+use super::element::{CrdtElement, DataSize};
+use super::object::CrdtObject;
+use crate::{Result, TimeTicket, YorkieError, TIME_TICKET_SIZE};
+use std::collections::{BTreeMap, BTreeSet};
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CrdtElementPair {
+    element: CrdtElement,
+    parent: Option<CrdtElement>,
+}
+
+impl CrdtElementPair {
+    fn new(element: CrdtElement, parent: Option<CrdtElement>) -> Self {
+        Self { element, parent }
+    }
+
+    pub(crate) fn element(&self) -> &CrdtElement {
+        &self.element
+    }
+
+    pub(crate) fn parent(&self) -> Option<&CrdtElement> {
+        self.parent.as_ref()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DocSize {
+    pub(crate) live: DataSize,
+    pub(crate) gc: DataSize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RootStats {
+    pub(crate) elements: usize,
+    pub(crate) gc_elements: usize,
+    pub(crate) gc_pairs: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CrdtRoot {
+    root_object: CrdtObject,
+    element_pair_by_created_at: BTreeMap<String, CrdtElementPair>,
+    gc_element_set_by_created_at: BTreeSet<String>,
+    doc_size: DocSize,
+}
+
+impl CrdtRoot {
+    pub(crate) fn new(root_object: CrdtObject) -> Self {
+        let mut root = Self {
+            root_object,
+            element_pair_by_created_at: BTreeMap::new(),
+            gc_element_set_by_created_at: BTreeSet::new(),
+            doc_size: DocSize::default(),
+        };
+        let root_element = root.root_element();
+        root.register_element(&root_element, None);
+        root.register_removed_descendants(&root_element);
+        root
+    }
+
+    pub(crate) fn create() -> Self {
+        Self::new(CrdtObject::create(TimeTicket::initial()))
+    }
+
+    pub(crate) fn find_by_created_at(&self, created_at: &TimeTicket) -> Option<&CrdtElement> {
+        self.element_pair_by_created_at
+            .get(&created_at.to_id_string())
+            .map(CrdtElementPair::element)
+    }
+
+    pub(crate) fn find_element_pair_by_created_at(
+        &self,
+        created_at: &TimeTicket,
+    ) -> Option<&CrdtElementPair> {
+        self.element_pair_by_created_at
+            .get(&created_at.to_id_string())
+    }
+
+    pub(crate) fn create_sub_paths(&self, created_at: &TimeTicket) -> Result<Vec<String>> {
+        let Some(mut pair) = self.find_element_pair_by_created_at(created_at) else {
+            return Ok(Vec::new());
+        };
+
+        let mut sub_paths = Vec::new();
+        while let Some(parent) = pair.parent() {
+            let child_created_at = pair.element().created_at();
+            let sub_path = sub_path_of(parent, child_created_at)
+                .ok_or_else(|| YorkieError::MissingCrdtElement(child_created_at.to_id_string()))?;
+            sub_paths.insert(0, sub_path.to_owned());
+
+            pair = self
+                .find_element_pair_by_created_at(parent.created_at())
+                .ok_or_else(|| {
+                    YorkieError::MissingCrdtElement(parent.created_at().to_id_string())
+                })?;
+        }
+
+        sub_paths.insert(0, "$".to_owned());
+        Ok(sub_paths)
+    }
+
+    pub(crate) fn create_path(&self, created_at: &TimeTicket) -> Result<String> {
+        Ok(self.create_sub_paths(created_at)?.join("."))
+    }
+
+    pub(crate) fn register_element(&mut self, element: &CrdtElement, parent: Option<&CrdtElement>) {
+        self.register_element_internal(element, parent);
+    }
+
+    pub(crate) fn deregister_element(&mut self, element: &CrdtElement) -> usize {
+        let mut count = 0;
+        self.deregister_element_internal(element, &mut count);
+        count
+    }
+
+    pub(crate) fn register_removed_element(&mut self, element: &CrdtElement) {
+        let created_at = element.created_at().to_id_string();
+        if let Some(pair) = self.element_pair_by_created_at.get_mut(&created_at) {
+            pair.element = element.deepcopy();
+        }
+
+        add_data_size(&mut self.doc_size.gc, element.data_size());
+        sub_data_size(&mut self.doc_size.live, element.data_size());
+        self.doc_size.live.meta += TIME_TICKET_SIZE;
+        self.gc_element_set_by_created_at.insert(created_at);
+    }
+
+    pub(crate) fn get_element_map_size(&self) -> usize {
+        self.element_pair_by_created_at.len()
+    }
+
+    pub(crate) fn get_garbage_element_set_size(&self) -> usize {
+        let mut seen = BTreeSet::new();
+
+        for created_at in &self.gc_element_set_by_created_at {
+            seen.insert(created_at.clone());
+            if let Some(pair) = self.element_pair_by_created_at.get(created_at) {
+                collect_descendant_ids(pair.element(), &mut seen);
+            }
+        }
+
+        seen.len()
+    }
+
+    pub(crate) fn get_garbage_len(&self) -> usize {
+        self.get_garbage_element_set_size()
+    }
+
+    pub(crate) fn object(&self) -> &CrdtObject {
+        &self.root_object
+    }
+
+    pub(crate) fn object_mut(&mut self) -> &mut CrdtObject {
+        &mut self.root_object
+    }
+
+    pub(crate) fn doc_size(&self) -> DocSize {
+        self.doc_size
+    }
+
+    pub(crate) fn deepcopy(&self) -> Self {
+        Self::new(self.root_object.deepcopy())
+    }
+
+    pub(crate) fn to_json(&self) -> String {
+        self.root_object.to_json()
+    }
+
+    pub(crate) fn to_sorted_json(&self) -> String {
+        self.root_object.to_sorted_json()
+    }
+
+    pub(crate) fn stats(&self) -> RootStats {
+        RootStats {
+            elements: self.get_element_map_size(),
+            gc_elements: self.get_garbage_element_set_size(),
+            gc_pairs: 0,
+        }
+    }
+
+    pub(crate) fn root_element(&self) -> CrdtElement {
+        CrdtElement::object(self.root_object.deepcopy())
+    }
+
+    fn register_element_internal(&mut self, element: &CrdtElement, parent: Option<&CrdtElement>) {
+        self.element_pair_by_created_at.insert(
+            element.created_at().to_id_string(),
+            CrdtElementPair::new(element.deepcopy(), parent.map(|parent| parent.deepcopy())),
+        );
+        add_data_size(&mut self.doc_size.live, element.data_size());
+
+        if let CrdtElement::Object(object) = element {
+            for (_, child) in object.iter_all() {
+                self.register_element_internal(child, Some(element));
+            }
+        }
+    }
+
+    fn deregister_element_internal(&mut self, element: &CrdtElement, count: &mut usize) {
+        let created_at = element.created_at().to_id_string();
+        sub_data_size(&mut self.doc_size.gc, element.data_size());
+        self.element_pair_by_created_at.remove(&created_at);
+        self.gc_element_set_by_created_at.remove(&created_at);
+        *count += 1;
+
+        if let CrdtElement::Object(object) = element {
+            for (_, child) in object.iter_all() {
+                self.deregister_element_internal(child, count);
+            }
+        }
+    }
+
+    fn register_removed_descendants(&mut self, element: &CrdtElement) {
+        if element.removed_at().is_some() {
+            self.register_removed_element(element);
+        }
+
+        if let CrdtElement::Object(object) = element {
+            for (_, child) in object.iter_all() {
+                self.register_removed_descendants(child);
+            }
+        }
+    }
+}
+
+fn sub_path_of<'a>(parent: &'a CrdtElement, created_at: &TimeTicket) -> Option<&'a str> {
+    match parent {
+        CrdtElement::Object(object) => object.sub_path_of(created_at),
+        CrdtElement::Primitive(_) => None,
+    }
+}
+
+fn collect_descendant_ids(element: &CrdtElement, seen: &mut BTreeSet<String>) {
+    if let CrdtElement::Object(object) = element {
+        for (_, child) in object.iter_all() {
+            seen.insert(child.created_at().to_id_string());
+            collect_descendant_ids(child, seen);
+        }
+    }
+}
+
+fn add_data_size(target: &mut DataSize, size: DataSize) {
+    target.data += size.data;
+    target.meta += size.meta;
+}
+
+fn sub_data_size(target: &mut DataSize, size: DataSize) {
+    target.data = target.data.saturating_sub(size.data);
+    target.meta = target.meta.saturating_sub(size.meta);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CrdtRoot;
+    use crate::crdt::element::CrdtElement;
+    use crate::crdt::object::CrdtObject;
+    use crate::crdt::primitive::{CrdtPrimitive, PrimitiveValue};
+    use crate::{TimeTicket, TIME_TICKET_SIZE};
+
+    #[test]
+    fn creates_root_with_initial_object() -> crate::Result<()> {
+        let root = CrdtRoot::create();
+
+        assert_eq!(1, root.get_element_map_size());
+        assert!(root.find_by_created_at(&TimeTicket::initial()).is_some());
+        assert_eq!("$", root.create_path(&TimeTicket::initial())?);
+        assert_eq!("", root.create_path(&TimeTicket::max())?);
+        assert_eq!("{}", root.to_json());
+        assert_eq!("{}", root.to_sorted_json());
+        Ok(())
+    }
+
+    #[test]
+    fn registers_and_finds_object_members() -> crate::Result<()> {
+        let mut root = CrdtRoot::create();
+        let created_at = ticket(1, "a");
+        let member = primitive_str("k1", created_at.clone());
+
+        root.object_mut()
+            .set("k1", member.deepcopy(), created_at.clone());
+        let parent = root.root_element();
+        root.register_element(&member, Some(&parent));
+
+        assert_eq!(2, root.get_element_map_size());
+        assert_eq!(Some(&member), root.find_by_created_at(&created_at));
+        assert_eq!("$.k1", root.create_path(&created_at)?);
+        assert_eq!(r#"{"k1":"k1"}"#, root.to_json());
+        Ok(())
+    }
+
+    #[test]
+    fn deregisters_object_members() {
+        let mut root = CrdtRoot::create();
+        let created_at = ticket(1, "a");
+        let removed_at = ticket(2, "a");
+        let member = primitive_str("k1", created_at.clone());
+
+        root.object_mut()
+            .set("k1", member.deepcopy(), created_at.clone());
+        let parent = root.root_element();
+        root.register_element(&member, Some(&parent));
+
+        let removed = root.object_mut().delete_by_key("k1", removed_at).unwrap();
+        assert_eq!(1, root.deregister_element(&removed));
+
+        assert_eq!(1, root.get_element_map_size());
+        assert!(root.find_by_created_at(&created_at).is_none());
+    }
+
+    #[test]
+    fn registers_nested_object_descendants() -> crate::Result<()> {
+        let mut root = CrdtRoot::create();
+        let profile_created_at = ticket(1, "a");
+        let name_created_at = ticket(2, "a");
+        let mut profile = CrdtObject::create(profile_created_at.clone());
+        let name = primitive_str("yorkie", name_created_at.clone());
+
+        profile.set("name", name.deepcopy(), name_created_at.clone());
+        let profile = CrdtElement::object(profile);
+        root.object_mut()
+            .set("profile", profile.deepcopy(), profile_created_at.clone());
+        let parent = root.root_element();
+        root.register_element(&profile, Some(&parent));
+
+        assert_eq!(3, root.get_element_map_size());
+        assert_eq!("$.profile", root.create_path(&profile_created_at)?);
+        assert_eq!("$.profile.name", root.create_path(&name_created_at)?);
+        assert_eq!(r#"{"profile":{"name":"yorkie"}}"#, root.to_json());
+        Ok(())
+    }
+
+    #[test]
+    fn tracks_removed_elements_for_garbage_collection() {
+        let mut root = CrdtRoot::create();
+        let created_at = ticket(1, "a");
+        let removed_at = ticket(2, "a");
+        let member = primitive_str("k1", created_at.clone());
+
+        root.object_mut()
+            .set("k1", member.deepcopy(), created_at.clone());
+        let parent = root.root_element();
+        root.register_element(&member, Some(&parent));
+
+        let removed = root.object_mut().delete_by_key("k1", removed_at).unwrap();
+        root.register_removed_element(&removed);
+
+        assert_eq!(1, root.get_garbage_element_set_size());
+        assert_eq!(1, root.get_garbage_len());
+        assert_eq!(
+            removed.removed_at(),
+            root.find_by_created_at(&created_at).unwrap().removed_at()
+        );
+        assert_eq!(2, root.stats().elements);
+        assert_eq!(1, root.stats().gc_elements);
+    }
+
+    #[test]
+    fn deepcopies_root_object_and_rebuilds_indexes() -> crate::Result<()> {
+        let mut root = CrdtRoot::create();
+        let created_at = ticket(1, "a");
+        let member = primitive_str("k1", created_at.clone());
+
+        root.object_mut()
+            .set("k1", member.deepcopy(), created_at.clone());
+        let parent = root.root_element();
+        root.register_element(&member, Some(&parent));
+
+        let copy = root.deepcopy();
+        root.object_mut().delete_by_key("k1", ticket(2, "a"));
+
+        assert_eq!(r#"{"k1":"k1"}"#, copy.to_json());
+        assert_eq!("$.k1", copy.create_path(&created_at)?);
+        assert_eq!(2, copy.get_element_map_size());
+        Ok(())
+    }
+
+    #[test]
+    fn reports_document_size_for_registered_elements() {
+        let mut root = CrdtRoot::create();
+        let created_at = ticket(1, "a");
+        let member = primitive_str("k1", created_at.clone());
+
+        root.object_mut()
+            .set("k1", member.deepcopy(), created_at.clone());
+        let parent = root.root_element();
+        root.register_element(&member, Some(&parent));
+
+        assert_eq!(TIME_TICKET_SIZE * 2, root.doc_size().live.meta);
+        assert!(root.doc_size().live.data > 0);
+    }
+
+    fn primitive_str(value: &str, created_at: TimeTicket) -> CrdtElement {
+        CrdtElement::primitive(CrdtPrimitive::new(
+            PrimitiveValue::String(value.to_owned()),
+            created_at,
+        ))
+    }
+
+    fn ticket(lamport: i64, actor_id: &str) -> TimeTicket {
+        TimeTicket::new(lamport, 0, actor_id)
+    }
+}

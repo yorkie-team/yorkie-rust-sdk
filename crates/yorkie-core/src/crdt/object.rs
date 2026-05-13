@@ -178,6 +178,12 @@ impl CrdtObject {
             .filter(|node| !node.is_removed())
             .map(|node| (node.str_key(), node.value()))
     }
+
+    pub(crate) fn iter_all(&self) -> impl Iterator<Item = (&str, &CrdtElement)> {
+        self.member_nodes
+            .iter()
+            .map(|node| (node.str_key(), node.value()))
+    }
 }
 
 #[cfg(test)]

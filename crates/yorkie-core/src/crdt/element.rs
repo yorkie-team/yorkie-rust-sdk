@@ -2,7 +2,7 @@ use super::object::CrdtObject;
 use super::primitive::CrdtPrimitive;
 use crate::{TimeTicket, TIME_TICKET_SIZE};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct DataSize {
     pub(crate) data: usize,
     pub(crate) meta: usize,
