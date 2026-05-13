@@ -1,0 +1,15 @@
+[workspace]
+members = [
+    "crates/yorkie",
+    "crates/yorkie-client",
+    "crates/yorkie-core",
+    "crates/yorkie-protocol",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/yorkie-team/yorkie-rust-sdk"
+version = "0.1.0"
+

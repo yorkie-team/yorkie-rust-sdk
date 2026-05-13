@@ -1,0 +1,12 @@
+[package]
+name = "yorkie"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[dependencies]
+yorkie-client = { path = "../yorkie-client" }
+yorkie-core = { path = "../yorkie-core" }
+yorkie-protocol = { path = "../yorkie-protocol" }
+
