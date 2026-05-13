@@ -7,6 +7,9 @@ pub enum YorkieError {
     /// An object member key is not allowed by Yorkie's document model.
     InvalidObjectKey(String),
 
+    /// A time ticket lamport value cannot be parsed as an integer.
+    InvalidTimeTicketLamport(String),
+
     /// A requested object member does not exist.
     MissingKey(String),
 
@@ -22,6 +25,9 @@ impl Display for YorkieError {
         match self {
             Self::InvalidObjectKey(key) => {
                 write!(f, "invalid object key {key:?}: key must not contain '.'")
+            }
+            Self::InvalidTimeTicketLamport(lamport) => {
+                write!(f, "invalid time ticket lamport {lamport:?}")
             }
             Self::MissingKey(key) => write!(f, "missing key {key:?}"),
             Self::UnexpectedType { key, expected } => {

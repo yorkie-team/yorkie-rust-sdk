@@ -1,4 +1,5 @@
 use super::{ActorId, INITIAL_ACTOR_ID, MAX_ACTOR_ID};
+use crate::{Result, YorkieError};
 use std::cmp::Ordering;
 
 pub const TIME_TICKET_SIZE: usize = 8 + 4 + 12;
@@ -6,6 +7,13 @@ pub const INITIAL_LAMPORT: i64 = 0;
 pub const INITIAL_DELIMITER: u32 = 0;
 pub const MAX_DELIMITER: u32 = u32::MAX;
 pub const MAX_LAMPORT: i64 = i64::MAX;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimeTicketStruct {
+    pub lamport: String,
+    pub delimiter: u32,
+    pub actor_id: ActorId,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimeTicket {
@@ -31,8 +39,25 @@ impl TimeTicket {
         Self::new(MAX_LAMPORT, MAX_DELIMITER, MAX_ACTOR_ID)
     }
 
+    pub fn from_struct(value: TimeTicketStruct) -> Result<Self> {
+        let lamport = value
+            .lamport
+            .parse::<i64>()
+            .map_err(|_| YorkieError::InvalidTimeTicketLamport(value.lamport.clone()))?;
+
+        Ok(Self::new(lamport, value.delimiter, value.actor_id))
+    }
+
     pub fn to_id_string(&self) -> String {
         format!("{}:{}:{}", self.lamport, self.actor_id, self.delimiter)
+    }
+
+    pub fn to_struct(&self) -> TimeTicketStruct {
+        TimeTicketStruct {
+            lamport: self.lamport_as_string(),
+            delimiter: self.delimiter,
+            actor_id: self.actor_id.clone(),
+        }
     }
 
     pub fn to_test_string(&self) -> String {

@@ -25,6 +25,19 @@ fn creates_time_ticket_identifiers() {
 }
 
 #[test]
+fn converts_time_ticket_to_and_from_struct() -> yorkie_core::Result<()> {
+    let ticket = TimeTicket::new(7, 2, "000000000000000000000034");
+
+    let ticket_struct = ticket.to_struct();
+    assert_eq!("7", ticket_struct.lamport);
+    assert_eq!(2, ticket_struct.delimiter);
+    assert_eq!("000000000000000000000034", ticket_struct.actor_id.as_str());
+    assert_eq!(ticket, TimeTicket::from_struct(ticket_struct)?);
+
+    Ok(())
+}
+
+#[test]
 fn exposes_initial_and_max_time_tickets() {
     assert_eq!(8 + 4 + 12, TIME_TICKET_SIZE);
     assert_eq!(0, INITIAL_LAMPORT);
