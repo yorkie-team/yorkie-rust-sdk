@@ -1,4 +1,4 @@
-use yorkie::{Document, Result};
+use yorkie::{ActorId, Document, Result, TimeTicket, VersionVector};
 
 #[test]
 fn facade_exports_document_api() -> Result<()> {
@@ -12,4 +12,15 @@ fn facade_exports_document_api() -> Result<()> {
     assert_eq!(r#"{"title":"hello"}"#, doc.to_sorted_json());
 
     Ok(())
+}
+
+#[test]
+fn facade_exports_time_api() {
+    let actor_id = ActorId::new("000000000000000000000001");
+    let ticket = TimeTicket::new(1, 0, actor_id.clone());
+    let mut vector = VersionVector::new();
+    vector.set(actor_id, 1);
+
+    assert_eq!("1:000000000000000000000001:0", ticket.to_id_string());
+    assert!(vector.after_or_equal(&ticket));
 }
