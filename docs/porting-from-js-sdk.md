@@ -101,5 +101,6 @@ Before adding or changing a Rust SDK concept:
 - Does the Rust name map clearly to the JS name?
 - Is this a public API or an internal implementation detail?
 - If this is a new internal abstraction, which JS concept does it support?
+- Does it preserve the dependency direction in
+  [Dependency Boundaries](dependency-boundaries.md)?
 - Did `cargo fmt` and `cargo test` pass?
-
