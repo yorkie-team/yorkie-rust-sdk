@@ -80,7 +80,7 @@ Update this table whenever a new Rust type becomes part of the porting surface.
 Start with the JS SDK behaviors that define the document surface before network
 sync:
 
-1. Document key validation.
+1. Document key handling.
 2. Primitive set on the root object.
 3. Object set and nested object updates.
 4. Array set and array push.

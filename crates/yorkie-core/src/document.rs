@@ -1,4 +1,4 @@
-use crate::{JsonObject, Result, YorkieError};
+use crate::{JsonObject, Result};
 
 /// A local Yorkie document.
 #[derive(Debug, Clone, PartialEq)]
@@ -9,14 +9,11 @@ pub struct Document {
 
 impl Document {
     /// Creates a document with the given Yorkie resource key.
-    pub fn new(key: impl Into<String>) -> Result<Self> {
-        let key = key.into();
-        validate_key(&key)?;
-
-        Ok(Self {
-            key,
+    pub fn new(key: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
             root: JsonObject::new(),
-        })
+        }
     }
 
     /// Returns this document's key.
@@ -46,34 +43,13 @@ impl Document {
     }
 }
 
-fn validate_key(key: &str) -> Result<()> {
-    let valid_len = (4..=120).contains(&key.chars().count());
-    let valid_chars = key
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '~'));
-
-    if valid_len && valid_chars {
-        return Ok(());
-    }
-
-    Err(YorkieError::InvalidKey(key.to_owned()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::Document;
 
     #[test]
-    fn rejects_invalid_document_keys() {
-        assert!(Document::new("abc").is_err());
-        assert!(Document::new("invalid key").is_err());
-        assert!(Document::new("invalid-key-$").is_err());
-    }
-
-    #[test]
-    fn accepts_yorkie_resource_keys() {
-        assert!(Document::new("valid-key").is_ok());
-        assert!(Document::new("Capital-Character-Key").is_ok());
-        assert!(Document::new("valid.key_~").is_ok());
+    fn creates_document_with_the_given_key() {
+        let doc = Document::new("doc-key");
+        assert_eq!("doc-key", doc.key());
     }
 }
