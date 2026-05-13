@@ -10,6 +10,16 @@ pub enum YorkieError {
     /// A time ticket lamport value cannot be parsed as an integer.
     InvalidTimeTicketLamport(String),
 
+    /// Primitive bytes do not match the expected primitive representation.
+    InvalidPrimitiveBytes {
+        primitive_type: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+
+    /// Primitive string bytes are not valid UTF-8.
+    InvalidPrimitiveUtf8,
+
     /// A requested object member does not exist.
     MissingKey(String),
 
@@ -29,6 +39,15 @@ impl Display for YorkieError {
             Self::InvalidTimeTicketLamport(lamport) => {
                 write!(f, "invalid time ticket lamport {lamport:?}")
             }
+            Self::InvalidPrimitiveBytes {
+                primitive_type,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "invalid primitive bytes for {primitive_type}: expected {expected}, got {actual}"
+            ),
+            Self::InvalidPrimitiveUtf8 => write!(f, "invalid primitive string bytes"),
             Self::MissingKey(key) => write!(f, "missing key {key:?}"),
             Self::UnexpectedType { key, expected } => {
                 write!(f, "unexpected type for key {key:?}: expected {expected}")
