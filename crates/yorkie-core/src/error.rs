@@ -20,6 +20,9 @@ pub enum YorkieError {
     /// Primitive string bytes are not valid UTF-8.
     InvalidPrimitiveUtf8,
 
+    /// A requested CRDT element does not exist.
+    MissingCrdtElement(String),
+
     /// A requested object member does not exist.
     MissingKey(String),
 
@@ -48,6 +51,7 @@ impl Display for YorkieError {
                 "invalid primitive bytes for {primitive_type}: expected {expected}, got {actual}"
             ),
             Self::InvalidPrimitiveUtf8 => write!(f, "invalid primitive string bytes"),
+            Self::MissingCrdtElement(id) => write!(f, "missing CRDT element {id:?}"),
             Self::MissingKey(key) => write!(f, "missing key {key:?}"),
             Self::UnexpectedType { key, expected } => {
                 write!(f, "unexpected type for key {key:?}: expected {expected}")

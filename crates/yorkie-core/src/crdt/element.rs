@@ -1,4 +1,11 @@
+use super::primitive::CrdtPrimitive;
 use crate::{TimeTicket, TIME_TICKET_SIZE};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DataSize {
+    pub(crate) data: usize,
+    pub(crate) meta: usize,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CrdtElementMeta {
@@ -95,9 +102,105 @@ impl CrdtElementMeta {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum CrdtElement {
+    Primitive(CrdtPrimitive),
+}
+
+impl CrdtElement {
+    pub(crate) fn primitive(value: CrdtPrimitive) -> Self {
+        Self::Primitive(value)
+    }
+
+    pub(crate) fn created_at(&self) -> &TimeTicket {
+        match self {
+            Self::Primitive(value) => value.created_at(),
+        }
+    }
+
+    pub(crate) fn id(&self) -> &TimeTicket {
+        match self {
+            Self::Primitive(value) => value.id(),
+        }
+    }
+
+    pub(crate) fn moved_at(&self) -> Option<&TimeTicket> {
+        match self {
+            Self::Primitive(value) => value.moved_at(),
+        }
+    }
+
+    pub(crate) fn removed_at(&self) -> Option<&TimeTicket> {
+        match self {
+            Self::Primitive(value) => value.removed_at(),
+        }
+    }
+
+    pub(crate) fn positioned_at(&self) -> &TimeTicket {
+        match self {
+            Self::Primitive(value) => value.positioned_at(),
+        }
+    }
+
+    pub(crate) fn set_moved_at(&mut self, moved_at: Option<TimeTicket>) -> bool {
+        match self {
+            Self::Primitive(value) => value.set_moved_at(moved_at),
+        }
+    }
+
+    pub(crate) fn set_removed_at(&mut self, removed_at: Option<TimeTicket>) {
+        match self {
+            Self::Primitive(value) => value.set_removed_at(removed_at),
+        }
+    }
+
+    pub(crate) fn remove(&mut self, removed_at: Option<TimeTicket>) -> bool {
+        match self {
+            Self::Primitive(value) => value.remove(removed_at),
+        }
+    }
+
+    pub(crate) fn is_removed(&self) -> bool {
+        match self {
+            Self::Primitive(value) => value.is_removed(),
+        }
+    }
+
+    pub(crate) fn meta_usage(&self) -> usize {
+        match self {
+            Self::Primitive(value) => value.meta_usage(),
+        }
+    }
+
+    pub(crate) fn data_size(&self) -> DataSize {
+        match self {
+            Self::Primitive(value) => value.data_size(),
+        }
+    }
+
+    pub(crate) fn to_json(&self) -> String {
+        match self {
+            Self::Primitive(value) => value.to_json(),
+        }
+    }
+
+    pub(crate) fn to_sorted_json(&self) -> String {
+        match self {
+            Self::Primitive(value) => value.to_sorted_json(),
+        }
+    }
+
+    pub(crate) fn deepcopy(&self) -> Self {
+        match self {
+            Self::Primitive(value) => Self::Primitive(value.deepcopy()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::CrdtElementMeta;
+    use super::{CrdtElement, CrdtElementMeta};
+    use crate::crdt::primitive::{CrdtPrimitive, PrimitiveValue};
     use crate::{TimeTicket, TIME_TICKET_SIZE};
 
     #[test]
@@ -171,5 +274,26 @@ mod tests {
 
         meta.set_removed_at(None);
         assert_eq!(None, meta.removed_at());
+    }
+
+    #[test]
+    fn delegates_element_operations_to_primitive() {
+        let created_at = TimeTicket::new(1, 0, "a");
+        let moved_at = TimeTicket::new(2, 0, "a");
+        let removed_at = TimeTicket::new(3, 0, "a");
+        let primitive = CrdtPrimitive::new(PrimitiveValue::String("hello".to_owned()), created_at);
+        let mut element = CrdtElement::primitive(primitive);
+
+        assert_eq!("\"hello\"", element.to_json());
+        assert_eq!(element.created_at(), element.id());
+        assert!(element.set_moved_at(Some(moved_at.clone())));
+        assert_eq!(Some(&moved_at), element.moved_at());
+        assert_eq!(&moved_at, element.positioned_at());
+
+        assert!(element.remove(Some(removed_at.clone())));
+        assert_eq!(Some(&removed_at), element.removed_at());
+        assert!(element.is_removed());
+        assert_eq!(TIME_TICKET_SIZE * 3, element.meta_usage());
+        assert_eq!(element, element.deepcopy());
     }
 }

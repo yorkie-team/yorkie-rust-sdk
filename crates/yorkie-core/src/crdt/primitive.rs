@@ -1,4 +1,4 @@
-use super::element::CrdtElementMeta;
+use super::element::{CrdtElementMeta, DataSize};
 use crate::json::escape_json_string;
 use crate::{Result, TimeTicket, YorkieError};
 
@@ -56,12 +56,6 @@ impl PrimitiveValue {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DataSize {
-    pub(crate) data: usize,
-    pub(crate) meta: usize,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CrdtPrimitive {
     meta: CrdtElementMeta,
@@ -114,6 +108,10 @@ impl CrdtPrimitive {
         self.meta.created_at()
     }
 
+    pub(crate) fn id(&self) -> &TimeTicket {
+        self.meta.id()
+    }
+
     pub(crate) fn moved_at(&self) -> Option<&TimeTicket> {
         self.meta.moved_at()
     }
@@ -122,12 +120,28 @@ impl CrdtPrimitive {
         self.meta.removed_at()
     }
 
+    pub(crate) fn positioned_at(&self) -> &TimeTicket {
+        self.meta.positioned_at()
+    }
+
     pub(crate) fn set_moved_at(&mut self, moved_at: Option<TimeTicket>) -> bool {
         self.meta.set_moved_at(moved_at)
     }
 
     pub(crate) fn set_removed_at(&mut self, removed_at: Option<TimeTicket>) {
         self.meta.set_removed_at(removed_at);
+    }
+
+    pub(crate) fn remove(&mut self, removed_at: Option<TimeTicket>) -> bool {
+        self.meta.remove(removed_at)
+    }
+
+    pub(crate) fn is_removed(&self) -> bool {
+        self.meta.is_removed()
+    }
+
+    pub(crate) fn meta_usage(&self) -> usize {
+        self.meta.meta_usage()
     }
 
     pub(crate) fn data_size(&self) -> DataSize {
