@@ -5,7 +5,7 @@ fn facade_exports_document_api() -> Result<()> {
     let mut doc = Document::new("test-doc");
 
     doc.update(|root| {
-        root.set("title", "hello");
+        root.set("title", "hello")?;
         Ok(())
     })?;
 

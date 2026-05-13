@@ -43,9 +43,18 @@ impl JsonObject {
         Self::default()
     }
 
-    pub fn set(&mut self, key: impl Into<String>, value: impl Into<JsonValue>) -> &mut Self {
-        self.members.insert(key.into(), value.into());
-        self
+    pub fn set(
+        &mut self,
+        key: impl Into<String>,
+        value: impl Into<JsonValue>,
+    ) -> Result<&mut Self> {
+        let key = key.into();
+        if key.contains('.') {
+            return Err(YorkieError::InvalidObjectKey(key));
+        }
+
+        self.members.insert(key, value.into());
+        Ok(self)
     }
 
     pub fn get(&self, key: &str) -> Option<&JsonValue> {
@@ -220,24 +229,39 @@ fn escape_json_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{JsonArray, JsonObject};
+    use crate::{Result, YorkieError};
 
     #[test]
-    fn serializes_objects_with_sorted_keys() {
+    fn serializes_objects_with_sorted_keys() -> Result<()> {
         let mut object = JsonObject::new();
-        object.set("z", 1i32);
-        object.set("a", "first");
+        object.set("z", 1i32)?;
+        object.set("a", "first")?;
 
         assert_eq!(r#"{"a":"first","z":1}"#, object.to_sorted_json());
+
+        Ok(())
     }
 
     #[test]
-    fn serializes_nested_arrays_and_objects() {
+    fn serializes_nested_arrays_and_objects() -> Result<()> {
         let mut child = JsonObject::new();
-        child.set("name", "yorkie");
+        child.set("name", "yorkie")?;
 
         let mut array = JsonArray::new();
         array.push("one").push(child);
 
         assert_eq!(r#"["one",{"name":"yorkie"}]"#, array.to_sorted_json());
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_object_keys_with_dot() {
+        let mut object = JsonObject::new();
+
+        let err = object.set("nested.key", 1i32).unwrap_err();
+
+        assert_eq!(YorkieError::InvalidObjectKey("nested.key".to_owned()), err);
+        assert_eq!("{}", object.to_sorted_json());
     }
 }

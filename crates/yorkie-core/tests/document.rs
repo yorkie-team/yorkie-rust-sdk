@@ -5,15 +5,15 @@ fn updates_a_local_document_root() -> Result<()> {
     let mut doc = Document::new("test-doc");
 
     doc.update(|root| {
-        root.set("title", "hello");
-        root.set("done", false);
-        root.set("count", 1i64);
+        root.set("title", "hello")?;
+        root.set("done", false)?;
+        root.set("count", 1i64)?;
 
         let mut profile = JsonObject::new();
-        profile.set("name", "yorkie");
-        root.set("profile", profile);
+        profile.set("name", "yorkie")?;
+        root.set("profile", profile)?;
 
-        root.set("todos", JsonArray::new());
+        root.set("todos", JsonArray::new())?;
         root.get_array_mut("todos")?
             .push("write tests")
             .push("sync");

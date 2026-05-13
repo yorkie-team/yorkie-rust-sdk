@@ -4,8 +4,8 @@ use std::fmt::{self, Display, Formatter};
 /// The common error type used by Yorkie core.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum YorkieError {
-    /// The document or channel key does not match Yorkie's resource key rules.
-    InvalidKey(String),
+    /// An object member key is not allowed by Yorkie's document model.
+    InvalidObjectKey(String),
 
     /// A requested object member does not exist.
     MissingKey(String),
@@ -20,8 +20,8 @@ pub type Result<T> = std::result::Result<T, YorkieError>;
 impl Display for YorkieError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidKey(key) => {
-                write!(f, "invalid key {key:?}: expected 4-120 slug characters")
+            Self::InvalidObjectKey(key) => {
+                write!(f, "invalid object key {key:?}: key must not contain '.'")
             }
             Self::MissingKey(key) => write!(f, "missing key {key:?}"),
             Self::UnexpectedType { key, expected } => {

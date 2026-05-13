@@ -68,6 +68,7 @@ it has:
 | `Document` | `packages/sdk/src/document/document.ts` | Rust `Document::new` maps to JS `new Document(key)`. |
 | `Document::to_sorted_json` | `Document.toSortedJSON()` | Rust naming is idiomatic; behavior must match JS. |
 | `JsonObject` | `packages/sdk/src/document/json/object.ts` | Public JSON-like object API must map to JS object behavior. |
+| `JsonObject::set` | `ObjectProxy.setInternal()` | Reject object keys containing `.` and store the new member value. |
 | `JsonArray` | `packages/sdk/src/document/json/array.ts` | Public array API must map to JS array behavior. |
 | `JsonValue` | JS JSON element/proxy values | Temporary Rust wrapper for porting primitives, objects, and arrays. |
 | `Client` | `packages/sdk/src/client/client.ts` | Currently scaffolded only. Lifecycle must follow JS. |
