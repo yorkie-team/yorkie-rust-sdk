@@ -33,13 +33,14 @@ concurrency, and protocol conversion.
 | Tree edit/style operations | missing | No Rust tree operations yet. |
 | Attribute RHT reuse | partial | Tree nodes now reuse `Rht`; visible attributes serialize deterministically, and removed attribute nodes become root GC pairs. |
 | Tree GC | partial | Removed tree nodes and removed tree attributes are registered and purged through root GC when rebuilding from an existing root object. Operation-time registration is pending tree edit/style operations. |
-| Path/index conversion | missing | Rust does not yet have the tree index structure used by JS `IndexTree` and Go `pkg/index`. |
+| Path/index conversion | partial | Rust now ports the JS/Go index/path/position conversion rules, including element padding and text-child paths. Edit-time index tree maintenance is still pending tree operations. |
 | Public tree facade | missing | Depends on context-backed editing model. |
 | Wire conversion | missing | Depends on tree operations and protocol conversion. |
 
 ## Next Checks
 
-- Port tree index/path conversion before public tree editing.
+- Extend tree index/path coverage with removed-node and mixed element/text
+  scenarios before public tree editing.
 - Port tree edit/style operation tests before public facade tests.
 - Keep split/merge metadata (`insPrevID`, `insNextID`, `mergedFrom`,
   `mergedAt`, `mergedInto`) aligned with JS/Go when adding edit operations.

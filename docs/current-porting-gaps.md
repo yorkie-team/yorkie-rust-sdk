@@ -427,6 +427,8 @@ Current Rust behavior:
 - `TreeNode` supports element nodes, text nodes, optional `Rht` attributes,
   tombstones, split-link metadata, merge metadata, JSON/XML output, UTF-16 text
   sizing, active attribute data size, and internal GC pair discovery.
+- `CrdtTree` can convert between linear tree indexes, paths, and CRDT tree
+  positions using the JS/Go element padding and text-child path rules.
 - `CrdtElement::Tree` participates in metadata dispatch, JSON conversion,
   data-size accounting, removal, and deep copy.
 - `CrdtRoot` can find tree elements by creation time, rebuild tree internal GC
@@ -447,7 +449,9 @@ JS/Go behavior:
 
 Gap:
 
-- Rust does not yet have the tree index structure for path/index conversion.
+- Tree path/index conversion exists for the current in-memory tree, but it is
+  not yet maintained by tree edit/style operations and still needs broader
+  removed-node and mixed child coverage.
 - Rust Tree edit/style operations are not implemented.
 - Split and merge metadata is stored but not yet maintained by edit operations.
 - Operation-time GC registration for removed tree nodes and removed tree
@@ -459,8 +463,9 @@ Gap:
 
 Expected direction:
 
-- Port tree index/path conversion first so edit/style operations can use JS/Go
-  position semantics.
+- Extend path/index conversion tests around removed nodes and mixed
+  element/text children so edit/style operations can reuse the same position
+  semantics.
 - Add Tree edit operation tests from JS/Go before exposing public Tree methods.
 - Reuse `Rht` exactly as Text does, and register removed attribute nodes through
   root GC during operation execution.

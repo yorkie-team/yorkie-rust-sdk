@@ -1,7 +1,7 @@
 use super::element::{CrdtElementMeta, DataSize};
 use super::rht::{Rht, RhtNode};
 use crate::json::escape_json_string;
-use crate::{JsonValue, TimeTicket, TIME_TICKET_SIZE};
+use crate::{JsonValue, Result, TimeTicket, YorkieError, TIME_TICKET_SIZE};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
@@ -79,6 +79,14 @@ impl TreePos {
 
     pub(crate) fn left_sibling_id(&self) -> &TreeNodeId {
         &self.left_sibling_id
+    }
+
+    pub(crate) fn to_test_string(&self) -> String {
+        format!(
+            "{}:{}",
+            self.parent_id.to_test_string(),
+            self.left_sibling_id.to_test_string()
+        )
     }
 }
 
@@ -219,6 +227,10 @@ impl TreeNode {
 
     pub(crate) fn is_text(&self) -> bool {
         self.node_type == DEFAULT_TEXT_TYPE
+    }
+
+    pub(crate) fn has_text_child(&self) -> bool {
+        self.children().any(TreeNode::is_text)
     }
 
     pub(crate) fn is_removed(&self) -> bool {
@@ -557,6 +569,34 @@ impl CrdtTree {
         self.node_by_id.len()
     }
 
+    pub(crate) fn find_pos(&self, index: usize, prefer_text: bool) -> Result<TreePos> {
+        let tree_pos = find_tree_pos(&self.root, Vec::new(), index, prefer_text)?;
+        tree_pos_to_crdt_pos(&self.root, &tree_pos)
+    }
+
+    pub(crate) fn index_to_path(&self, index: usize) -> Result<Vec<usize>> {
+        let tree_pos = find_tree_pos(&self.root, Vec::new(), index, true)?;
+        tree_pos_to_path(&self.root, &tree_pos)
+    }
+
+    pub(crate) fn path_to_index(&self, path: &[usize]) -> Result<usize> {
+        let tree_pos = path_to_tree_pos(&self.root, path)?;
+        index_of_tree_pos(&self.root, &tree_pos, false)
+    }
+
+    pub(crate) fn path_to_pos(&self, path: &[usize]) -> Result<TreePos> {
+        let tree_pos = path_to_tree_pos(&self.root, path)?;
+        tree_pos_to_crdt_pos(&self.root, &tree_pos)
+    }
+
+    pub(crate) fn path_to_pos_range(&self, path: &[usize]) -> Result<(TreePos, TreePos)> {
+        let from_index = self.path_to_index(path)?;
+        Ok((
+            self.find_pos(from_index, true)?,
+            self.find_pos(from_index + 1, true)?,
+        ))
+    }
+
     pub(crate) fn data_size(&self) -> DataSize {
         let mut size = DataSize {
             data: 0,
@@ -630,6 +670,258 @@ impl CrdtTree {
         rebuild_merge_state_in_node(&mut self.root, &merged_pairs);
         self.rebuild_node_map();
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IndexTreePos {
+    path: Vec<usize>,
+    offset: usize,
+}
+
+impl IndexTreePos {
+    fn new(path: Vec<usize>, offset: usize) -> Self {
+        Self { path, offset }
+    }
+}
+
+fn find_tree_pos(
+    node: &TreeNode,
+    path: Vec<usize>,
+    index: usize,
+    prefer_text: bool,
+) -> Result<IndexTreePos> {
+    if index > node.len() {
+        return Err(YorkieError::InvalidTreePosition(format!(
+            "index is out of range: {index} > {}",
+            node.len()
+        )));
+    }
+
+    if node.is_text() {
+        return Ok(IndexTreePos::new(path, index));
+    }
+
+    let mut offset = 0;
+    let mut pos = 0;
+    for (visible_index, child) in node.children().enumerate() {
+        let child_size = child.padded_size(false);
+        let relative = index.saturating_sub(pos);
+
+        if prefer_text && child.is_text() && child.len() >= relative {
+            let mut child_path = path.clone();
+            child_path.push(visible_index);
+            return find_tree_pos(child, child_path, relative, prefer_text);
+        }
+
+        if index == pos {
+            return Ok(IndexTreePos::new(path, offset));
+        }
+
+        if !prefer_text && child_size == relative {
+            return Ok(IndexTreePos::new(path, offset + 1));
+        }
+
+        if child_size > relative {
+            let mut child_path = path.clone();
+            child_path.push(visible_index);
+            return find_tree_pos(child, child_path, relative - 1, prefer_text);
+        }
+
+        pos += child_size;
+        offset += 1;
+    }
+
+    Ok(IndexTreePos::new(path, offset))
+}
+
+fn tree_pos_to_path(root: &TreeNode, tree_pos: &IndexTreePos) -> Result<Vec<usize>> {
+    let node = node_at_visible_path(root, &tree_pos.path)?;
+    let mut path = Vec::new();
+    let mut current_path = tree_pos.path.clone();
+
+    if node.is_text() {
+        let Some((parent_path, offset)) = split_parent_path(&current_path) else {
+            return Err(YorkieError::InvalidTreePosition(
+                "text node has no parent".to_owned(),
+            ));
+        };
+        let parent = node_at_visible_path(root, &parent_path)?;
+        path.push(left_siblings_size(parent, offset, false)? + tree_pos.offset);
+        current_path = parent_path;
+    } else if node.has_text_child() {
+        path.push(left_siblings_size(node, tree_pos.offset, false)?);
+    } else {
+        path.push(tree_pos.offset);
+    }
+
+    while let Some((parent_path, offset)) = split_parent_path(&current_path) {
+        path.push(offset);
+        current_path = parent_path;
+    }
+
+    path.reverse();
+    Ok(path)
+}
+
+fn path_to_tree_pos(root: &TreeNode, path: &[usize]) -> Result<IndexTreePos> {
+    if path.is_empty() {
+        return Err(YorkieError::InvalidTreePosition(
+            "unacceptable path".to_owned(),
+        ));
+    }
+
+    let mut node = root;
+    let mut node_path = Vec::new();
+    for path_element in &path[..path.len() - 1] {
+        let child = visible_child(node, *path_element)
+            .ok_or_else(|| YorkieError::InvalidTreePosition("unacceptable path".to_owned()))?;
+        node_path.push(*path_element);
+        node = child;
+    }
+
+    let last = path[path.len() - 1];
+    if node.has_text_child() {
+        return find_text_pos(node, node_path, last);
+    }
+
+    if visible_child_count(node) < last {
+        return Err(YorkieError::InvalidTreePosition(
+            "unacceptable path".to_owned(),
+        ));
+    }
+
+    Ok(IndexTreePos::new(node_path, last))
+}
+
+fn find_text_pos(
+    node: &TreeNode,
+    path: Vec<usize>,
+    mut path_element: usize,
+) -> Result<IndexTreePos> {
+    if node.len() < path_element {
+        return Err(YorkieError::InvalidTreePosition(
+            "unacceptable path".to_owned(),
+        ));
+    }
+
+    for (visible_index, child) in node.children().enumerate() {
+        let child_len = child.len();
+        if child_len < path_element {
+            path_element -= child_len;
+        } else {
+            let mut child_path = path;
+            child_path.push(visible_index);
+            return Ok(IndexTreePos::new(child_path, path_element));
+        }
+    }
+
+    Ok(IndexTreePos::new(path, path_element))
+}
+
+fn index_of_tree_pos(
+    root: &TreeNode,
+    tree_pos: &IndexTreePos,
+    include_removed: bool,
+) -> Result<usize> {
+    let node = node_at_visible_path(root, &tree_pos.path)?;
+    let mut current_path = tree_pos.path.clone();
+    let mut size = 0;
+    let mut depth = 1;
+
+    if node.is_text() {
+        size += tree_pos.offset;
+        let Some((parent_path, offset)) = split_parent_path(&current_path) else {
+            return Err(YorkieError::InvalidTreePosition(
+                "text node has no parent".to_owned(),
+            ));
+        };
+        let parent = node_at_visible_path(root, &parent_path)?;
+        size += left_siblings_size(parent, offset, include_removed)?;
+        current_path = parent_path;
+    } else {
+        size += left_siblings_size(node, tree_pos.offset, include_removed)?;
+    }
+
+    while let Some((parent_path, offset)) = split_parent_path(&current_path) {
+        let parent = node_at_visible_path(root, &parent_path)?;
+        size += left_siblings_size(parent, offset, include_removed)?;
+        depth += 1;
+        current_path = parent_path;
+    }
+
+    Ok(size + depth - 1)
+}
+
+fn tree_pos_to_crdt_pos(root: &TreeNode, tree_pos: &IndexTreePos) -> Result<TreePos> {
+    let node = node_at_visible_path(root, &tree_pos.path)?;
+
+    let (parent, left_node) = if node.is_text() {
+        let Some((parent_path, offset_in_parent)) = split_parent_path(&tree_pos.path) else {
+            return Err(YorkieError::InvalidTreePosition(
+                "text node has no parent".to_owned(),
+            ));
+        };
+        let parent = node_at_visible_path(root, &parent_path)?;
+        let left_node = if offset_in_parent == 0 && tree_pos.offset == 0 {
+            parent
+        } else {
+            node
+        };
+        (parent, left_node)
+    } else if tree_pos.offset == 0 {
+        (node, node)
+    } else {
+        let left_node = visible_child(node, tree_pos.offset - 1)
+            .ok_or_else(|| YorkieError::InvalidTreePosition("left sibling not found".to_owned()))?;
+        (node, left_node)
+    };
+
+    Ok(TreePos::new(
+        parent.id().clone(),
+        left_node.id().split(tree_pos.offset),
+    ))
+}
+
+fn left_siblings_size(parent: &TreeNode, offset: usize, include_removed: bool) -> Result<usize> {
+    let children = if include_removed {
+        parent.all_children().collect::<Vec<_>>()
+    } else {
+        parent.children().collect::<Vec<_>>()
+    };
+
+    if offset > children.len() {
+        return Err(YorkieError::InvalidTreePosition(
+            "offset is out of range".to_owned(),
+        ));
+    }
+
+    Ok(children
+        .into_iter()
+        .take(offset)
+        .map(|child| child.padded_size(include_removed))
+        .sum())
+}
+
+fn node_at_visible_path<'a>(root: &'a TreeNode, path: &[usize]) -> Result<&'a TreeNode> {
+    let mut node = root;
+    for offset in path {
+        node = visible_child(node, *offset)
+            .ok_or_else(|| YorkieError::InvalidTreePosition("unacceptable path".to_owned()))?;
+    }
+    Ok(node)
+}
+
+fn visible_child(node: &TreeNode, offset: usize) -> Option<&TreeNode> {
+    node.children().nth(offset)
+}
+
+fn visible_child_count(node: &TreeNode) -> usize {
+    node.children().count()
+}
+
+fn split_parent_path(path: &[usize]) -> Option<(Vec<usize>, usize)> {
+    let (&offset, parent_path) = path.split_last()?;
+    Some((parent_path.to_vec(), offset))
 }
 
 fn collect_nodes<'a>(node: &'a TreeNode, nodes: &mut Vec<&'a TreeNode>) {
@@ -833,6 +1125,36 @@ mod tests {
             tree.find_floor_node(&node_id(2, 4)).unwrap().id()
         );
         assert!(tree.find_floor_node(&node_id(3, 0)).is_none());
+    }
+
+    #[test]
+    fn converts_tree_indexes_paths_and_positions() -> crate::Result<()> {
+        let tree = CrdtTree::create(
+            TreeNode::create_element(
+                node_id(1, 0),
+                "root",
+                None,
+                vec![TreeNode::create_element(
+                    node_id(2, 0),
+                    "p",
+                    None,
+                    vec![TreeNode::create_text(node_id(3, 0), "ABC")],
+                )],
+            ),
+            ticket(10, "a"),
+        );
+
+        assert_eq!(5, tree.root().len());
+        assert_eq!(vec![0, 2], tree.index_to_path(3)?);
+        assert_eq!(3, tree.path_to_index(&[0, 2])?);
+        assert_eq!(
+            "2:a:0/0:3:a:0/2",
+            tree.path_to_pos(&[0, 2])?.to_test_string()
+        );
+        assert_eq!("1:a:0/0:1:a:0/0", tree.find_pos(0, true)?.to_test_string());
+        assert_eq!("2:a:0/0:2:a:0/0", tree.find_pos(1, true)?.to_test_string());
+        assert_eq!("2:a:0/0:3:a:0/3", tree.find_pos(4, true)?.to_test_string());
+        Ok(())
     }
 
     #[test]

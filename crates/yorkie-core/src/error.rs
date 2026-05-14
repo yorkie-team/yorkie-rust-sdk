@@ -38,6 +38,9 @@ pub enum YorkieError {
     /// A requested text position or range is not valid for the current text.
     InvalidTextPosition(String),
 
+    /// A requested tree position, path, or index is not valid for the current tree.
+    InvalidTreePosition(String),
+
     /// A weighted index lookup is out of range.
     InvalidIndex(String),
 
@@ -79,6 +82,7 @@ impl Display for YorkieError {
                 write!(f, "unexpected type for key {key:?}: expected {expected}")
             }
             Self::InvalidTextPosition(message) => write!(f, "invalid text position: {message}"),
+            Self::InvalidTreePosition(message) => write!(f, "invalid tree position: {message}"),
             Self::InvalidIndex(message) => write!(f, "invalid index: {message}"),
             Self::InvalidCounterOperation(message) => {
                 write!(f, "invalid counter operation: {message}")

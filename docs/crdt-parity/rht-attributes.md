@@ -25,13 +25,14 @@ integration.
 | LWW conflict behavior | covered | Tests cover late sets/removes and newer tombstones. |
 | Purge behavior | covered | Tests cover current tombstone purge behavior. |
 | Text integration | covered | Text values use `Rht`; style operations register removed attribute GC pairs. |
-| Tree integration | blocked | Tree is not ported yet. |
+| Tree integration | partial | Tree nodes use `Rht`; visible attributes serialize to JSON/XML and removed attributes become root GC pairs when rebuilding from CRDT state. Operation-time tree style registration is pending tree operations. |
 | JSON ordering | partial | Rust uses deterministic key ordering; direct JS `Map` ordering differs, while text output is aligned. |
 | Wire conversion | missing | No attribute protocol conversion yet. |
 
 ## Next Checks
 
-- Reuse `Rht` in tree nodes.
+- Register removed tree attributes during tree style operations once those
+  operations are ported.
 - Keep text output parity tests focused on `CRDTTextValue` serialization rather
   than raw `RHT.toJSON` insertion order.
 - Add protocol conversion once text/tree operations are converted.

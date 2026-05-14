@@ -25,7 +25,7 @@ RGA text/list and Tree path/index conversion.
 | Array index lookup | covered | `find_for_array` skips tombstoned nodes by weight and rejects out-of-range lookups. |
 | RGA list integration | partial | `RgaTreeList` keeps position/element maps and uses weighted splay lookup for visible indexes and paths. Structural mutations rebuild the index around the current `Vec` storage instead of using stable linked-node handles. |
 | RGA text integration | partial | `RgaTreeSplit` keeps `tree_by_index` and `tree_by_id` equivalents and uses weighted splay lookup for text indexes. Structural mutations rebuild indexes around the current `Vec` storage instead of using stable linked-node handles. |
-| Tree `IndexTree` integration | missing | Tree path/index conversion still needs the JS `IndexTree` / Go `pkg/index` model. |
+| Tree `IndexTree` integration | partial | Tree index/path/position conversion now follows the JS `IndexTree` / Go `pkg/index` padding rules for the current in-memory tree. Edit-time index maintenance is still pending tree operations. |
 
 ## Next Checks
 
@@ -33,5 +33,5 @@ RGA text/list and Tree path/index conversion.
   when aligning the write-side implementation with JS/Go.
 - Move `RgaTreeList` from rebuild-on-mutation indexing to stable node handles
   when aligning the write-side implementation with JS/Go.
-- Port Tree path/index conversion separately because its index model includes
-  element padding and hierarchical paths, not only flat weighted lookup.
+- Extend Tree path/index coverage around removed nodes and mixed element/text
+  children before tree edit/style operations.
