@@ -291,6 +291,36 @@ impl TreeNode {
         self.children.insert(index, node);
     }
 
+    pub(crate) fn insert_visible_at(
+        &mut self,
+        visible_offset: usize,
+        node: TreeNode,
+    ) -> Result<()> {
+        let visible_count = self.children().count();
+        if visible_offset > visible_count {
+            return Err(YorkieError::InvalidTreePosition(
+                "insert offset is out of range".to_owned(),
+            ));
+        }
+
+        let physical_offset = if visible_offset == visible_count {
+            self.children.len()
+        } else {
+            self.children
+                .iter()
+                .enumerate()
+                .filter(|(_, child)| !child.is_removed())
+                .nth(visible_offset)
+                .map(|(index, _)| index)
+                .ok_or_else(|| {
+                    YorkieError::InvalidTreePosition("insert offset is out of range".to_owned())
+                })?
+        };
+
+        self.children.insert(physical_offset, node);
+        Ok(())
+    }
+
     pub(crate) fn remove(&mut self, removed_at: TimeTicket) -> bool {
         if self.removed_at.is_none() {
             self.removed_at = Some(removed_at);
@@ -305,6 +335,29 @@ impl TreeNode {
             self.removed_at = Some(removed_at);
         }
         false
+    }
+
+    pub(crate) fn clear_removed_recursively(&mut self) {
+        self.removed_at = None;
+        for child in self.all_children_mut() {
+            child.clear_removed_recursively();
+        }
+    }
+
+    pub(crate) fn remove_recursively(
+        &mut self,
+        removed_at: TimeTicket,
+        entries: &mut Vec<(String, DataSize, TimeTicket)>,
+        removed_nodes: &mut Vec<TreeNode>,
+    ) {
+        if self.remove(removed_at.clone()) {
+            entries.push((self.id_string(), self.data_size(), removed_at.clone()));
+            removed_nodes.push(self.clone());
+        }
+
+        for child in self.all_children_mut() {
+            child.remove_recursively(removed_at.clone(), entries, removed_nodes);
+        }
     }
 
     pub(crate) fn set_attr(
@@ -511,6 +564,27 @@ pub(crate) struct TreeStyleChange {
     pub(crate) to_path: Vec<usize>,
     pub(crate) attributes: BTreeMap<String, String>,
     pub(crate) attributes_to_remove: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TreeEditChange {
+    pub(crate) from: usize,
+    pub(crate) to: usize,
+    pub(crate) from_path: Vec<usize>,
+    pub(crate) to_path: Vec<usize>,
+    pub(crate) value: Option<Vec<String>>,
+    pub(crate) split_level: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TreeEditResult {
+    pub(crate) changes: Vec<TreeEditChange>,
+    pub(crate) gc_pairs: Vec<(String, DataSize, TimeTicket)>,
+    pub(crate) diff: DataSize,
+    pub(crate) removed_nodes: Vec<TreeNode>,
+    pub(crate) from_idx: usize,
+    pub(crate) to_idx: usize,
+    pub(crate) inserted_size: usize,
 }
 
 impl CrdtTree {
@@ -774,6 +848,76 @@ impl CrdtTree {
         Ok((gc_nodes, diff, changes, previous_attributes))
     }
 
+    pub(crate) fn edit_by_range_with_changes(
+        &mut self,
+        range: (TreePos, TreePos),
+        contents: Option<Vec<TreeNode>>,
+        split_level: usize,
+        edited_at: TimeTicket,
+        version_vector: Option<&crate::VersionVector>,
+    ) -> Result<TreeEditResult> {
+        if split_level > 0 {
+            return Err(YorkieError::InvalidTreePosition(
+                "tree split edit is not implemented yet".to_owned(),
+            ));
+        }
+
+        let from_idx = self.pos_to_index(&range.0)?;
+        let to_idx = self.pos_to_index(&range.1)?;
+        let from_path = self.index_to_path(from_idx)?;
+        let to_path = self.index_to_path(to_idx)?;
+        let mut diff = DataSize::default();
+        let mut gc_pairs = Vec::new();
+        let mut removed_nodes = Vec::new();
+
+        if from_idx < to_idx {
+            let target_paths =
+                self.edit_delete_target_paths(from_idx, to_idx, &edited_at, version_vector);
+            for path in target_paths.into_iter().rev() {
+                let node = node_at_visible_path_mut(&mut self.root, &path)?;
+                node.remove_recursively(edited_at.clone(), &mut gc_pairs, &mut removed_nodes);
+            }
+        }
+
+        let mut inserted_size = 0;
+        let inserted_value = contents
+            .as_ref()
+            .map(|nodes| nodes.iter().map(TreeNode::to_json).collect::<Vec<_>>());
+
+        if let Some(contents) = contents {
+            let (parent_path, offset) = self.position_to_parent_offset(&range.0)?;
+            let parent = node_at_visible_path_mut(&mut self.root, &parent_path)?;
+            let mut insert_offset = offset;
+            for mut content in contents {
+                content.clear_removed_recursively();
+                inserted_size += content.padded_size(false);
+                add_data_size(&mut diff, subtree_data_size(&content));
+                parent.insert_visible_at(insert_offset, content)?;
+                insert_offset += 1;
+            }
+        }
+
+        self.rebuild_node_map();
+        self.rebuild_merge_state();
+
+        Ok(TreeEditResult {
+            changes: vec![TreeEditChange {
+                from: from_idx,
+                to: to_idx,
+                from_path,
+                to_path,
+                value: inserted_value,
+                split_level: (split_level > 0).then_some(split_level),
+            }],
+            gc_pairs,
+            diff,
+            removed_nodes,
+            from_idx,
+            to_idx,
+            inserted_size,
+        })
+    }
+
     pub(crate) fn data_size(&self) -> DataSize {
         let mut size = DataSize {
             data: 0,
@@ -864,6 +1008,62 @@ impl CrdtTree {
             &mut targets,
         );
         targets
+    }
+
+    fn edit_delete_target_paths(
+        &self,
+        from_idx: usize,
+        to_idx: usize,
+        edited_at: &TimeTicket,
+        version_vector: Option<&crate::VersionVector>,
+    ) -> Vec<Vec<usize>> {
+        let mut targets = Vec::new();
+        let mut seen = BTreeSet::new();
+        collect_edit_delete_targets(
+            &self.root,
+            Vec::new(),
+            0,
+            from_idx,
+            to_idx,
+            edited_at,
+            version_vector,
+            &mut seen,
+            &mut targets,
+        );
+        remove_descendant_paths(targets)
+    }
+
+    fn position_to_parent_offset(&self, pos: &TreePos) -> Result<(Vec<usize>, usize)> {
+        let parent_path = self
+            .path_by_node_id(pos.parent_id())
+            .ok_or_else(|| YorkieError::InvalidTreePosition("parent not found".to_owned()))?;
+        let parent = node_at_visible_path(&self.root, &parent_path)?;
+
+        if pos.left_sibling_id().has_same_created_at(parent.id())
+            && pos.left_sibling_id().offset() == 0
+        {
+            return Ok((parent_path, 0));
+        }
+
+        for (offset, child) in parent.children().enumerate() {
+            if pos.left_sibling_id().has_same_created_at(child.id()) {
+                if child.is_text() && pos.left_sibling_id().offset() != child.len() {
+                    return Err(YorkieError::InvalidTreePosition(
+                        "text split edit is not implemented yet".to_owned(),
+                    ));
+                }
+                return Ok((parent_path, offset + 1));
+            }
+        }
+
+        Err(YorkieError::InvalidTreePosition(
+            "left sibling not found".to_owned(),
+        ))
+    }
+
+    fn path_by_node_id(&self, id: &TreeNodeId) -> Option<Vec<usize>> {
+        let mut path = Vec::new();
+        find_visible_path_by_node_id(&self.root, id, &mut Vec::new(), &mut path).then_some(path)
     }
 
     fn rebuild_node_map(&mut self) {
@@ -1234,6 +1434,132 @@ fn collect_style_targets(
     }
 
     cursor
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_edit_delete_targets(
+    node: &TreeNode,
+    path: Vec<usize>,
+    start_index: usize,
+    from_idx: usize,
+    to_idx: usize,
+    edited_at: &TimeTicket,
+    version_vector: Option<&crate::VersionVector>,
+    seen: &mut BTreeSet<String>,
+    targets: &mut Vec<Vec<usize>>,
+) -> usize {
+    if node.is_text() {
+        return start_index + node.len();
+    }
+
+    let mut cursor = start_index;
+    if !path.is_empty() {
+        let end_index = start_index + node.padded_size(false) - 1;
+        let key = node.id_string();
+        if (range_contains(from_idx, to_idx, start_index)
+            || range_contains(from_idx, to_idx, end_index))
+            && node_can_delete(node, edited_at, version_vector)
+            && seen.insert(key)
+        {
+            targets.push(path.clone());
+        }
+        cursor += 1;
+    }
+
+    for (visible_index, child) in node.children().enumerate() {
+        let mut child_path = path.clone();
+        child_path.push(visible_index);
+        cursor = collect_edit_delete_targets(
+            child,
+            child_path,
+            cursor,
+            from_idx,
+            to_idx,
+            edited_at,
+            version_vector,
+            seen,
+            targets,
+        );
+    }
+
+    if !path.is_empty() {
+        cursor += 1;
+    }
+
+    cursor
+}
+
+fn node_can_delete(
+    node: &TreeNode,
+    edited_at: &TimeTicket,
+    version_vector: Option<&crate::VersionVector>,
+) -> bool {
+    if node.is_text() {
+        return false;
+    }
+
+    if !ticket_known(version_vector, node.id().created_at()) {
+        return false;
+    }
+
+    match node.removed_at() {
+        None => true,
+        Some(removed_at) => {
+            !ticket_known(version_vector, removed_at) && edited_at.after(removed_at)
+        }
+    }
+}
+
+fn ticket_known(version_vector: Option<&crate::VersionVector>, ticket: &TimeTicket) -> bool {
+    version_vector
+        .map(|vector| vector.after_or_equal(ticket))
+        .unwrap_or(true)
+}
+
+fn remove_descendant_paths(mut paths: Vec<Vec<usize>>) -> Vec<Vec<usize>> {
+    paths.sort();
+    let mut filtered: Vec<Vec<usize>> = Vec::new();
+
+    'next_path: for path in paths {
+        for parent in &filtered {
+            if path.starts_with(parent) && path.len() > parent.len() {
+                continue 'next_path;
+            }
+        }
+        filtered.push(path);
+    }
+
+    filtered
+}
+
+fn find_visible_path_by_node_id(
+    node: &TreeNode,
+    id: &TreeNodeId,
+    current: &mut Vec<usize>,
+    result: &mut Vec<usize>,
+) -> bool {
+    if node.id() == id {
+        *result = current.clone();
+        return true;
+    }
+
+    for (visible_index, child) in node.children().enumerate() {
+        current.push(visible_index);
+        if find_visible_path_by_node_id(child, id, current, result) {
+            return true;
+        }
+        current.pop();
+    }
+
+    false
+}
+
+fn subtree_data_size(node: &TreeNode) -> DataSize {
+    let mut size = node.data_size();
+    for child in node.all_children() {
+        add_data_size(&mut size, subtree_data_size(child));
+    }
+    size
 }
 
 fn range_contains(from_idx: usize, to_idx: usize, index: usize) -> bool {
@@ -1628,6 +1954,67 @@ mod tests {
         );
         assert_eq!(1, changes.len());
         assert_eq!(r#"<root><p>hello</p></root>"#, tree.to_xml());
+        Ok(())
+    }
+
+    #[test]
+    fn edits_tree_by_inserting_element_nodes() -> crate::Result<()> {
+        let mut tree = CrdtTree::create(TreeNode::create_root(node_id(1, 0)), ticket(1, "a"));
+        let pos = tree.find_pos(0, true)?;
+        let result = tree.edit_by_range_with_changes(
+            (pos.clone(), pos),
+            Some(vec![TreeNode::create_element(
+                node_id(2, 0),
+                "p",
+                None,
+                vec![TreeNode::create_text(node_id(3, 0), "hello")],
+            )]),
+            0,
+            ticket(10, "a"),
+            None,
+        )?;
+
+        assert_eq!(r#"<root><p>hello</p></root>"#, tree.to_xml());
+        assert_eq!(0, result.from_idx);
+        assert_eq!(0, result.to_idx);
+        assert_eq!(7, result.inserted_size);
+        assert_eq!(vec![0], result.changes[0].from_path);
+        assert_eq!(vec![0], result.changes[0].to_path);
+        assert_eq!(
+            Some(vec![
+                r#"{"type":"p","children":[{"type":"text","value":"hello"}]}"#.to_owned()
+            ]),
+            result.changes[0].value
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn edits_tree_by_removing_element_nodes() -> crate::Result<()> {
+        let mut tree = CrdtTree::create(
+            TreeNode::create_element(
+                node_id(1, 0),
+                "root",
+                None,
+                vec![TreeNode::create_element(
+                    node_id(2, 0),
+                    "p",
+                    None,
+                    vec![TreeNode::create_text(node_id(3, 0), "hello")],
+                )],
+            ),
+            ticket(1, "a"),
+        );
+        let range = tree.path_to_pos_range(&[0])?;
+
+        let result = tree.edit_by_range_with_changes(range, None, 0, ticket(10, "a"), None)?;
+
+        assert_eq!(r#"<root></root>"#, tree.to_xml());
+        assert_eq!(0, result.from_idx);
+        assert_eq!(1, result.to_idx);
+        assert_eq!(2, result.removed_nodes.len());
+        assert_eq!(2, result.gc_pairs.len());
+        assert_eq!(None, result.changes[0].value);
         Ok(())
     }
 

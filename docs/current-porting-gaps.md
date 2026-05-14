@@ -438,6 +438,9 @@ Current Rust behavior:
 - `CrdtTree` can apply simple style/remove-style ranges to visible element
   tokens, ignore text-only ranges, collect tree style operation info, and
   report reverse-operation inputs.
+- `CrdtTree` can apply split-free element insert/delete edits, collect tree
+  edit operation info, register removed node GC pairs, and report reverse
+  operation inputs.
 - `CrdtElement::Tree` participates in metadata dispatch, JSON conversion,
   data-size accounting, removal, and deep copy.
 - `CrdtRoot` can find tree elements by creation time, rebuild tree internal GC
@@ -447,6 +450,9 @@ Current Rust behavior:
 - `TreeStyleOperation` executes tree style/remove-style operations, registers
   removed attribute GC pairs, accumulates root size diff, and creates reverse
   tree style operations.
+- `TreeEditOperation` executes split-free element insert/delete operations,
+  registers removed tree-node GC pairs, accumulates root size diff for inserted
+  nodes, and creates reverse tree edit operations.
 
 JS/Go behavior:
 
@@ -468,10 +474,13 @@ Gap:
   style boundaries, advance unknown split siblings, or propagate style/remove
   style across unknown split siblings the way JS/Go do for concurrent Tree
   split cases.
-- Rust Tree edit operation is not implemented.
+- Rust Tree edit operation is only partial. It does not split text nodes,
+  split element nodes, merge element boundaries, maintain `insPrevID`/
+  `insNextID` during edits, propagate merge metadata, or handle unknown split
+  siblings like JS/Go.
 - Split and merge metadata is stored but not yet maintained by edit operations.
-- Operation-time GC registration for removed tree nodes is pending tree edit
-  operations.
+- Operation-time GC registration exists for split-free tree-node deletion, but
+  split/merge deletion paths still need JS/Go parity.
 - Public Tree facade and wire conversion are missing.
 - Tree attribute JSON/XML output follows the same scalar parsing helper as
   Text, but object/array attribute values still need broader JS parity tests
