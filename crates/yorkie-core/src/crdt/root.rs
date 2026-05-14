@@ -74,8 +74,8 @@ impl CrdtRoot {
             doc_size: DocSize::default(),
         };
         let root_element = root.root_element();
-        root.register_element(&root_element, None);
-        root.register_removed_descendants(&root_element);
+        root.register_element_for_rebuild(&root_element, None, false);
+        root.register_removed_descendants_for_rebuild(&root_element);
         root.register_gc_pairs(&root_element);
         root
     }
@@ -350,11 +350,15 @@ impl CrdtRoot {
             return Err(self.array_parent_error(parent_created_at));
         }
 
-        let (moved, dead_node) = {
+        let (moved, dead_node, previous_size) = {
             let array = self
                 .array_by_created_at_mut(parent_created_at)
                 .ok_or_else(|| YorkieError::MissingCrdtElement(parent_created_at.to_id_string()))?;
 
+            let previous_size = array
+                .get_by_id(created_at)
+                .ok_or_else(|| YorkieError::MissingCrdtElement(created_at.to_id_string()))?
+                .data_size();
             let dead_node = array.move_after(prev_created_at, created_at, executed_at)?;
             let dead_node = dead_node.filter(|node| node.removed_at().is_some());
             let moved = array
@@ -362,10 +366,11 @@ impl CrdtRoot {
                 .ok_or_else(|| YorkieError::MissingCrdtElement(created_at.to_id_string()))?
                 .deepcopy();
 
-            (moved, dead_node)
+            (moved, dead_node, previous_size)
         };
 
         self.refresh_element_pair_and_ancestors(parent_created_at);
+        adjust_data_size(&mut self.doc_size.live, previous_size, moved.data_size());
         if let Some(dead_node) = &dead_node {
             self.register_gc_pair(dead_node);
         }
@@ -752,20 +757,57 @@ impl CrdtRoot {
         }
     }
 
-    fn register_removed_descendants(&mut self, element: &CrdtElement) {
+    fn register_element_for_rebuild(
+        &mut self,
+        element: &CrdtElement,
+        parent: Option<&CrdtElement>,
+        ancestor_removed: bool,
+    ) {
+        self.element_pair_by_created_at.insert(
+            element.created_at().to_id_string(),
+            CrdtElementPair::new(element.deepcopy(), parent.map(|parent| parent.deepcopy())),
+        );
+
+        if !ancestor_removed && !element.is_removed() {
+            add_data_size(&mut self.doc_size.live, element.data_size());
+        }
+
+        let descendant_removed = ancestor_removed || element.is_removed();
+        match element {
+            CrdtElement::Object(object) => {
+                for (_, child) in object.iter_all() {
+                    self.register_element_for_rebuild(child, Some(element), descendant_removed);
+                }
+            }
+            CrdtElement::Array(array) => {
+                for child in array.iter_all() {
+                    self.register_element_for_rebuild(child, Some(element), descendant_removed);
+                }
+            }
+            CrdtElement::Primitive(_) | CrdtElement::Text(_) => {}
+        }
+    }
+
+    fn register_removed_descendants_for_rebuild(&mut self, element: &CrdtElement) {
         if element.removed_at().is_some() {
-            self.register_removed_element(element);
+            let created_at = element.created_at().to_id_string();
+            if let Some(pair) = self.element_pair_by_created_at.get_mut(&created_at) {
+                pair.element = element.deepcopy();
+            }
+
+            add_data_size(&mut self.doc_size.gc, element.data_size());
+            self.gc_element_set_by_created_at.insert(created_at);
         }
 
         match element {
             CrdtElement::Object(object) => {
                 for (_, child) in object.iter_all() {
-                    self.register_removed_descendants(child);
+                    self.register_removed_descendants_for_rebuild(child);
                 }
             }
             CrdtElement::Array(array) => {
                 for child in array.iter_all() {
-                    self.register_removed_descendants(child);
+                    self.register_removed_descendants_for_rebuild(child);
                 }
             }
             CrdtElement::Primitive(_) | CrdtElement::Text(_) => {}
@@ -837,6 +879,20 @@ fn add_data_size(target: &mut DataSize, size: DataSize) {
 fn sub_data_size(target: &mut DataSize, size: DataSize) {
     target.data = target.data.saturating_sub(size.data);
     target.meta = target.meta.saturating_sub(size.meta);
+}
+
+fn adjust_data_size(target: &mut DataSize, old: DataSize, new: DataSize) {
+    if new.data >= old.data {
+        target.data += new.data - old.data;
+    } else {
+        target.data = target.data.saturating_sub(old.data - new.data);
+    }
+
+    if new.meta >= old.meta {
+        target.meta += new.meta - old.meta;
+    } else {
+        target.meta = target.meta.saturating_sub(old.meta - new.meta);
+    }
 }
 
 #[cfg(test)]
@@ -1041,6 +1097,7 @@ mod tests {
         let mut copy = root.deepcopy();
         assert_eq!(root.to_json(), copy.to_json());
         assert_eq!(root.stats(), copy.stats());
+        assert_eq!(root.doc_size(), copy.doc_size());
         assert_eq!(
             moved_at,
             copy.array_by_created_at(&array_at)
@@ -1092,6 +1149,7 @@ mod tests {
         let mut rebuilt = CrdtRoot::new(root.root_object.deepcopy());
         assert_eq!(root.to_json(), rebuilt.to_json());
         assert_eq!(root.stats(), rebuilt.stats());
+        assert_eq!(root.doc_size(), rebuilt.doc_size());
         assert_eq!("$.items.0", rebuilt.create_path(&two_at)?);
         assert_eq!(
             Some(&removed_at),
