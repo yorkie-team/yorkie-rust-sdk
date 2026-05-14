@@ -142,6 +142,8 @@ Current Rust behavior:
   identity, moved position timestamps, removed elements, and dead move
   positions.
 - The backing structure is a `Vec` with linear scans.
+- Dead position nodes from array moves are registered in the root GC pair map
+  and included in garbage length/stat counters.
 
 JS/Go behavior:
 
@@ -156,8 +158,8 @@ Gap:
 - Rust does not yet keep explicit maps for position IDs and element IDs. Linear
   lookup preserves simple behavior, but duplicate replay/idempotency cases are
   not fully covered.
-- Dead position nodes from move operations are created but are not registered as
-  root GC pairs.
+- Root tracks dead RGA position GC pairs, but physical garbage collection and
+  purge of those internal nodes is not implemented yet.
 - Concurrent move/insert/set combinations need more parity tests, especially
   inserts after dead positions and late moves that still create dead positions.
 - Snapshot restoration behavior for moved elements and dead positions is not
@@ -168,7 +170,7 @@ Expected direction:
 
 - Add focused tests from JS/Go array and RGA behavior before optimizing the
   data structure.
-- Introduce root-level GC pair tracking for dead RGA position nodes.
+- Implement physical garbage collection for dead RGA position nodes.
 - Add explicit position and element indexes when replay/idempotency tests need
   them, or when performance becomes a real concern.
 
@@ -179,6 +181,7 @@ Current Rust behavior:
 - Internal `AddOperation`, `MoveOperation`, and `ArraySetOperation` exist.
 - `RemoveOperation` can remove either an object member or an array element.
 - Tests cover basic add, move, array set, and array remove behavior.
+- `MoveOperation` registers dead position nodes as root GC pairs.
 
 JS/Go behavior:
 
@@ -190,7 +193,6 @@ JS/Go behavior:
 Gap:
 
 - Rust array operations are not yet created by public `JsonArray` methods.
-- Rust does not register dead position nodes as GC pairs during move.
 - Rust operation execution does not yet receive or use version vectors.
 - Rust operation structs do not yet convert to/from protobuf or wire-level
   operation payloads.

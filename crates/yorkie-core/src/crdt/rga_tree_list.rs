@@ -66,6 +66,10 @@ impl RgaTreeListNode {
         self.removed_at.as_ref()
     }
 
+    pub(crate) fn id_string(&self) -> String {
+        self.position_created_at.to_id_string()
+    }
+
     pub(crate) fn set_removed_at(&mut self, removed_at: TimeTicket) {
         self.removed_at = Some(removed_at);
     }

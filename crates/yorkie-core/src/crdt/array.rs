@@ -323,6 +323,10 @@ impl CrdtArray {
             .iter_all()
             .filter_map(RgaTreeListNode::element)
     }
+
+    pub(crate) fn iter_all_nodes(&self) -> impl Iterator<Item = &RgaTreeListNode> {
+        self.elements.iter_all()
+    }
 }
 
 #[cfg(test)]

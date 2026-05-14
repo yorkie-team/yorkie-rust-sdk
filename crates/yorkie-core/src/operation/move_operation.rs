@@ -170,6 +170,8 @@ mod tests {
 
         assert_eq!(r#"{"items":["two","one"]}"#, root.to_json());
         assert_eq!("$.items.1", root.create_path(&one_at)?);
+        assert_eq!(1, root.get_garbage_len());
+        assert_eq!(1, root.stats().gc_pairs);
         assert_eq!(
             vec![OpInfo::Move {
                 path: "$.items".to_owned(),

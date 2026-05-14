@@ -1,5 +1,6 @@
 use super::element::{CrdtElement, DataSize};
 use super::object::CrdtObject;
+use super::rga_tree_list::RgaTreeListNode;
 use crate::{Result, TimeTicket, YorkieError, TIME_TICKET_SIZE};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -23,6 +24,21 @@ impl CrdtElementPair {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CrdtGcPair {
+    child_id: String,
+    child_size: DataSize,
+}
+
+impl CrdtGcPair {
+    fn new(child: &RgaTreeListNode) -> Self {
+        Self {
+            child_id: child.id_string(),
+            child_size: child.data_size(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct DocSize {
     pub(crate) live: DataSize,
@@ -41,6 +57,7 @@ pub(crate) struct CrdtRoot {
     root_object: CrdtObject,
     element_pair_by_created_at: BTreeMap<String, CrdtElementPair>,
     gc_element_set_by_created_at: BTreeSet<String>,
+    gc_pair_by_child_id: BTreeMap<String, CrdtGcPair>,
     doc_size: DocSize,
 }
 
@@ -50,11 +67,13 @@ impl CrdtRoot {
             root_object,
             element_pair_by_created_at: BTreeMap::new(),
             gc_element_set_by_created_at: BTreeSet::new(),
+            gc_pair_by_child_id: BTreeMap::new(),
             doc_size: DocSize::default(),
         };
         let root_element = root.root_element();
         root.register_element(&root_element, None);
         root.register_removed_descendants(&root_element);
+        root.register_gc_pairs(&root_element);
         root
     }
 
@@ -123,6 +142,18 @@ impl CrdtRoot {
         sub_data_size(&mut self.doc_size.live, element.data_size());
         self.doc_size.live.meta += TIME_TICKET_SIZE;
         self.gc_element_set_by_created_at.insert(created_at);
+    }
+
+    pub(crate) fn register_gc_pair(&mut self, child: &RgaTreeListNode) {
+        let child_id = child.id_string();
+        if let Some(pair) = self.gc_pair_by_child_id.remove(&child_id) {
+            sub_data_size(&mut self.doc_size.gc, pair.child_size);
+            return;
+        }
+
+        let pair = CrdtGcPair::new(child);
+        add_data_size(&mut self.doc_size.gc, pair.child_size);
+        self.gc_pair_by_child_id.insert(child_id, pair);
     }
 
     pub(crate) fn get_object_member(
@@ -302,19 +333,25 @@ impl CrdtRoot {
             return Err(self.array_parent_error(parent_created_at));
         }
 
-        let moved = {
+        let (moved, dead_node) = {
             let array = self
                 .array_by_created_at_mut(parent_created_at)
                 .ok_or_else(|| YorkieError::MissingCrdtElement(parent_created_at.to_id_string()))?;
 
-            array.move_after(prev_created_at, created_at, executed_at)?;
-            array
+            let dead_node = array.move_after(prev_created_at, created_at, executed_at)?;
+            let dead_node = dead_node.filter(|node| node.removed_at().is_some());
+            let moved = array
                 .get_by_id(created_at)
                 .ok_or_else(|| YorkieError::MissingCrdtElement(created_at.to_id_string()))?
-                .deepcopy()
+                .deepcopy();
+
+            (moved, dead_node)
         };
 
         self.refresh_element_pair_and_ancestors(parent_created_at);
+        if let Some(dead_node) = &dead_node {
+            self.register_gc_pair(dead_node);
+        }
         let parent = self
             .actual_element_by_created_at(parent_created_at)
             .ok_or_else(|| YorkieError::MissingCrdtElement(parent_created_at.to_id_string()))?;
@@ -406,7 +443,7 @@ impl CrdtRoot {
     }
 
     pub(crate) fn get_garbage_len(&self) -> usize {
-        self.get_garbage_element_set_size()
+        self.get_garbage_element_set_size() + self.gc_pair_by_child_id.len()
     }
 
     pub(crate) fn object(&self) -> &CrdtObject {
@@ -470,7 +507,7 @@ impl CrdtRoot {
         RootStats {
             elements: self.get_element_map_size(),
             gc_elements: self.get_garbage_element_set_size(),
-            gc_pairs: 0,
+            gc_pairs: self.gc_pair_by_child_id.len(),
         }
     }
 
@@ -632,6 +669,27 @@ impl CrdtRoot {
             CrdtElement::Primitive(_) => {}
         }
     }
+
+    fn register_gc_pairs(&mut self, element: &CrdtElement) {
+        match element {
+            CrdtElement::Object(object) => {
+                for (_, child) in object.iter_all() {
+                    self.register_gc_pairs(child);
+                }
+            }
+            CrdtElement::Array(array) => {
+                for node in array.iter_all_nodes() {
+                    if node.element().is_none() && node.removed_at().is_some() {
+                        self.register_gc_pair(node);
+                    }
+                    if let Some(child) = node.element() {
+                        self.register_gc_pairs(child);
+                    }
+                }
+            }
+            CrdtElement::Primitive(_) => {}
+        }
+    }
 }
 
 fn sub_path_of(parent: &CrdtElement, created_at: &TimeTicket) -> Option<String> {
@@ -673,6 +731,7 @@ fn sub_data_size(target: &mut DataSize, size: DataSize) {
 #[cfg(test)]
 mod tests {
     use super::CrdtRoot;
+    use crate::crdt::array::CrdtArray;
     use crate::crdt::element::CrdtElement;
     use crate::crdt::object::CrdtObject;
     use crate::crdt::primitive::{CrdtPrimitive, PrimitiveValue};
@@ -792,6 +851,46 @@ mod tests {
         assert_eq!(r#"{"k1":"k1"}"#, copy.to_json());
         assert_eq!("$.k1", copy.create_path(&created_at)?);
         assert_eq!(2, copy.get_element_map_size());
+        Ok(())
+    }
+
+    #[test]
+    fn tracks_array_dead_positions_for_garbage_collection() -> crate::Result<()> {
+        let mut root = CrdtRoot::create();
+        let array_at = ticket(1, "a");
+        let one_at = ticket(2, "a");
+        let two_at = ticket(3, "a");
+        let moved_at = ticket(4, "a");
+
+        root.set_object_member(
+            &TimeTicket::initial(),
+            "items",
+            CrdtElement::array(CrdtArray::create(array_at.clone())),
+            array_at.clone(),
+        )?;
+        root.insert_array_element(
+            &array_at,
+            &TimeTicket::initial(),
+            primitive_str("one", one_at.clone()),
+            one_at.clone(),
+        )?;
+        root.insert_array_element(
+            &array_at,
+            &one_at,
+            primitive_str("two", two_at.clone()),
+            two_at.clone(),
+        )?;
+
+        root.move_array_element(&array_at, &two_at, &one_at, moved_at)?;
+
+        assert_eq!(r#"{"items":["two","one"]}"#, root.to_json());
+        assert_eq!(1, root.stats().gc_pairs);
+        assert_eq!(1, root.get_garbage_len());
+
+        let copy = root.deepcopy();
+        assert_eq!(1, copy.stats().gc_pairs);
+        assert_eq!(1, copy.get_garbage_len());
+        assert_eq!("$.items.1", copy.create_path(&one_at)?);
         Ok(())
     }
 
