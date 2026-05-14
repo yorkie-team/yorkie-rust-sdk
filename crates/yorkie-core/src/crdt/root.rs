@@ -125,6 +125,82 @@ impl CrdtRoot {
         self.gc_element_set_by_created_at.insert(created_at);
     }
 
+    pub(crate) fn get_object_member(
+        &self,
+        parent_created_at: &TimeTicket,
+        key: &str,
+    ) -> Result<Option<&CrdtElement>> {
+        let object = self
+            .object_by_created_at(parent_created_at)
+            .ok_or_else(|| {
+                if self.find_by_created_at(parent_created_at).is_some() {
+                    return YorkieError::UnexpectedCrdtElement {
+                        id: parent_created_at.to_id_string(),
+                        expected: "object",
+                    };
+                }
+
+                YorkieError::MissingCrdtElement(parent_created_at.to_id_string())
+            })?;
+
+        Ok(object.get(key))
+    }
+
+    pub(crate) fn set_object_member(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        key: impl Into<String>,
+        value: CrdtElement,
+        executed_at: TimeTicket,
+    ) -> Result<(CrdtElement, Option<CrdtElement>)> {
+        let key = key.into();
+        let value_created_at = value.created_at().clone();
+
+        if self.object_by_created_at(parent_created_at).is_none() {
+            if self.find_by_created_at(parent_created_at).is_some() {
+                return Err(YorkieError::UnexpectedCrdtElement {
+                    id: parent_created_at.to_id_string(),
+                    expected: "object",
+                });
+            }
+
+            return Err(YorkieError::MissingCrdtElement(
+                parent_created_at.to_id_string(),
+            ));
+        }
+
+        let (inserted, removed) = {
+            let object = self
+                .object_by_created_at_mut(parent_created_at)
+                .ok_or_else(|| YorkieError::MissingCrdtElement(parent_created_at.to_id_string()))?;
+
+            let removed = object.set(key, value, executed_at);
+            let inserted = object
+                .get_by_id(&value_created_at)
+                .ok_or_else(|| YorkieError::MissingCrdtElement(value_created_at.to_id_string()))?
+                .deepcopy();
+
+            (inserted, removed)
+        };
+
+        self.refresh_element_pair(parent_created_at);
+        self.refresh_element_pair(&TimeTicket::initial());
+
+        let parent = self
+            .actual_element_by_created_at(parent_created_at)
+            .ok_or_else(|| YorkieError::MissingCrdtElement(parent_created_at.to_id_string()))?;
+
+        self.register_element(&inserted, Some(&parent));
+        if let Some(removed) = &removed {
+            self.register_removed_element(removed);
+        }
+        if inserted.removed_at().is_some() {
+            self.register_removed_element(&inserted);
+        }
+
+        Ok((inserted, removed))
+    }
+
     pub(crate) fn get_element_map_size(&self) -> usize {
         self.element_pair_by_created_at.len()
     }
@@ -154,6 +230,25 @@ impl CrdtRoot {
         &mut self.root_object
     }
 
+    pub(crate) fn object_by_created_at(&self, created_at: &TimeTicket) -> Option<&CrdtObject> {
+        if self.root_object.created_at() == created_at {
+            return Some(&self.root_object);
+        }
+
+        self.root_object.find_object_by_created_at(created_at)
+    }
+
+    pub(crate) fn object_by_created_at_mut(
+        &mut self,
+        created_at: &TimeTicket,
+    ) -> Option<&mut CrdtObject> {
+        if self.root_object.created_at() == created_at {
+            return Some(&mut self.root_object);
+        }
+
+        self.root_object.find_object_by_created_at_mut(created_at)
+    }
+
     pub(crate) fn doc_size(&self) -> DocSize {
         self.doc_size
     }
@@ -180,6 +275,29 @@ impl CrdtRoot {
 
     pub(crate) fn root_element(&self) -> CrdtElement {
         CrdtElement::object(self.root_object.deepcopy())
+    }
+
+    fn actual_element_by_created_at(&self, created_at: &TimeTicket) -> Option<CrdtElement> {
+        if self.root_object.created_at() == created_at {
+            return Some(self.root_element());
+        }
+
+        self.root_object
+            .find_by_created_at(created_at)
+            .map(CrdtElement::deepcopy)
+    }
+
+    fn refresh_element_pair(&mut self, created_at: &TimeTicket) {
+        let Some(element) = self.actual_element_by_created_at(created_at) else {
+            return;
+        };
+
+        if let Some(pair) = self
+            .element_pair_by_created_at
+            .get_mut(&created_at.to_id_string())
+        {
+            pair.element = element;
+        }
     }
 
     fn register_element_internal(&mut self, element: &CrdtElement, parent: Option<&CrdtElement>) {

@@ -6,6 +6,8 @@ mod crdt;
 mod document;
 mod error;
 mod json;
+#[allow(dead_code)]
+mod operation;
 mod time;
 
 pub use document::Document;

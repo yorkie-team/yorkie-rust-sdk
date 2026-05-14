@@ -21,6 +21,10 @@ impl ElementRhtNode {
         &self.value
     }
 
+    pub(crate) fn value_mut(&mut self) -> &mut CrdtElement {
+        &mut self.value
+    }
+
     pub(crate) fn is_removed(&self) -> bool {
         self.value.is_removed()
     }
@@ -197,6 +201,10 @@ impl ElementRht {
         self.created_order
             .iter()
             .filter_map(|created_id| self.node_by_created_at.get(created_id))
+    }
+
+    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = &mut ElementRhtNode> {
+        self.node_by_created_at.values_mut()
     }
 
     fn set_new_node_moved_at(&mut self, created_id: &str, executed_at: TimeTicket) {

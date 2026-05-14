@@ -23,8 +23,14 @@ pub enum YorkieError {
     /// A requested CRDT element does not exist.
     MissingCrdtElement(String),
 
+    /// An operation is missing its execution time.
+    MissingExecutionTime,
+
     /// A requested object member does not exist.
     MissingKey(String),
+
+    /// A CRDT element exists but has a different kind than expected.
+    UnexpectedCrdtElement { id: String, expected: &'static str },
 
     /// A requested object member exists but has a different JSON type.
     UnexpectedType { key: String, expected: &'static str },
@@ -52,7 +58,11 @@ impl Display for YorkieError {
             ),
             Self::InvalidPrimitiveUtf8 => write!(f, "invalid primitive string bytes"),
             Self::MissingCrdtElement(id) => write!(f, "missing CRDT element {id:?}"),
+            Self::MissingExecutionTime => write!(f, "operation executed_at is not set"),
             Self::MissingKey(key) => write!(f, "missing key {key:?}"),
+            Self::UnexpectedCrdtElement { id, expected } => {
+                write!(f, "unexpected CRDT element {id:?}: expected {expected}")
+            }
             Self::UnexpectedType { key, expected } => {
                 write!(f, "unexpected type for key {key:?}: expected {expected}")
             }

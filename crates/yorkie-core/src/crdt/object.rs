@@ -125,6 +125,57 @@ impl CrdtObject {
             .map(|node| node.value())
     }
 
+    pub(crate) fn find_by_created_at(&self, created_at: &TimeTicket) -> Option<&CrdtElement> {
+        if let Some(element) = self.get_by_id(created_at) {
+            return Some(element);
+        }
+
+        for (_, child) in self.iter_all() {
+            if let CrdtElement::Object(object) = child {
+                if let Some(element) = object.find_by_created_at(created_at) {
+                    return Some(element);
+                }
+            }
+        }
+
+        None
+    }
+
+    pub(crate) fn find_object_by_created_at(&self, created_at: &TimeTicket) -> Option<&CrdtObject> {
+        for (_, child) in self.iter_all() {
+            if let CrdtElement::Object(object) = child {
+                if object.created_at() == created_at {
+                    return Some(object);
+                }
+
+                if let Some(object) = object.find_object_by_created_at(created_at) {
+                    return Some(object);
+                }
+            }
+        }
+
+        None
+    }
+
+    pub(crate) fn find_object_by_created_at_mut(
+        &mut self,
+        created_at: &TimeTicket,
+    ) -> Option<&mut CrdtObject> {
+        for node in self.member_nodes.iter_mut() {
+            if let CrdtElement::Object(object) = node.value_mut() {
+                if object.created_at() == created_at {
+                    return Some(object);
+                }
+
+                if let Some(object) = object.find_object_by_created_at_mut(created_at) {
+                    return Some(object);
+                }
+            }
+        }
+
+        None
+    }
+
     pub(crate) fn has(&self, key: &str) -> bool {
         self.member_nodes.has(key)
     }
