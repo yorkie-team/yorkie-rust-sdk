@@ -1,6 +1,7 @@
 use super::{ExecutionResult, OpInfo, OpSource, Operation, OperationMeta, RemoveOperation};
 use crate::crdt::element::CrdtElement;
 use crate::crdt::root::CrdtRoot;
+use crate::time::ActorId;
 use crate::{Result, TimeTicket, YorkieError};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -80,6 +81,10 @@ impl SetOperation {
 
     pub(crate) fn set_executed_at(&mut self, executed_at: TimeTicket) {
         self.meta.set_executed_at(executed_at);
+    }
+
+    pub(crate) fn set_actor(&mut self, actor_id: impl Into<ActorId>) {
+        self.meta.set_actor(actor_id);
     }
 
     pub(crate) fn effected_created_at(&self) -> &TimeTicket {

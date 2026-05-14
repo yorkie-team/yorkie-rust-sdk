@@ -2,6 +2,8 @@
 //! Core document and CRDT model for Yorkie.
 
 #[allow(dead_code)]
+mod change;
+#[allow(dead_code)]
 mod crdt;
 mod document;
 mod error;
