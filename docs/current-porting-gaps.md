@@ -260,7 +260,7 @@ JS/Go behavior:
 
 Gap:
 
-- Rust `Rht` is not yet connected to `CRDTTextValue`/text or tree nodes.
+- Rust `Rht` is connected to internal `TextValue`, but not yet to tree nodes.
 - Root-level GC pair registration for removed `RhtNode` values is not wired yet.
 - Rust `Rht::to_json` uses deterministic key ordering through `BTreeMap`.
   This matches Go marshaling and text's sorted attribute output, but JS
@@ -274,6 +274,56 @@ Expected direction:
   are added.
 - Keep Text output aligned with JS `CRDTTextValue.toJSON`, including parsing
   attribute values from JSON strings before serializing visible attributes.
+
+## Text and RGATreeSplit
+
+Current Rust behavior:
+
+- `TextValue` stores text content plus `Rht` attributes and reports length in
+  UTF-16 code units.
+- `RgaTreeSplit` models text blocks, split positions, tombstones, insertion
+  predecessor links, basic edit/delete behavior, styling, style removal, JSON
+  output, text output, removed text-node GC candidates, and attribute GC
+  candidates.
+- `CrdtText` wraps `RgaTreeSplit<TextValue>` with CRDT element metadata and
+  offers internal index-based edit/style/remove-style helpers.
+- Unit tests cover the Go text CRDT smoke tests and the matching JS internal
+  flow: insert text, replace a range, split a styled range, remove style, delete
+  content, and split strings by UTF-16 code units.
+
+JS/Go behavior:
+
+- JS and Go use `RGATreeSplit` with splay-tree index lookup and an LLRB tree by
+  node ID.
+- JS public `Text` methods stringify attribute values before passing them into
+  internal `CRDTText`, and `CRDTTextValue.toJSON` parses those stringified
+  values before serializing visible attributes.
+- Text edit/style/remove-style operations register text-node and attribute-node
+  GC pairs in the change context.
+
+Gap:
+
+- Rust `RgaTreeSplit` currently uses a linear `Vec` backing structure instead
+  of splay/LLRB indexes.
+- Rust `CrdtText` is not yet part of `CrdtElement`, `CrdtRoot`, public
+  `JsonValue`, public Text API, operation structs, or wire conversion.
+- Rust style/edit helpers do not yet emit operation info or reverse operations.
+- Version-vector-aware edit/style conflict behavior is only modeled at the
+  internal helper level and needs parity tests from JS/Go concurrent text cases.
+- Rust strings cannot represent invalid standalone UTF-16 surrogate halves, so
+  splitting inside a surrogate pair currently uses lossy UTF-16 decoding. Exact
+  JS string parity for that edge case needs a deliberate representation choice.
+
+Expected direction:
+
+- Add `CrdtText` to `CrdtElement` once the public Text facade and conversion
+  path can preserve the correct JSON/document semantics.
+- Port `EditOperation` and `StyleOperation`, then connect public Text methods
+  through `ChangeContext`.
+- Add root GC pair registration for removed text nodes and removed attribute
+  nodes.
+- Port focused JS/Go tests for text concurrency before optimizing the backing
+  indexes.
 
 ## Change, ChangeContext, and ChangePack
 

@@ -94,6 +94,10 @@ it has:
 | `CrdtObject` | `packages/sdk/src/document/crdt/object.ts` | Internal CRDT container for object members stored in `ElementRht`. |
 | `RhtNode` | `packages/sdk/src/document/crdt/rht.ts` | Internal node for string attributes used by text and tree values. |
 | `Rht` | `packages/sdk/src/document/crdt/rht.ts` | Internal replicated hash table for string attributes. Cross-check with Go `pkg/document/crdt/rht.go`. |
+| `RgaTreeSplitNodeId` | `packages/sdk/src/document/crdt/rga_tree_split.ts` | Internal block identifier for text nodes, ordered by creation ticket and UTF-16 offset. |
+| `RgaTreeSplit` | `packages/sdk/src/document/crdt/rga_tree_split.ts` | Internal block-based RGA for text. Rust currently keeps the same node semantics with a linear backing structure. |
+| `TextValue` | `packages/sdk/src/document/crdt/text.ts` | Internal text block content plus `Rht` attributes. |
+| `CrdtText` | `packages/sdk/src/document/crdt/text.ts` | Internal CRDT text element backed by `RgaTreeSplit<TextValue>`. |
 | `RgaTreeList` | `packages/sdk/src/document/crdt/rga_tree_list.ts` | Internal replicated growable array list. Rust currently keeps the same node semantics with a linear backing structure. |
 | `CrdtArray` | `packages/sdk/src/document/crdt/array.ts` | Internal CRDT container for array elements stored in `RgaTreeList`. |
 | `CrdtRoot` | `packages/sdk/src/document/crdt/root.ts` | Internal root that indexes CRDT elements by creation time and creates element paths. |

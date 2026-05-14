@@ -35,6 +35,9 @@ pub enum YorkieError {
     /// A requested object member exists but has a different JSON type.
     UnexpectedType { key: String, expected: &'static str },
 
+    /// A requested text position or range is not valid for the current text.
+    InvalidTextPosition(String),
+
     /// Snapshot application has not been implemented yet.
     UnsupportedSnapshot,
 }
@@ -69,6 +72,7 @@ impl Display for YorkieError {
             Self::UnexpectedType { key, expected } => {
                 write!(f, "unexpected type for key {key:?}: expected {expected}")
             }
+            Self::InvalidTextPosition(message) => write!(f, "invalid text position: {message}"),
             Self::UnsupportedSnapshot => write!(f, "snapshot application is not supported yet"),
         }
     }
