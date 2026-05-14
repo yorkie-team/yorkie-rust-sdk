@@ -4,6 +4,7 @@ use super::object::CrdtObject;
 use super::primitive::CrdtPrimitive;
 use super::rga_tree_list::RgaTreeListNode;
 use super::text::CrdtText;
+use super::tree::CrdtTree;
 use crate::{Result, TimeTicket, YorkieError, TIME_TICKET_SIZE};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -584,6 +585,17 @@ impl CrdtRoot {
         self.root_object.find_counter_by_created_at_mut(created_at)
     }
 
+    pub(crate) fn tree_by_created_at(&self, created_at: &TimeTicket) -> Option<&CrdtTree> {
+        self.root_object.find_tree_by_created_at(created_at)
+    }
+
+    pub(crate) fn tree_by_created_at_mut(
+        &mut self,
+        created_at: &TimeTicket,
+    ) -> Option<&mut CrdtTree> {
+        self.root_object.find_tree_by_created_at_mut(created_at)
+    }
+
     pub(crate) fn increase_counter(
         &mut self,
         created_at: &TimeTicket,
@@ -677,7 +689,10 @@ impl CrdtRoot {
                     self.refresh_element_pair_tree(child, Some(element));
                 }
             }
-            CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Text(_) => {}
+            CrdtElement::Primitive(_)
+            | CrdtElement::Counter(_)
+            | CrdtElement::Text(_)
+            | CrdtElement::Tree(_) => {}
         }
     }
 
@@ -778,7 +793,10 @@ impl CrdtRoot {
                     self.register_element_internal(child, Some(element));
                 }
             }
-            CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Text(_) => {}
+            CrdtElement::Primitive(_)
+            | CrdtElement::Counter(_)
+            | CrdtElement::Text(_)
+            | CrdtElement::Tree(_) => {}
         }
     }
 
@@ -800,7 +818,10 @@ impl CrdtRoot {
                     self.deregister_element_internal(child, count);
                 }
             }
-            CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Text(_) => {}
+            CrdtElement::Primitive(_)
+            | CrdtElement::Counter(_)
+            | CrdtElement::Text(_)
+            | CrdtElement::Tree(_) => {}
         }
     }
 
@@ -831,7 +852,10 @@ impl CrdtRoot {
                     self.register_element_for_rebuild(child, Some(element), descendant_removed);
                 }
             }
-            CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Text(_) => {}
+            CrdtElement::Primitive(_)
+            | CrdtElement::Counter(_)
+            | CrdtElement::Text(_)
+            | CrdtElement::Tree(_) => {}
         }
     }
 
@@ -857,7 +881,10 @@ impl CrdtRoot {
                     self.register_removed_descendants_for_rebuild(child);
                 }
             }
-            CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Text(_) => {}
+            CrdtElement::Primitive(_)
+            | CrdtElement::Counter(_)
+            | CrdtElement::Text(_)
+            | CrdtElement::Tree(_) => {}
         }
     }
 
@@ -883,6 +910,11 @@ impl CrdtRoot {
                     self.register_gc_pair_by_id(child_id, child_size, removed_at);
                 }
             }
+            CrdtElement::Tree(tree) => {
+                for (child_id, child_size, removed_at) in tree.gc_pair_entries() {
+                    self.register_gc_pair_by_id(child_id, child_size, removed_at);
+                }
+            }
             CrdtElement::Primitive(_) | CrdtElement::Counter(_) => {}
         }
     }
@@ -896,7 +928,10 @@ fn sub_path_of(parent: &CrdtElement, created_at: &TimeTicket) -> Option<String> 
     match parent {
         CrdtElement::Object(object) => object.sub_path_of(created_at).map(ToOwned::to_owned),
         CrdtElement::Array(array) => array.sub_path_of(created_at),
-        CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Text(_) => None,
+        CrdtElement::Primitive(_)
+        | CrdtElement::Counter(_)
+        | CrdtElement::Text(_)
+        | CrdtElement::Tree(_) => None,
     }
 }
 
@@ -914,7 +949,10 @@ fn collect_descendant_ids(element: &CrdtElement, seen: &mut BTreeSet<String>) {
                 collect_descendant_ids(child, seen);
             }
         }
-        CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Text(_) => {}
+        CrdtElement::Primitive(_)
+        | CrdtElement::Counter(_)
+        | CrdtElement::Text(_)
+        | CrdtElement::Tree(_) => {}
     }
 }
 
@@ -949,7 +987,9 @@ mod tests {
     use crate::crdt::element::CrdtElement;
     use crate::crdt::object::CrdtObject;
     use crate::crdt::primitive::{CrdtPrimitive, PrimitiveValue};
+    use crate::crdt::rht::Rht;
     use crate::crdt::text::CrdtText;
+    use crate::crdt::tree::{CrdtTree, TreeNode, TreeNodeId};
     use crate::{TimeTicket, VersionVector, TIME_TICKET_SIZE};
     use std::collections::BTreeMap;
 
@@ -1309,6 +1349,72 @@ mod tests {
     }
 
     #[test]
+    fn registers_tree_members_and_tree_gc_pairs() -> crate::Result<()> {
+        let tree_at = ticket(1, "a");
+        let mut attrs = Rht::new();
+        attrs.set("bold", "\"true\"", ticket(5, "a"));
+        attrs.remove("bold", ticket(6, "a"));
+
+        let mut removed_text = TreeNode::create_text(tree_node_id(4, 0), " removed");
+        removed_text.remove(ticket(7, "a"));
+        let paragraph = TreeNode::create_element(
+            tree_node_id(2, 0),
+            "p",
+            Some(attrs),
+            vec![
+                TreeNode::create_text(tree_node_id(3, 0), "Hi"),
+                removed_text,
+            ],
+        );
+        let tree = CrdtTree::create(
+            TreeNode::create_element(
+                TreeNodeId::new(tree_at.clone(), 0),
+                "root",
+                None,
+                vec![paragraph],
+            ),
+            tree_at.clone(),
+        );
+
+        let mut root = CrdtRoot::new(CrdtObject::create_with_members(
+            TimeTicket::initial(),
+            [("body", CrdtElement::tree(tree))],
+        ));
+
+        assert_eq!(2, root.get_element_map_size());
+        assert_eq!("$.body", root.create_path(&tree_at)?);
+        assert_eq!(
+            r#"{"body":{"type":"root","children":[{"type":"p","children":[{"type":"text","value":"Hi"}]}]}}"#,
+            root.to_json()
+        );
+        assert_eq!(2, root.stats().gc_pairs);
+        assert_eq!(2, root.get_garbage_len());
+        assert_eq!(
+            r#"<root><p>Hi</p></root>"#,
+            root.tree_by_created_at(&tree_at).unwrap().to_xml()
+        );
+
+        let copy = root.deepcopy();
+        assert_eq!(2, copy.stats().gc_pairs);
+        assert_eq!(root.to_json(), copy.to_json());
+
+        let mut vector = VersionVector::new();
+        vector.set("a", 6);
+        assert_eq!(1, root.garbage_collect(&vector)?);
+        assert_eq!(1, root.stats().gc_pairs);
+
+        vector.set("a", 7);
+        assert_eq!(1, root.garbage_collect(&vector)?);
+        assert_eq!(0, root.get_garbage_len());
+        assert_eq!(
+            r#"{"body":{"type":"root","children":[{"type":"p","children":[{"type":"text","value":"Hi"}]}]}}"#,
+            root.to_json()
+        );
+        assert_eq!(3, root.tree_by_created_at(&tree_at).unwrap().node_map_len());
+        Ok(())
+    }
+
+    #[test]
     fn reports_document_size_for_registered_elements() {
         let mut root = CrdtRoot::create();
         let created_at = ticket(1, "a");
@@ -1365,5 +1471,9 @@ mod tests {
 
     fn ticket(lamport: i64, actor_id: &str) -> TimeTicket {
         TimeTicket::new(lamport, 0, actor_id)
+    }
+
+    fn tree_node_id(lamport: i64, offset: usize) -> TreeNodeId {
+        TreeNodeId::new(ticket(lamport, "a"), offset)
     }
 }

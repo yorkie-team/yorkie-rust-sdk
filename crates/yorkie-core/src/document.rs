@@ -5,6 +5,7 @@ use crate::crdt::element::CrdtElement;
 use crate::crdt::object::CrdtObject;
 use crate::crdt::primitive::{CrdtPrimitive, PrimitiveValue};
 use crate::crdt::root::CrdtRoot;
+use crate::crdt::tree::{attribute_value_to_json_value, TreeNode};
 use crate::operation::{OpSource, Operation, RemoveOperation, SetOperation};
 use crate::{JsonObject, JsonValue, Result, TimeTicket, YorkieError};
 
@@ -289,9 +290,39 @@ fn crdt_element_to_json_value(element: &CrdtElement) -> Result<JsonValue> {
             JsonValue::Array(array)
         }
         CrdtElement::Text(value) => JsonValue::Array(value.to_json_array()?),
+        CrdtElement::Tree(value) => crdt_tree_node_to_json_value(value.root())?,
     };
 
     Ok(value)
+}
+
+fn crdt_tree_node_to_json_value(node: &TreeNode) -> Result<JsonValue> {
+    let mut object = JsonObject::new();
+    object.set_unchecked("type", node.node_type().to_owned());
+
+    if node.is_text() {
+        object.set_unchecked("value", node.value().to_owned());
+        return Ok(JsonValue::Object(object));
+    }
+
+    let mut children = crate::JsonArray::new();
+    for child in node.children() {
+        children.push(crdt_tree_node_to_json_value(child)?);
+    }
+    object.set_unchecked("children", children);
+
+    if let Some(attrs) = node.attrs() {
+        let values = attrs.to_object();
+        if !values.is_empty() {
+            let mut attr_object = JsonObject::new();
+            for (key, value) in values {
+                attr_object.set_unchecked(key, attribute_value_to_json_value(&value));
+            }
+            object.set_unchecked("attributes", attr_object);
+        }
+    }
+
+    Ok(JsonValue::Object(object))
 }
 
 #[cfg(test)]
@@ -300,7 +331,9 @@ mod tests {
     use crate::change::ChangePack;
     use crate::crdt::counter::{CounterType, CounterValue, CrdtCounter};
     use crate::crdt::element::CrdtElement;
+    use crate::crdt::rht::Rht;
     use crate::crdt::text::CrdtText;
+    use crate::crdt::tree::{CrdtTree, TreeNode, TreeNodeId};
     use crate::{Checkpoint, JsonArray, JsonObject, Result, VersionVector, YorkieError};
 
     #[test]
@@ -352,6 +385,37 @@ mod tests {
         let value = crdt_element_to_json_value(&CrdtElement::counter(counter))?;
 
         assert_eq!("10", value.to_sorted_json());
+        Ok(())
+    }
+
+    #[test]
+    fn converts_crdt_tree_to_public_json_object() -> Result<()> {
+        let mut attrs = Rht::new();
+        attrs.set("bold", "\"true\"", crate::TimeTicket::new(4, 0, "a"));
+        let tree = CrdtTree::create(
+            TreeNode::create_element(
+                TreeNodeId::new(crate::TimeTicket::new(1, 0, "a"), 0),
+                "root",
+                None,
+                vec![TreeNode::create_element(
+                    TreeNodeId::new(crate::TimeTicket::new(2, 0, "a"), 0),
+                    "p",
+                    Some(attrs),
+                    vec![TreeNode::create_text(
+                        TreeNodeId::new(crate::TimeTicket::new(3, 0, "a"), 0),
+                        "Hi",
+                    )],
+                )],
+            ),
+            crate::TimeTicket::new(1, 0, "a"),
+        );
+
+        let value = crdt_element_to_json_value(&CrdtElement::tree(tree))?;
+
+        assert_eq!(
+            r#"{"children":[{"attributes":{"bold":"true"},"children":[{"type":"text","value":"Hi"}],"type":"p"}],"type":"root"}"#,
+            value.to_sorted_json()
+        );
         Ok(())
     }
 

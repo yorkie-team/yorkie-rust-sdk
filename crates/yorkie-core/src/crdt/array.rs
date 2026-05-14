@@ -3,6 +3,7 @@ use super::element::{CrdtElement, CrdtElementMeta, DataSize};
 use super::object::CrdtObject;
 use super::rga_tree_list::{RgaTreeList, RgaTreeListNode};
 use super::text::CrdtText;
+use super::tree::CrdtTree;
 use crate::{Result, TimeTicket};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -184,7 +185,10 @@ impl CrdtArray {
                         return Some(element);
                     }
                 }
-                CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Text(_) => {}
+                CrdtElement::Primitive(_)
+                | CrdtElement::Counter(_)
+                | CrdtElement::Text(_)
+                | CrdtElement::Tree(_) => {}
             }
         }
 
@@ -208,7 +212,10 @@ impl CrdtArray {
                         return Some(object);
                     }
                 }
-                CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Text(_) => {}
+                CrdtElement::Primitive(_)
+                | CrdtElement::Counter(_)
+                | CrdtElement::Text(_)
+                | CrdtElement::Tree(_) => {}
             }
         }
 
@@ -239,7 +246,10 @@ impl CrdtArray {
                         return Some(object);
                     }
                 }
-                CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Text(_) => {}
+                CrdtElement::Primitive(_)
+                | CrdtElement::Counter(_)
+                | CrdtElement::Text(_)
+                | CrdtElement::Tree(_) => {}
             }
         }
 
@@ -263,7 +273,10 @@ impl CrdtArray {
                         return Some(array);
                     }
                 }
-                CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Text(_) => {}
+                CrdtElement::Primitive(_)
+                | CrdtElement::Counter(_)
+                | CrdtElement::Text(_)
+                | CrdtElement::Tree(_) => {}
             }
         }
 
@@ -294,7 +307,10 @@ impl CrdtArray {
                         return Some(array);
                     }
                 }
-                CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Text(_) => {}
+                CrdtElement::Primitive(_)
+                | CrdtElement::Counter(_)
+                | CrdtElement::Text(_)
+                | CrdtElement::Tree(_) => {}
             }
         }
 
@@ -319,7 +335,7 @@ impl CrdtArray {
                         return Some(text);
                     }
                 }
-                CrdtElement::Primitive(_) | CrdtElement::Counter(_) => {}
+                CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Tree(_) => {}
             }
         }
 
@@ -351,7 +367,7 @@ impl CrdtArray {
                         return Some(text);
                     }
                 }
-                CrdtElement::Primitive(_) | CrdtElement::Counter(_) => {}
+                CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Tree(_) => {}
             }
         }
 
@@ -379,7 +395,7 @@ impl CrdtArray {
                         return Some(counter);
                     }
                 }
-                CrdtElement::Primitive(_) | CrdtElement::Text(_) => {}
+                CrdtElement::Primitive(_) | CrdtElement::Text(_) | CrdtElement::Tree(_) => {}
             }
         }
 
@@ -411,7 +427,64 @@ impl CrdtArray {
                         return Some(counter);
                     }
                 }
-                CrdtElement::Primitive(_) | CrdtElement::Text(_) => {}
+                CrdtElement::Primitive(_) | CrdtElement::Text(_) | CrdtElement::Tree(_) => {}
+            }
+        }
+
+        None
+    }
+
+    pub(crate) fn find_tree_by_created_at(&self, created_at: &TimeTicket) -> Option<&CrdtTree> {
+        for child in self.iter_all() {
+            match child {
+                CrdtElement::Tree(tree) => {
+                    if tree.created_at() == created_at {
+                        return Some(tree);
+                    }
+                }
+                CrdtElement::Object(object) => {
+                    if let Some(tree) = object.find_tree_by_created_at(created_at) {
+                        return Some(tree);
+                    }
+                }
+                CrdtElement::Array(array) => {
+                    if let Some(tree) = array.find_tree_by_created_at(created_at) {
+                        return Some(tree);
+                    }
+                }
+                CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Text(_) => {}
+            }
+        }
+
+        None
+    }
+
+    pub(crate) fn find_tree_by_created_at_mut(
+        &mut self,
+        created_at: &TimeTicket,
+    ) -> Option<&mut CrdtTree> {
+        for node in self.elements.iter_all_mut() {
+            let Some(child) = node.element_mut() else {
+                continue;
+            };
+
+            match child {
+                CrdtElement::Tree(tree) => {
+                    if tree.created_at() == created_at {
+                        return Some(tree);
+                    }
+                }
+                CrdtElement::Object(object) => {
+                    if let Some(tree) = object.find_tree_by_created_at_mut(created_at) {
+                        return Some(tree);
+                    }
+                }
+                CrdtElement::Array(array) => {
+                    if let Some(tree) = array.find_tree_by_created_at_mut(created_at) {
+                        return Some(tree);
+                    }
+                }
+                CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Text(_) => {}
             }
         }
 
@@ -441,6 +514,11 @@ impl CrdtArray {
                 }
                 CrdtElement::Array(array) => {
                     if array.purge_gc_pair_by_id(child_id) {
+                        return true;
+                    }
+                }
+                CrdtElement::Tree(tree) => {
+                    if tree.purge_gc_pair_by_id(child_id) {
                         return true;
                     }
                 }

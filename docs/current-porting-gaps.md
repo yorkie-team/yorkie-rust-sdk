@@ -300,11 +300,11 @@ Current Rust behavior:
 - `Rht` and `RhtNode` now model string attributes with LWW updates,
   tombstones, removed-node GC candidates, visible-size accounting,
   deep-copy behavior, node identity, and JSON/object conversion.
-- `TextValue` uses `Rht` for text block attributes, and `CrdtRoot` can rebuild
-  GC pair indexes for removed text attribute nodes when a root is created from
-  an existing CRDT tree.
-- Root garbage collection can physically purge removed text attribute nodes
-  once the synced version vector covers their removal time.
+- `TextValue` and `TreeNode` use `Rht` for attributes, and `CrdtRoot` can
+  rebuild GC pair indexes for removed text/tree attribute nodes when a root is
+  created from an existing CRDT tree.
+- Root garbage collection can physically purge removed text/tree attribute
+  nodes once the synced version vector covers their removal time.
 - `StyleOperation` registers removed text attribute nodes as root GC pairs when
   applying or removing text styles through the operation layer.
 - Unit tests cover the JS RHT test flow for set/get/has, remove, remove of
@@ -322,7 +322,6 @@ JS/Go behavior:
 
 Gap:
 
-- Rust `Rht` is connected to internal `TextValue`, but not yet to tree nodes.
 - Public Text facade methods are not connected yet, so users cannot create
   text style operations from the public document API.
 - Rust `Rht::to_json` uses deterministic key ordering through `BTreeMap`.
@@ -332,7 +331,6 @@ Gap:
 
 Expected direction:
 
-- Use this `Rht` directly in the upcoming tree node port.
 - Connect public Text style APIs to `StyleOperation`.
 - Keep Text output aligned with JS `CRDTTextValue.toJSON`, including parsing
   attribute values from JSON strings before serializing visible attributes.
@@ -403,6 +401,56 @@ Expected direction:
   watch/event APIs.
 - Continue porting JS history and multi-client text scenarios at the operation
   layer before optimizing the backing indexes.
+
+## Tree
+
+Current Rust behavior:
+
+- `TreeNodeId` models the same creation-ticket plus UTF-16 offset identity used
+  by JS `CRDTTreeNodeID` and Go `TreeNodeID`.
+- `CrdtTree` stores a root `TreeNode`, rebuilds a node lookup map by ID, and
+  resolves split-node floor lookups only when the requested ID has the same
+  creation ticket.
+- `TreeNode` supports element nodes, text nodes, optional `Rht` attributes,
+  tombstones, split-link metadata, merge metadata, JSON/XML output, UTF-16 text
+  sizing, active attribute data size, and internal GC pair discovery.
+- `CrdtElement::Tree` participates in metadata dispatch, JSON conversion,
+  data-size accounting, removal, and deep copy.
+- `CrdtRoot` can find tree elements by creation time, rebuild tree internal GC
+  pairs from an existing root object, deep-copy them, and physically purge
+  removed tree nodes or removed tree attributes once a version vector covers
+  their removal time.
+
+JS/Go behavior:
+
+- JS and Go back Tree with an index tree for path/index conversion and an LLRB
+  map for node IDs.
+- Tree edit/style operations split text and element nodes, maintain
+  `insPrevID`/`insNextID`, redirect merged parents through `mergedFrom`,
+  `mergedAt`, and `mergedInto`, register tree-node and attribute GC pairs, and
+  produce reverse operation info.
+- Public Tree wrappers create context-backed tree edits instead of direct node
+  mutation.
+
+Gap:
+
+- Rust does not yet have the tree index structure for path/index conversion.
+- Rust Tree edit/style operations are not implemented.
+- Split and merge metadata is stored but not yet maintained by edit operations.
+- Operation-time GC registration for removed tree nodes and removed tree
+  attributes is pending tree edit/style operations.
+- Public Tree facade and wire conversion are missing.
+- Tree attribute JSON/XML output follows the same scalar parsing helper as
+  Text, but object/array attribute values still need broader JS parity tests
+  before public style APIs expose them.
+
+Expected direction:
+
+- Port tree index/path conversion first so edit/style operations can use JS/Go
+  position semantics.
+- Add Tree edit operation tests from JS/Go before exposing public Tree methods.
+- Reuse `Rht` exactly as Text does, and register removed attribute nodes through
+  root GC during operation execution.
 
 ## Change, ChangeContext, and ChangePack
 

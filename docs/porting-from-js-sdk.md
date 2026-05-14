@@ -88,7 +88,7 @@ it has:
 | `Change` | `packages/sdk/src/document/change/change.ts` | Unit of document modification that executes operations and collects operation info and reverse operations. |
 | `ChangePack` | `packages/sdk/src/document/change/change_pack.ts` | Bundle of document key, checkpoint, changes, version vector, removal flag, and optional snapshot for sync. |
 | `CrdtElementMeta` | `packages/sdk/src/document/crdt/element.ts` | Rust metadata holder for CRDT element timestamps. |
-| `CrdtElement` | `packages/sdk/src/document/crdt/element.ts` | Internal enum that exposes common element behavior across primitive, object, array, and text values. |
+| `CrdtElement` | `packages/sdk/src/document/crdt/element.ts` | Internal enum that exposes common element behavior across primitive, object, array, text, counter, and tree values. |
 | `CrdtPrimitive` | `packages/sdk/src/document/crdt/primitive.ts` | Internal CRDT element for leaf primitive values. |
 | `ElementRht` | `packages/sdk/src/document/crdt/element_rht.ts` | Internal replicated hash table for object members, keyed by visible key and element creation time. |
 | `CrdtObject` | `packages/sdk/src/document/crdt/object.ts` | Internal CRDT container for object members stored in `ElementRht`. |
@@ -98,6 +98,9 @@ it has:
 | `RgaTreeSplit` | `packages/sdk/src/document/crdt/rga_tree_split.ts` | Internal block-based RGA for text. Rust currently keeps the same node semantics with a linear backing structure. |
 | `TextValue` | `packages/sdk/src/document/crdt/text.ts` | Internal text block content plus `Rht` attributes. |
 | `CrdtText` | `packages/sdk/src/document/crdt/text.ts` | Internal CRDT text element backed by `RgaTreeSplit<TextValue>` and indexed by `CrdtRoot` as a CRDT element. |
+| `TreeNodeId` | `packages/sdk/src/document/crdt/tree.ts` | Internal tree node identifier ordered by creation ticket and UTF-16 offset. |
+| `TreeNode` | `packages/sdk/src/document/crdt/tree.ts` | Internal tree node for element/text content, attributes, tombstones, split links, and merge metadata. |
+| `CrdtTree` | `packages/sdk/src/document/crdt/tree.ts` | Internal CRDT tree element with node lookup, serialization, data-size accounting, deep copy, and GC-pair discovery. Tree edit/style operations are still pending. |
 | `RgaTreeList` | `packages/sdk/src/document/crdt/rga_tree_list.ts` | Internal replicated growable array list. Rust currently keeps the same node semantics with a linear backing structure. |
 | `CrdtArray` | `packages/sdk/src/document/crdt/array.ts` | Internal CRDT container for array elements stored in `RgaTreeList`. |
 | `CrdtRoot` | `packages/sdk/src/document/crdt/root.ts` | Internal root that indexes CRDT elements by creation time and creates element paths. |

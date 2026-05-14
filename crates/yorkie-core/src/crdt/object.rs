@@ -3,6 +3,7 @@ use super::counter::CrdtCounter;
 use super::element::{CrdtElement, CrdtElementMeta, DataSize};
 use super::element_rht::ElementRht;
 use super::text::CrdtText;
+use super::tree::CrdtTree;
 use crate::json::escape_json_string;
 use crate::{Result, TimeTicket};
 use std::collections::BTreeSet;
@@ -145,7 +146,10 @@ impl CrdtObject {
                         return Some(element);
                     }
                 }
-                CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Text(_) => {}
+                CrdtElement::Primitive(_)
+                | CrdtElement::Counter(_)
+                | CrdtElement::Text(_)
+                | CrdtElement::Tree(_) => {}
             }
         }
 
@@ -169,7 +173,10 @@ impl CrdtObject {
                         return Some(object);
                     }
                 }
-                CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Text(_) => {}
+                CrdtElement::Primitive(_)
+                | CrdtElement::Counter(_)
+                | CrdtElement::Text(_)
+                | CrdtElement::Tree(_) => {}
             }
         }
 
@@ -196,7 +203,10 @@ impl CrdtObject {
                         return Some(object);
                     }
                 }
-                CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Text(_) => {}
+                CrdtElement::Primitive(_)
+                | CrdtElement::Counter(_)
+                | CrdtElement::Text(_)
+                | CrdtElement::Tree(_) => {}
             }
         }
 
@@ -220,7 +230,10 @@ impl CrdtObject {
                         return Some(array);
                     }
                 }
-                CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Text(_) => {}
+                CrdtElement::Primitive(_)
+                | CrdtElement::Counter(_)
+                | CrdtElement::Text(_)
+                | CrdtElement::Tree(_) => {}
             }
         }
 
@@ -247,7 +260,10 @@ impl CrdtObject {
                         return Some(array);
                     }
                 }
-                CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Text(_) => {}
+                CrdtElement::Primitive(_)
+                | CrdtElement::Counter(_)
+                | CrdtElement::Text(_)
+                | CrdtElement::Tree(_) => {}
             }
         }
 
@@ -272,7 +288,7 @@ impl CrdtObject {
                         return Some(text);
                     }
                 }
-                CrdtElement::Primitive(_) | CrdtElement::Counter(_) => {}
+                CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Tree(_) => {}
             }
         }
 
@@ -300,7 +316,7 @@ impl CrdtObject {
                         return Some(text);
                     }
                 }
-                CrdtElement::Primitive(_) | CrdtElement::Counter(_) => {}
+                CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Tree(_) => {}
             }
         }
 
@@ -328,7 +344,7 @@ impl CrdtObject {
                         return Some(counter);
                     }
                 }
-                CrdtElement::Primitive(_) | CrdtElement::Text(_) => {}
+                CrdtElement::Primitive(_) | CrdtElement::Text(_) | CrdtElement::Tree(_) => {}
             }
         }
 
@@ -356,7 +372,60 @@ impl CrdtObject {
                         return Some(counter);
                     }
                 }
-                CrdtElement::Primitive(_) | CrdtElement::Text(_) => {}
+                CrdtElement::Primitive(_) | CrdtElement::Text(_) | CrdtElement::Tree(_) => {}
+            }
+        }
+
+        None
+    }
+
+    pub(crate) fn find_tree_by_created_at(&self, created_at: &TimeTicket) -> Option<&CrdtTree> {
+        for (_, child) in self.iter_all() {
+            match child {
+                CrdtElement::Tree(tree) => {
+                    if tree.created_at() == created_at {
+                        return Some(tree);
+                    }
+                }
+                CrdtElement::Object(object) => {
+                    if let Some(tree) = object.find_tree_by_created_at(created_at) {
+                        return Some(tree);
+                    }
+                }
+                CrdtElement::Array(array) => {
+                    if let Some(tree) = array.find_tree_by_created_at(created_at) {
+                        return Some(tree);
+                    }
+                }
+                CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Text(_) => {}
+            }
+        }
+
+        None
+    }
+
+    pub(crate) fn find_tree_by_created_at_mut(
+        &mut self,
+        created_at: &TimeTicket,
+    ) -> Option<&mut CrdtTree> {
+        for node in self.member_nodes.iter_mut() {
+            match node.value_mut() {
+                CrdtElement::Tree(tree) => {
+                    if tree.created_at() == created_at {
+                        return Some(tree);
+                    }
+                }
+                CrdtElement::Object(object) => {
+                    if let Some(tree) = object.find_tree_by_created_at_mut(created_at) {
+                        return Some(tree);
+                    }
+                }
+                CrdtElement::Array(array) => {
+                    if let Some(tree) = array.find_tree_by_created_at_mut(created_at) {
+                        return Some(tree);
+                    }
+                }
+                CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Text(_) => {}
             }
         }
 
@@ -378,6 +447,11 @@ impl CrdtObject {
                 }
                 CrdtElement::Array(array) => {
                     if array.purge_gc_pair_by_id(child_id) {
+                        return true;
+                    }
+                }
+                CrdtElement::Tree(tree) => {
+                    if tree.purge_gc_pair_by_id(child_id) {
                         return true;
                     }
                 }
