@@ -23,6 +23,7 @@ Use these status labels:
 - [Array and RGATreeList](array-rga-tree-list.md)
 - [Text and RGATreeSplit](text-rga-tree-split.md)
 - [Tree](tree.md)
+- [Splay and Index](splay-index.md)
 - [RHT Attributes](rht-attributes.md)
 - [Root and Garbage Collection](root-and-gc.md)
 

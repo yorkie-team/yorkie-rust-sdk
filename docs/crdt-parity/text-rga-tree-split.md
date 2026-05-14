@@ -15,6 +15,7 @@ Last reviewed: 2026-05-14
   `pkg/document/crdt/rga_tree_split_test.go`
 - Rust: `crates/yorkie-core/src/crdt/text.rs`,
   `crates/yorkie-core/src/crdt/rga_tree_split.rs`,
+  `crates/yorkie-core/src/crdt/splay.rs`,
   `crates/yorkie-core/src/operation/edit_operation.rs`,
   `crates/yorkie-core/src/operation/style_operation.rs`
 
@@ -35,7 +36,7 @@ behavior, public text facade, and operation info output.
 | Text GC pairs | covered | Removed text nodes and removed attributes are registered and purged. |
 | Operation execution | partial | Edit/style operations execute and register GC pairs, but operation info shape is not final. |
 | Public Text facade | missing | No public context-backed text API yet. |
-| Splay/LLRB optimization | missing | Rust uses linear structures. |
+| Splay/LLRB optimization | partial | Rust has a weighted splay utility, but `RgaTreeSplit` still uses linear structures and does not yet maintain an ID tree. |
 | History and multi-client scenarios | partial | Important integration-style cases still need operation-level replay tests. |
 | Wire conversion | missing | No text operation protocol conversion yet. |
 
@@ -45,4 +46,5 @@ behavior, public text facade, and operation info output.
   implementation before exposing events.
 - Add operation-level replay tests for multi-change text scenarios.
 - Decide how Rust should represent invalid UTF-16 surrogate edges.
-- Add indexes after behavior is stable.
+- Attach the weighted splay utility to `RgaTreeSplit` after explicit node
+  handles and ID lookup are in place.

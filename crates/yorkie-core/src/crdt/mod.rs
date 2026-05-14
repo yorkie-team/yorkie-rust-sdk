@@ -9,5 +9,6 @@ pub(crate) mod rga_tree_list;
 pub(crate) mod rga_tree_split;
 pub(crate) mod rht;
 pub(crate) mod root;
+pub(crate) mod splay;
 pub(crate) mod text;
 pub(crate) mod tree;

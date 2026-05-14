@@ -148,6 +148,9 @@ Current Rust behavior:
   identity, moved position timestamps, removed elements, and dead move
   positions.
 - The backing structure is a `Vec` with linear scans.
+- A weighted `SplayTree` utility now exists with JS/Go-shaped insert, splay,
+  text cursor lookup, array index lookup, delete, range reweighting, and weight
+  verification tests.
 - Dead position nodes from array moves are registered in the root GC pair map
   and included in garbage length/stat counters.
 - Root garbage collection can now physically purge dead RGA position nodes once
@@ -169,8 +172,8 @@ JS/Go behavior:
 
 Gap:
 
-- Rust does not yet have the splay tree index. Index lookup and path creation
-  are O(n).
+- `RgaTreeList` is not yet attached to the weighted splay utility. Index lookup
+  and path creation are still O(n).
 - Rust does not yet keep explicit maps for position IDs and element IDs. Linear
   lookup preserves simple behavior, but duplicate replay/idempotency cases are
   not fully covered.
@@ -186,6 +189,8 @@ Expected direction:
   data structure.
 - Add explicit position and element indexes when replay/idempotency tests need
   them, or when performance becomes a real concern.
+- Attach `RgaTreeList` visible-index lookup to the weighted splay utility after
+  the explicit position/element indexes exist.
 
 ## Array Operations
 
@@ -382,7 +387,7 @@ JS/Go behavior:
 Gap:
 
 - Rust `RgaTreeSplit` currently uses a linear `Vec` backing structure instead
-  of splay/LLRB indexes.
+  of the available weighted splay utility and a node-ID tree.
 - Rust `CrdtText` is not yet exposed through a public Text facade or wire
   conversion.
 - `StyleOperation` emits per-block style operation info from the text helper,
@@ -404,6 +409,8 @@ Expected direction:
   watch/event APIs.
 - Continue porting JS history and multi-client text scenarios at the operation
   layer before optimizing the backing indexes.
+- Attach `RgaTreeSplit` index lookup to the weighted splay utility once node
+  handles and ID lookup are explicit.
 
 ## Tree
 

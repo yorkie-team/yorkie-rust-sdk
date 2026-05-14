@@ -15,6 +15,7 @@ Last reviewed: 2026-05-14
   `pkg/document/crdt/rga_tree_list_test.go`
 - Rust: `crates/yorkie-core/src/crdt/array.rs`,
   `crates/yorkie-core/src/crdt/rga_tree_list.rs`,
+  `crates/yorkie-core/src/crdt/splay.rs`,
   `crates/yorkie-core/src/operation/add_operation.rs`,
   `crates/yorkie-core/src/operation/move_operation.rs`,
   `crates/yorkie-core/src/operation/array_set_operation.rs`,
@@ -40,7 +41,7 @@ application, public array mutation APIs, and sync-level convergence.
 | Operation-level matrix | covered | Add/move/array-set/remove pairs are applied through `CrdtRoot` in both orders and checked for JSON, path, root stats, and GC convergence. |
 | Operation position anchors | covered | Rust ports Go position-confusion regressions for move-front/move-last followed by push or insert. |
 | Public `JsonArray` facade | blocked | Current public array is not context-backed, so operation intent is not preserved. |
-| Splay/index optimization | missing | Rust uses linear `Vec` scans. |
+| Splay/index optimization | partial | Rust has a JS/Go-shaped weighted splay utility, but `RgaTreeList` still uses linear `Vec` scans. |
 | Snapshot restoration | partial | Root rebuild tests cover moved positions, dead positions, path lookup, and GC after copy; protocol snapshot conversion is still missing. |
 | Wire conversion | missing | No operation/protocol conversion yet. |
 
@@ -48,5 +49,5 @@ application, public array mutation APIs, and sync-level convergence.
 
 - Build the context-backed public `JsonArray` facade before porting JS public
   array tests.
-- Add explicit position and element indexes before attempting splay
-  optimization.
+- Add explicit position and element indexes, then attach array index lookup to
+  the weighted splay utility.
