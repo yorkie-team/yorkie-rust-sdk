@@ -86,7 +86,7 @@ impl CrdtRoot {
             let child_created_at = pair.element().created_at();
             let sub_path = sub_path_of(parent, child_created_at)
                 .ok_or_else(|| YorkieError::MissingCrdtElement(child_created_at.to_id_string()))?;
-            sub_paths.insert(0, sub_path.to_owned());
+            sub_paths.insert(0, sub_path);
 
             pair = self
                 .find_element_pair_by_created_at(parent.created_at())
@@ -147,6 +147,22 @@ impl CrdtRoot {
             .ok_or_else(|| self.object_parent_error(parent_created_at))?;
 
         Ok(object.sub_path_of(created_at))
+    }
+
+    pub(crate) fn container_sub_path(
+        &self,
+        parent_created_at: &TimeTicket,
+        created_at: &TimeTicket,
+    ) -> Result<Option<String>> {
+        if let Some(object) = self.object_by_created_at(parent_created_at) {
+            return Ok(object.sub_path_of(created_at).map(ToOwned::to_owned));
+        }
+
+        if let Some(array) = self.array_by_created_at(parent_created_at) {
+            return Ok(array.sub_path_of(created_at));
+        }
+
+        Err(self.container_parent_error(parent_created_at))
     }
 
     pub(crate) fn set_object_member(
@@ -220,6 +236,158 @@ impl CrdtRoot {
         Ok(removed)
     }
 
+    pub(crate) fn get_container_child(
+        &self,
+        parent_created_at: &TimeTicket,
+        created_at: &TimeTicket,
+    ) -> Result<Option<CrdtElement>> {
+        if let Some(object) = self.object_by_created_at(parent_created_at) {
+            return Ok(object.get_by_id(created_at).map(CrdtElement::deepcopy));
+        }
+
+        if let Some(array) = self.array_by_created_at(parent_created_at) {
+            return Ok(array.get_by_id(created_at).map(CrdtElement::deepcopy));
+        }
+
+        Err(self.container_parent_error(parent_created_at))
+    }
+
+    pub(crate) fn insert_array_element(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        prev_created_at: &TimeTicket,
+        value: CrdtElement,
+        executed_at: TimeTicket,
+    ) -> Result<CrdtElement> {
+        let value_created_at = value.created_at().clone();
+
+        if self.array_by_created_at(parent_created_at).is_none() {
+            return Err(self.array_parent_error(parent_created_at));
+        }
+
+        let inserted = {
+            let array = self
+                .array_by_created_at_mut(parent_created_at)
+                .ok_or_else(|| YorkieError::MissingCrdtElement(parent_created_at.to_id_string()))?;
+
+            array.insert_after(prev_created_at, value, Some(executed_at))?;
+            array
+                .get_by_id(&value_created_at)
+                .ok_or_else(|| YorkieError::MissingCrdtElement(value_created_at.to_id_string()))?
+                .deepcopy()
+        };
+
+        self.refresh_element_pair_and_ancestors(parent_created_at);
+
+        let parent = self
+            .actual_element_by_created_at(parent_created_at)
+            .ok_or_else(|| YorkieError::MissingCrdtElement(parent_created_at.to_id_string()))?;
+
+        self.register_element(&inserted, Some(&parent));
+        if inserted.removed_at().is_some() {
+            self.register_removed_element(&inserted);
+        }
+
+        Ok(inserted)
+    }
+
+    pub(crate) fn move_array_element(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        prev_created_at: &TimeTicket,
+        created_at: &TimeTicket,
+        executed_at: TimeTicket,
+    ) -> Result<CrdtElement> {
+        if self.array_by_created_at(parent_created_at).is_none() {
+            return Err(self.array_parent_error(parent_created_at));
+        }
+
+        let moved = {
+            let array = self
+                .array_by_created_at_mut(parent_created_at)
+                .ok_or_else(|| YorkieError::MissingCrdtElement(parent_created_at.to_id_string()))?;
+
+            array.move_after(prev_created_at, created_at, executed_at)?;
+            array
+                .get_by_id(created_at)
+                .ok_or_else(|| YorkieError::MissingCrdtElement(created_at.to_id_string()))?
+                .deepcopy()
+        };
+
+        self.refresh_element_pair_and_ancestors(parent_created_at);
+        let parent = self
+            .actual_element_by_created_at(parent_created_at)
+            .ok_or_else(|| YorkieError::MissingCrdtElement(parent_created_at.to_id_string()))?;
+        if let Some(pair) = self
+            .element_pair_by_created_at
+            .get_mut(&created_at.to_id_string())
+        {
+            pair.element = moved.deepcopy();
+            pair.parent = Some(parent);
+        }
+
+        Ok(moved)
+    }
+
+    pub(crate) fn set_array_element(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        created_at: &TimeTicket,
+        value: CrdtElement,
+        executed_at: TimeTicket,
+    ) -> Result<(CrdtElement, CrdtElement)> {
+        let value_created_at = value.created_at().clone();
+
+        if self.array_by_created_at(parent_created_at).is_none() {
+            return Err(self.array_parent_error(parent_created_at));
+        }
+
+        let (inserted, removed) = {
+            let array = self
+                .array_by_created_at_mut(parent_created_at)
+                .ok_or_else(|| YorkieError::MissingCrdtElement(parent_created_at.to_id_string()))?;
+
+            let removed = array.set(created_at, value, executed_at)?;
+            let inserted = array
+                .get_by_id(&value_created_at)
+                .ok_or_else(|| YorkieError::MissingCrdtElement(value_created_at.to_id_string()))?
+                .deepcopy();
+
+            (inserted, removed)
+        };
+
+        self.refresh_element_pair_and_ancestors(parent_created_at);
+
+        let parent = self
+            .actual_element_by_created_at(parent_created_at)
+            .ok_or_else(|| YorkieError::MissingCrdtElement(parent_created_at.to_id_string()))?;
+
+        self.register_element(&inserted, Some(&parent));
+        self.register_removed_element(&removed);
+        if inserted.removed_at().is_some() {
+            self.register_removed_element(&inserted);
+        }
+
+        Ok((inserted, removed))
+    }
+
+    pub(crate) fn remove_container_element(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        created_at: &TimeTicket,
+        executed_at: TimeTicket,
+    ) -> Result<CrdtElement> {
+        if self.object_by_created_at(parent_created_at).is_some() {
+            return self.remove_object_member(parent_created_at, created_at, executed_at);
+        }
+
+        if self.array_by_created_at(parent_created_at).is_some() {
+            return self.remove_array_element(parent_created_at, created_at, executed_at);
+        }
+
+        Err(self.container_parent_error(parent_created_at))
+    }
+
     pub(crate) fn get_element_map_size(&self) -> usize {
         self.element_pair_by_created_at.len()
     }
@@ -266,6 +434,20 @@ impl CrdtRoot {
         }
 
         self.root_object.find_object_by_created_at_mut(created_at)
+    }
+
+    pub(crate) fn array_by_created_at(
+        &self,
+        created_at: &TimeTicket,
+    ) -> Option<&super::array::CrdtArray> {
+        self.root_object.find_array_by_created_at(created_at)
+    }
+
+    pub(crate) fn array_by_created_at_mut(
+        &mut self,
+        created_at: &TimeTicket,
+    ) -> Option<&mut super::array::CrdtArray> {
+        self.root_object.find_array_by_created_at_mut(created_at)
     }
 
     pub(crate) fn doc_size(&self) -> DocSize {
@@ -343,6 +525,50 @@ impl CrdtRoot {
         YorkieError::MissingCrdtElement(parent_created_at.to_id_string())
     }
 
+    fn array_parent_error(&self, parent_created_at: &TimeTicket) -> YorkieError {
+        if self.find_by_created_at(parent_created_at).is_some() {
+            return YorkieError::UnexpectedCrdtElement {
+                id: parent_created_at.to_id_string(),
+                expected: "array",
+            };
+        }
+
+        YorkieError::MissingCrdtElement(parent_created_at.to_id_string())
+    }
+
+    fn container_parent_error(&self, parent_created_at: &TimeTicket) -> YorkieError {
+        if self.find_by_created_at(parent_created_at).is_some() {
+            return YorkieError::UnexpectedCrdtElement {
+                id: parent_created_at.to_id_string(),
+                expected: "object or array",
+            };
+        }
+
+        YorkieError::MissingCrdtElement(parent_created_at.to_id_string())
+    }
+
+    fn remove_array_element(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        created_at: &TimeTicket,
+        executed_at: TimeTicket,
+    ) -> Result<CrdtElement> {
+        let removed = {
+            let array = self
+                .array_by_created_at_mut(parent_created_at)
+                .ok_or_else(|| YorkieError::MissingCrdtElement(parent_created_at.to_id_string()))?;
+
+            array.delete(created_at, executed_at)?
+        };
+
+        self.refresh_element_pair_and_ancestors(parent_created_at);
+        if removed.removed_at().is_some() {
+            self.register_removed_element(&removed);
+        }
+
+        Ok(removed)
+    }
+
     fn register_element_internal(&mut self, element: &CrdtElement, parent: Option<&CrdtElement>) {
         self.element_pair_by_created_at.insert(
             element.created_at().to_id_string(),
@@ -350,10 +576,18 @@ impl CrdtRoot {
         );
         add_data_size(&mut self.doc_size.live, element.data_size());
 
-        if let CrdtElement::Object(object) = element {
-            for (_, child) in object.iter_all() {
-                self.register_element_internal(child, Some(element));
+        match element {
+            CrdtElement::Object(object) => {
+                for (_, child) in object.iter_all() {
+                    self.register_element_internal(child, Some(element));
+                }
             }
+            CrdtElement::Array(array) => {
+                for child in array.iter_all() {
+                    self.register_element_internal(child, Some(element));
+                }
+            }
+            CrdtElement::Primitive(_) => {}
         }
     }
 
@@ -364,10 +598,18 @@ impl CrdtRoot {
         self.gc_element_set_by_created_at.remove(&created_at);
         *count += 1;
 
-        if let CrdtElement::Object(object) = element {
-            for (_, child) in object.iter_all() {
-                self.deregister_element_internal(child, count);
+        match element {
+            CrdtElement::Object(object) => {
+                for (_, child) in object.iter_all() {
+                    self.deregister_element_internal(child, count);
+                }
             }
+            CrdtElement::Array(array) => {
+                for child in array.iter_all() {
+                    self.deregister_element_internal(child, count);
+                }
+            }
+            CrdtElement::Primitive(_) => {}
         }
     }
 
@@ -376,27 +618,45 @@ impl CrdtRoot {
             self.register_removed_element(element);
         }
 
-        if let CrdtElement::Object(object) = element {
-            for (_, child) in object.iter_all() {
-                self.register_removed_descendants(child);
+        match element {
+            CrdtElement::Object(object) => {
+                for (_, child) in object.iter_all() {
+                    self.register_removed_descendants(child);
+                }
             }
+            CrdtElement::Array(array) => {
+                for child in array.iter_all() {
+                    self.register_removed_descendants(child);
+                }
+            }
+            CrdtElement::Primitive(_) => {}
         }
     }
 }
 
-fn sub_path_of<'a>(parent: &'a CrdtElement, created_at: &TimeTicket) -> Option<&'a str> {
+fn sub_path_of(parent: &CrdtElement, created_at: &TimeTicket) -> Option<String> {
     match parent {
-        CrdtElement::Object(object) => object.sub_path_of(created_at),
+        CrdtElement::Object(object) => object.sub_path_of(created_at).map(ToOwned::to_owned),
+        CrdtElement::Array(array) => array.sub_path_of(created_at),
         CrdtElement::Primitive(_) => None,
     }
 }
 
 fn collect_descendant_ids(element: &CrdtElement, seen: &mut BTreeSet<String>) {
-    if let CrdtElement::Object(object) = element {
-        for (_, child) in object.iter_all() {
-            seen.insert(child.created_at().to_id_string());
-            collect_descendant_ids(child, seen);
+    match element {
+        CrdtElement::Object(object) => {
+            for (_, child) in object.iter_all() {
+                seen.insert(child.created_at().to_id_string());
+                collect_descendant_ids(child, seen);
+            }
         }
+        CrdtElement::Array(array) => {
+            for child in array.iter_all() {
+                seen.insert(child.created_at().to_id_string());
+                collect_descendant_ids(child, seen);
+            }
+        }
+        CrdtElement::Primitive(_) => {}
     }
 }
 

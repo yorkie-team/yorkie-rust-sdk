@@ -1,3 +1,4 @@
+use super::array::CrdtArray;
 use super::object::CrdtObject;
 use super::primitive::CrdtPrimitive;
 use crate::{TimeTicket, TIME_TICKET_SIZE};
@@ -107,6 +108,7 @@ impl CrdtElementMeta {
 pub(crate) enum CrdtElement {
     Primitive(CrdtPrimitive),
     Object(Box<CrdtObject>),
+    Array(Box<CrdtArray>),
 }
 
 impl CrdtElement {
@@ -118,10 +120,15 @@ impl CrdtElement {
         Self::Object(Box::new(value))
     }
 
+    pub(crate) fn array(value: CrdtArray) -> Self {
+        Self::Array(Box::new(value))
+    }
+
     pub(crate) fn created_at(&self) -> &TimeTicket {
         match self {
             Self::Primitive(value) => value.created_at(),
             Self::Object(value) => value.created_at(),
+            Self::Array(value) => value.created_at(),
         }
     }
 
@@ -129,6 +136,7 @@ impl CrdtElement {
         match self {
             Self::Primitive(value) => value.id(),
             Self::Object(value) => value.id(),
+            Self::Array(value) => value.id(),
         }
     }
 
@@ -136,6 +144,7 @@ impl CrdtElement {
         match self {
             Self::Primitive(value) => value.moved_at(),
             Self::Object(value) => value.moved_at(),
+            Self::Array(value) => value.moved_at(),
         }
     }
 
@@ -143,6 +152,7 @@ impl CrdtElement {
         match self {
             Self::Primitive(value) => value.removed_at(),
             Self::Object(value) => value.removed_at(),
+            Self::Array(value) => value.removed_at(),
         }
     }
 
@@ -150,6 +160,7 @@ impl CrdtElement {
         match self {
             Self::Primitive(value) => value.positioned_at(),
             Self::Object(value) => value.positioned_at(),
+            Self::Array(value) => value.positioned_at(),
         }
     }
 
@@ -157,6 +168,7 @@ impl CrdtElement {
         match self {
             Self::Primitive(value) => value.set_moved_at(moved_at),
             Self::Object(value) => value.set_moved_at(moved_at),
+            Self::Array(value) => value.set_moved_at(moved_at),
         }
     }
 
@@ -164,6 +176,7 @@ impl CrdtElement {
         match self {
             Self::Primitive(value) => value.set_removed_at(removed_at),
             Self::Object(value) => value.set_removed_at(removed_at),
+            Self::Array(value) => value.set_removed_at(removed_at),
         }
     }
 
@@ -171,6 +184,7 @@ impl CrdtElement {
         match self {
             Self::Primitive(value) => value.remove(removed_at),
             Self::Object(value) => value.remove(removed_at),
+            Self::Array(value) => value.remove(removed_at),
         }
     }
 
@@ -178,6 +192,7 @@ impl CrdtElement {
         match self {
             Self::Primitive(value) => value.is_removed(),
             Self::Object(value) => value.is_removed(),
+            Self::Array(value) => value.is_removed(),
         }
     }
 
@@ -185,6 +200,7 @@ impl CrdtElement {
         match self {
             Self::Primitive(value) => value.meta_usage(),
             Self::Object(value) => value.meta_usage(),
+            Self::Array(value) => value.meta_usage(),
         }
     }
 
@@ -192,6 +208,7 @@ impl CrdtElement {
         match self {
             Self::Primitive(value) => value.data_size(),
             Self::Object(value) => value.data_size(),
+            Self::Array(value) => value.data_size(),
         }
     }
 
@@ -199,6 +216,7 @@ impl CrdtElement {
         match self {
             Self::Primitive(value) => value.to_json(),
             Self::Object(value) => value.to_json(),
+            Self::Array(value) => value.to_json(),
         }
     }
 
@@ -206,6 +224,7 @@ impl CrdtElement {
         match self {
             Self::Primitive(value) => value.to_sorted_json(),
             Self::Object(value) => value.to_sorted_json(),
+            Self::Array(value) => value.to_sorted_json(),
         }
     }
 
@@ -213,6 +232,7 @@ impl CrdtElement {
         match self {
             Self::Primitive(value) => Self::Primitive(value.deepcopy()),
             Self::Object(value) => Self::Object(Box::new(value.deepcopy())),
+            Self::Array(value) => Self::Array(Box::new(value.deepcopy())),
         }
     }
 }
