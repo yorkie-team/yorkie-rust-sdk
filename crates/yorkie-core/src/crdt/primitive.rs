@@ -1,5 +1,6 @@
 use super::element::{CrdtElementMeta, DataSize};
 use crate::json::escape_json_string;
+use crate::JsonValue;
 use crate::{Result, TimeTicket, YorkieError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +167,19 @@ impl CrdtPrimitive {
 
     pub(crate) fn to_sorted_json(&self) -> String {
         self.to_json()
+    }
+
+    pub(crate) fn to_json_value(&self) -> JsonValue {
+        match &self.value {
+            PrimitiveValue::Null => JsonValue::Null,
+            PrimitiveValue::Boolean(value) => JsonValue::Bool(*value),
+            PrimitiveValue::Integer(value) => JsonValue::Integer(*value),
+            PrimitiveValue::Long(value) => JsonValue::Long(*value),
+            PrimitiveValue::Double(value) => JsonValue::Double(*value),
+            PrimitiveValue::String(value) => JsonValue::String(value.clone()),
+            PrimitiveValue::Bytes(value) => JsonValue::String(base64_encode(value)),
+            PrimitiveValue::Date(value) => JsonValue::String(iso_string_from_millis(*value)),
+        }
     }
 
     pub(crate) fn deepcopy(&self) -> Self {

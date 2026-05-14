@@ -4,7 +4,7 @@ use crate::crdt::object::CrdtObject;
 use crate::crdt::primitive::{CrdtPrimitive, PrimitiveValue};
 use crate::crdt::root::CrdtRoot;
 use crate::operation::{OpSource, Operation, RemoveOperation, SetOperation};
-use crate::{JsonObject, JsonValue, Result, TimeTicket};
+use crate::{JsonObject, JsonValue, Result, TimeTicket, YorkieError};
 
 /// A local Yorkie document.
 #[derive(Debug, Clone, PartialEq)]
@@ -92,9 +92,43 @@ impl Document {
         )
     }
 
+    /// Applies the given change pack to this document.
+    pub fn apply_change_pack(&mut self, pack: &ChangePack) -> Result<()> {
+        if pack.has_snapshot() {
+            return Err(YorkieError::UnsupportedSnapshot);
+        }
+
+        self.apply_changes(pack.changes(), OpSource::Remote)?;
+        self.remove_pushed_local_changes(pack.checkpoint().client_seq());
+
+        self.checkpoint = self.checkpoint.forward(pack.checkpoint());
+        Ok(())
+    }
+
     /// Serializes the document root with object keys sorted lexicographically.
     pub fn to_sorted_json(&self) -> String {
         self.root.to_sorted_json()
+    }
+
+    fn apply_changes(&mut self, changes: &[Change], source: OpSource) -> Result<()> {
+        for change in changes {
+            change.execute(&mut self.crdt_root, source)?;
+            self.change_id = self.change_id.sync_clocks(change.id());
+        }
+
+        self.root = crdt_object_to_json_object(self.crdt_root.object())?;
+        Ok(())
+    }
+
+    fn remove_pushed_local_changes(&mut self, client_seq: u32) {
+        while self
+            .local_changes
+            .first()
+            .map(|change| change.id().client_seq() <= client_seq)
+            .unwrap_or(false)
+        {
+            self.local_changes.remove(0);
+        }
     }
 }
 
@@ -236,10 +270,30 @@ fn primitive(value: PrimitiveValue, created_at: TimeTicket) -> CrdtElement {
     CrdtElement::primitive(CrdtPrimitive::new(value, created_at))
 }
 
+fn crdt_object_to_json_object(object: &CrdtObject) -> Result<JsonObject> {
+    let mut json_object = JsonObject::new();
+
+    for (key, element) in object.iter() {
+        json_object.set(key, crdt_element_to_json_value(element)?)?;
+    }
+
+    Ok(json_object)
+}
+
+fn crdt_element_to_json_value(element: &CrdtElement) -> Result<JsonValue> {
+    let value = match element {
+        CrdtElement::Primitive(value) => value.to_json_value(),
+        CrdtElement::Object(value) => JsonValue::Object(crdt_object_to_json_object(value)?),
+    };
+
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::Document;
-    use crate::{Checkpoint, JsonObject, Result};
+    use crate::change::ChangePack;
+    use crate::{Checkpoint, JsonObject, Result, VersionVector, YorkieError};
 
     #[test]
     fn creates_document_with_the_given_key() {
@@ -342,5 +396,92 @@ mod tests {
                 .and_then(|vector| vector.get(doc.change_id.actor_id().as_str()))
         );
         Ok(())
+    }
+
+    #[test]
+    fn applies_ack_change_pack_and_removes_pushed_local_changes() -> Result<()> {
+        let mut doc = Document::new("doc-key");
+
+        doc.update(|root| root.set("title", "hello").map(|_| ()))?;
+        doc.update(|root| root.set("done", false).map(|_| ()))?;
+
+        let pack = ChangePack::create(
+            "doc-key",
+            Checkpoint::new(3, 1),
+            false,
+            Vec::new(),
+            Some(VersionVector::new()),
+            None,
+        );
+        doc.apply_change_pack(&pack)?;
+
+        assert_eq!(Checkpoint::new(3, 1), doc.checkpoint());
+        assert!(doc.has_local_changes());
+        assert_eq!(1, doc.local_changes.len());
+        assert_eq!(2, doc.local_changes[0].id().client_seq());
+        assert_eq!(r#"{"done":false,"title":"hello"}"#, doc.to_sorted_json());
+
+        let pack = ChangePack::create(
+            "doc-key",
+            Checkpoint::new(4, 2),
+            false,
+            Vec::new(),
+            Some(VersionVector::new()),
+            None,
+        );
+        doc.apply_change_pack(&pack)?;
+
+        assert_eq!(Checkpoint::new(4, 2), doc.checkpoint());
+        assert!(!doc.has_local_changes());
+        Ok(())
+    }
+
+    #[test]
+    fn applies_remote_changes_from_change_pack() -> Result<()> {
+        let mut source = Document::new("source-doc");
+        let mut target = Document::new("target-doc");
+
+        source.update(|root| {
+            let mut profile = JsonObject::new();
+            profile.set("name", "yorkie")?;
+            root.set("profile", profile)?;
+            Ok(())
+        })?;
+
+        let source_pack = source.create_change_pack();
+        let remote_pack = ChangePack::create(
+            "target-doc",
+            Checkpoint::new(1, 0),
+            false,
+            source_pack.changes().to_vec(),
+            source_pack.version_vector().cloned(),
+            None,
+        );
+
+        target.apply_change_pack(&remote_pack)?;
+
+        assert_eq!(Checkpoint::new(1, 0), target.checkpoint());
+        assert_eq!(2, target.change_id.lamport());
+        assert_eq!(r#"{"profile":{"name":"yorkie"}}"#, target.to_sorted_json());
+        assert_eq!(target.crdt_root.to_sorted_json(), target.to_sorted_json());
+        Ok(())
+    }
+
+    #[test]
+    fn reports_snapshot_change_pack_until_snapshot_apply_is_supported() {
+        let mut doc = Document::new("doc-key");
+        let pack = ChangePack::create(
+            "doc-key",
+            Checkpoint::new(1, 0),
+            false,
+            Vec::new(),
+            Some(VersionVector::new()),
+            Some(vec![1]),
+        );
+
+        let err = doc.apply_change_pack(&pack).unwrap_err();
+
+        assert_eq!(YorkieError::UnsupportedSnapshot, err);
+        assert_eq!(Checkpoint::initial(), doc.checkpoint());
     }
 }

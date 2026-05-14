@@ -34,6 +34,9 @@ pub enum YorkieError {
 
     /// A requested object member exists but has a different JSON type.
     UnexpectedType { key: String, expected: &'static str },
+
+    /// Snapshot application has not been implemented yet.
+    UnsupportedSnapshot,
 }
 
 /// Convenient result alias for Yorkie core operations.
@@ -66,6 +69,7 @@ impl Display for YorkieError {
             Self::UnexpectedType { key, expected } => {
                 write!(f, "unexpected type for key {key:?}: expected {expected}")
             }
+            Self::UnsupportedSnapshot => write!(f, "snapshot application is not supported yet"),
         }
     }
 }
