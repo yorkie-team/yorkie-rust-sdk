@@ -8,6 +8,7 @@ Last reviewed: 2026-05-14
   `packages/sdk/src/document/crdt/rga_tree_list.ts`,
   `packages/sdk/src/document/json/array.ts`
 - JS tests: `packages/sdk/test/integration/array_test.ts`,
+  `packages/sdk/test/integration/history_array_test.ts`,
   `packages/sdk/test/unit/document/document_test.ts`
 - Go: `pkg/document/crdt/array.go`,
   `pkg/document/crdt/rga_tree_list.go`,
@@ -40,6 +41,7 @@ application, public array mutation APIs, and sync-level convergence.
 | Operation basics | covered | Add, move, set, remove have focused operation tests. |
 | Operation-level matrix | covered | Add/move/array-set/remove pairs are applied through `CrdtRoot` in both orders and checked for JSON, path, root stats, and GC convergence. |
 | Operation position anchors | covered | Rust ports Go position-confusion regressions for move-front/move-last followed by push or insert. |
+| Upstream skipped history cases | blocked | JS skips array history undo matrix cases where a move is followed by a set. Rust must keep these skipped or ignored until upstream unskips them. See `upstream-skipped-tests.md`. |
 | Public `JsonArray` facade | blocked | Current public array is not context-backed, so operation intent is not preserved. |
 | Splay/index optimization | partial | `RgaTreeList` now keeps JS/Go-shaped position and element maps and uses weighted splay lookup for visible indexes and paths. Structural mutations still rebuild the indexes around the Rust `Vec` backing store instead of maintaining linked node handles incrementally. |
 | Snapshot restoration | partial | Root rebuild tests cover moved positions, dead positions, path lookup, and GC after copy; protocol snapshot conversion is still missing. |

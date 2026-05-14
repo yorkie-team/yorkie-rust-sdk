@@ -26,6 +26,7 @@ Use these status labels:
 - [Splay and Index](splay-index.md)
 - [RHT Attributes](rht-attributes.md)
 - [Root and Garbage Collection](root-and-gc.md)
+- [Upstream Skipped Tests](upstream-skipped-tests.md)
 
 ## Maintenance Rules
 
@@ -37,3 +38,6 @@ Use these status labels:
   see what changed and what remains.
 - Keep broad summaries in `docs/current-porting-gaps.md`; keep detailed test
   matrices and itemized parity status here.
+- Keep skipped upstream tests in `upstream-skipped-tests.md`. Do not turn a
+  skipped JS/Go CRDT case into a Rust pass target without documenting the
+  upstream status change or an explicit Rust divergence.

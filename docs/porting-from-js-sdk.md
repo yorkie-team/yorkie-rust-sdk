@@ -49,20 +49,25 @@ In the local development workspace, the main references are:
 - Every ported feature must start from a JS SDK test or a JS SDK source section.
   If no JS test exists, add the Rust test from the JS source behavior and record
   the source path in the test or nearby module docs.
+- Do not treat skipped JS/Go CRDT tests as pass targets. If they are represented
+  in Rust, keep them ignored and reference
+  `docs/crdt-parity/upstream-skipped-tests.md`.
 
 ## Porting Workflow
 
 1. Pick one JS SDK test file or one small behavior inside a test file.
 2. Add a Rust test that states the same observable behavior.
-3. Keep source references in docs and planning notes, not in public code
+3. If the source test is skipped upstream, document it and keep the Rust test
+   ignored instead of implementing ahead of upstream behavior.
+4. Keep source references in docs and planning notes, not in public code
    comments unless they are necessary for maintainability.
-4. Cross-check the corresponding Go SDK/client implementation when the feature
+5. Cross-check the corresponding Go SDK/client implementation when the feature
    touches CRDT internals, operation application, typed API flow, ownership-like
    structure, or error handling.
-5. Implement the smallest Rust code needed to pass the test.
-6. Keep the Rust names mapped to JS names. Add a mapping note when the Rust name
+6. Implement the smallest Rust code needed to pass the test.
+7. Keep the Rust names mapped to JS names. Add a mapping note when the Rust name
    differs for idiomatic reasons.
-7. Run `cargo fmt` and `cargo test`.
+8. Run `cargo fmt` and `cargo test`.
 
 Prefer vertical slices over broad scaffolding. A small feature is done only when
 it has:

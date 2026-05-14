@@ -12,6 +12,12 @@ The JS SDK remains the behavioral source of truth. The Go implementation should
 be used as a typed cross-check, especially for CRDT internals, operation
 application, and ownership-like structure.
 
+Skipped upstream CRDT tests are tracked in
+`docs/crdt-parity/upstream-skipped-tests.md`. They are not Rust pass targets
+while they remain skipped upstream. If ported into Rust, they should stay
+ignored unless the upstream behavior changes or a deliberate Rust divergence is
+documented.
+
 ## Reference Areas
 
 - JS document facade and update flow:

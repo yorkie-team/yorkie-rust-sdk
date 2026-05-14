@@ -8,6 +8,8 @@ Last reviewed: 2026-05-14
   `packages/sdk/src/document/json/tree.ts`
 - JS tests: `packages/sdk/test/integration/tree_test.ts`,
   `packages/sdk/test/integration/tree_concurrency_test.ts`,
+  `packages/sdk/test/integration/history_tree_test.ts`,
+  `packages/sdk/test/integration/history_tree_split_test.ts`,
   `packages/sdk/test/unit/document/crdt/tree_test.ts`
 - Go: `pkg/document/crdt/tree.go`,
   `pkg/document/crdt/tree_test.go`,
@@ -34,6 +36,7 @@ concurrency, and protocol conversion.
 | Attribute RHT reuse | partial | Tree nodes now reuse `Rht`; visible attributes serialize deterministically, and removed attribute nodes become root GC pairs. |
 | Tree GC | partial | Removed tree nodes and removed tree attributes are registered and purged through root GC when rebuilding from an existing root object. Operation-time registration is pending tree edit/style operations. |
 | Path/index conversion | partial | Rust now ports the JS/Go index/path/position conversion rules, including element padding and text-child paths. Edit-time index tree maintenance is still pending tree operations. |
+| Upstream skipped history/unit cases | blocked | JS and Go carry skipped Tree cases around history redo, overlapping undo reconciliation, L2 split undo, mixed-level merge, and generated concurrency failures. Rust must keep these skipped or ignored until upstream unskips them. See `upstream-skipped-tests.md`. |
 | Public tree facade | missing | Depends on context-backed editing model. |
 | Wire conversion | missing | Depends on tree operations and protocol conversion. |
 

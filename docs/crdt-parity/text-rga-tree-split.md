@@ -35,6 +35,7 @@ behavior, public text facade, and operation info output.
 | Style/remove-style behavior | covered | Tests cover overlap, conflict LWW, concurrent insert formatting, and style removal. |
 | Text GC pairs | covered | Removed text nodes and removed attributes are registered and purged. |
 | Operation execution | partial | Edit/style operations execute and register GC pairs, but operation info shape is not final. |
+| Upstream skipped history cases | blocked | JS skips overlapping-delete undo correctness cases because both clients can converge to duplicated content. Rust must keep these skipped or ignored until upstream unskips them. See `upstream-skipped-tests.md`. |
 | Public Text facade | missing | No public context-backed text API yet. |
 | Splay/ID lookup optimization | partial | `RgaTreeSplit` now keeps `tree_by_index` and `tree_by_id` equivalents and uses weighted splay lookup for text indexes. Structural mutations still rebuild indexes around the current `Vec` storage instead of using stable linked-node handles. |
 | History and multi-client scenarios | partial | Important integration-style cases still need operation-level replay tests. |
