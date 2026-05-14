@@ -357,6 +357,35 @@ impl CrdtArray {
         None
     }
 
+    pub(crate) fn purge_text_gc_pair_by_id(&mut self, child_id: &str) -> bool {
+        for node in self.elements.iter_all_mut() {
+            let Some(child) = node.element_mut() else {
+                continue;
+            };
+
+            match child {
+                CrdtElement::Text(text) => {
+                    if text.purge_gc_pair_by_id(child_id) {
+                        return true;
+                    }
+                }
+                CrdtElement::Object(object) => {
+                    if object.purge_text_gc_pair_by_id(child_id) {
+                        return true;
+                    }
+                }
+                CrdtElement::Array(array) => {
+                    if array.purge_text_gc_pair_by_id(child_id) {
+                        return true;
+                    }
+                }
+                CrdtElement::Primitive(_) => {}
+            }
+        }
+
+        false
+    }
+
     pub(crate) fn to_json(&self) -> String {
         self.elements.to_json()
     }

@@ -29,13 +29,15 @@ impl CrdtElementPair {
 pub(crate) struct CrdtGcPair {
     child_id: String,
     child_size: DataSize,
+    removed_at: TimeTicket,
 }
 
 impl CrdtGcPair {
-    fn new(child_id: String, child_size: DataSize) -> Self {
+    fn new(child_id: String, child_size: DataSize, removed_at: TimeTicket) -> Self {
         Self {
             child_id,
             child_size,
+            removed_at,
         }
     }
 }
@@ -146,16 +148,23 @@ impl CrdtRoot {
     }
 
     pub(crate) fn register_gc_pair(&mut self, child: &RgaTreeListNode) {
-        self.register_gc_pair_by_id(child.id_string(), child.data_size());
+        if let Some(removed_at) = child.removed_at() {
+            self.register_gc_pair_by_id(child.id_string(), child.data_size(), removed_at.clone());
+        }
     }
 
-    pub(crate) fn register_gc_pair_by_id(&mut self, child_id: String, child_size: DataSize) {
+    pub(crate) fn register_gc_pair_by_id(
+        &mut self,
+        child_id: String,
+        child_size: DataSize,
+        removed_at: TimeTicket,
+    ) {
         if let Some(pair) = self.gc_pair_by_child_id.remove(&child_id) {
             sub_data_size(&mut self.doc_size.gc, pair.child_size);
             return;
         }
 
-        let pair = CrdtGcPair::new(child_id.clone(), child_size);
+        let pair = CrdtGcPair::new(child_id.clone(), child_size, removed_at);
         add_data_size(&mut self.doc_size.gc, pair.child_size);
         self.gc_pair_by_child_id.insert(child_id, pair);
     }
@@ -450,6 +459,57 @@ impl CrdtRoot {
         self.get_garbage_element_set_size() + self.gc_pair_by_child_id.len()
     }
 
+    pub(crate) fn garbage_collect(&mut self, vector: &crate::VersionVector) -> Result<usize> {
+        let mut count = 0;
+
+        let removed_element_ids = self
+            .gc_element_set_by_created_at
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        for created_id in removed_element_ids {
+            let Some(pair) = self.element_pair_by_created_at.get(&created_id).cloned() else {
+                continue;
+            };
+            let Some(removed_at) = pair.element().removed_at() else {
+                continue;
+            };
+            if !vector.after_or_equal(removed_at) {
+                continue;
+            }
+
+            if let Some(parent) = pair.parent() {
+                if let Some(object) = self.object_by_created_at_mut(parent.created_at()) {
+                    object.purge(pair.element())?;
+                } else if let Some(array) = self.array_by_created_at_mut(parent.created_at()) {
+                    array.purge(pair.element())?;
+                }
+            }
+
+            count += self.deregister_element(pair.element());
+        }
+
+        let gc_pairs = self
+            .gc_pair_by_child_id
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for pair in gc_pairs {
+            if !vector.after_or_equal(&pair.removed_at) {
+                continue;
+            }
+
+            if self.purge_gc_pair_by_child_id(&pair.child_id) {
+                if let Some(pair) = self.gc_pair_by_child_id.remove(&pair.child_id) {
+                    sub_data_size(&mut self.doc_size.gc, pair.child_size);
+                }
+                count += 1;
+            }
+        }
+
+        Ok(count)
+    }
+
     pub(crate) fn object(&self) -> &CrdtObject {
         &self.root_object
     }
@@ -703,12 +763,16 @@ impl CrdtRoot {
                 }
             }
             CrdtElement::Text(text) => {
-                for (child_id, child_size) in text.gc_pair_entries() {
-                    self.register_gc_pair_by_id(child_id, child_size);
+                for (child_id, child_size, removed_at) in text.gc_pair_entries() {
+                    self.register_gc_pair_by_id(child_id, child_size, removed_at);
                 }
             }
             CrdtElement::Primitive(_) => {}
         }
+    }
+
+    fn purge_gc_pair_by_child_id(&mut self, child_id: &str) -> bool {
+        self.root_object.purge_text_gc_pair_by_id(child_id)
     }
 }
 
@@ -756,7 +820,7 @@ mod tests {
     use crate::crdt::object::CrdtObject;
     use crate::crdt::primitive::{CrdtPrimitive, PrimitiveValue};
     use crate::crdt::text::CrdtText;
-    use crate::{TimeTicket, TIME_TICKET_SIZE};
+    use crate::{TimeTicket, VersionVector, TIME_TICKET_SIZE};
     use std::collections::BTreeMap;
 
     #[test]
@@ -948,6 +1012,39 @@ mod tests {
         let copy = root.deepcopy();
         assert_eq!(2, copy.stats().gc_pairs);
         assert_eq!(r#"{"message":[{"val":"Hello"}]}"#, copy.to_json());
+        Ok(())
+    }
+
+    #[test]
+    fn garbage_collects_text_internal_nodes() -> crate::Result<()> {
+        let text_at = ticket(1, "a");
+        let mut text = CrdtText::create(text_at.clone());
+        text.edit_by_index(0, 0, "Hello World", None, ticket(2, "a"), None)?;
+        text.edit_by_index(5, 10, "Yorkie", None, ticket(3, "a"), None)?;
+        text.edit_by_index(0, 5, "", None, ticket(4, "a"), None)?;
+        text.edit_by_index(6, 7, "", None, ticket(5, "a"), None)?;
+
+        let mut root = CrdtRoot::new(CrdtObject::create_with_members(
+            TimeTicket::initial(),
+            [("message", CrdtElement::text(text))],
+        ));
+
+        assert_eq!(
+            "Yorkie",
+            root.text_by_created_at(&text_at).unwrap().to_string()
+        );
+        assert_eq!(3, root.get_garbage_len());
+
+        let mut vector = VersionVector::new();
+        vector.set("a", 5);
+        assert_eq!(3, root.garbage_collect(&vector)?);
+
+        assert_eq!(0, root.get_garbage_len());
+        assert_eq!(r#"{"message":[{"val":"Yorkie"}]}"#, root.to_json());
+        assert_eq!(
+            r#"[0:00:0:0 {} ""][3:a:0:0 {} "Yorkie"]"#,
+            root.text_by_created_at(&text_at).unwrap().to_test_string()
+        );
         Ok(())
     }
 

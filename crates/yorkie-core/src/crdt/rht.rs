@@ -239,6 +239,28 @@ impl Rht {
         self.node_by_key.remove(child.key());
         self.number_of_removed_elements -= 1;
     }
+
+    pub(crate) fn purge_by_id(&mut self, child_id: &str) -> bool {
+        let Some(key) = self
+            .node_by_key
+            .iter()
+            .find(|(_, node)| node.id_string() == child_id)
+            .map(|(key, _)| key.clone())
+        else {
+            return false;
+        };
+
+        if self
+            .node_by_key
+            .get(&key)
+            .is_some_and(|node| node.is_removed())
+        {
+            self.number_of_removed_elements -= 1;
+        }
+
+        self.node_by_key.remove(&key);
+        true
+    }
 }
 
 impl Default for Rht {

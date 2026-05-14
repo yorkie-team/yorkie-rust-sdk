@@ -248,6 +248,8 @@ Current Rust behavior:
 - `TextValue` uses `Rht` for text block attributes, and `CrdtRoot` can rebuild
   GC pair indexes for removed text attribute nodes when a root is created from
   an existing CRDT tree.
+- Root garbage collection can physically purge removed text attribute nodes
+  once the synced version vector covers their removal time.
 - Unit tests cover the JS RHT test flow for set/get/has, remove, remove of
   missing keys, set after remove, repeated remove, deep copy, purge, and escaped
   JSON output.
@@ -290,15 +292,21 @@ Current Rust behavior:
   output, text output, removed text-node GC candidates, and attribute GC
   candidates.
 - `CrdtText` wraps `RgaTreeSplit<TextValue>` with CRDT element metadata and
-  offers internal index-based edit/style/remove-style helpers.
+  offers internal index-based and position-range-based edit/style/remove-style
+  helpers.
 - `CrdtText` is now a `CrdtElement` variant, participates in root path lookup,
   can be found through root text lookup helpers, and converts to public
   `JsonValue::Array` for internal document-root materialization.
 - `CrdtRoot` can rebuild GC pair indexes for removed text nodes and removed
   text attribute nodes when it is created from an existing CRDT tree.
-- Unit tests cover the Go text CRDT smoke tests and the matching JS internal
-  flow: insert text, replace a range, split a styled range, remove style, delete
-  content, and split strings by UTF-16 code units.
+- Root garbage collection can physically purge removed text nodes and removed
+  text attribute nodes.
+- Unit tests cover the Go text CRDT smoke tests and matching JS scenarios:
+  split-position lookup, Korean composition replacement, deletion with removed
+  boundary nodes, deletion of last nodes, concurrent insert/delete with original
+  positions, Peritext-style concurrent insertion, format plus insertion,
+  overlapping format, conflicting LWW format, style removal, and UTF-16 code
+  unit splitting.
 
 JS/Go behavior:
 
@@ -320,8 +328,9 @@ Gap:
 - Text edit/style operations are not ported yet, so root indexes and document
   sizes are not updated through the full JS operation flow during live text
   edits.
-- Version-vector-aware edit/style conflict behavior is only modeled at the
-  internal helper level and needs parity tests from JS/Go concurrent text cases.
+- Version-vector-aware edit/style conflict behavior is modeled at the internal
+  helper level and has focused parity tests, but it still needs broader replay
+  coverage once `EditOperation` and `StyleOperation` are ported.
 - Rust strings cannot represent invalid standalone UTF-16 surrogate halves, so
   splitting inside a surrogate pair currently uses lossy UTF-16 decoding. Exact
   JS string parity for that edge case needs a deliberate representation choice.
@@ -332,8 +341,8 @@ Expected direction:
   through `ChangeContext`.
 - Register new removed text nodes and removed attribute nodes as root GC pairs
   from those operations.
-- Port focused JS/Go tests for text concurrency before optimizing the backing
-  indexes.
+- Continue porting JS history and multi-client text scenarios at the operation
+  layer before optimizing the backing indexes.
 
 ## Change, ChangeContext, and ChangePack
 

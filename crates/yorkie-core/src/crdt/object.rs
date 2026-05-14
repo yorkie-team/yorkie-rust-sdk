@@ -306,6 +306,31 @@ impl CrdtObject {
         None
     }
 
+    pub(crate) fn purge_text_gc_pair_by_id(&mut self, child_id: &str) -> bool {
+        for node in self.member_nodes.iter_mut() {
+            match node.value_mut() {
+                CrdtElement::Text(text) => {
+                    if text.purge_gc_pair_by_id(child_id) {
+                        return true;
+                    }
+                }
+                CrdtElement::Object(object) => {
+                    if object.purge_text_gc_pair_by_id(child_id) {
+                        return true;
+                    }
+                }
+                CrdtElement::Array(array) => {
+                    if array.purge_text_gc_pair_by_id(child_id) {
+                        return true;
+                    }
+                }
+                CrdtElement::Primitive(_) => {}
+            }
+        }
+
+        false
+    }
+
     pub(crate) fn has(&self, key: &str) -> bool {
         self.member_nodes.has(key)
     }

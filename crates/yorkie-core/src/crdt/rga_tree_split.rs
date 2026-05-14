@@ -291,6 +291,52 @@ where
         ))
     }
 
+    pub(crate) fn normalize_pos(&self, pos: &RgaTreeSplitPos) -> Result<RgaTreeSplitPos> {
+        let mut index = self.find_floor_node(pos.id()).ok_or_else(|| {
+            YorkieError::InvalidTextPosition(format!(
+                "node not found for {}",
+                pos.id().to_test_string()
+            ))
+        })?;
+
+        let mut total = pos.relative_offset();
+        while index > 0 {
+            index -= 1;
+            total += self.nodes[index].len();
+        }
+
+        Ok(RgaTreeSplitPos::new(self.nodes[index].id().clone(), total))
+    }
+
+    pub(crate) fn refine_pos(&self, pos: &RgaTreeSplitPos) -> Result<RgaTreeSplitPos> {
+        let mut index = self.find_floor_node(pos.id()).ok_or_else(|| {
+            YorkieError::InvalidTextPosition(format!(
+                "node not found for {}",
+                pos.id().to_test_string()
+            ))
+        })?;
+        let mut offset_in_part = pos.relative_offset();
+        let mut part_len = self.nodes[index].content_len();
+
+        while offset_in_part > part_len {
+            offset_in_part -= part_len;
+            let Some(next_index) = self.next_index(index) else {
+                return Ok(RgaTreeSplitPos::new(
+                    self.nodes[index].id().clone(),
+                    part_len,
+                ));
+            };
+
+            index = next_index;
+            part_len = self.nodes[index].len();
+        }
+
+        Ok(RgaTreeSplitPos::new(
+            self.nodes[index].id().clone(),
+            offset_in_part,
+        ))
+    }
+
     pub(crate) fn edit(
         &mut self,
         range: RgaTreeSplitPosRange,
@@ -403,6 +449,10 @@ where
         self.nodes.iter().skip(1)
     }
 
+    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = &mut RgaTreeSplitNode<V>> {
+        self.nodes.iter_mut().skip(1)
+    }
+
     pub(crate) fn to_json(&self) -> String {
         let values = self
             .iter()
@@ -428,25 +478,38 @@ where
     }
 
     pub(crate) fn purge(&mut self, child: &RgaTreeSplitNode<V>) {
-        let Some(index) = self.find_node_index(child.id()) else {
-            return;
+        self.purge_by_id(&child.id_string());
+    }
+
+    pub(crate) fn purge_by_id(&mut self, child_id: &str) -> bool {
+        let Some(index) = self
+            .nodes
+            .iter()
+            .position(|node| node.id_string() == child_id)
+        else {
+            return false;
         };
 
         if index == 0 {
-            return;
+            return false;
         }
 
+        let child_id = self.nodes[index].id().clone();
+        let ins_prev_id = self.nodes[index].ins_prev_id.clone();
+        let ins_next_id = self.nodes[index].ins_next_id.clone();
         self.nodes.remove(index);
 
         for node in &mut self.nodes {
-            if node.ins_prev_id.as_ref() == Some(child.id()) {
-                node.ins_prev_id = child.ins_prev_id.clone();
+            if node.ins_prev_id.as_ref() == Some(&child_id) {
+                node.ins_prev_id = ins_prev_id.clone();
             }
 
-            if node.ins_next_id.as_ref() == Some(child.id()) {
-                node.ins_next_id = child.ins_next_id.clone();
+            if node.ins_next_id.as_ref() == Some(&child_id) {
+                node.ins_next_id = ins_next_id.clone();
             }
         }
+
+        true
     }
 
     fn find_node_pos(&self, index: usize) -> Result<RgaTreeSplitPos> {

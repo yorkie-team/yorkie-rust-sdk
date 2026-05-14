@@ -1,6 +1,7 @@
 use super::element::{CrdtElementMeta, DataSize};
 use super::rga_tree_split::{
-    RgaTreeSplit, RgaTreeSplitNode, RgaTreeSplitNodeId, RgaTreeSplitPosRange, RgaTreeSplitValue,
+    RgaTreeSplit, RgaTreeSplitNode, RgaTreeSplitNodeId, RgaTreeSplitPos, RgaTreeSplitPosRange,
+    RgaTreeSplitValue,
 };
 use super::rht::{Rht, RhtNode};
 use crate::json::escape_json_string;
@@ -72,6 +73,10 @@ impl TextValue {
 
     pub(crate) fn purge(&mut self, node: &RhtNode) {
         self.attributes.purge(node);
+    }
+
+    pub(crate) fn purge_attr_by_id(&mut self, child_id: &str) -> bool {
+        self.attributes.purge_by_id(child_id)
     }
 
     pub(crate) fn gc_nodes(&self) -> Vec<RhtNode> {
@@ -218,6 +223,25 @@ impl CrdtText {
         self.rga_tree_split.create_range(from_idx, to_idx)
     }
 
+    pub(crate) fn index_to_pos(&self, index: usize) -> Result<RgaTreeSplitPos> {
+        self.rga_tree_split.index_to_pos(index)
+    }
+
+    pub(crate) fn find_indexes_from_range(
+        &self,
+        range: &RgaTreeSplitPosRange,
+    ) -> Result<(usize, usize)> {
+        self.rga_tree_split.find_indexes_from_range(range)
+    }
+
+    pub(crate) fn normalize_pos(&self, pos: &RgaTreeSplitPos) -> Result<RgaTreeSplitPos> {
+        self.rga_tree_split.normalize_pos(pos)
+    }
+
+    pub(crate) fn refine_pos(&self, pos: &RgaTreeSplitPos) -> Result<RgaTreeSplitPos> {
+        self.rga_tree_split.refine_pos(pos)
+    }
+
     pub(crate) fn edit_by_index(
         &mut self,
         from_idx: usize,
@@ -228,6 +252,17 @@ impl CrdtText {
         version_vector: Option<&VersionVector>,
     ) -> Result<(Vec<RgaTreeSplitNode<TextValue>>, DataSize, Vec<TextValue>)> {
         let range = self.index_range_to_pos_range(from_idx, to_idx)?;
+        self.edit_by_range(range, content, attributes, edited_at, version_vector)
+    }
+
+    pub(crate) fn edit_by_range(
+        &mut self,
+        range: RgaTreeSplitPosRange,
+        content: impl Into<String>,
+        attributes: Option<BTreeMap<String, String>>,
+        edited_at: TimeTicket,
+        version_vector: Option<&VersionVector>,
+    ) -> Result<(Vec<RgaTreeSplitNode<TextValue>>, DataSize, Vec<TextValue>)> {
         let content = content.into();
         let value = if content.is_empty() {
             None
@@ -255,8 +290,18 @@ impl CrdtText {
         edited_at: TimeTicket,
         version_vector: Option<&VersionVector>,
     ) -> Result<(Vec<RhtNode>, DataSize)> {
-        let mut diff = DataSize::default();
         let range = self.index_range_to_pos_range(from_idx, to_idx)?;
+        self.set_style_by_range(range, attributes, edited_at, version_vector)
+    }
+
+    pub(crate) fn set_style_by_range(
+        &mut self,
+        range: RgaTreeSplitPosRange,
+        attributes: BTreeMap<String, String>,
+        edited_at: TimeTicket,
+        version_vector: Option<&VersionVector>,
+    ) -> Result<(Vec<RhtNode>, DataSize)> {
+        let mut diff = DataSize::default();
         let (_, diff_to, to_right) = self
             .rga_tree_split
             .find_node_with_split(&range.1, &edited_at)?;
@@ -332,8 +377,18 @@ impl CrdtText {
         edited_at: TimeTicket,
         version_vector: Option<&VersionVector>,
     ) -> Result<(Vec<RhtNode>, DataSize)> {
-        let mut diff = DataSize::default();
         let range = self.index_range_to_pos_range(from_idx, to_idx)?;
+        self.remove_style_by_range(range, attributes_to_remove, edited_at, version_vector)
+    }
+
+    pub(crate) fn remove_style_by_range(
+        &mut self,
+        range: RgaTreeSplitPosRange,
+        attributes_to_remove: &[String],
+        edited_at: TimeTicket,
+        version_vector: Option<&VersionVector>,
+    ) -> Result<(Vec<RhtNode>, DataSize)> {
+        let mut diff = DataSize::default();
         let (_, diff_to, to_right) = self
             .rga_tree_split
             .find_node_with_split(&range.1, &edited_at)?;
@@ -445,20 +500,40 @@ impl CrdtText {
         self.rga_tree_split.to_test_string()
     }
 
-    pub(crate) fn gc_pair_entries(&self) -> Vec<(String, DataSize)> {
+    pub(crate) fn gc_pair_entries(&self) -> Vec<(String, DataSize, TimeTicket)> {
         let mut pairs = Vec::new();
 
         for node in self.rga_tree_split.iter() {
-            if node.removed_at().is_some() {
-                pairs.push((node.id_string(), node.data_size()));
+            if let Some(removed_at) = node.removed_at() {
+                pairs.push((node.id_string(), node.data_size(), removed_at.clone()));
             }
 
             for attr_node in node.value().gc_nodes() {
-                pairs.push((attr_node.id_string(), attr_node.data_size()));
+                if let Some(removed_at) = attr_node.removed_at() {
+                    pairs.push((
+                        attr_node.id_string(),
+                        attr_node.data_size(),
+                        removed_at.clone(),
+                    ));
+                }
             }
         }
 
         pairs
+    }
+
+    pub(crate) fn purge_gc_pair_by_id(&mut self, child_id: &str) -> bool {
+        if self.rga_tree_split.purge_by_id(child_id) {
+            return true;
+        }
+
+        for node in self.rga_tree_split.iter_mut() {
+            if node.value_mut().purge_attr_by_id(child_id) {
+                return true;
+            }
+        }
+
+        false
     }
 
     pub(crate) fn deepcopy(&self) -> Self {
@@ -563,7 +638,7 @@ mod tests {
     use super::{CrdtText, TextValue};
     use crate::crdt::rga_tree_split::RgaTreeSplitValue;
     use crate::crdt::rht::Rht;
-    use crate::TimeTicket;
+    use crate::{TimeTicket, VersionVector};
     use std::collections::BTreeMap;
 
     #[test]
@@ -615,6 +690,133 @@ mod tests {
         text.edit_by_index(6, 11, "Yorkie", None, ticket(3), None)?;
         assert_eq!(r#"[{"val":"Hello "},{"val":"Yorkie"}]"#, text.to_json());
         assert_eq!("Hello Yorkie", text.to_string());
+
+        Ok(())
+    }
+
+    #[test]
+    fn matches_js_edit_split_positions() -> crate::Result<()> {
+        let mut text = CrdtText::create(ticket(1));
+        text.edit_by_index(0, 0, "ABCD", None, ticket(2), None)?;
+        text.edit_by_index(1, 3, "12", None, ticket(3), None)?;
+
+        assert_eq!(r#"[{"val":"A"},{"val":"12"},{"val":"D"}]"#, text.to_json());
+        assert_eq!(
+            r#"[0:00:0:0 {} ""][2:a:0:0 {} "A"][3:a:0:0 {} "12"]{2:a:0:1 {} "BC"}[2:a:0:3 {} "D"]"#,
+            text.to_test_string()
+        );
+
+        let expected_positions = [
+            (0, "0:00:0:0:0"),
+            (1, "2:a:0:0:1"),
+            (2, "3:a:0:0:1"),
+            (3, "3:a:0:0:2"),
+            (4, "2:a:0:3:1"),
+        ];
+
+        for (index, expected) in expected_positions {
+            let range = text.index_range_to_pos_range(index, index)?;
+            assert_eq!(expected, range.0.to_test_string());
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn inserts_newline_between_split_blocks_with_attributes() -> crate::Result<()> {
+        let mut text = CrdtText::create(ticket(1));
+        let mut attrs = BTreeMap::new();
+        attrs.insert("b".to_owned(), "\"1\"".to_owned());
+
+        text.edit_by_index(0, 0, "ABCD", Some(attrs), ticket(2), None)?;
+        text.edit_by_index(3, 3, "\n", None, ticket(3), None)?;
+
+        assert_eq!(
+            r#"[{"attrs":{"b":"1"},"val":"ABC"},{"val":"\n"},{"attrs":{"b":"1"},"val":"D"}]"#,
+            text.to_json()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn handles_composition_replacements() -> crate::Result<()> {
+        let mut text = CrdtText::create(ticket(1));
+
+        text.edit_by_index(0, 0, "ㅎ", None, ticket(2), None)?;
+        text.edit_by_index(0, 1, "하", None, ticket(3), None)?;
+        text.edit_by_index(0, 1, "한", None, ticket(4), None)?;
+        text.edit_by_index(0, 1, "하", None, ticket(5), None)?;
+        text.edit_by_index(1, 1, "느", None, ticket(6), None)?;
+        text.edit_by_index(1, 2, "늘", None, ticket(7), None)?;
+
+        assert_eq!("하늘", text.to_string());
+        assert_eq!(r#"[{"val":"하"},{"val":"늘"}]"#, text.to_json());
+        Ok(())
+    }
+
+    #[test]
+    fn handles_nested_deletion_scenarios_from_js_tests() -> crate::Result<()> {
+        let mut text = CrdtText::create(ticket(1));
+        let commands = [
+            (0, 0, "ABC", "ABC"),
+            (3, 3, "DEF", "ABCDEF"),
+            (2, 4, "1", "AB1EF"),
+            (1, 4, "2", "A2F"),
+        ];
+
+        for (idx, (from, to, content, expected)) in commands.into_iter().enumerate() {
+            text.edit_by_index(from, to, content, None, ticket((idx + 2) as i64), None)?;
+            assert_eq!(expected, text.to_string());
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn handles_deletion_of_last_nodes_from_js_tests() -> crate::Result<()> {
+        let mut text = CrdtText::create(ticket(1));
+        let commands = [
+            (0, 0, "A", "A"),
+            (1, 1, "B", "AB"),
+            (2, 2, "C", "ABC"),
+            (3, 3, "DE", "ABCDE"),
+            (5, 5, "F", "ABCDEF"),
+            (6, 6, "GHI", "ABCDEFGHI"),
+            (9, 9, "", "ABCDEFGHI"),
+            (8, 9, "", "ABCDEFGH"),
+            (6, 8, "", "ABCDEF"),
+            (4, 6, "", "ABCD"),
+            (2, 4, "", "AB"),
+            (0, 2, "", ""),
+        ];
+
+        for (idx, (from, to, content, expected)) in commands.into_iter().enumerate() {
+            text.edit_by_index(from, to, content, None, ticket((idx + 2) as i64), None)?;
+            assert_eq!(expected, text.to_string());
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn handles_deletion_with_removed_boundary_nodes_from_js_tests() -> crate::Result<()> {
+        let mut text = CrdtText::create(ticket(1));
+        let commands = [
+            (0, 0, "1A1BCXEF1", "1A1BCXEF1"),
+            (8, 9, "", "1A1BCXEF"),
+            (2, 3, "", "1ABCXEF"),
+            (0, 1, "", "ABCXEF"),
+            (0, 1, "", "BCXEF"),
+            (0, 1, "", "CXEF"),
+            (3, 4, "", "CXE"),
+            (1, 2, "", "CE"),
+            (0, 2, "", ""),
+        ];
+
+        for (idx, (from, to, content, expected)) in commands.into_iter().enumerate() {
+            text.edit_by_index(from, to, content, None, ticket((idx + 2) as i64), None)?;
+            assert_eq!(expected, text.to_string());
+        }
 
         Ok(())
     }
@@ -681,6 +883,188 @@ mod tests {
     }
 
     #[test]
+    fn applies_remote_insert_and_delete_with_original_positions() -> crate::Result<()> {
+        let mut left = CrdtText::create(ticket_actor(1, "a"));
+        left.edit_by_index(0, 0, "AB", None, ticket_actor(2, "a"), None)?;
+        let mut right = left.deepcopy();
+
+        let delete_range = left.index_range_to_pos_range(0, 2)?;
+        let insert_range = left.index_range_to_pos_range(1, 1)?;
+        let left_delete_at = ticket_actor(3, "a");
+        let right_insert_at = ticket_actor(3, "b");
+        let seen_base = vector([("a", 2)]);
+
+        left.edit_by_range(delete_range.clone(), "", None, left_delete_at.clone(), None)?;
+        right.edit_by_range(
+            insert_range.clone(),
+            "C",
+            None,
+            right_insert_at.clone(),
+            None,
+        )?;
+
+        left.edit_by_range(insert_range, "C", None, right_insert_at, Some(&seen_base))?;
+        right.edit_by_range(delete_range, "", None, left_delete_at, Some(&seen_base))?;
+
+        assert_eq!(r#"[{"val":"C"}]"#, left.to_json());
+        assert_eq!(left.to_json(), right.to_json());
+        Ok(())
+    }
+
+    #[test]
+    fn applies_concurrent_insertions_from_peritext_example() -> crate::Result<()> {
+        let mut left = CrdtText::create(ticket_actor(1, "a"));
+        left.edit_by_index(0, 0, "The fox jumped.", None, ticket_actor(2, "a"), None)?;
+        let mut right = left.deepcopy();
+
+        let left_range = left.index_range_to_pos_range(4, 4)?;
+        let right_range = left.index_range_to_pos_range(14, 14)?;
+        let left_edit_at = ticket_actor(3, "a");
+        let right_edit_at = ticket_actor(3, "b");
+        let seen_base = vector([("a", 2)]);
+
+        left.edit_by_range(
+            left_range.clone(),
+            "quick ",
+            None,
+            left_edit_at.clone(),
+            None,
+        )?;
+        right.edit_by_range(
+            right_range.clone(),
+            " over the dog",
+            None,
+            right_edit_at.clone(),
+            None,
+        )?;
+
+        left.edit_by_range(
+            right_range,
+            " over the dog",
+            None,
+            right_edit_at,
+            Some(&seen_base),
+        )?;
+        right.edit_by_range(left_range, "quick ", None, left_edit_at, Some(&seen_base))?;
+
+        assert_eq!(
+            r#"[{"val":"The "},{"val":"quick "},{"val":"fox jumped"},{"val":" over the dog"},{"val":"."}]"#,
+            left.to_json()
+        );
+        assert_eq!(left.to_json(), right.to_json());
+        Ok(())
+    }
+
+    #[test]
+    fn keeps_concurrent_insertions_unstyled_when_format_did_not_see_them() -> crate::Result<()> {
+        let mut left = CrdtText::create(ticket_actor(1, "a"));
+        left.edit_by_index(0, 0, "The fox jumped.", None, ticket_actor(2, "a"), None)?;
+        let mut right = left.deepcopy();
+
+        let style_range = left.index_range_to_pos_range(0, 15)?;
+        let insert_range = left.index_range_to_pos_range(4, 4)?;
+        let style_at = ticket_actor(3, "a");
+        let insert_at = ticket_actor(3, "b");
+        let seen_base = vector([("a", 2)]);
+
+        let mut bold = BTreeMap::new();
+        bold.insert("bold".to_owned(), "true".to_owned());
+        left.set_style_by_range(style_range.clone(), bold, style_at.clone(), None)?;
+        right.edit_by_range(
+            insert_range.clone(),
+            "brown ",
+            None,
+            insert_at.clone(),
+            None,
+        )?;
+
+        left.edit_by_range(insert_range, "brown ", None, insert_at, Some(&seen_base))?;
+
+        let mut bold = BTreeMap::new();
+        bold.insert("bold".to_owned(), "true".to_owned());
+        right.set_style_by_range(style_range, bold, style_at, Some(&seen_base))?;
+
+        assert_eq!(
+            r#"[{"attrs":{"bold":true},"val":"The "},{"val":"brown "},{"attrs":{"bold":true},"val":"fox jumped."}]"#,
+            left.to_json()
+        );
+        assert_eq!(left.to_json(), right.to_json());
+        Ok(())
+    }
+
+    #[test]
+    fn applies_overlapping_remote_styles_with_original_positions() -> crate::Result<()> {
+        let mut left = CrdtText::create(ticket_actor(1, "a"));
+        left.edit_by_index(0, 0, "The fox jumped.", None, ticket_actor(2, "a"), None)?;
+        let mut right = left.deepcopy();
+
+        let left_range = left.index_range_to_pos_range(0, 7)?;
+        let right_range = left.index_range_to_pos_range(4, 15)?;
+        let left_style_at = ticket_actor(3, "a");
+        let right_style_at = ticket_actor(3, "b");
+        let seen_base = vector([("a", 2)]);
+
+        let mut bold = BTreeMap::new();
+        bold.insert("bold".to_owned(), "true".to_owned());
+        left.set_style_by_range(left_range.clone(), bold, left_style_at.clone(), None)?;
+
+        let mut italic = BTreeMap::new();
+        italic.insert("italic".to_owned(), "true".to_owned());
+        right.set_style_by_range(right_range.clone(), italic, right_style_at.clone(), None)?;
+
+        let mut italic = BTreeMap::new();
+        italic.insert("italic".to_owned(), "true".to_owned());
+        left.set_style_by_range(right_range, italic, right_style_at, Some(&seen_base))?;
+
+        let mut bold = BTreeMap::new();
+        bold.insert("bold".to_owned(), "true".to_owned());
+        right.set_style_by_range(left_range, bold, left_style_at, Some(&seen_base))?;
+
+        assert_eq!(
+            r#"[{"attrs":{"bold":true},"val":"The "},{"attrs":{"bold":true,"italic":true},"val":"fox"},{"attrs":{"italic":true},"val":" jumped."}]"#,
+            left.to_json()
+        );
+        assert_eq!(left.to_json(), right.to_json());
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_conflicting_overlapping_styles_by_lww() -> crate::Result<()> {
+        let mut left = CrdtText::create(ticket_actor(1, "a"));
+        left.edit_by_index(0, 0, "The fox jumped.", None, ticket_actor(2, "a"), None)?;
+        let mut right = left.deepcopy();
+
+        let left_range = left.index_range_to_pos_range(0, 7)?;
+        let right_range = left.index_range_to_pos_range(4, 15)?;
+        let left_style_at = ticket_actor(3, "a");
+        let right_style_at = ticket_actor(3, "b");
+        let seen_base = vector([("a", 2)]);
+
+        let mut red = BTreeMap::new();
+        red.insert("highlight".to_owned(), "\"red\"".to_owned());
+        left.set_style_by_range(left_range.clone(), red, left_style_at.clone(), None)?;
+
+        let mut blue = BTreeMap::new();
+        blue.insert("highlight".to_owned(), "\"blue\"".to_owned());
+        right.set_style_by_range(right_range.clone(), blue, right_style_at.clone(), None)?;
+
+        let mut blue = BTreeMap::new();
+        blue.insert("highlight".to_owned(), "\"blue\"".to_owned());
+        left.set_style_by_range(right_range, blue, right_style_at, Some(&seen_base))?;
+
+        let mut red = BTreeMap::new();
+        red.insert("highlight".to_owned(), "\"red\"".to_owned());
+        right.set_style_by_range(left_range, red, left_style_at, Some(&seen_base))?;
+
+        assert_eq!(
+            r#"[{"attrs":{"highlight":"red"},"val":"The "},{"attrs":{"highlight":"blue"},"val":"fox"},{"attrs":{"highlight":"blue"},"val":" jumped."}]"#,
+            left.to_json()
+        );
+        assert_eq!(left.to_json(), right.to_json());
+        Ok(())
+    }
+
+    #[test]
     fn removes_text_styles_and_returns_gc_nodes() -> crate::Result<()> {
         let mut text = CrdtText::create(ticket(1));
         text.edit_by_index(0, 0, "Hello", None, ticket(2), None)?;
@@ -716,5 +1100,17 @@ mod tests {
 
     fn ticket(lamport: i64) -> TimeTicket {
         TimeTicket::new(lamport, 0, "a")
+    }
+
+    fn ticket_actor(lamport: i64, actor_id: &str) -> TimeTicket {
+        TimeTicket::new(lamport, 0, actor_id)
+    }
+
+    fn vector<const N: usize>(entries: [(&str, i64); N]) -> VersionVector {
+        let mut vector = VersionVector::new();
+        for (actor_id, lamport) in entries {
+            vector.set(actor_id, lamport);
+        }
+        vector
     }
 }
