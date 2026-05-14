@@ -20,7 +20,10 @@ application, and ownership-like structure.
 - JS CRDT containers:
   `packages/sdk/src/document/crdt/object.ts`,
   `packages/sdk/src/document/crdt/array.ts`,
-  `packages/sdk/src/document/crdt/rga_tree_list.ts`
+  `packages/sdk/src/document/crdt/rga_tree_list.ts`,
+  `packages/sdk/src/document/crdt/rht.ts`,
+  `packages/sdk/src/document/crdt/text.ts`,
+  `packages/sdk/src/document/crdt/tree.ts`
 - JS operations:
   `packages/sdk/src/document/operation/*_operation.ts`
 - Go typed document and CRDT implementation:
@@ -234,6 +237,43 @@ Expected direction:
 
 - Keep adding tests from JS object and container behavior.
 - Move public object mutation toward the same context-backed model as arrays.
+
+## Attributes and RHT
+
+Current Rust behavior:
+
+- `Rht` and `RhtNode` now model string attributes with LWW updates,
+  tombstones, removed-node GC candidates, visible-size accounting,
+  deep-copy behavior, node identity, and JSON/object conversion.
+- Unit tests cover the JS RHT test flow for set/get/has, remove, remove of
+  missing keys, set after remove, repeated remove, deep copy, purge, and escaped
+  JSON output.
+
+JS/Go behavior:
+
+- JS `RHT.set` returns both the previous removed node and the new node so text
+  and tree style operations can register GC pairs and construct reverse
+  operation info.
+- JS `RHT.remove` creates tombstones even when the key did not exist, which is
+  required for concurrent style removal.
+- Go exposes the same typed CRDT concept and sorts keys during marshaling.
+
+Gap:
+
+- Rust `Rht` is not yet connected to `CRDTTextValue`/text or tree nodes.
+- Root-level GC pair registration for removed `RhtNode` values is not wired yet.
+- Rust `Rht::to_json` uses deterministic key ordering through `BTreeMap`.
+  This matches Go marshaling and text's sorted attribute output, but JS
+  `RHT.toJSON` itself follows `Map` insertion order.
+- Wire conversion for tree/text attributes is not implemented.
+
+Expected direction:
+
+- Use this `Rht` directly in the upcoming text value and tree node ports.
+- Register removed attribute nodes as root GC pairs when style/edit operations
+  are added.
+- Keep Text output aligned with JS `CRDTTextValue.toJSON`, including parsing
+  attribute values from JSON strings before serializing visible attributes.
 
 ## Change, ChangeContext, and ChangePack
 
