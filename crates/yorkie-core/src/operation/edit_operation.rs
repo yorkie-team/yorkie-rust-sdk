@@ -198,7 +198,7 @@ mod tests {
     use crate::crdt::root::CrdtRoot;
     use crate::crdt::text::CrdtText;
     use crate::operation::{OpInfo, OpSource, Operation, SetOperation};
-    use crate::TimeTicket;
+    use crate::{TimeTicket, VersionVector};
     use std::collections::BTreeMap;
 
     #[test]
@@ -276,9 +276,130 @@ mod tests {
         Ok(())
     }
 
-    fn root_with_text() -> crate::Result<CrdtRoot> {
-        let mut root = CrdtRoot::create();
+    #[test]
+    fn applies_remote_insert_and_delete_with_original_positions() -> crate::Result<()> {
+        let text_at = ticket_actor(1, "a");
+        let mut left = root_with_text_at(text_at.clone())?;
+        insert_text(&mut left, &text_at, "AB", ticket_actor(2, "a"))?;
+        let mut right = left.deepcopy();
+
+        let delete_range = left
+            .text_by_created_at(&text_at)
+            .unwrap()
+            .index_range_to_pos_range(0, 2)?;
+        let insert_range = left
+            .text_by_created_at(&text_at)
+            .unwrap()
+            .index_range_to_pos_range(1, 1)?;
+        let left_delete_at = ticket_actor(3, "a");
+        let right_insert_at = ticket_actor(3, "b");
+        let seen_base = vector([("a", 2)]);
+
+        EditOperation::create(
+            text_at.clone(),
+            delete_range.0.clone(),
+            delete_range.1.clone(),
+            "",
+            BTreeMap::new(),
+            Some(left_delete_at.clone()),
+        )
+        .execute(&mut left, OpSource::Remote, None)?;
+        EditOperation::create(
+            text_at.clone(),
+            insert_range.0.clone(),
+            insert_range.1.clone(),
+            "C",
+            BTreeMap::new(),
+            Some(right_insert_at.clone()),
+        )
+        .execute(&mut right, OpSource::Remote, None)?;
+
+        EditOperation::create(
+            text_at.clone(),
+            insert_range.0,
+            insert_range.1,
+            "C",
+            BTreeMap::new(),
+            Some(right_insert_at),
+        )
+        .execute(&mut left, OpSource::Remote, Some(&seen_base))?;
+        EditOperation::create(
+            text_at,
+            delete_range.0,
+            delete_range.1,
+            "",
+            BTreeMap::new(),
+            Some(left_delete_at),
+        )
+        .execute(&mut right, OpSource::Remote, Some(&seen_base))?;
+
+        assert_eq!(r#"{"text":[{"val":"C"}]}"#, left.to_json());
+        assert_eq!(left.to_json(), right.to_json());
+        Ok(())
+    }
+
+    #[test]
+    fn handles_composition_replacements() -> crate::Result<()> {
         let text_at = ticket(1);
+        let mut root = root_with_text_at(text_at.clone())?;
+        let commands = [
+            (0, 0, "ㅎ", r#"{"text":[{"val":"ㅎ"}]}"#),
+            (0, 1, "하", r#"{"text":[{"val":"하"}]}"#),
+            (0, 1, "한", r#"{"text":[{"val":"한"}]}"#),
+            (0, 1, "하", r#"{"text":[{"val":"하"}]}"#),
+            (1, 1, "느", r#"{"text":[{"val":"하"},{"val":"느"}]}"#),
+            (1, 2, "늘", r#"{"text":[{"val":"하"},{"val":"늘"}]}"#),
+        ];
+
+        for (idx, (from, to, content, expected)) in commands.into_iter().enumerate() {
+            let range = root
+                .text_by_created_at(&text_at)
+                .unwrap()
+                .index_range_to_pos_range(from, to)?;
+            EditOperation::create(
+                text_at.clone(),
+                range.0,
+                range.1,
+                content,
+                BTreeMap::new(),
+                Some(ticket((idx + 2) as i64)),
+            )
+            .execute(&mut root, OpSource::Remote, None)?;
+
+            assert_eq!(expected, root.to_json());
+        }
+
+        Ok(())
+    }
+
+    fn insert_text(
+        root: &mut CrdtRoot,
+        text_at: &TimeTicket,
+        content: &str,
+        edited_at: TimeTicket,
+    ) -> crate::Result<()> {
+        let range = root
+            .text_by_created_at(text_at)
+            .unwrap()
+            .index_range_to_pos_range(0, 0)?;
+        EditOperation::create(
+            text_at.clone(),
+            range.0,
+            range.1,
+            content,
+            BTreeMap::new(),
+            Some(edited_at),
+        )
+        .execute(root, OpSource::Remote, None)?;
+        Ok(())
+    }
+
+    fn root_with_text() -> crate::Result<CrdtRoot> {
+        root_with_text_at(ticket(1))
+    }
+
+    fn root_with_text_at(text_at: TimeTicket) -> crate::Result<CrdtRoot> {
+        let mut root = CrdtRoot::create();
         SetOperation::create(
             "text",
             CrdtElement::text(CrdtText::create(text_at.clone())),
@@ -291,5 +412,17 @@ mod tests {
 
     fn ticket(lamport: i64) -> TimeTicket {
         TimeTicket::new(lamport, 0, "a")
+    }
+
+    fn ticket_actor(lamport: i64, actor_id: &str) -> TimeTicket {
+        TimeTicket::new(lamport, 0, actor_id)
+    }
+
+    fn vector(entries: impl IntoIterator<Item = (&'static str, i64)>) -> VersionVector {
+        let mut vector = VersionVector::new();
+        for (actor_id, lamport) in entries {
+            vector.set(actor_id, lamport);
+        }
+        vector
     }
 }

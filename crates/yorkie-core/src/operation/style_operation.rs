@@ -256,7 +256,7 @@ mod tests {
     use crate::crdt::root::CrdtRoot;
     use crate::crdt::text::CrdtText;
     use crate::operation::{EditOperation, OpInfo, OpSource, Operation, SetOperation};
-    use crate::TimeTicket;
+    use crate::{TimeTicket, VersionVector};
     use std::collections::BTreeMap;
 
     #[test]
@@ -337,6 +337,127 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn keeps_concurrent_insertions_unstyled_when_format_did_not_see_them() -> crate::Result<()> {
+        let text_at = ticket_actor(1, "a");
+        let mut left = root_with_text_at(text_at.clone())?;
+        insert_text(&mut left, &text_at, "The fox jumped.", ticket_actor(2, "a"))?;
+        let mut right = left.deepcopy();
+
+        let style_range = left
+            .text_by_created_at(&text_at)
+            .unwrap()
+            .index_range_to_pos_range(0, 15)?;
+        let insert_range = left
+            .text_by_created_at(&text_at)
+            .unwrap()
+            .index_range_to_pos_range(4, 4)?;
+        let style_at = ticket_actor(3, "a");
+        let insert_at = ticket_actor(3, "b");
+        let seen_base = vector([("a", 2)]);
+        let bold = BTreeMap::from([("bold".to_owned(), "true".to_owned())]);
+
+        StyleOperation::create(
+            text_at.clone(),
+            style_range.0.clone(),
+            style_range.1.clone(),
+            bold.clone(),
+            Some(style_at.clone()),
+        )
+        .execute(&mut left, OpSource::Remote, None)?;
+        EditOperation::create(
+            text_at.clone(),
+            insert_range.0.clone(),
+            insert_range.1.clone(),
+            "brown ",
+            BTreeMap::new(),
+            Some(insert_at.clone()),
+        )
+        .execute(&mut right, OpSource::Remote, None)?;
+
+        EditOperation::create(
+            text_at.clone(),
+            insert_range.0,
+            insert_range.1,
+            "brown ",
+            BTreeMap::new(),
+            Some(insert_at),
+        )
+        .execute(&mut left, OpSource::Remote, Some(&seen_base))?;
+        StyleOperation::create(text_at, style_range.0, style_range.1, bold, Some(style_at))
+            .execute(&mut right, OpSource::Remote, Some(&seen_base))?;
+
+        assert_eq!(
+            r#"{"text":[{"attrs":{"bold":true},"val":"The "},{"val":"brown "},{"attrs":{"bold":true},"val":"fox jumped."}]}"#,
+            left.to_json()
+        );
+        assert_eq!(left.to_json(), right.to_json());
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_conflicting_overlapping_styles_by_lww() -> crate::Result<()> {
+        let text_at = ticket_actor(1, "a");
+        let mut left = root_with_text_at(text_at.clone())?;
+        insert_text(&mut left, &text_at, "The fox jumped.", ticket_actor(2, "a"))?;
+        let mut right = left.deepcopy();
+
+        let left_range = left
+            .text_by_created_at(&text_at)
+            .unwrap()
+            .index_range_to_pos_range(0, 7)?;
+        let right_range = left
+            .text_by_created_at(&text_at)
+            .unwrap()
+            .index_range_to_pos_range(4, 15)?;
+        let left_style_at = ticket_actor(3, "a");
+        let right_style_at = ticket_actor(3, "b");
+        let seen_base = vector([("a", 2)]);
+        let red = BTreeMap::from([("highlight".to_owned(), "\"red\"".to_owned())]);
+        let blue = BTreeMap::from([("highlight".to_owned(), "\"blue\"".to_owned())]);
+
+        StyleOperation::create(
+            text_at.clone(),
+            left_range.0.clone(),
+            left_range.1.clone(),
+            red.clone(),
+            Some(left_style_at.clone()),
+        )
+        .execute(&mut left, OpSource::Remote, None)?;
+        StyleOperation::create(
+            text_at.clone(),
+            right_range.0.clone(),
+            right_range.1.clone(),
+            blue.clone(),
+            Some(right_style_at.clone()),
+        )
+        .execute(&mut right, OpSource::Remote, None)?;
+
+        StyleOperation::create(
+            text_at.clone(),
+            right_range.0,
+            right_range.1,
+            blue,
+            Some(right_style_at),
+        )
+        .execute(&mut left, OpSource::Remote, Some(&seen_base))?;
+        StyleOperation::create(
+            text_at,
+            left_range.0,
+            left_range.1,
+            red,
+            Some(left_style_at),
+        )
+        .execute(&mut right, OpSource::Remote, Some(&seen_base))?;
+
+        assert_eq!(
+            r#"{"text":[{"attrs":{"highlight":"red"},"val":"The "},{"attrs":{"highlight":"blue"},"val":"fox"},{"attrs":{"highlight":"blue"},"val":" jumped."}]}"#,
+            left.to_json()
+        );
+        assert_eq!(left.to_json(), right.to_json());
+        Ok(())
+    }
+
     fn insert_text(
         root: &mut CrdtRoot,
         text_at: &TimeTicket,
@@ -360,8 +481,11 @@ mod tests {
     }
 
     fn root_with_text() -> crate::Result<CrdtRoot> {
+        root_with_text_at(ticket(1))
+    }
+
+    fn root_with_text_at(text_at: TimeTicket) -> crate::Result<CrdtRoot> {
         let mut root = CrdtRoot::create();
-        let text_at = ticket(1);
         SetOperation::create(
             "text",
             CrdtElement::text(CrdtText::create(text_at.clone())),
@@ -374,5 +498,17 @@ mod tests {
 
     fn ticket(lamport: i64) -> TimeTicket {
         TimeTicket::new(lamport, 0, "a")
+    }
+
+    fn ticket_actor(lamport: i64, actor_id: &str) -> TimeTicket {
+        TimeTicket::new(lamport, 0, actor_id)
+    }
+
+    fn vector(entries: impl IntoIterator<Item = (&'static str, i64)>) -> VersionVector {
+        let mut vector = VersionVector::new();
+        for (actor_id, lamport) in entries {
+            vector.set(actor_id, lamport);
+        }
+        vector
     }
 }
