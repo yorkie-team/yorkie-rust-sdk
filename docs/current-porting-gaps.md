@@ -147,6 +147,11 @@ Current Rust behavior:
 - The backing structure is a `Vec` with linear scans.
 - Dead position nodes from array moves are registered in the root GC pair map
   and included in garbage length/stat counters.
+- Root garbage collection can now physically purge dead RGA position nodes once
+  the supplied version vector covers their removal time.
+- RGA-level tests cover same-element move convergence, insert/set/remove versus
+  move convergence, late losing moves that still create a position, and inserts
+  after those dead positions.
 
 JS/Go behavior:
 
@@ -161,10 +166,8 @@ Gap:
 - Rust does not yet keep explicit maps for position IDs and element IDs. Linear
   lookup preserves simple behavior, but duplicate replay/idempotency cases are
   not fully covered.
-- Root tracks dead RGA position GC pairs, but physical garbage collection and
-  purge of those internal nodes is not implemented yet.
-- Concurrent move/insert/set combinations need more parity tests, especially
-  inserts after dead positions and late moves that still create dead positions.
+- Operation-level and public API array tests still need broader parity coverage
+  for concurrent move/insert/set/remove combinations.
 - Snapshot restoration behavior for moved elements and dead positions is not
   implemented, so `addDeadPosition`/`addMovedElement` parity is only modeled
   internally.
@@ -173,7 +176,6 @@ Expected direction:
 
 - Add focused tests from JS/Go array and RGA behavior before optimizing the
   data structure.
-- Implement physical garbage collection for dead RGA position nodes.
 - Add explicit position and element indexes when replay/idempotency tests need
   them, or when performance becomes a real concern.
 
@@ -196,7 +198,8 @@ JS/Go behavior:
 Gap:
 
 - Rust array operations are not yet created by public `JsonArray` methods.
-- Rust operation execution does not yet receive or use version vectors.
+- `Change` passes a version vector to operation execution, but array operations
+  do not yet use version-vector visibility rules.
 - Rust operation structs do not yet convert to/from protobuf or wire-level
   operation payloads.
 - Rust `OpInfo` currently uses a separate `ArrayRemove` enum variant for

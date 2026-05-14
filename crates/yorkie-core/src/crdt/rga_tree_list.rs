@@ -277,6 +277,17 @@ impl RgaTreeList {
         Ok(())
     }
 
+    pub(crate) fn purge_by_id(&mut self, child_id: &str) -> bool {
+        let Some(index) = self.nodes.iter().position(|node| {
+            node.element.is_none() && node.removed_at.is_some() && node.id_string() == child_id
+        }) else {
+            return false;
+        };
+
+        self.nodes.remove(index);
+        true
+    }
+
     pub(crate) fn delete(
         &mut self,
         created_at: &TimeTicket,
@@ -579,6 +590,158 @@ mod tests {
         assert_eq!(t4, list.pos_created_at(&t1)?);
         assert!(list.get_by_id(&t3).is_some());
         Ok(())
+    }
+
+    #[test]
+    fn purges_dead_position_nodes_by_id() -> crate::Result<()> {
+        let mut list = RgaTreeList::new();
+        let t1 = ticket(1, "a");
+        let t2 = ticket(2, "a");
+        let t3 = ticket(3, "a");
+
+        list.add(primitive("one", t1.clone()))?;
+        list.add(primitive("two", t2.clone()))?;
+        let dead_node = list.move_after(&t2, &t1, t3)?.unwrap();
+        let child_id = dead_node.id_string();
+
+        assert!(list.get_by_id(&t1).unwrap().element().is_some());
+        assert!(list.purge_by_id(&child_id));
+        assert!(!list.purge_by_id(&child_id));
+        assert_eq!(r#"["two","one"]"#, list.to_json());
+        assert_eq!(Some("1".to_owned()), list.sub_path_of(&t1));
+        Ok(())
+    }
+
+    #[test]
+    fn losing_move_keeps_position_for_following_insert() -> crate::Result<()> {
+        let mut list = RgaTreeList::new();
+        let t_a = ticket(1, "a");
+        let t_b = ticket(2, "a");
+        let t_x = ticket(3, "a");
+        let losing_move_at = ticket(4, "a");
+        let winning_move_at = ticket(5, "a");
+        let y_at = ticket(6, "a");
+
+        list.add(primitive("A", t_a.clone()))?;
+        list.add(primitive("B", t_b.clone()))?;
+        list.add(primitive("X", t_x.clone()))?;
+
+        list.move_after(&t_b, &t_x, winning_move_at)?;
+        list.move_after(&t_a, &t_x, losing_move_at.clone())?;
+        list.insert_after(&losing_move_at, primitive("Y", y_at), None)?;
+
+        assert_eq!(r#"["A","Y","B","X"]"#, list.to_json());
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_moves_of_same_element_converge() -> crate::Result<()> {
+        let t_a = ticket(1, "a");
+        let t_b = ticket(2, "a");
+        let t_c = ticket(3, "a");
+        let move_after_b = ticket(4, "a");
+        let move_after_c = ticket(5, "a");
+
+        let mut first = list_with(&[("A", t_a.clone()), ("B", t_b.clone()), ("C", t_c.clone())])?;
+        first.move_after(&t_b, &t_a, move_after_b.clone())?;
+        first.move_after(&t_c, &t_a, move_after_c.clone())?;
+
+        let mut second = list_with(&[("A", t_a.clone()), ("B", t_b.clone()), ("C", t_c.clone())])?;
+        second.move_after(&t_c, &t_a, move_after_c)?;
+        second.move_after(&t_b, &t_a, move_after_b)?;
+
+        assert_eq!(first.to_json(), second.to_json());
+        assert_eq!(r#"["B","C","A"]"#, first.to_json());
+        Ok(())
+    }
+
+    #[test]
+    fn insert_after_moved_element_uses_original_position_identity() -> crate::Result<()> {
+        let t1 = ticket(1, "a");
+        let t2 = ticket(2, "a");
+        let t3 = ticket(3, "a");
+        let t4 = ticket(4, "a");
+        let insert_at = ticket(5, "a");
+        let move_at = ticket(6, "a");
+        let new_at = ticket(7, "a");
+
+        let mut first = list_with(&[
+            ("1", t1.clone()),
+            ("2", t2.clone()),
+            ("3", t3.clone()),
+            ("4", t4.clone()),
+        ])?;
+        first.insert_after(&t2, primitive("5", new_at.clone()), Some(insert_at.clone()))?;
+        first.move_after(&t4, &t2, move_at.clone())?;
+
+        let mut second = list_with(&[("1", t1), ("2", t2.clone()), ("3", t3), ("4", t4.clone())])?;
+        second.move_after(&t4, &t2, move_at)?;
+        second.insert_after(&t2, primitive("5", new_at), Some(insert_at))?;
+
+        assert_eq!(first.to_json(), second.to_json());
+        Ok(())
+    }
+
+    #[test]
+    fn set_and_move_of_same_element_converge() -> crate::Result<()> {
+        let t1 = ticket(1, "a");
+        let t2 = ticket(2, "a");
+        let t3 = ticket(3, "a");
+        let t4 = ticket(4, "a");
+        let set_at = ticket(5, "a");
+        let move_at = ticket(6, "a");
+
+        let mut first = list_with(&[
+            ("1", t1.clone()),
+            ("2", t2.clone()),
+            ("3", t3.clone()),
+            ("4", t4.clone()),
+        ])?;
+        first.set(&t2, primitive("5", set_at.clone()), set_at.clone())?;
+        first.move_after(&t4, &t2, move_at.clone())?;
+
+        let mut second = list_with(&[("1", t1), ("2", t2.clone()), ("3", t3), ("4", t4.clone())])?;
+        second.move_after(&t4, &t2, move_at)?;
+        second.set(&t2, primitive("5", set_at.clone()), set_at)?;
+
+        assert_eq!(first.to_json(), second.to_json());
+        assert_eq!(r#"["1","5","3","4"]"#, first.to_json());
+        Ok(())
+    }
+
+    #[test]
+    fn remove_and_move_of_same_element_converge() -> crate::Result<()> {
+        let t1 = ticket(1, "a");
+        let t2 = ticket(2, "a");
+        let t3 = ticket(3, "a");
+        let t4 = ticket(4, "a");
+        let remove_at = ticket(5, "a");
+        let move_at = ticket(6, "a");
+
+        let mut first = list_with(&[
+            ("1", t1.clone()),
+            ("2", t2.clone()),
+            ("3", t3.clone()),
+            ("4", t4.clone()),
+        ])?;
+        first.delete(&t2, remove_at.clone())?;
+        first.move_after(&t4, &t2, move_at.clone())?;
+
+        let mut second = list_with(&[("1", t1), ("2", t2.clone()), ("3", t3), ("4", t4.clone())])?;
+        second.move_after(&t4, &t2, move_at)?;
+        second.delete(&t2, remove_at)?;
+
+        assert_eq!(first.to_json(), second.to_json());
+        assert_eq!(r#"["1","3","4"]"#, first.to_json());
+        Ok(())
+    }
+
+    fn list_with(values: &[(&str, TimeTicket)]) -> crate::Result<RgaTreeList> {
+        let mut list = RgaTreeList::new();
+        for (value, created_at) in values {
+            list.add(primitive(value, created_at.clone()))?;
+        }
+        Ok(list)
     }
 
     fn primitive(value: &str, created_at: TimeTicket) -> CrdtElement {

@@ -357,7 +357,11 @@ impl CrdtArray {
         None
     }
 
-    pub(crate) fn purge_text_gc_pair_by_id(&mut self, child_id: &str) -> bool {
+    pub(crate) fn purge_gc_pair_by_id(&mut self, child_id: &str) -> bool {
+        if self.elements.purge_by_id(child_id) {
+            return true;
+        }
+
         for node in self.elements.iter_all_mut() {
             let Some(child) = node.element_mut() else {
                 continue;
@@ -370,12 +374,12 @@ impl CrdtArray {
                     }
                 }
                 CrdtElement::Object(object) => {
-                    if object.purge_text_gc_pair_by_id(child_id) {
+                    if object.purge_gc_pair_by_id(child_id) {
                         return true;
                     }
                 }
                 CrdtElement::Array(array) => {
-                    if array.purge_text_gc_pair_by_id(child_id) {
+                    if array.purge_gc_pair_by_id(child_id) {
                         return true;
                     }
                 }

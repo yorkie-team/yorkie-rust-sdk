@@ -776,7 +776,7 @@ impl CrdtRoot {
     }
 
     fn purge_gc_pair_by_child_id(&mut self, child_id: &str) -> bool {
-        self.root_object.purge_text_gc_pair_by_id(child_id)
+        self.root_object.purge_gc_pair_by_id(child_id)
     }
 }
 
@@ -981,6 +981,18 @@ mod tests {
         assert_eq!(1, copy.stats().gc_pairs);
         assert_eq!(1, copy.get_garbage_len());
         assert_eq!("$.items.1", copy.create_path(&one_at)?);
+
+        let mut vector = VersionVector::new();
+        vector.set("a", 3);
+        assert_eq!(0, root.garbage_collect(&vector)?);
+        assert_eq!(1, root.get_garbage_len());
+
+        vector.set("a", 4);
+        assert_eq!(1, root.garbage_collect(&vector)?);
+        assert_eq!(0, root.get_garbage_len());
+        assert_eq!(0, root.stats().gc_pairs);
+        assert_eq!(r#"{"items":["two","one"]}"#, root.to_json());
+        assert_eq!("$.items.1", root.create_path(&one_at)?);
         Ok(())
     }
 
