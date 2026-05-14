@@ -107,7 +107,7 @@ it has:
 | `CrdtText` | `packages/sdk/src/document/crdt/text.ts` | Internal CRDT text element backed by `RgaTreeSplit<TextValue>` and indexed by `CrdtRoot` as a CRDT element. |
 | `TreeNodeId` | `packages/sdk/src/document/crdt/tree.ts` | Internal tree node identifier ordered by creation ticket and UTF-16 offset. |
 | `TreeNode` | `packages/sdk/src/document/crdt/tree.ts` | Internal tree node for element/text content, attributes, tombstones, split links, and merge metadata. |
-| `CrdtTree` | `packages/sdk/src/document/crdt/tree.ts` | Internal CRDT tree element with node lookup, serialization, data-size accounting, deep copy, GC-pair discovery, initial style/remove-style behavior, and split-free element insert/delete edit behavior. |
+| `CrdtTree` | `packages/sdk/src/document/crdt/tree.ts` | Internal CRDT tree element with node lookup, serialization, data-size accounting, deep copy, GC-pair discovery, initial style/remove-style behavior, split-free element insert/delete edit behavior, and text-node split insert/delete edit behavior. |
 | `RgaTreeList` | `packages/sdk/src/document/crdt/rga_tree_list.ts` | Internal replicated growable array list. Rust currently keeps the same node semantics with a linear backing structure. |
 | `CrdtArray` | `packages/sdk/src/document/crdt/array.ts` | Internal CRDT container for array elements stored in `RgaTreeList`. |
 | `CrdtRoot` | `packages/sdk/src/document/crdt/root.ts` | Internal root that indexes CRDT elements by creation time and creates element paths. |
@@ -118,7 +118,7 @@ it has:
 | `ArraySetOperation` | `packages/sdk/src/document/operation/array_set_operation.ts` | Operation that replaces an array element by inserting a new element and tombstoning the previous one. |
 | `EditOperation` | `packages/sdk/src/document/operation/edit_operation.ts` | Operation that edits a text range, registers removed text-node GC pairs, and creates a reverse edit. |
 | `StyleOperation` | `packages/sdk/src/document/operation/style_operation.ts` | Operation that applies or removes text attributes, registers removed attribute GC pairs, and creates a reverse style operation. |
-| `TreeEditOperation` | `packages/sdk/src/document/operation/tree_edit_operation.ts` | Operation that edits tree content. Rust currently covers split-free element insert/delete, operation info, reverse operations, and tree-node GC registration. |
+| `TreeEditOperation` | `packages/sdk/src/document/operation/tree_edit_operation.ts` | Operation that edits tree content. Rust currently covers split-free element insert/delete, text-node split insert/delete, operation info, reverse operations, and tree-node GC registration. |
 | `TreeStyleOperation` | `packages/sdk/src/document/operation/tree_style_operation.ts` | Operation that applies or removes tree element attributes, registers removed attribute GC pairs, and creates a reverse tree style operation. |
 | `JsonObject` | `packages/sdk/src/document/json/object.ts` | Public JSON-like object API must map to JS object behavior. |
 | `JsonObject::set` | `ObjectProxy.setInternal()` | Reject object keys containing `.` and store the new member value. |

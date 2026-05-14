@@ -321,6 +321,62 @@ impl TreeNode {
         Ok(())
     }
 
+    pub(crate) fn split_text_child_at(
+        &mut self,
+        child_index: usize,
+        absolute_offset: usize,
+    ) -> Result<DataSize> {
+        let Some(child) = self.children.get(child_index) else {
+            return Err(YorkieError::InvalidTreePosition(
+                "split child not found".to_owned(),
+            ));
+        };
+        if !child.is_text() {
+            return Ok(DataSize::default());
+        }
+
+        let child_start = child.id().offset();
+        let child_end = child_start + child.len();
+        if absolute_offset <= child_start || absolute_offset >= child_end {
+            return Ok(DataSize::default());
+        }
+
+        let relative_offset = absolute_offset - child_start;
+        let prev_size = child.data_size();
+        let right_id = child.id().split(relative_offset);
+        let right_removed_at = child.removed_at().cloned();
+        let right_ins_next_id = child.ins_next_id().cloned();
+        let right_merged_from = child.merged_from().cloned();
+        let right_merged_at = child.merged_at().cloned();
+        let (left_value, right_value) = split_utf16(child.value(), relative_offset);
+        if right_value.is_empty() {
+            return Ok(DataSize::default());
+        }
+
+        let child = self
+            .children
+            .get_mut(child_index)
+            .expect("child existence checked above");
+        child.value = left_value;
+        child.ins_next_id = Some(right_id.clone());
+
+        let mut right = TreeNode::create_text(right_id, right_value);
+        right.removed_at = right_removed_at;
+        right.ins_prev_id = Some(child.id().clone());
+        right.ins_next_id = right_ins_next_id;
+        right.merged_from = right_merged_from;
+        right.merged_at = right_merged_at;
+
+        let left_size = child.data_size();
+        let right_size = right.data_size();
+        self.children.insert(child_index + 1, right);
+
+        Ok(DataSize {
+            data: left_size.data + right_size.data - prev_size.data,
+            meta: left_size.meta + right_size.meta - prev_size.meta,
+        })
+    }
+
     pub(crate) fn remove(&mut self, removed_at: TimeTicket) -> bool {
         if self.removed_at.is_none() {
             self.removed_at = Some(removed_at);
@@ -867,6 +923,9 @@ impl CrdtTree {
         let from_path = self.index_to_path(from_idx)?;
         let to_path = self.index_to_path(to_idx)?;
         let mut diff = DataSize::default();
+        add_data_size(&mut diff, self.split_text_at_position(&range.0)?);
+        add_data_size(&mut diff, self.split_text_at_position(&range.1)?);
+        self.rebuild_node_map();
         let mut gc_pairs = Vec::new();
         let mut removed_nodes = Vec::new();
 
@@ -1033,6 +1092,26 @@ impl CrdtTree {
         remove_descendant_paths(targets)
     }
 
+    fn split_text_at_position(&mut self, pos: &TreePos) -> Result<DataSize> {
+        let parent_path = self
+            .path_by_node_id(pos.parent_id())
+            .ok_or_else(|| YorkieError::InvalidTreePosition("parent not found".to_owned()))?;
+        let parent = node_at_visible_path_mut(&mut self.root, &parent_path)?;
+        let split_offset = pos.left_sibling_id().offset();
+
+        let Some(child_index) = parent.children.iter().position(|child| {
+            !child.is_removed()
+                && child.is_text()
+                && pos.left_sibling_id().has_same_created_at(child.id())
+                && child.id().offset() < split_offset
+                && split_offset < child.id().offset() + child.len()
+        }) else {
+            return Ok(DataSize::default());
+        };
+
+        parent.split_text_child_at(child_index, split_offset)
+    }
+
     fn position_to_parent_offset(&self, pos: &TreePos) -> Result<(Vec<usize>, usize)> {
         let parent_path = self
             .path_by_node_id(pos.parent_id())
@@ -1047,10 +1126,16 @@ impl CrdtTree {
 
         for (offset, child) in parent.children().enumerate() {
             if pos.left_sibling_id().has_same_created_at(child.id()) {
-                if child.is_text() && pos.left_sibling_id().offset() != child.len() {
-                    return Err(YorkieError::InvalidTreePosition(
-                        "text split edit is not implemented yet".to_owned(),
-                    ));
+                if child.is_text() {
+                    let child_start = child.id().offset();
+                    let child_end = child_start + child.len();
+                    if pos.left_sibling_id().offset() == child_start {
+                        return Ok((parent_path, offset));
+                    }
+                    if pos.left_sibling_id().offset() == child_end {
+                        return Ok((parent_path, offset + 1));
+                    }
+                    continue;
                 }
                 return Ok((parent_path, offset + 1));
             }
@@ -1449,7 +1534,16 @@ fn collect_edit_delete_targets(
     targets: &mut Vec<Vec<usize>>,
 ) -> usize {
     if node.is_text() {
-        return start_index + node.len();
+        let end_index = start_index + node.len();
+        let key = node.id_string();
+        if from_idx <= start_index
+            && end_index <= to_idx
+            && node_can_delete(node, edited_at, version_vector)
+            && seen.insert(key)
+        {
+            targets.push(path);
+        }
+        return end_index;
     }
 
     let mut cursor = start_index;
@@ -1494,10 +1588,6 @@ fn node_can_delete(
     edited_at: &TimeTicket,
     version_vector: Option<&crate::VersionVector>,
 ) -> bool {
-    if node.is_text() {
-        return false;
-    }
-
     if !ticket_known(version_vector, node.id().created_at()) {
         return false;
     }
@@ -1604,6 +1694,15 @@ fn rebuild_merge_state_in_node(node: &mut TreeNode, pairs: &[(TreeNodeId, TreeNo
 
 fn utf16_len(value: &str) -> usize {
     value.encode_utf16().count()
+}
+
+fn split_utf16(value: &str, offset: usize) -> (String, String) {
+    let units = value.encode_utf16().collect::<Vec<_>>();
+    let offset = offset.min(units.len());
+    (
+        String::from_utf16_lossy(&units[..offset]),
+        String::from_utf16_lossy(&units[offset..]),
+    )
 }
 
 fn escape_xml_text(value: &str) -> String {
@@ -2016,6 +2115,60 @@ mod tests {
         assert_eq!(2, result.gc_pairs.len());
         assert_eq!(None, result.changes[0].value);
         Ok(())
+    }
+
+    #[test]
+    fn edits_tree_by_inserting_inside_text_nodes() -> crate::Result<()> {
+        let mut tree = text_tree("hello");
+        let pos = tree.find_pos(3, true)?;
+
+        let result = tree.edit_by_range_with_changes(
+            (pos.clone(), pos),
+            Some(vec![TreeNode::create_text(node_id(4, 0), "X")]),
+            0,
+            ticket(10, "a"),
+            None,
+        )?;
+
+        assert_eq!(r#"<root><p>heXllo</p></root>"#, tree.to_xml());
+        assert_eq!(3, result.from_idx);
+        assert_eq!(3, result.to_idx);
+        assert_eq!(1, result.inserted_size);
+        assert_eq!(5, tree.node_map_len());
+        Ok(())
+    }
+
+    #[test]
+    fn edits_tree_by_deleting_inside_text_nodes() -> crate::Result<()> {
+        let mut tree = text_tree("hello");
+        let range = (tree.find_pos(2, true)?, tree.find_pos(5, true)?);
+
+        let result = tree.edit_by_range_with_changes(range, None, 0, ticket(10, "a"), None)?;
+
+        assert_eq!(r#"<root><p>ho</p></root>"#, tree.to_xml());
+        assert_eq!(2, result.from_idx);
+        assert_eq!(5, result.to_idx);
+        assert_eq!(1, result.removed_nodes.len());
+        assert_eq!(1, result.gc_pairs.len());
+        assert_eq!(5, tree.node_map_len());
+        Ok(())
+    }
+
+    fn text_tree(value: &str) -> CrdtTree {
+        CrdtTree::create(
+            TreeNode::create_element(
+                node_id(1, 0),
+                "root",
+                None,
+                vec![TreeNode::create_element(
+                    node_id(2, 0),
+                    "p",
+                    None,
+                    vec![TreeNode::create_text(node_id(3, 0), value)],
+                )],
+            ),
+            ticket(1, "a"),
+        )
     }
 
     fn node_id(lamport: i64, offset: usize) -> TreeNodeId {

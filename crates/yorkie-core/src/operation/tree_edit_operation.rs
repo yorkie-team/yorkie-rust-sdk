@@ -291,6 +291,101 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn inserts_tree_content_inside_text() -> crate::Result<()> {
+        let tree_at = ticket(1, "a");
+        let mut root = seeded_root(tree_at.clone(), vec![paragraph_node()]);
+        let pos = root
+            .tree_by_created_at(&tree_at)
+            .unwrap()
+            .find_pos(3, true)?;
+
+        let result = TreeEditOperation::create(
+            tree_at.clone(),
+            pos.clone(),
+            pos,
+            Some(vec![TreeNode::create_text(
+                TreeNodeId::new(ticket(4, "a"), 0),
+                "X",
+            )]),
+            0,
+            Some(ticket(10, "a")),
+        )
+        .execute(&mut root, OpSource::Remote, None)?
+        .unwrap();
+
+        assert_eq!(
+            r#"<root><p>heXllo</p></root>"#,
+            root.tree_by_created_at(&tree_at).unwrap().to_xml()
+        );
+        assert!(matches!(result.reverse_op, Some(Operation::TreeEdit(_))));
+        assert_eq!(1, result.op_infos.len());
+        match &result.op_infos[0] {
+            OpInfo::TreeEdit {
+                path,
+                from,
+                to,
+                value,
+                ..
+            } => {
+                assert_eq!("$.body", path);
+                assert_eq!(3, *from);
+                assert_eq!(3, *to);
+                assert_eq!(
+                    Some(vec![r#"{"type":"text","value":"X"}"#.to_owned()]),
+                    *value
+                );
+            }
+            other => panic!("unexpected op info: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn removes_tree_text_range_with_splits() -> crate::Result<()> {
+        let tree_at = ticket(1, "a");
+        let mut root = seeded_root(tree_at.clone(), vec![paragraph_node()]);
+        let range = {
+            let tree = root.tree_by_created_at(&tree_at).unwrap();
+            (tree.find_pos(2, true)?, tree.find_pos(5, true)?)
+        };
+
+        let result = TreeEditOperation::create(
+            tree_at.clone(),
+            range.0,
+            range.1,
+            None,
+            0,
+            Some(ticket(10, "a")),
+        )
+        .execute(&mut root, OpSource::Remote, None)?
+        .unwrap();
+
+        assert_eq!(
+            r#"<root><p>ho</p></root>"#,
+            root.tree_by_created_at(&tree_at).unwrap().to_xml()
+        );
+        assert_eq!(1, root.get_garbage_len());
+        assert!(matches!(result.reverse_op, Some(Operation::TreeEdit(_))));
+        assert_eq!(1, result.op_infos.len());
+        match &result.op_infos[0] {
+            OpInfo::TreeEdit {
+                path,
+                from,
+                to,
+                value,
+                ..
+            } => {
+                assert_eq!("$.body", path);
+                assert_eq!(2, *from);
+                assert_eq!(5, *to);
+                assert!(value.is_none());
+            }
+            other => panic!("unexpected op info: {other:?}"),
+        }
+        Ok(())
+    }
+
     fn seeded_root(tree_at: TimeTicket, children: Vec<TreeNode>) -> CrdtRoot {
         let tree = CrdtTree::create(
             TreeNode::create_element(TreeNodeId::new(tree_at.clone(), 0), "root", None, children),

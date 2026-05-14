@@ -1,6 +1,6 @@
 # Root and Garbage Collection Parity
 
-Last reviewed: 2026-05-14
+Last reviewed: 2026-05-15
 
 ## References
 
@@ -31,7 +31,7 @@ deep copy/rebuild.
 | Removed element GC | covered | Root tracks removed elements and deregisters them on GC. |
 | Array dead position GC | covered | Dead RGA position nodes are registered, copied, and purged. |
 | Text node/attribute GC | covered | Root rebuilds and purges text internal GC pairs. |
-| Tree node/attribute GC | partial | Root rebuilds and purges removed tree nodes and removed tree attributes from an existing root object. Operation-time registration waits for tree edit/style operations. |
+| Tree node/attribute GC | partial | Root rebuilds and purges removed tree nodes and removed tree attributes from an existing root object. Tree style operations register removed attribute GC pairs, and tree edit operations register removed tree-node GC pairs for split-free element deletion and text-node split deletion. |
 | Document size accounting | partial | Current tests cover narrow slices, including array move/remove size consistency after root rebuild. Broad JS/Go size tests remain. |
 | Deep copy index rebuild | partial | Covered for current variants, including array moved/dead position lookup, counter root refresh, text GC pairs, and tree internal GC pairs. |
 | Sync lifecycle GC | blocked | Requires client/sync lifecycle and server version vectors. |
@@ -40,6 +40,6 @@ deep copy/rebuild.
 ## Next Checks
 
 - Add doc size tests for array dead position GC and mixed element/internal GC.
-- Add root-level operation tests once tree edit/style operations can register
-  internal GC pairs during execution.
+- Extend root-level operation tests from current tree edit/style GC
+  registration toward element split/merge GC cases.
 - Defer sync lifecycle GC tests until client and protocol layers exist.

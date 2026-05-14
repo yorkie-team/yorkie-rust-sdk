@@ -1,6 +1,6 @@
 # Current Porting Gaps
 
-Last reviewed: 2026-05-14
+Last reviewed: 2026-05-15
 
 This document records known differences between the current Rust SDK and the
 JS/Go implementations. It is intentionally practical: each section explains
@@ -438,9 +438,9 @@ Current Rust behavior:
 - `CrdtTree` can apply simple style/remove-style ranges to visible element
   tokens, ignore text-only ranges, collect tree style operation info, and
   report reverse-operation inputs.
-- `CrdtTree` can apply split-free element insert/delete edits, collect tree
-  edit operation info, register removed node GC pairs, and report reverse
-  operation inputs.
+- `CrdtTree` can apply split-free element insert/delete edits and text-node
+  split insert/delete edits, collect tree edit operation info, register removed
+  node GC pairs, and report reverse operation inputs.
 - `CrdtElement::Tree` participates in metadata dispatch, JSON conversion,
   data-size accounting, removal, and deep copy.
 - `CrdtRoot` can find tree elements by creation time, rebuild tree internal GC
@@ -450,9 +450,10 @@ Current Rust behavior:
 - `TreeStyleOperation` executes tree style/remove-style operations, registers
   removed attribute GC pairs, accumulates root size diff, and creates reverse
   tree style operations.
-- `TreeEditOperation` executes split-free element insert/delete operations,
-  registers removed tree-node GC pairs, accumulates root size diff for inserted
-  nodes, and creates reverse tree edit operations.
+- `TreeEditOperation` executes split-free element insert/delete operations and
+  text-node split insert/delete operations, registers removed tree-node GC
+  pairs, accumulates root size diff for inserted nodes and text splits, and
+  creates reverse tree edit operations.
 
 JS/Go behavior:
 
@@ -474,13 +475,19 @@ Gap:
   style boundaries, advance unknown split siblings, or propagate style/remove
   style across unknown split siblings the way JS/Go do for concurrent Tree
   split cases.
-- Rust Tree edit operation is only partial. It does not split text nodes,
-  split element nodes, merge element boundaries, maintain `insPrevID`/
-  `insNextID` during edits, propagate merge metadata, or handle unknown split
-  siblings like JS/Go.
-- Split and merge metadata is stored but not yet maintained by edit operations.
-- Operation-time GC registration exists for split-free tree-node deletion, but
-  split/merge deletion paths still need JS/Go parity.
+- Rust Tree edit operation is only partial. It can split text nodes for simple
+  insert/delete ranges, but it does not split element nodes, merge element
+  boundaries, fully maintain `insPrevID`/`insNextID` across existing neighbors,
+  propagate merge metadata, or handle unknown split siblings like JS/Go.
+- Like `CrdtText`, Tree text-node splitting uses valid Rust strings. Splitting
+  inside an invalid standalone UTF-16 surrogate edge would need the same
+  deliberate representation choice as Text.
+- Split and merge metadata is stored, and new text split nodes receive the
+  basic split identity/link metadata, but broader split/merge metadata
+  maintenance is still incomplete.
+- Operation-time GC registration exists for split-free tree-node deletion and
+  text-node split deletion, but element split/merge deletion paths still need
+  JS/Go parity.
 - Public Tree facade and wire conversion are missing.
 - Tree attribute JSON/XML output follows the same scalar parsing helper as
   Text, but object/array attribute values still need broader JS parity tests
@@ -491,8 +498,9 @@ Expected direction:
 - Extend path/index conversion tests around removed nodes and mixed
   element/text children so edit/style operations can reuse the same position
   semantics.
-- Add Tree edit operation tests from JS/Go before exposing public Tree methods.
-- Extend Tree style parity after edit/split support lands, especially around
+- Add Tree edit operation tests from JS/Go around element split, merge, and
+  unknown split sibling cases before exposing public Tree methods.
+- Extend Tree style parity on top of text split support, especially around
   version vectors and split sibling propagation.
 
 ## Change, ChangeContext, and ChangePack
