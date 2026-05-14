@@ -217,6 +217,114 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn array_operations_push_after_move_front_without_position_confusion() -> crate::Result<()> {
+        let tickets = ArrayTickets::new();
+        let mut root = seeded_integer_array(&tickets)?;
+
+        move_front(
+            &mut root,
+            &tickets.array,
+            tickets.two.clone(),
+            tickets.move_one.clone(),
+        )?;
+        assert_eq!(r#"{"items":[2,0,1]}"#, root.to_json());
+
+        push_integer(&mut root, &tickets.array, 3, tickets.three.clone())?;
+        assert_eq!(r#"{"items":[2,0,1,3]}"#, root.to_json());
+
+        move_front(
+            &mut root,
+            &tickets.array,
+            tickets.three.clone(),
+            tickets.move_two.clone(),
+        )?;
+
+        assert_eq!(r#"{"items":[3,2,0,1]}"#, root.to_json());
+        assert_eq!("$.items.0", root.create_path(&tickets.three)?);
+        assert_eq!("$.items.3", root.create_path(&tickets.one)?);
+        Ok(())
+    }
+
+    #[test]
+    fn array_operations_push_after_move_last_without_position_confusion() -> crate::Result<()> {
+        let tickets = ArrayTickets::new();
+        let mut root = seeded_integer_array(&tickets)?;
+
+        move_last(
+            &mut root,
+            &tickets.array,
+            tickets.zero.clone(),
+            tickets.move_one.clone(),
+        )?;
+        assert_eq!(r#"{"items":[1,2,0]}"#, root.to_json());
+
+        push_integer(&mut root, &tickets.array, 3, tickets.three.clone())?;
+
+        assert_eq!(r#"{"items":[1,2,0,3]}"#, root.to_json());
+        assert_eq!("$.items.3", root.create_path(&tickets.three)?);
+        Ok(())
+    }
+
+    #[test]
+    fn array_operations_insert_after_moved_element_uses_position_anchor() -> crate::Result<()> {
+        let tickets = ArrayTickets::new();
+        let mut root = seeded_integer_array(&tickets)?;
+
+        move_front(
+            &mut root,
+            &tickets.array,
+            tickets.two.clone(),
+            tickets.move_one.clone(),
+        )?;
+        assert_eq!(r#"{"items":[2,0,1]}"#, root.to_json());
+
+        let prev_at = array_pos_created_at(&root, &tickets.array, &tickets.one)?;
+        AddOperation::create(
+            tickets.array.clone(),
+            prev_at,
+            primitive_int(3, tickets.three.clone()),
+            Some(tickets.three.clone()),
+        )
+        .execute(&mut root, OpSource::Remote)?;
+
+        assert_eq!(r#"{"items":[2,0,1,3]}"#, root.to_json());
+        assert_eq!("$.items.3", root.create_path(&tickets.three)?);
+        Ok(())
+    }
+
+    #[test]
+    fn array_operations_move_last_sequence_keeps_position_identity() -> crate::Result<()> {
+        let tickets = ArrayTickets::new();
+        let mut root = seeded_integer_array(&tickets)?;
+
+        move_last(
+            &mut root,
+            &tickets.array,
+            tickets.two.clone(),
+            tickets.move_one.clone(),
+        )?;
+        assert_eq!(r#"{"items":[0,1,2]}"#, root.to_json());
+
+        move_last(
+            &mut root,
+            &tickets.array,
+            tickets.one.clone(),
+            tickets.move_two.clone(),
+        )?;
+        assert_eq!(r#"{"items":[0,2,1]}"#, root.to_json());
+
+        move_last(
+            &mut root,
+            &tickets.array,
+            tickets.zero.clone(),
+            tickets.move_three.clone(),
+        )?;
+        assert_eq!(r#"{"items":[2,1,0]}"#, root.to_json());
+        assert_eq!("$.items.2", root.create_path(&tickets.zero)?);
+        Ok(())
+    }
+
     #[derive(Debug, Clone, Copy)]
     enum MatrixOperation {
         InsertPrev,
@@ -274,6 +382,32 @@ mod tests {
         }
     }
 
+    struct ArrayTickets {
+        array: TimeTicket,
+        zero: TimeTicket,
+        one: TimeTicket,
+        two: TimeTicket,
+        three: TimeTicket,
+        move_one: TimeTicket,
+        move_two: TimeTicket,
+        move_three: TimeTicket,
+    }
+
+    impl ArrayTickets {
+        fn new() -> Self {
+            Self {
+                array: ticket(1, "a"),
+                zero: ticket(2, "a"),
+                one: ticket(3, "a"),
+                two: ticket(4, "a"),
+                three: ticket(5, "a"),
+                move_one: ticket(6, "a"),
+                move_two: ticket(7, "a"),
+                move_three: ticket(8, "a"),
+            }
+        }
+    }
+
     fn seeded_root(tickets: &MatrixTickets) -> crate::Result<CrdtRoot> {
         let mut root = CrdtRoot::create();
         Operation::Set(SetOperation::create(
@@ -294,6 +428,33 @@ mod tests {
                 tickets.array.clone(),
                 prev_at,
                 primitive(value, created_at.clone()),
+                Some(created_at),
+            ))
+            .execute(&mut root, OpSource::Remote)?;
+        }
+
+        Ok(root)
+    }
+
+    fn seeded_integer_array(tickets: &ArrayTickets) -> crate::Result<CrdtRoot> {
+        let mut root = CrdtRoot::create();
+        Operation::Set(SetOperation::create(
+            "items",
+            CrdtElement::array(CrdtArray::create(tickets.array.clone())),
+            TimeTicket::initial(),
+            Some(tickets.array.clone()),
+        ))
+        .execute(&mut root, OpSource::Remote)?;
+
+        for (prev_at, value, created_at) in [
+            (TimeTicket::initial(), 0, tickets.zero.clone()),
+            (tickets.zero.clone(), 1, tickets.one.clone()),
+            (tickets.one.clone(), 2, tickets.two.clone()),
+        ] {
+            Operation::Add(AddOperation::create(
+                tickets.array.clone(),
+                prev_at,
+                primitive_int(value, created_at.clone()),
                 Some(created_at),
             ))
             .execute(&mut root, OpSource::Remote)?;
@@ -414,9 +575,84 @@ mod tests {
         Ok(snapshots)
     }
 
+    fn move_front(
+        root: &mut CrdtRoot,
+        array_at: &TimeTicket,
+        target_at: TimeTicket,
+        executed_at: TimeTicket,
+    ) -> crate::Result<()> {
+        Operation::Move(MoveOperation::create(
+            array_at.clone(),
+            TimeTicket::initial(),
+            target_at,
+            Some(executed_at),
+        ))
+        .execute(root, OpSource::Remote)?;
+        Ok(())
+    }
+
+    fn move_last(
+        root: &mut CrdtRoot,
+        array_at: &TimeTicket,
+        target_at: TimeTicket,
+        executed_at: TimeTicket,
+    ) -> crate::Result<()> {
+        let prev_at = array_last_created_at(root, array_at)?;
+        Operation::Move(MoveOperation::create(
+            array_at.clone(),
+            prev_at,
+            target_at,
+            Some(executed_at),
+        ))
+        .execute(root, OpSource::Remote)?;
+        Ok(())
+    }
+
+    fn push_integer(
+        root: &mut CrdtRoot,
+        array_at: &TimeTicket,
+        value: i32,
+        created_at: TimeTicket,
+    ) -> crate::Result<()> {
+        let prev_at = array_last_created_at(root, array_at)?;
+        Operation::Add(AddOperation::create(
+            array_at.clone(),
+            prev_at,
+            primitive_int(value, created_at.clone()),
+            Some(created_at),
+        ))
+        .execute(root, OpSource::Remote)?;
+        Ok(())
+    }
+
+    fn array_last_created_at(root: &CrdtRoot, array_at: &TimeTicket) -> crate::Result<TimeTicket> {
+        let array = root
+            .array_by_created_at(array_at)
+            .ok_or_else(|| crate::YorkieError::MissingCrdtElement(array_at.to_id_string()))?;
+        Ok(array.get_last_created_at())
+    }
+
+    fn array_pos_created_at(
+        root: &CrdtRoot,
+        array_at: &TimeTicket,
+        element_at: &TimeTicket,
+    ) -> crate::Result<TimeTicket> {
+        let array = root
+            .array_by_created_at(array_at)
+            .ok_or_else(|| crate::YorkieError::MissingCrdtElement(array_at.to_id_string()))?;
+        array.pos_created_at(element_at)
+    }
+
     fn primitive(value: &str, created_at: TimeTicket) -> CrdtElement {
         CrdtElement::primitive(CrdtPrimitive::new(
             PrimitiveValue::String(value.to_owned()),
+            created_at,
+        ))
+    }
+
+    fn primitive_int(value: i32, created_at: TimeTicket) -> CrdtElement {
+        CrdtElement::primitive(CrdtPrimitive::new(
+            PrimitiveValue::Integer(value),
             created_at,
         ))
     }
