@@ -1,4 +1,6 @@
-use super::{ExecutionResult, OpInfo, OpSource, Operation, OperationMeta, SetOperation};
+use super::{
+    AddOperation, ExecutionResult, OpInfo, OpSource, Operation, OperationMeta, SetOperation,
+};
 use crate::crdt::root::CrdtRoot;
 use crate::time::ActorId;
 use crate::{Result, TimeTicket, YorkieError};
@@ -34,18 +36,33 @@ impl RemoveOperation {
             return Ok(None);
         }
 
-        let key = root
-            .object_member_sub_path(self.parent_created_at(), &self.created_at)?
+        let sub_path = root
+            .container_sub_path(self.parent_created_at(), &self.created_at)?
             .ok_or_else(|| YorkieError::MissingCrdtElement(self.created_at.to_id_string()))?
             .to_owned();
+        let is_array_parent = root.array_by_created_at(self.parent_created_at()).is_some();
         let reverse_op = self.to_reverse_operation(root)?;
         let executed_at = self.executed_at()?.clone();
 
-        root.remove_object_member(self.parent_created_at(), &self.created_at, executed_at)?;
+        root.remove_container_element(self.parent_created_at(), &self.created_at, executed_at)?;
 
         let path = root.create_path(self.parent_created_at())?;
+        let op_infos = if is_array_parent {
+            vec![OpInfo::ArrayRemove {
+                path,
+                index: sub_path
+                    .parse::<usize>()
+                    .map_err(|_| YorkieError::MissingCrdtElement(self.created_at.to_id_string()))?,
+            }]
+        } else {
+            vec![OpInfo::Remove {
+                path,
+                key: sub_path,
+            }]
+        };
+
         Ok(Some(ExecutionResult {
-            op_infos: vec![OpInfo::Remove { path, key }],
+            op_infos,
             reverse_op,
         }))
     }
@@ -87,6 +104,20 @@ impl RemoveOperation {
     }
 
     fn to_reverse_operation(&self, root: &CrdtRoot) -> Result<Option<Operation>> {
+        if let Some(array) = root.array_by_created_at(self.parent_created_at()) {
+            let Some(value) = array.get_by_id(self.created_at()) else {
+                return Ok(None);
+            };
+            let prev_created_at = array.get_prev_created_at(self.created_at())?;
+
+            return Ok(Some(Operation::Add(AddOperation::create(
+                self.parent_created_at().clone(),
+                prev_created_at,
+                value.deepcopy(),
+                None,
+            ))));
+        }
+
         let Some(key) = root.object_member_sub_path(self.parent_created_at(), self.created_at())?
         else {
             return Ok(None);
@@ -106,7 +137,7 @@ impl RemoveOperation {
 
     fn has_removed_target_or_ancestor(&self, root: &CrdtRoot) -> Result<bool> {
         if root
-            .object_member_sub_path(self.parent_created_at(), self.created_at())?
+            .container_sub_path(self.parent_created_at(), self.created_at())?
             .is_none()
         {
             return Ok(false);
@@ -137,11 +168,12 @@ impl RemoveOperation {
 #[cfg(test)]
 mod tests {
     use super::RemoveOperation;
+    use crate::crdt::array::CrdtArray;
     use crate::crdt::element::CrdtElement;
     use crate::crdt::object::CrdtObject;
     use crate::crdt::primitive::{CrdtPrimitive, PrimitiveValue};
     use crate::crdt::root::CrdtRoot;
-    use crate::operation::{OpInfo, OpSource, Operation, SetOperation};
+    use crate::operation::{AddOperation, OpInfo, OpSource, Operation, SetOperation};
     use crate::{TimeTicket, YorkieError};
 
     #[test]
@@ -227,6 +259,55 @@ mod tests {
     }
 
     #[test]
+    fn removes_array_element() -> crate::Result<()> {
+        let mut root = CrdtRoot::create();
+        let array_at = ticket(1, "a");
+        let value_at = ticket(2, "a");
+        let removed_at = ticket(3, "a");
+
+        set(
+            &mut root,
+            "items",
+            CrdtElement::array(CrdtArray::create(array_at.clone())),
+            TimeTicket::initial(),
+            array_at.clone(),
+        )?;
+        AddOperation::create(
+            array_at.clone(),
+            TimeTicket::initial(),
+            primitive_str("one", value_at.clone()),
+            Some(value_at.clone()),
+        )
+        .execute(&mut root, OpSource::Remote)?;
+
+        let result = RemoveOperation::new(array_at, value_at.clone(), Some(removed_at.clone()))
+            .execute(&mut root, OpSource::Remote)?
+            .unwrap();
+
+        assert_eq!(r#"{"items":[]}"#, root.to_json());
+        assert_eq!(1, root.get_garbage_len());
+        assert_eq!(
+            Some(&removed_at),
+            root.find_by_created_at(&value_at).unwrap().removed_at()
+        );
+        assert_eq!(
+            vec![OpInfo::ArrayRemove {
+                path: "$.items".to_owned(),
+                index: 0,
+            }],
+            result.op_infos
+        );
+        match result.reverse_op {
+            Some(Operation::Add(operation)) => {
+                assert_eq!(&TimeTicket::initial(), operation.prev_created_at());
+                assert_eq!("\"one\"", operation.value().to_json());
+            }
+            _ => panic!("expected add reverse operation"),
+        }
+        Ok(())
+    }
+
+    #[test]
     fn skips_undo_redo_when_target_is_removed() -> crate::Result<()> {
         let mut root = CrdtRoot::create();
         let title_at = ticket(1, "a");
@@ -275,7 +356,7 @@ mod tests {
         assert_eq!(
             YorkieError::UnexpectedCrdtElement {
                 id: title_at.to_id_string(),
-                expected: "object"
+                expected: "object or array"
             },
             err
         );

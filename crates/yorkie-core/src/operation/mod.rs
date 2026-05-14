@@ -1,6 +1,12 @@
+mod add;
+mod array_set;
+mod move_op;
 mod remove;
 mod set;
 
+pub(crate) use add::AddOperation;
+pub(crate) use array_set::ArraySetOperation;
+pub(crate) use move_op::MoveOperation;
 pub(crate) use remove::RemoveOperation;
 pub(crate) use set::SetOperation;
 
@@ -19,14 +25,39 @@ pub(crate) enum OpSource {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OpInfo {
-    Set { path: String, key: String },
-    Remove { path: String, key: String },
+    Set {
+        path: String,
+        key: String,
+    },
+    Remove {
+        path: String,
+        key: String,
+    },
+    ArrayRemove {
+        path: String,
+        index: usize,
+    },
+    Add {
+        path: String,
+        index: usize,
+    },
+    Move {
+        path: String,
+        index: usize,
+        previous_index: usize,
+    },
+    ArraySet {
+        path: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Operation {
     Set(SetOperation),
     Remove(RemoveOperation),
+    Add(AddOperation),
+    Move(MoveOperation),
+    ArraySet(ArraySetOperation),
 }
 
 impl Operation {
@@ -38,6 +69,9 @@ impl Operation {
         match self {
             Self::Set(operation) => operation.execute(root, source),
             Self::Remove(operation) => operation.execute(root, source),
+            Self::Add(operation) => operation.execute(root, source),
+            Self::Move(operation) => operation.execute(root, source),
+            Self::ArraySet(operation) => operation.execute(root, source),
         }
     }
 
@@ -46,6 +80,9 @@ impl Operation {
         match self {
             Self::Set(operation) => operation.set_actor(actor_id),
             Self::Remove(operation) => operation.set_actor(actor_id),
+            Self::Add(operation) => operation.set_actor(actor_id),
+            Self::Move(operation) => operation.set_actor(actor_id),
+            Self::ArraySet(operation) => operation.set_actor(actor_id),
         }
     }
 
@@ -53,6 +90,9 @@ impl Operation {
         match self {
             Self::Set(operation) => operation.to_test_string(),
             Self::Remove(operation) => operation.to_test_string(),
+            Self::Add(operation) => operation.to_test_string(),
+            Self::Move(operation) => operation.to_test_string(),
+            Self::ArraySet(operation) => operation.to_test_string(),
         }
     }
 }
