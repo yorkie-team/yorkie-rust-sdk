@@ -112,7 +112,8 @@ Current Rust behavior:
 - `CrdtRoot` stores `CrdtElementPair` values as deep copies in
   `element_pair_by_created_at`.
 - Mutations are applied to the owned root object tree, then root index entries
-  are refreshed manually.
+  are refreshed manually, including the mutated container's descendant parent
+  snapshots.
 - Parent pointers in the index are also stored as copied elements.
 
 JS/Go behavior:
@@ -124,7 +125,7 @@ JS/Go behavior:
 Gap:
 
 - Rust's copied index can become stale if a future mutation path forgets to
-  refresh the affected element or its ancestors.
+  refresh the affected element, descendants, or ancestors.
 - The current approach is acceptable for small slices, but it puts more
   responsibility on every root mutation method.
 - The ownership model is not yet settled. Future code may need an arena,
@@ -156,6 +157,9 @@ Current Rust behavior:
   versus move convergence, the array concurrency matrix of
   insert/move/set/remove target combinations, late losing moves that still
   create a position, and inserts after those dead positions.
+- Operation-level array matrix tests apply add/move/set/remove operation pairs
+  through `CrdtRoot` in both orders and verify JSON, paths, root stats, and GC
+  counts converge.
 
 JS/Go behavior:
 
@@ -170,8 +174,6 @@ Gap:
 - Rust does not yet keep explicit maps for position IDs and element IDs. Linear
   lookup preserves simple behavior, but duplicate replay/idempotency cases are
   not fully covered.
-- Operation-level array tests still need broader parity coverage for the full
-  concurrent move/insert/set/remove matrix.
 - Public API array tests still need to be connected once `JsonArray` becomes a
   context-backed editing facade.
 - Snapshot restoration behavior for moved elements and dead positions is not
@@ -196,6 +198,8 @@ Current Rust behavior:
 - `MoveOperation` tests cover the case where a later winning move is applied
   before an earlier losing move, and a following add references the losing
   move's position.
+- Cross-operation tests cover add/move/array-set/remove matrix convergence at
+  the root operation layer.
 
 JS/Go behavior:
 

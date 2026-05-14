@@ -27,7 +27,7 @@ deep copy/rebuild.
 | Area | Status | Notes |
 | --- | --- | --- |
 | Root object and element lookup | covered | Tests cover basic object members and nested descendants. |
-| Path creation | covered | Tests cover object, array, and text paths for current variants. |
+| Path creation | covered | Tests cover object, array, and text paths for current variants, including root operation matrix cases that refresh descendant parent snapshots. |
 | Removed element GC | covered | Root tracks removed elements and deregisters them on GC. |
 | Array dead position GC | covered | Dead RGA position nodes are registered, copied, and purged. |
 | Text node/attribute GC | covered | Root rebuilds and purges text internal GC pairs. |

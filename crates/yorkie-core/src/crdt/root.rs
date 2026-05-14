@@ -604,16 +604,39 @@ impl CrdtRoot {
             .map(CrdtElement::deepcopy)
     }
 
-    fn refresh_element_pair(&mut self, created_at: &TimeTicket) {
+    fn refresh_element_pair_subtree(&mut self, created_at: &TimeTicket) {
         let Some(element) = self.actual_element_by_created_at(created_at) else {
             return;
         };
+        let parent = self
+            .find_element_pair_by_created_at(created_at)
+            .and_then(|pair| pair.parent())
+            .map(CrdtElement::deepcopy);
 
+        self.refresh_element_pair_tree(&element, parent.as_ref());
+    }
+
+    fn refresh_element_pair_tree(&mut self, element: &CrdtElement, parent: Option<&CrdtElement>) {
         if let Some(pair) = self
             .element_pair_by_created_at
-            .get_mut(&created_at.to_id_string())
+            .get_mut(&element.created_at().to_id_string())
         {
-            pair.element = element;
+            pair.element = element.deepcopy();
+            pair.parent = parent.map(CrdtElement::deepcopy);
+        }
+
+        match element {
+            CrdtElement::Object(object) => {
+                for (_, child) in object.iter_all() {
+                    self.refresh_element_pair_tree(child, Some(element));
+                }
+            }
+            CrdtElement::Array(array) => {
+                for child in array.iter_all() {
+                    self.refresh_element_pair_tree(child, Some(element));
+                }
+            }
+            CrdtElement::Primitive(_) | CrdtElement::Text(_) => {}
         }
     }
 
@@ -626,7 +649,7 @@ impl CrdtRoot {
                 .and_then(|pair| pair.parent())
                 .map(|parent| parent.created_at().clone());
 
-            self.refresh_element_pair(&created_at);
+            self.refresh_element_pair_subtree(&created_at);
         }
     }
 

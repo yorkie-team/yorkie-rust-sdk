@@ -174,3 +174,254 @@ impl OperationMeta {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AddOperation, ArraySetOperation, MoveOperation, OpSource, Operation, RemoveOperation,
+        SetOperation,
+    };
+    use crate::crdt::array::CrdtArray;
+    use crate::crdt::element::CrdtElement;
+    use crate::crdt::primitive::{CrdtPrimitive, PrimitiveValue};
+    use crate::crdt::root::CrdtRoot;
+    use crate::TimeTicket;
+
+    #[test]
+    fn array_operations_converge_across_matrix_orders() -> crate::Result<()> {
+        let operations = [
+            MatrixOperation::InsertPrev,
+            MatrixOperation::InsertPrevNext,
+            MatrixOperation::MovePrev,
+            MatrixOperation::MovePrevNext,
+            MatrixOperation::MoveTarget,
+            MatrixOperation::SetTarget,
+            MatrixOperation::RemoveTarget,
+        ];
+
+        for &first_op in &operations {
+            for &second_op in &operations {
+                let tickets = MatrixTickets::new();
+                let mut first = seeded_root(&tickets)?;
+                apply_matrix_operation(&mut first, first_op, 0, &tickets)?;
+                apply_matrix_operation(&mut first, second_op, 1, &tickets)?;
+
+                let mut second = seeded_root(&tickets)?;
+                apply_matrix_operation(&mut second, second_op, 1, &tickets)?;
+                apply_matrix_operation(&mut second, first_op, 0, &tickets)?;
+
+                assert_roots_converge(&first, &second, &tickets, first_op, second_op)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum MatrixOperation {
+        InsertPrev,
+        InsertPrevNext,
+        MovePrev,
+        MovePrevNext,
+        MoveTarget,
+        SetTarget,
+        RemoveTarget,
+    }
+
+    struct MatrixTickets {
+        array: TimeTicket,
+        one: TimeTicket,
+        two: TimeTicket,
+        three: TimeTicket,
+        four: TimeTicket,
+        operation_times: [TimeTicket; 2],
+    }
+
+    impl MatrixTickets {
+        fn new() -> Self {
+            Self {
+                array: ticket(1, "a"),
+                one: ticket(2, "a"),
+                two: ticket(3, "a"),
+                three: ticket(4, "a"),
+                four: ticket(5, "a"),
+                operation_times: [ticket(6, "a"), ticket(7, "a")],
+            }
+        }
+
+        fn other_target(&self, client_id: usize) -> &TimeTicket {
+            if client_id == 0 {
+                &self.three
+            } else {
+                &self.four
+            }
+        }
+
+        fn operation_time(&self, client_id: usize) -> TimeTicket {
+            self.operation_times[client_id].clone()
+        }
+
+        fn tracked_ids(&self) -> Vec<TimeTicket> {
+            vec![
+                self.array.clone(),
+                self.one.clone(),
+                self.two.clone(),
+                self.three.clone(),
+                self.four.clone(),
+                self.operation_times[0].clone(),
+                self.operation_times[1].clone(),
+            ]
+        }
+    }
+
+    fn seeded_root(tickets: &MatrixTickets) -> crate::Result<CrdtRoot> {
+        let mut root = CrdtRoot::create();
+        Operation::Set(SetOperation::create(
+            "items",
+            CrdtElement::array(CrdtArray::create(tickets.array.clone())),
+            TimeTicket::initial(),
+            Some(tickets.array.clone()),
+        ))
+        .execute(&mut root, OpSource::Remote)?;
+
+        for (prev_at, value, created_at) in [
+            (TimeTicket::initial(), "1", tickets.one.clone()),
+            (tickets.one.clone(), "2", tickets.two.clone()),
+            (tickets.two.clone(), "3", tickets.three.clone()),
+            (tickets.three.clone(), "4", tickets.four.clone()),
+        ] {
+            Operation::Add(AddOperation::create(
+                tickets.array.clone(),
+                prev_at,
+                primitive(value, created_at.clone()),
+                Some(created_at),
+            ))
+            .execute(&mut root, OpSource::Remote)?;
+        }
+
+        Ok(root)
+    }
+
+    fn apply_matrix_operation(
+        root: &mut CrdtRoot,
+        operation: MatrixOperation,
+        client_id: usize,
+        tickets: &MatrixTickets,
+    ) -> crate::Result<()> {
+        matrix_operation(operation, client_id, tickets).execute(root, OpSource::Remote)?;
+        Ok(())
+    }
+
+    fn matrix_operation(
+        operation: MatrixOperation,
+        client_id: usize,
+        tickets: &MatrixTickets,
+    ) -> Operation {
+        let executed_at = tickets.operation_time(client_id);
+        let new_value = if client_id == 0 { "5" } else { "6" };
+
+        match operation {
+            MatrixOperation::InsertPrev => Operation::Add(AddOperation::create(
+                tickets.array.clone(),
+                tickets.two.clone(),
+                primitive(new_value, executed_at.clone()),
+                Some(executed_at),
+            )),
+            MatrixOperation::InsertPrevNext => Operation::Add(AddOperation::create(
+                tickets.array.clone(),
+                tickets.one.clone(),
+                primitive(new_value, executed_at.clone()),
+                Some(executed_at),
+            )),
+            MatrixOperation::MovePrev => Operation::Move(MoveOperation::create(
+                tickets.array.clone(),
+                tickets.two.clone(),
+                tickets.other_target(client_id).clone(),
+                Some(executed_at),
+            )),
+            MatrixOperation::MovePrevNext => Operation::Move(MoveOperation::create(
+                tickets.array.clone(),
+                tickets.one.clone(),
+                tickets.other_target(client_id).clone(),
+                Some(executed_at),
+            )),
+            MatrixOperation::MoveTarget => Operation::Move(MoveOperation::create(
+                tickets.array.clone(),
+                tickets.other_target(client_id).clone(),
+                tickets.two.clone(),
+                Some(executed_at),
+            )),
+            MatrixOperation::SetTarget => Operation::ArraySet(ArraySetOperation::create(
+                tickets.array.clone(),
+                tickets.two.clone(),
+                primitive(new_value, executed_at.clone()),
+                Some(executed_at),
+            )),
+            MatrixOperation::RemoveTarget => Operation::Remove(RemoveOperation::new(
+                tickets.array.clone(),
+                tickets.two.clone(),
+                Some(executed_at),
+            )),
+        }
+    }
+
+    fn assert_roots_converge(
+        first: &CrdtRoot,
+        second: &CrdtRoot,
+        tickets: &MatrixTickets,
+        first_op: MatrixOperation,
+        second_op: MatrixOperation,
+    ) -> crate::Result<()> {
+        assert_eq!(
+            first.to_json(),
+            second.to_json(),
+            "{first_op:?} vs {second_op:?}"
+        );
+        assert_eq!(
+            first.get_garbage_len(),
+            second.get_garbage_len(),
+            "{first_op:?} vs {second_op:?}"
+        );
+        assert_eq!(
+            first.stats(),
+            second.stats(),
+            "{first_op:?} vs {second_op:?}"
+        );
+        assert_eq!(
+            element_snapshots(first, tickets)?,
+            element_snapshots(second, tickets)?,
+            "{first_op:?} vs {second_op:?}"
+        );
+        Ok(())
+    }
+
+    fn element_snapshots(
+        root: &CrdtRoot,
+        tickets: &MatrixTickets,
+    ) -> crate::Result<Vec<(String, bool, String)>> {
+        let mut snapshots = Vec::new();
+
+        for id in tickets.tracked_ids() {
+            if let Some(element) = root.find_by_created_at(&id) {
+                snapshots.push((
+                    id.to_id_string(),
+                    element.is_removed(),
+                    root.create_path(&id)?,
+                ));
+            }
+        }
+
+        Ok(snapshots)
+    }
+
+    fn primitive(value: &str, created_at: TimeTicket) -> CrdtElement {
+        CrdtElement::primitive(CrdtPrimitive::new(
+            PrimitiveValue::String(value.to_owned()),
+            created_at,
+        ))
+    }
+
+    fn ticket(lamport: i64, actor_id: &str) -> TimeTicket {
+        TimeTicket::new(lamport, 0, actor_id)
+    }
+}

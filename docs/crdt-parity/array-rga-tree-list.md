@@ -36,8 +36,8 @@ application, public array mutation APIs, and sync-level convergence.
 | RGA move semantics | covered | Tests cover position nodes, LWW losing moves, and dead positions. |
 | RGA convergence matrix | covered | Rust covers same/different moves, chained moves, independent moves, and insert/move/set/remove combinations at RGA level. |
 | Dead position GC | covered | Root can register and physically purge dead RGA position nodes. |
-| Operation basics | partial | Add, move, set, remove have basic operation tests. |
-| Operation-level matrix | partial | Losing move followed by add is covered; full operation matrix is still missing. |
+| Operation basics | covered | Add, move, set, remove have focused operation tests. |
+| Operation-level matrix | covered | Add/move/array-set/remove pairs are applied through `CrdtRoot` in both orders and checked for JSON, path, root stats, and GC convergence. |
 | Public `JsonArray` facade | blocked | Current public array is not context-backed, so operation intent is not preserved. |
 | Splay/index optimization | missing | Rust uses linear `Vec` scans. |
 | Snapshot restoration | partial | Internal `add_dead_position` and `add_moved_element` exist but snapshot tests are missing. |
@@ -45,8 +45,6 @@ application, public array mutation APIs, and sync-level convergence.
 
 ## Next Checks
 
-- Add operation-level matrix tests for `AddOperation`, `MoveOperation`,
-  `ArraySetOperation`, and `RemoveOperation` applied through `CrdtRoot`.
 - Port Go array position-confusion cases at root/operation level:
   move-front/move-last followed by push or insert.
 - Build the context-backed public `JsonArray` facade before porting JS public
