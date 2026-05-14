@@ -184,6 +184,47 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn preserves_losing_move_position_for_following_add() -> crate::Result<()> {
+        let mut root = CrdtRoot::create();
+        let array_at = ticket(1, "a");
+        let a_at = ticket(2, "a");
+        let b_at = ticket(3, "a");
+        let x_at = ticket(4, "a");
+        let losing_move_at = ticket(5, "a");
+        let winning_move_at = ticket(6, "a");
+        let y_at = ticket(7, "a");
+
+        create_array(&mut root, array_at.clone())?;
+        add(
+            &mut root,
+            array_at.clone(),
+            TimeTicket::initial(),
+            "A",
+            a_at.clone(),
+        )?;
+        add(&mut root, array_at.clone(), a_at.clone(), "B", b_at.clone())?;
+        add(&mut root, array_at.clone(), b_at.clone(), "X", x_at.clone())?;
+
+        MoveOperation::create(array_at.clone(), b_at, x_at.clone(), Some(winning_move_at))
+            .execute(&mut root, OpSource::Remote)?;
+        MoveOperation::create(array_at.clone(), a_at, x_at, Some(losing_move_at.clone()))
+            .execute(&mut root, OpSource::Remote)?;
+        AddOperation::create(
+            array_at,
+            losing_move_at,
+            primitive("Y", y_at.clone()),
+            Some(y_at.clone()),
+        )
+        .execute(&mut root, OpSource::Remote)?;
+
+        assert_eq!(r#"{"items":["A","Y","B","X"]}"#, root.to_json());
+        assert_eq!("$.items.1", root.create_path(&y_at)?);
+        assert_eq!(2, root.get_garbage_len());
+        assert_eq!(2, root.stats().gc_pairs);
+        Ok(())
+    }
+
     fn create_array(root: &mut CrdtRoot, created_at: TimeTicket) -> crate::Result<()> {
         SetOperation::create(
             "items",

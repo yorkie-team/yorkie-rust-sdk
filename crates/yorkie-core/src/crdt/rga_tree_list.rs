@@ -656,6 +656,77 @@ mod tests {
     }
 
     #[test]
+    fn moves_of_different_elements_converge() -> crate::Result<()> {
+        let t_a = ticket(1, "a");
+        let t_b = ticket(2, "a");
+        let t_c = ticket(3, "a");
+        let move_a_after_c = ticket(4, "a");
+        let move_b_after_a = ticket(5, "a");
+
+        let mut first = list_with(&[("A", t_a.clone()), ("B", t_b.clone()), ("C", t_c.clone())])?;
+        first.move_after(&t_c, &t_a, move_a_after_c.clone())?;
+        first.move_after(&t_a, &t_b, move_b_after_a.clone())?;
+
+        let mut second = list_with(&[("A", t_a.clone()), ("B", t_b.clone()), ("C", t_c.clone())])?;
+        second.move_after(&t_a, &t_b, move_b_after_a)?;
+        second.move_after(&t_c, &t_a, move_a_after_c)?;
+
+        assert_eq!(first.to_json(), second.to_json());
+        Ok(())
+    }
+
+    #[test]
+    fn chained_moves_converge_across_permutations() -> crate::Result<()> {
+        let orders = [
+            [1, 2, 3],
+            [1, 3, 2],
+            [2, 1, 3],
+            [2, 3, 1],
+            [3, 1, 2],
+            [3, 2, 1],
+        ];
+
+        let expected = apply_chained_moves(&orders[0])?;
+        for order in orders.iter().skip(1) {
+            assert_eq!(expected, apply_chained_moves(order)?, "order: {order:?}");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn independent_destination_moves_converge() -> crate::Result<()> {
+        let t_a = ticket(1, "a");
+        let t_b = ticket(2, "a");
+        let t_c = ticket(3, "a");
+        let t_d = ticket(4, "a");
+        let move_a_after_d = ticket(5, "a");
+        let move_b_after_c = ticket(6, "a");
+
+        let mut first = list_with(&[
+            ("A", t_a.clone()),
+            ("B", t_b.clone()),
+            ("C", t_c.clone()),
+            ("D", t_d.clone()),
+        ])?;
+        first.move_after(&t_d, &t_a, move_a_after_d.clone())?;
+        first.move_after(&t_c, &t_b, move_b_after_c.clone())?;
+
+        let mut second = list_with(&[
+            ("A", t_a.clone()),
+            ("B", t_b.clone()),
+            ("C", t_c.clone()),
+            ("D", t_d.clone()),
+        ])?;
+        second.move_after(&t_c, &t_b, move_b_after_c)?;
+        second.move_after(&t_d, &t_a, move_a_after_d)?;
+
+        assert_eq!(first.to_json(), second.to_json());
+        assert_eq!(r#"["C","B","D","A"]"#, first.to_json());
+        Ok(())
+    }
+
+    #[test]
     fn insert_after_moved_element_uses_original_position_identity() -> crate::Result<()> {
         let t1 = ticket(1, "a");
         let t2 = ticket(2, "a");
@@ -734,6 +805,163 @@ mod tests {
         assert_eq!(first.to_json(), second.to_json());
         assert_eq!(r#"["1","3","4"]"#, first.to_json());
         Ok(())
+    }
+
+    #[test]
+    fn concurrency_matrix_operations_converge() -> crate::Result<()> {
+        let operations = [
+            MatrixOperation::InsertPrev,
+            MatrixOperation::InsertPrevNext,
+            MatrixOperation::MovePrev,
+            MatrixOperation::MovePrevNext,
+            MatrixOperation::MoveTarget,
+            MatrixOperation::SetTarget,
+            MatrixOperation::RemoveTarget,
+        ];
+
+        for &first_op in &operations {
+            for &second_op in &operations {
+                let tickets = MatrixTickets::new();
+                let mut first = matrix_list(&tickets)?;
+                apply_matrix_operation(&mut first, first_op, 0, &tickets)?;
+                apply_matrix_operation(&mut first, second_op, 1, &tickets)?;
+
+                let mut second = matrix_list(&tickets)?;
+                apply_matrix_operation(&mut second, second_op, 1, &tickets)?;
+                apply_matrix_operation(&mut second, first_op, 0, &tickets)?;
+
+                assert_eq!(
+                    first.to_json(),
+                    second.to_json(),
+                    "{first_op:?} vs {second_op:?}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum MatrixOperation {
+        InsertPrev,
+        InsertPrevNext,
+        MovePrev,
+        MovePrevNext,
+        MoveTarget,
+        SetTarget,
+        RemoveTarget,
+    }
+
+    struct MatrixTickets {
+        one: TimeTicket,
+        two: TimeTicket,
+        three: TimeTicket,
+        four: TimeTicket,
+        operation_times: [TimeTicket; 2],
+    }
+
+    impl MatrixTickets {
+        fn new() -> Self {
+            Self {
+                one: ticket(1, "a"),
+                two: ticket(2, "a"),
+                three: ticket(3, "a"),
+                four: ticket(4, "a"),
+                operation_times: [ticket(5, "a"), ticket(6, "a")],
+            }
+        }
+
+        fn other_target(&self, client_id: usize) -> &TimeTicket {
+            if client_id == 0 {
+                &self.three
+            } else {
+                &self.four
+            }
+        }
+
+        fn operation_time(&self, client_id: usize) -> TimeTicket {
+            self.operation_times[client_id].clone()
+        }
+    }
+
+    fn apply_chained_moves(order: &[usize; 3]) -> crate::Result<String> {
+        let t_a = ticket(1, "a");
+        let t_b = ticket(2, "a");
+        let t_c = ticket(3, "a");
+        let t_d = ticket(4, "a");
+        let move_a_after_d = ticket(5, "a");
+        let move_b_after_a = ticket(6, "a");
+        let move_c_after_b = ticket(7, "a");
+        let mut list = list_with(&[
+            ("A", t_a.clone()),
+            ("B", t_b.clone()),
+            ("C", t_c.clone()),
+            ("D", t_d.clone()),
+        ])?;
+
+        for operation in order {
+            match operation {
+                1 => list.move_after(&t_d, &t_a, move_a_after_d.clone())?,
+                2 => list.move_after(&t_a, &t_b, move_b_after_a.clone())?,
+                3 => list.move_after(&t_b, &t_c, move_c_after_b.clone())?,
+                _ => unreachable!(),
+            };
+        }
+
+        Ok(list.to_json())
+    }
+
+    fn matrix_list(tickets: &MatrixTickets) -> crate::Result<RgaTreeList> {
+        list_with(&[
+            ("1", tickets.one.clone()),
+            ("2", tickets.two.clone()),
+            ("3", tickets.three.clone()),
+            ("4", tickets.four.clone()),
+        ])
+    }
+
+    fn apply_matrix_operation(
+        list: &mut RgaTreeList,
+        operation: MatrixOperation,
+        client_id: usize,
+        tickets: &MatrixTickets,
+    ) -> crate::Result<()> {
+        let executed_at = tickets.operation_time(client_id);
+        let new_value = if client_id == 0 { "5" } else { "6" };
+
+        match operation {
+            MatrixOperation::InsertPrev => list
+                .insert_after(
+                    &tickets.two,
+                    primitive(new_value, executed_at.clone()),
+                    Some(executed_at),
+                )
+                .map(|_| ()),
+            MatrixOperation::InsertPrevNext => list
+                .insert_after(
+                    &tickets.one,
+                    primitive(new_value, executed_at.clone()),
+                    Some(executed_at),
+                )
+                .map(|_| ()),
+            MatrixOperation::MovePrev => list
+                .move_after(&tickets.two, tickets.other_target(client_id), executed_at)
+                .map(|_| ()),
+            MatrixOperation::MovePrevNext => list
+                .move_after(&tickets.one, tickets.other_target(client_id), executed_at)
+                .map(|_| ()),
+            MatrixOperation::MoveTarget => list
+                .move_after(tickets.other_target(client_id), &tickets.two, executed_at)
+                .map(|_| ()),
+            MatrixOperation::SetTarget => list
+                .set(
+                    &tickets.two,
+                    primitive(new_value, executed_at.clone()),
+                    executed_at,
+                )
+                .map(|_| ()),
+            MatrixOperation::RemoveTarget => list.delete(&tickets.two, executed_at).map(|_| ()),
+        }
     }
 
     fn list_with(values: &[(&str, TimeTicket)]) -> crate::Result<RgaTreeList> {

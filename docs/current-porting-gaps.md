@@ -149,9 +149,11 @@ Current Rust behavior:
   and included in garbage length/stat counters.
 - Root garbage collection can now physically purge dead RGA position nodes once
   the supplied version vector covers their removal time.
-- RGA-level tests cover same-element move convergence, insert/set/remove versus
-  move convergence, late losing moves that still create a position, and inserts
-  after those dead positions.
+- RGA-level tests cover same-element and different-element move convergence,
+  chained move permutations, independent move destinations, insert/set/remove
+  versus move convergence, the array concurrency matrix of
+  insert/move/set/remove target combinations, late losing moves that still
+  create a position, and inserts after those dead positions.
 
 JS/Go behavior:
 
@@ -166,8 +168,10 @@ Gap:
 - Rust does not yet keep explicit maps for position IDs and element IDs. Linear
   lookup preserves simple behavior, but duplicate replay/idempotency cases are
   not fully covered.
-- Operation-level and public API array tests still need broader parity coverage
-  for concurrent move/insert/set/remove combinations.
+- Operation-level array tests still need broader parity coverage for the full
+  concurrent move/insert/set/remove matrix.
+- Public API array tests still need to be connected once `JsonArray` becomes a
+  context-backed editing facade.
 - Snapshot restoration behavior for moved elements and dead positions is not
   implemented, so `addDeadPosition`/`addMovedElement` parity is only modeled
   internally.
@@ -187,6 +191,9 @@ Current Rust behavior:
 - `RemoveOperation` can remove either an object member or an array element.
 - Tests cover basic add, move, array set, and array remove behavior.
 - `MoveOperation` registers dead position nodes as root GC pairs.
+- `MoveOperation` tests cover the case where a later winning move is applied
+  before an earlier losing move, and a following add references the losing
+  move's position.
 
 JS/Go behavior:
 
