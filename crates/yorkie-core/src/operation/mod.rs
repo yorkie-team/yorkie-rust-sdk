@@ -1,14 +1,14 @@
-mod add;
-mod array_set;
-mod move_op;
-mod remove;
-mod set;
+mod add_operation;
+mod array_set_operation;
+mod move_operation;
+mod remove_operation;
+mod set_operation;
 
-pub(crate) use add::AddOperation;
-pub(crate) use array_set::ArraySetOperation;
-pub(crate) use move_op::MoveOperation;
-pub(crate) use remove::RemoveOperation;
-pub(crate) use set::SetOperation;
+pub(crate) use add_operation::AddOperation;
+pub(crate) use array_set_operation::ArraySetOperation;
+pub(crate) use move_operation::MoveOperation;
+pub(crate) use remove_operation::RemoveOperation;
+pub(crate) use set_operation::SetOperation;
 
 use crate::crdt::root::CrdtRoot;
 use crate::time::ActorId;
