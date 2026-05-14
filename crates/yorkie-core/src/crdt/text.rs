@@ -4,7 +4,7 @@ use super::rga_tree_split::{
 };
 use super::rht::{Rht, RhtNode};
 use crate::json::escape_json_string;
-use crate::{Result, TimeTicket, VersionVector};
+use crate::{JsonArray, JsonObject, JsonValue, Result, TimeTicket, VersionVector};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +52,22 @@ impl TextValue {
 
     pub(crate) fn get_attributes(&self) -> BTreeMap<String, String> {
         self.attributes.to_object()
+    }
+
+    pub(crate) fn to_json_object(&self) -> Result<JsonObject> {
+        let mut object = JsonObject::new();
+        let attributes = self.get_attributes();
+
+        if !attributes.is_empty() {
+            let mut attrs = JsonObject::new();
+            for (key, value) in attributes {
+                attrs.set_unchecked(key, attribute_value_to_json_value(&value));
+            }
+            object.set("attrs", attrs)?;
+        }
+
+        object.set("val", self.content.clone())?;
+        Ok(object)
     }
 
     pub(crate) fn purge(&mut self, node: &RhtNode) {
@@ -399,6 +415,19 @@ impl CrdtText {
         self.rga_tree_split.to_json()
     }
 
+    pub(crate) fn to_json_array(&self) -> Result<JsonArray> {
+        let mut array = JsonArray::new();
+        for node in self.rga_tree_split.iter() {
+            if node.is_removed() {
+                continue;
+            }
+
+            array.push(node.value().to_json_object()?);
+        }
+
+        Ok(array)
+    }
+
     pub(crate) fn to_sorted_json(&self) -> String {
         self.to_json()
     }
@@ -414,6 +443,22 @@ impl CrdtText {
 
     pub(crate) fn to_test_string(&self) -> String {
         self.rga_tree_split.to_test_string()
+    }
+
+    pub(crate) fn gc_pair_entries(&self) -> Vec<(String, DataSize)> {
+        let mut pairs = Vec::new();
+
+        for node in self.rga_tree_split.iter() {
+            if node.removed_at().is_some() {
+                pairs.push((node.id_string(), node.data_size()));
+            }
+
+            for attr_node in node.value().gc_nodes() {
+                pairs.push((attr_node.id_string(), attr_node.data_size()));
+            }
+        }
+
+        pairs
     }
 
     pub(crate) fn deepcopy(&self) -> Self {
@@ -454,6 +499,60 @@ fn attribute_value_to_json(value: &str) -> String {
     }
 }
 
+fn attribute_value_to_json_value(value: &str) -> JsonValue {
+    let trimmed = value.trim();
+    if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
+        return JsonValue::String(unescape_json_string(&trimmed[1..trimmed.len() - 1]));
+    }
+
+    match trimmed {
+        "true" => JsonValue::Bool(true),
+        "false" => JsonValue::Bool(false),
+        "null" => JsonValue::Null,
+        _ => trimmed
+            .parse::<i32>()
+            .map(JsonValue::Integer)
+            .or_else(|_| trimmed.parse::<i64>().map(JsonValue::Long))
+            .or_else(|_| trimmed.parse::<f64>().map(JsonValue::Double))
+            .unwrap_or_else(|_| JsonValue::String(value.to_owned())),
+    }
+}
+
+fn unescape_json_string(value: &str) -> String {
+    let mut unescaped = String::new();
+    let mut chars = value.chars();
+
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            unescaped.push(ch);
+            continue;
+        }
+
+        match chars.next() {
+            Some('"') => unescaped.push('"'),
+            Some('\\') => unescaped.push('\\'),
+            Some('/') => unescaped.push('/'),
+            Some('b') => unescaped.push('\u{08}'),
+            Some('f') => unescaped.push('\u{0c}'),
+            Some('n') => unescaped.push('\n'),
+            Some('r') => unescaped.push('\r'),
+            Some('t') => unescaped.push('\t'),
+            Some('u') => {
+                let hex = chars.by_ref().take(4).collect::<String>();
+                if let Ok(code) = u32::from_str_radix(&hex, 16) {
+                    if let Some(ch) = char::from_u32(code) {
+                        unescaped.push(ch);
+                    }
+                }
+            }
+            Some(ch) => unescaped.push(ch),
+            None => unescaped.push('\\'),
+        }
+    }
+
+    unescaped
+}
+
 fn add_data_size(target: &mut DataSize, size: DataSize) {
     target.data += size.data;
     target.meta += size.meta;
@@ -491,6 +590,18 @@ mod tests {
         value.set_attr("b", "\"1\"", ticket(2));
 
         assert_eq!(r#"{"attrs":{"b":"1","i":true},"val":"H"}"#, value.to_json());
+    }
+
+    #[test]
+    fn converts_text_values_to_json_objects_without_document_key_validation() -> crate::Result<()> {
+        let mut value = TextValue::create("H");
+        value.set_attr("font.size", "12", ticket(1));
+
+        assert_eq!(
+            r#"{"attrs":{"font.size":12},"val":"H"}"#,
+            value.to_json_object()?.to_sorted_json()
+        );
+        Ok(())
     }
 
     #[test]

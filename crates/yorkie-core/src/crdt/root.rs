@@ -1,6 +1,7 @@
 use super::element::{CrdtElement, DataSize};
 use super::object::CrdtObject;
 use super::rga_tree_list::RgaTreeListNode;
+use super::text::CrdtText;
 use crate::{Result, TimeTicket, YorkieError, TIME_TICKET_SIZE};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -31,10 +32,10 @@ pub(crate) struct CrdtGcPair {
 }
 
 impl CrdtGcPair {
-    fn new(child: &RgaTreeListNode) -> Self {
+    fn new(child_id: String, child_size: DataSize) -> Self {
         Self {
-            child_id: child.id_string(),
-            child_size: child.data_size(),
+            child_id,
+            child_size,
         }
     }
 }
@@ -145,13 +146,16 @@ impl CrdtRoot {
     }
 
     pub(crate) fn register_gc_pair(&mut self, child: &RgaTreeListNode) {
-        let child_id = child.id_string();
+        self.register_gc_pair_by_id(child.id_string(), child.data_size());
+    }
+
+    pub(crate) fn register_gc_pair_by_id(&mut self, child_id: String, child_size: DataSize) {
         if let Some(pair) = self.gc_pair_by_child_id.remove(&child_id) {
             sub_data_size(&mut self.doc_size.gc, pair.child_size);
             return;
         }
 
-        let pair = CrdtGcPair::new(child);
+        let pair = CrdtGcPair::new(child_id.clone(), child_size);
         add_data_size(&mut self.doc_size.gc, pair.child_size);
         self.gc_pair_by_child_id.insert(child_id, pair);
     }
@@ -487,6 +491,17 @@ impl CrdtRoot {
         self.root_object.find_array_by_created_at_mut(created_at)
     }
 
+    pub(crate) fn text_by_created_at(&self, created_at: &TimeTicket) -> Option<&CrdtText> {
+        self.root_object.find_text_by_created_at(created_at)
+    }
+
+    pub(crate) fn text_by_created_at_mut(
+        &mut self,
+        created_at: &TimeTicket,
+    ) -> Option<&mut CrdtText> {
+        self.root_object.find_text_by_created_at_mut(created_at)
+    }
+
     pub(crate) fn doc_size(&self) -> DocSize {
         self.doc_size
     }
@@ -624,7 +639,7 @@ impl CrdtRoot {
                     self.register_element_internal(child, Some(element));
                 }
             }
-            CrdtElement::Primitive(_) => {}
+            CrdtElement::Primitive(_) | CrdtElement::Text(_) => {}
         }
     }
 
@@ -646,7 +661,7 @@ impl CrdtRoot {
                     self.deregister_element_internal(child, count);
                 }
             }
-            CrdtElement::Primitive(_) => {}
+            CrdtElement::Primitive(_) | CrdtElement::Text(_) => {}
         }
     }
 
@@ -666,7 +681,7 @@ impl CrdtRoot {
                     self.register_removed_descendants(child);
                 }
             }
-            CrdtElement::Primitive(_) => {}
+            CrdtElement::Primitive(_) | CrdtElement::Text(_) => {}
         }
     }
 
@@ -687,6 +702,11 @@ impl CrdtRoot {
                     }
                 }
             }
+            CrdtElement::Text(text) => {
+                for (child_id, child_size) in text.gc_pair_entries() {
+                    self.register_gc_pair_by_id(child_id, child_size);
+                }
+            }
             CrdtElement::Primitive(_) => {}
         }
     }
@@ -696,7 +716,7 @@ fn sub_path_of(parent: &CrdtElement, created_at: &TimeTicket) -> Option<String> 
     match parent {
         CrdtElement::Object(object) => object.sub_path_of(created_at).map(ToOwned::to_owned),
         CrdtElement::Array(array) => array.sub_path_of(created_at),
-        CrdtElement::Primitive(_) => None,
+        CrdtElement::Primitive(_) | CrdtElement::Text(_) => None,
     }
 }
 
@@ -714,7 +734,7 @@ fn collect_descendant_ids(element: &CrdtElement, seen: &mut BTreeSet<String>) {
                 collect_descendant_ids(child, seen);
             }
         }
-        CrdtElement::Primitive(_) => {}
+        CrdtElement::Primitive(_) | CrdtElement::Text(_) => {}
     }
 }
 
@@ -735,7 +755,9 @@ mod tests {
     use crate::crdt::element::CrdtElement;
     use crate::crdt::object::CrdtObject;
     use crate::crdt::primitive::{CrdtPrimitive, PrimitiveValue};
+    use crate::crdt::text::CrdtText;
     use crate::{TimeTicket, TIME_TICKET_SIZE};
+    use std::collections::BTreeMap;
 
     #[test]
     fn creates_root_with_initial_object() -> crate::Result<()> {
@@ -891,6 +913,62 @@ mod tests {
         assert_eq!(1, copy.stats().gc_pairs);
         assert_eq!(1, copy.get_garbage_len());
         assert_eq!("$.items.1", copy.create_path(&one_at)?);
+        Ok(())
+    }
+
+    #[test]
+    fn registers_text_members_and_text_gc_pairs() -> crate::Result<()> {
+        let text_at = ticket(1, "a");
+        let mut text = CrdtText::create(text_at.clone());
+        text.edit_by_index(0, 0, "Hello World", None, ticket(2, "a"), None)?;
+
+        let mut attrs = BTreeMap::new();
+        attrs.insert("b".to_owned(), "true".to_owned());
+        text.set_style_by_index(0, 5, attrs, ticket(3, "a"), None)?;
+        text.remove_style_by_index(0, 5, &["b".to_owned()], ticket(4, "a"), None)?;
+        text.edit_by_index(5, 11, "", None, ticket(5, "a"), None)?;
+
+        assert_eq!(2, text.gc_pair_entries().len());
+
+        let root = CrdtRoot::new(CrdtObject::create_with_members(
+            TimeTicket::initial(),
+            [("message", CrdtElement::text(text))],
+        ));
+
+        assert_eq!(2, root.get_element_map_size());
+        assert_eq!("$.message", root.create_path(&text_at)?);
+        assert_eq!(r#"{"message":[{"val":"Hello"}]}"#, root.to_json());
+        assert_eq!(
+            "Hello",
+            root.text_by_created_at(&text_at).unwrap().to_string()
+        );
+        assert_eq!(2, root.stats().gc_pairs);
+        assert_eq!(2, root.get_garbage_len());
+
+        let copy = root.deepcopy();
+        assert_eq!(2, copy.stats().gc_pairs);
+        assert_eq!(r#"{"message":[{"val":"Hello"}]}"#, copy.to_json());
+        Ok(())
+    }
+
+    #[test]
+    fn finds_mutable_text_members_in_the_live_tree() -> crate::Result<()> {
+        let mut root = CrdtRoot::create();
+        let text_at = ticket(1, "a");
+
+        root.set_object_member(
+            &TimeTicket::initial(),
+            "message",
+            CrdtElement::text(CrdtText::create(text_at.clone())),
+            text_at.clone(),
+        )?;
+
+        root.text_by_created_at_mut(&text_at)
+            .unwrap()
+            .edit_by_index(0, 0, "Hi", None, ticket(2, "a"), None)?;
+
+        assert_eq!(r#"{"message":[{"val":"Hi"}]}"#, root.to_json());
+        assert_eq!("$.message", root.create_path(&text_at)?);
         Ok(())
     }
 

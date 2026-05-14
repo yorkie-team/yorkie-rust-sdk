@@ -282,6 +282,7 @@ fn crdt_element_to_json_value(element: &CrdtElement) -> Result<JsonValue> {
             }
             JsonValue::Array(array)
         }
+        CrdtElement::Text(value) => JsonValue::Array(value.to_json_array()?),
     };
 
     Ok(value)
@@ -289,8 +290,10 @@ fn crdt_element_to_json_value(element: &CrdtElement) -> Result<JsonValue> {
 
 #[cfg(test)]
 mod tests {
-    use super::Document;
+    use super::{crdt_element_to_json_value, Document};
     use crate::change::ChangePack;
+    use crate::crdt::element::CrdtElement;
+    use crate::crdt::text::CrdtText;
     use crate::{Checkpoint, JsonArray, JsonObject, Result, VersionVector, YorkieError};
 
     #[test]
@@ -317,6 +320,17 @@ mod tests {
             "0:00:0.SET.title=\"hello\"",
             doc.local_changes[0].to_test_string()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn converts_crdt_text_to_public_json_array() -> Result<()> {
+        let mut text = CrdtText::create(crate::TimeTicket::new(1, 0, "a"));
+        text.edit_by_index(0, 0, "Hi", None, crate::TimeTicket::new(2, 0, "a"), None)?;
+
+        let value = crdt_element_to_json_value(&CrdtElement::text(text))?;
+
+        assert_eq!(r#"[{"val":"Hi"}]"#, value.to_sorted_json());
         Ok(())
     }
 

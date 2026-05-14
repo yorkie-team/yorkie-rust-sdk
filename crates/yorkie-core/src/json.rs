@@ -57,6 +57,15 @@ impl JsonObject {
         Ok(self)
     }
 
+    pub(crate) fn set_unchecked(
+        &mut self,
+        key: impl Into<String>,
+        value: impl Into<JsonValue>,
+    ) -> &mut Self {
+        self.members.insert(key.into(), value.into());
+        self
+    }
+
     pub fn get(&self, key: &str) -> Option<&JsonValue> {
         self.members.get(key)
     }

@@ -1,6 +1,7 @@
 use super::element::{CrdtElement, CrdtElementMeta, DataSize};
 use super::object::CrdtObject;
 use super::rga_tree_list::{RgaTreeList, RgaTreeListNode};
+use super::text::CrdtText;
 use crate::{Result, TimeTicket};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -182,7 +183,7 @@ impl CrdtArray {
                         return Some(element);
                     }
                 }
-                CrdtElement::Primitive(_) => {}
+                CrdtElement::Primitive(_) | CrdtElement::Text(_) => {}
             }
         }
 
@@ -206,7 +207,7 @@ impl CrdtArray {
                         return Some(object);
                     }
                 }
-                CrdtElement::Primitive(_) => {}
+                CrdtElement::Primitive(_) | CrdtElement::Text(_) => {}
             }
         }
 
@@ -237,7 +238,7 @@ impl CrdtArray {
                         return Some(object);
                     }
                 }
-                CrdtElement::Primitive(_) => {}
+                CrdtElement::Primitive(_) | CrdtElement::Text(_) => {}
             }
         }
 
@@ -261,7 +262,7 @@ impl CrdtArray {
                         return Some(array);
                     }
                 }
-                CrdtElement::Primitive(_) => {}
+                CrdtElement::Primitive(_) | CrdtElement::Text(_) => {}
             }
         }
 
@@ -290,6 +291,63 @@ impl CrdtArray {
                 CrdtElement::Object(object) => {
                     if let Some(array) = object.find_array_by_created_at_mut(created_at) {
                         return Some(array);
+                    }
+                }
+                CrdtElement::Primitive(_) | CrdtElement::Text(_) => {}
+            }
+        }
+
+        None
+    }
+
+    pub(crate) fn find_text_by_created_at(&self, created_at: &TimeTicket) -> Option<&CrdtText> {
+        for child in self.iter_all() {
+            match child {
+                CrdtElement::Text(text) => {
+                    if text.created_at() == created_at {
+                        return Some(text);
+                    }
+                }
+                CrdtElement::Object(object) => {
+                    if let Some(text) = object.find_text_by_created_at(created_at) {
+                        return Some(text);
+                    }
+                }
+                CrdtElement::Array(array) => {
+                    if let Some(text) = array.find_text_by_created_at(created_at) {
+                        return Some(text);
+                    }
+                }
+                CrdtElement::Primitive(_) => {}
+            }
+        }
+
+        None
+    }
+
+    pub(crate) fn find_text_by_created_at_mut(
+        &mut self,
+        created_at: &TimeTicket,
+    ) -> Option<&mut CrdtText> {
+        for node in self.elements.iter_all_mut() {
+            let Some(child) = node.element_mut() else {
+                continue;
+            };
+
+            match child {
+                CrdtElement::Text(text) => {
+                    if text.created_at() == created_at {
+                        return Some(text);
+                    }
+                }
+                CrdtElement::Object(object) => {
+                    if let Some(text) = object.find_text_by_created_at_mut(created_at) {
+                        return Some(text);
+                    }
+                }
+                CrdtElement::Array(array) => {
+                    if let Some(text) = array.find_text_by_created_at_mut(created_at) {
+                        return Some(text);
                     }
                 }
                 CrdtElement::Primitive(_) => {}

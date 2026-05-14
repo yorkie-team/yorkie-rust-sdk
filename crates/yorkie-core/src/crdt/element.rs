@@ -1,6 +1,7 @@
 use super::array::CrdtArray;
 use super::object::CrdtObject;
 use super::primitive::CrdtPrimitive;
+use super::text::CrdtText;
 use crate::{TimeTicket, TIME_TICKET_SIZE};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -109,6 +110,7 @@ pub(crate) enum CrdtElement {
     Primitive(CrdtPrimitive),
     Object(Box<CrdtObject>),
     Array(Box<CrdtArray>),
+    Text(Box<CrdtText>),
 }
 
 impl CrdtElement {
@@ -124,11 +126,16 @@ impl CrdtElement {
         Self::Array(Box::new(value))
     }
 
+    pub(crate) fn text(value: CrdtText) -> Self {
+        Self::Text(Box::new(value))
+    }
+
     pub(crate) fn created_at(&self) -> &TimeTicket {
         match self {
             Self::Primitive(value) => value.created_at(),
             Self::Object(value) => value.created_at(),
             Self::Array(value) => value.created_at(),
+            Self::Text(value) => value.created_at(),
         }
     }
 
@@ -137,6 +144,7 @@ impl CrdtElement {
             Self::Primitive(value) => value.id(),
             Self::Object(value) => value.id(),
             Self::Array(value) => value.id(),
+            Self::Text(value) => value.id(),
         }
     }
 
@@ -145,6 +153,7 @@ impl CrdtElement {
             Self::Primitive(value) => value.moved_at(),
             Self::Object(value) => value.moved_at(),
             Self::Array(value) => value.moved_at(),
+            Self::Text(value) => value.moved_at(),
         }
     }
 
@@ -153,6 +162,7 @@ impl CrdtElement {
             Self::Primitive(value) => value.removed_at(),
             Self::Object(value) => value.removed_at(),
             Self::Array(value) => value.removed_at(),
+            Self::Text(value) => value.removed_at(),
         }
     }
 
@@ -161,6 +171,7 @@ impl CrdtElement {
             Self::Primitive(value) => value.positioned_at(),
             Self::Object(value) => value.positioned_at(),
             Self::Array(value) => value.positioned_at(),
+            Self::Text(value) => value.positioned_at(),
         }
     }
 
@@ -169,6 +180,7 @@ impl CrdtElement {
             Self::Primitive(value) => value.set_moved_at(moved_at),
             Self::Object(value) => value.set_moved_at(moved_at),
             Self::Array(value) => value.set_moved_at(moved_at),
+            Self::Text(value) => value.set_moved_at(moved_at),
         }
     }
 
@@ -177,6 +189,7 @@ impl CrdtElement {
             Self::Primitive(value) => value.set_removed_at(removed_at),
             Self::Object(value) => value.set_removed_at(removed_at),
             Self::Array(value) => value.set_removed_at(removed_at),
+            Self::Text(value) => value.set_removed_at(removed_at),
         }
     }
 
@@ -185,6 +198,7 @@ impl CrdtElement {
             Self::Primitive(value) => value.remove(removed_at),
             Self::Object(value) => value.remove(removed_at),
             Self::Array(value) => value.remove(removed_at),
+            Self::Text(value) => value.remove(removed_at),
         }
     }
 
@@ -193,6 +207,7 @@ impl CrdtElement {
             Self::Primitive(value) => value.is_removed(),
             Self::Object(value) => value.is_removed(),
             Self::Array(value) => value.is_removed(),
+            Self::Text(value) => value.is_removed(),
         }
     }
 
@@ -201,6 +216,7 @@ impl CrdtElement {
             Self::Primitive(value) => value.meta_usage(),
             Self::Object(value) => value.meta_usage(),
             Self::Array(value) => value.meta_usage(),
+            Self::Text(value) => value.meta_usage(),
         }
     }
 
@@ -209,6 +225,7 @@ impl CrdtElement {
             Self::Primitive(value) => value.data_size(),
             Self::Object(value) => value.data_size(),
             Self::Array(value) => value.data_size(),
+            Self::Text(value) => value.data_size(),
         }
     }
 
@@ -217,6 +234,7 @@ impl CrdtElement {
             Self::Primitive(value) => value.to_json(),
             Self::Object(value) => value.to_json(),
             Self::Array(value) => value.to_json(),
+            Self::Text(value) => value.to_json(),
         }
     }
 
@@ -225,6 +243,7 @@ impl CrdtElement {
             Self::Primitive(value) => value.to_sorted_json(),
             Self::Object(value) => value.to_sorted_json(),
             Self::Array(value) => value.to_sorted_json(),
+            Self::Text(value) => value.to_sorted_json(),
         }
     }
 
@@ -233,6 +252,7 @@ impl CrdtElement {
             Self::Primitive(value) => Self::Primitive(value.deepcopy()),
             Self::Object(value) => Self::Object(Box::new(value.deepcopy())),
             Self::Array(value) => Self::Array(Box::new(value.deepcopy())),
+            Self::Text(value) => Self::Text(Box::new(value.deepcopy())),
         }
     }
 }
@@ -241,6 +261,7 @@ impl CrdtElement {
 mod tests {
     use super::{CrdtElement, CrdtElementMeta};
     use crate::crdt::primitive::{CrdtPrimitive, PrimitiveValue};
+    use crate::crdt::text::CrdtText;
     use crate::{TimeTicket, TIME_TICKET_SIZE};
 
     #[test]
@@ -335,5 +356,29 @@ mod tests {
         assert!(element.is_removed());
         assert_eq!(TIME_TICKET_SIZE * 3, element.meta_usage());
         assert_eq!(element, element.deepcopy());
+    }
+
+    #[test]
+    fn delegates_element_operations_to_text() -> crate::Result<()> {
+        let created_at = TimeTicket::new(1, 0, "a");
+        let edited_at = TimeTicket::new(2, 0, "a");
+        let moved_at = TimeTicket::new(3, 0, "a");
+        let removed_at = TimeTicket::new(4, 0, "a");
+        let mut text = CrdtText::create(created_at);
+        text.edit_by_index(0, 0, "Hi", None, edited_at, None)?;
+
+        let mut element = CrdtElement::text(text);
+
+        assert_eq!(r#"[{"val":"Hi"}]"#, element.to_json());
+        assert_eq!(element.created_at(), element.id());
+        assert!(element.set_moved_at(Some(moved_at.clone())));
+        assert_eq!(Some(&moved_at), element.moved_at());
+        assert_eq!(&moved_at, element.positioned_at());
+
+        assert!(element.remove(Some(removed_at.clone())));
+        assert_eq!(Some(&removed_at), element.removed_at());
+        assert!(element.is_removed());
+        assert_eq!(element, element.deepcopy());
+        Ok(())
     }
 }

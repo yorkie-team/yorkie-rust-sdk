@@ -245,6 +245,9 @@ Current Rust behavior:
 - `Rht` and `RhtNode` now model string attributes with LWW updates,
   tombstones, removed-node GC candidates, visible-size accounting,
   deep-copy behavior, node identity, and JSON/object conversion.
+- `TextValue` uses `Rht` for text block attributes, and `CrdtRoot` can rebuild
+  GC pair indexes for removed text attribute nodes when a root is created from
+  an existing CRDT tree.
 - Unit tests cover the JS RHT test flow for set/get/has, remove, remove of
   missing keys, set after remove, repeated remove, deep copy, purge, and escaped
   JSON output.
@@ -261,7 +264,8 @@ JS/Go behavior:
 Gap:
 
 - Rust `Rht` is connected to internal `TextValue`, but not yet to tree nodes.
-- Root-level GC pair registration for removed `RhtNode` values is not wired yet.
+- Text style/edit operations are not ported yet, so new removed `RhtNode`
+  values are not registered through a change-context operation path.
 - Rust `Rht::to_json` uses deterministic key ordering through `BTreeMap`.
   This matches Go marshaling and text's sorted attribute output, but JS
   `RHT.toJSON` itself follows `Map` insertion order.
@@ -269,9 +273,9 @@ Gap:
 
 Expected direction:
 
-- Use this `Rht` directly in the upcoming text value and tree node ports.
-- Register removed attribute nodes as root GC pairs when style/edit operations
-  are added.
+- Use this `Rht` directly in the upcoming tree node port.
+- Register removed attribute nodes as root GC pairs from `StyleOperation` and
+  any future public Text style API.
 - Keep Text output aligned with JS `CRDTTextValue.toJSON`, including parsing
   attribute values from JSON strings before serializing visible attributes.
 
@@ -287,6 +291,11 @@ Current Rust behavior:
   candidates.
 - `CrdtText` wraps `RgaTreeSplit<TextValue>` with CRDT element metadata and
   offers internal index-based edit/style/remove-style helpers.
+- `CrdtText` is now a `CrdtElement` variant, participates in root path lookup,
+  can be found through root text lookup helpers, and converts to public
+  `JsonValue::Array` for internal document-root materialization.
+- `CrdtRoot` can rebuild GC pair indexes for removed text nodes and removed
+  text attribute nodes when it is created from an existing CRDT tree.
 - Unit tests cover the Go text CRDT smoke tests and the matching JS internal
   flow: insert text, replace a range, split a styled range, remove style, delete
   content, and split strings by UTF-16 code units.
@@ -305,9 +314,12 @@ Gap:
 
 - Rust `RgaTreeSplit` currently uses a linear `Vec` backing structure instead
   of splay/LLRB indexes.
-- Rust `CrdtText` is not yet part of `CrdtElement`, `CrdtRoot`, public
-  `JsonValue`, public Text API, operation structs, or wire conversion.
+- Rust `CrdtText` is not yet exposed through a public Text facade, operation
+  structs, or wire conversion.
 - Rust style/edit helpers do not yet emit operation info or reverse operations.
+- Text edit/style operations are not ported yet, so root indexes and document
+  sizes are not updated through the full JS operation flow during live text
+  edits.
 - Version-vector-aware edit/style conflict behavior is only modeled at the
   internal helper level and needs parity tests from JS/Go concurrent text cases.
 - Rust strings cannot represent invalid standalone UTF-16 surrogate halves, so
@@ -316,12 +328,10 @@ Gap:
 
 Expected direction:
 
-- Add `CrdtText` to `CrdtElement` once the public Text facade and conversion
-  path can preserve the correct JSON/document semantics.
 - Port `EditOperation` and `StyleOperation`, then connect public Text methods
   through `ChangeContext`.
-- Add root GC pair registration for removed text nodes and removed attribute
-  nodes.
+- Register new removed text nodes and removed attribute nodes as root GC pairs
+  from those operations.
 - Port focused JS/Go tests for text concurrency before optimizing the backing
   indexes.
 
