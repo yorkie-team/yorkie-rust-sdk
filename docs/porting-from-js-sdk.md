@@ -92,9 +92,14 @@ it has:
 | `CrdtPrimitive` | `packages/sdk/src/document/crdt/primitive.ts` | Internal CRDT element for leaf primitive values. |
 | `ElementRht` | `packages/sdk/src/document/crdt/element_rht.ts` | Internal replicated hash table for object members, keyed by visible key and element creation time. |
 | `CrdtObject` | `packages/sdk/src/document/crdt/object.ts` | Internal CRDT container for object members stored in `ElementRht`. |
+| `RgaTreeList` | `packages/sdk/src/document/crdt/rga_tree_list.ts` | Internal replicated growable array list. Rust currently keeps the same node semantics with a linear backing structure. |
+| `CrdtArray` | `packages/sdk/src/document/crdt/array.ts` | Internal CRDT container for array elements stored in `RgaTreeList`. |
 | `CrdtRoot` | `packages/sdk/src/document/crdt/root.ts` | Internal root that indexes CRDT elements by creation time and creates element paths. |
 | `SetOperation` | `packages/sdk/src/document/operation/set_operation.ts` | Operation that sets an object member and updates the root index and GC candidates. |
-| `RemoveOperation` | `packages/sdk/src/document/operation/remove_operation.ts` | Operation that removes an object member by creation time and updates GC candidates. |
+| `RemoveOperation` | `packages/sdk/src/document/operation/remove_operation.ts` | Operation that removes an object member or array element by creation time and updates GC candidates. |
+| `AddOperation` | `packages/sdk/src/document/operation/add_operation.ts` | Operation that inserts a CRDT element into an array after a position identity. |
+| `MoveOperation` | `packages/sdk/src/document/operation/move_operation.ts` | Operation that moves an existing array element using position-node identity. |
+| `ArraySetOperation` | `packages/sdk/src/document/operation/array_set_operation.ts` | Operation that replaces an array element by inserting a new element and tombstoning the previous one. |
 | `JsonObject` | `packages/sdk/src/document/json/object.ts` | Public JSON-like object API must map to JS object behavior. |
 | `JsonObject::set` | `ObjectProxy.setInternal()` | Reject object keys containing `.` and store the new member value. |
 | `JsonObject::remove` | `ObjectProxy.deleteInternal()` | Rust method for deleting an object member. Missing keys must be a no-op. |
@@ -124,6 +129,8 @@ Only after local change capture is aligned should the Rust SDK move to
 
 Before adding or changing a Rust SDK concept:
 
+- Did you check [Current Porting Gaps](current-porting-gaps.md) for known
+  differences in the area you are touching?
 - Which JS SDK file is the source of truth?
 - Which JS SDK test or behavior is being ported?
 - Which Go SDK/client file was cross-checked, if the feature has a comparable
