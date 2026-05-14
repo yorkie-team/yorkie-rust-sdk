@@ -1020,6 +1020,101 @@ mod tests {
     }
 
     #[test]
+    fn deepcopies_array_position_nodes_for_following_insert() -> crate::Result<()> {
+        let mut root = CrdtRoot::create();
+        let array_at = ticket(1, "a");
+        let zero_at = ticket(2, "a");
+        let one_at = ticket(3, "a");
+        let two_at = ticket(4, "a");
+        let moved_at = ticket(5, "a");
+        let three_at = ticket(6, "a");
+
+        create_integer_array(
+            &mut root,
+            &array_at,
+            [(&zero_at, 0), (&one_at, 1), (&two_at, 2)],
+        )?;
+        root.move_array_element(&array_at, &TimeTicket::initial(), &two_at, moved_at.clone())?;
+
+        assert_eq!(r#"{"items":[2,0,1]}"#, root.to_json());
+
+        let mut copy = root.deepcopy();
+        assert_eq!(root.to_json(), copy.to_json());
+        assert_eq!(root.stats(), copy.stats());
+        assert_eq!(
+            moved_at,
+            copy.array_by_created_at(&array_at)
+                .unwrap()
+                .pos_created_at(&two_at)?
+        );
+
+        let copied_last_at = copy
+            .array_by_created_at(&array_at)
+            .unwrap()
+            .get_last_created_at();
+        copy.insert_array_element(
+            &array_at,
+            &copied_last_at,
+            primitive_int(3, three_at.clone()),
+            three_at.clone(),
+        )?;
+
+        assert_eq!(r#"{"items":[2,0,1]}"#, root.to_json());
+        assert_eq!(r#"{"items":[2,0,1,3]}"#, copy.to_json());
+        assert_eq!("$.items.0", copy.create_path(&two_at)?);
+        assert_eq!("$.items.3", copy.create_path(&three_at)?);
+        Ok(())
+    }
+
+    #[test]
+    fn rebuilds_array_gc_indexes_from_copied_root_object() -> crate::Result<()> {
+        let mut root = CrdtRoot::create();
+        let array_at = ticket(1, "a");
+        let zero_at = ticket(2, "a");
+        let one_at = ticket(3, "a");
+        let two_at = ticket(4, "a");
+        let moved_at = ticket(5, "a");
+        let removed_at = ticket(6, "a");
+
+        create_integer_array(
+            &mut root,
+            &array_at,
+            [(&zero_at, 0), (&one_at, 1), (&two_at, 2)],
+        )?;
+        root.move_array_element(&array_at, &TimeTicket::initial(), &two_at, moved_at)?;
+        root.remove_container_element(&array_at, &one_at, removed_at.clone())?;
+
+        assert_eq!(r#"{"items":[2,0]}"#, root.to_json());
+        assert_eq!(1, root.stats().gc_elements);
+        assert_eq!(1, root.stats().gc_pairs);
+        assert_eq!(2, root.get_garbage_len());
+
+        let mut rebuilt = CrdtRoot::new(root.root_object.deepcopy());
+        assert_eq!(root.to_json(), rebuilt.to_json());
+        assert_eq!(root.stats(), rebuilt.stats());
+        assert_eq!("$.items.0", rebuilt.create_path(&two_at)?);
+        assert_eq!(
+            Some(&removed_at),
+            rebuilt.find_by_created_at(&one_at).unwrap().removed_at()
+        );
+
+        let mut vector = VersionVector::new();
+        vector.set("a", 5);
+        assert_eq!(1, rebuilt.garbage_collect(&vector)?);
+        assert_eq!(1, rebuilt.stats().gc_elements);
+        assert_eq!(0, rebuilt.stats().gc_pairs);
+        assert_eq!(1, rebuilt.get_garbage_len());
+        assert_eq!(r#"{"items":[2,0]}"#, rebuilt.to_json());
+
+        vector.set("a", 6);
+        assert_eq!(1, rebuilt.garbage_collect(&vector)?);
+        assert_eq!(0, rebuilt.get_garbage_len());
+        assert!(rebuilt.find_by_created_at(&one_at).is_none());
+        assert_eq!(r#"{"items":[2,0]}"#, rebuilt.to_json());
+        Ok(())
+    }
+
+    #[test]
     fn registers_text_members_and_text_gc_pairs() -> crate::Result<()> {
         let text_at = ticket(1, "a");
         let mut text = CrdtText::create(text_at.clone());
@@ -1123,9 +1218,42 @@ mod tests {
         assert!(root.doc_size().live.data > 0);
     }
 
+    fn create_integer_array<const N: usize>(
+        root: &mut CrdtRoot,
+        array_at: &TimeTicket,
+        values: [(&TimeTicket, i32); N],
+    ) -> crate::Result<()> {
+        root.set_object_member(
+            &TimeTicket::initial(),
+            "items",
+            CrdtElement::array(CrdtArray::create(array_at.clone())),
+            array_at.clone(),
+        )?;
+
+        let mut prev_at = TimeTicket::initial();
+        for (created_at, value) in values {
+            root.insert_array_element(
+                array_at,
+                &prev_at,
+                primitive_int(value, created_at.clone()),
+                created_at.clone(),
+            )?;
+            prev_at = created_at.clone();
+        }
+
+        Ok(())
+    }
+
     fn primitive_str(value: &str, created_at: TimeTicket) -> CrdtElement {
         CrdtElement::primitive(CrdtPrimitive::new(
             PrimitiveValue::String(value.to_owned()),
+            created_at,
+        ))
+    }
+
+    fn primitive_int(value: i32, created_at: TimeTicket) -> CrdtElement {
+        CrdtElement::primitive(CrdtPrimitive::new(
+            PrimitiveValue::Integer(value),
             created_at,
         ))
     }

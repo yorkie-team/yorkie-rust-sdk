@@ -31,13 +31,15 @@ deep copy/rebuild.
 | Removed element GC | covered | Root tracks removed elements and deregisters them on GC. |
 | Array dead position GC | covered | Dead RGA position nodes are registered, copied, and purged. |
 | Text node/attribute GC | covered | Root rebuilds and purges text internal GC pairs. |
-| Document size accounting | partial | Current tests cover narrow slices; broad JS/Go size tests remain. |
-| Deep copy index rebuild | partial | Covered for current variants; tree/counter missing. |
+| Document size accounting | partial | Current tests cover narrow slices; array move/remove size can differ between operation-maintained roots and rebuilt roots. Broad JS/Go size tests remain. |
+| Deep copy index rebuild | partial | Covered for current variants, including array moved/dead position lookup; tree/counter missing. |
 | Sync lifecycle GC | blocked | Requires client/sync lifecycle and server version vectors. |
-| Snapshot GC rebuild | partial | Text/array internal rebuilds are partial; snapshot application is missing. |
+| Snapshot GC rebuild | partial | Array moved/dead positions and text internal pairs rebuild through copied root objects; snapshot application is missing. |
 
 ## Next Checks
 
+- Resolve array move/remove document-size parity for operation-maintained roots
+  versus rebuilt roots.
 - Add doc size tests for array dead position GC and mixed element/internal GC.
 - Add root-level tests whenever a new CRDT element variant is introduced.
 - Defer sync lifecycle GC tests until client and protocol layers exist.

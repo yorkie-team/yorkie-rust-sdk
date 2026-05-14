@@ -41,7 +41,7 @@ application, public array mutation APIs, and sync-level convergence.
 | Operation position anchors | covered | Rust ports Go position-confusion regressions for move-front/move-last followed by push or insert. |
 | Public `JsonArray` facade | blocked | Current public array is not context-backed, so operation intent is not preserved. |
 | Splay/index optimization | missing | Rust uses linear `Vec` scans. |
-| Snapshot restoration | partial | Internal `add_dead_position` and `add_moved_element` exist but snapshot tests are missing. |
+| Snapshot restoration | partial | Root rebuild tests cover moved positions, dead positions, path lookup, and GC after copy; protocol snapshot conversion is still missing. |
 | Wire conversion | missing | No operation/protocol conversion yet. |
 
 ## Next Checks
