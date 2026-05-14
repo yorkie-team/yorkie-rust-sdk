@@ -89,6 +89,7 @@ it has:
 | `CrdtObject` | `packages/sdk/src/document/crdt/object.ts` | Internal CRDT container for object members stored in `ElementRht`. |
 | `CrdtRoot` | `packages/sdk/src/document/crdt/root.ts` | Internal root that indexes CRDT elements by creation time and creates element paths. |
 | `SetOperation` | `packages/sdk/src/document/operation/set_operation.ts` | Operation that sets an object member and updates the root index and GC candidates. |
+| `RemoveOperation` | `packages/sdk/src/document/operation/remove_operation.ts` | Operation that removes an object member by creation time and updates GC candidates. |
 | `JsonObject` | `packages/sdk/src/document/json/object.ts` | Public JSON-like object API must map to JS object behavior. |
 | `JsonObject::set` | `ObjectProxy.setInternal()` | Reject object keys containing `.` and store the new member value. |
 | `JsonObject::remove` | `ObjectProxy.deleteInternal()` | Rust method for deleting an object member. Missing keys must be a no-op. |

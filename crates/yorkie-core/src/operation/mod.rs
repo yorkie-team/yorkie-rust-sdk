@@ -16,6 +16,7 @@ pub(crate) enum OpSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OpInfo {
     Set { path: String, key: String },
+    Remove { path: String, key: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]

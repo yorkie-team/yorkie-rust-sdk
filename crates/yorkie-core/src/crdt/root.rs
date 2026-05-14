@@ -132,18 +132,21 @@ impl CrdtRoot {
     ) -> Result<Option<&CrdtElement>> {
         let object = self
             .object_by_created_at(parent_created_at)
-            .ok_or_else(|| {
-                if self.find_by_created_at(parent_created_at).is_some() {
-                    return YorkieError::UnexpectedCrdtElement {
-                        id: parent_created_at.to_id_string(),
-                        expected: "object",
-                    };
-                }
-
-                YorkieError::MissingCrdtElement(parent_created_at.to_id_string())
-            })?;
+            .ok_or_else(|| self.object_parent_error(parent_created_at))?;
 
         Ok(object.get(key))
+    }
+
+    pub(crate) fn object_member_sub_path(
+        &self,
+        parent_created_at: &TimeTicket,
+        created_at: &TimeTicket,
+    ) -> Result<Option<&str>> {
+        let object = self
+            .object_by_created_at(parent_created_at)
+            .ok_or_else(|| self.object_parent_error(parent_created_at))?;
+
+        Ok(object.sub_path_of(created_at))
     }
 
     pub(crate) fn set_object_member(
@@ -157,16 +160,7 @@ impl CrdtRoot {
         let value_created_at = value.created_at().clone();
 
         if self.object_by_created_at(parent_created_at).is_none() {
-            if self.find_by_created_at(parent_created_at).is_some() {
-                return Err(YorkieError::UnexpectedCrdtElement {
-                    id: parent_created_at.to_id_string(),
-                    expected: "object",
-                });
-            }
-
-            return Err(YorkieError::MissingCrdtElement(
-                parent_created_at.to_id_string(),
-            ));
+            return Err(self.object_parent_error(parent_created_at));
         }
 
         let (inserted, removed) = {
@@ -183,8 +177,7 @@ impl CrdtRoot {
             (inserted, removed)
         };
 
-        self.refresh_element_pair(parent_created_at);
-        self.refresh_element_pair(&TimeTicket::initial());
+        self.refresh_element_pair_and_ancestors(parent_created_at);
 
         let parent = self
             .actual_element_by_created_at(parent_created_at)
@@ -199,6 +192,32 @@ impl CrdtRoot {
         }
 
         Ok((inserted, removed))
+    }
+
+    pub(crate) fn remove_object_member(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        created_at: &TimeTicket,
+        executed_at: TimeTicket,
+    ) -> Result<CrdtElement> {
+        if self.object_by_created_at(parent_created_at).is_none() {
+            return Err(self.object_parent_error(parent_created_at));
+        }
+
+        let removed = {
+            let object = self
+                .object_by_created_at_mut(parent_created_at)
+                .ok_or_else(|| YorkieError::MissingCrdtElement(parent_created_at.to_id_string()))?;
+
+            object.delete(created_at, executed_at)?
+        };
+
+        self.refresh_element_pair_and_ancestors(parent_created_at);
+        if removed.removed_at().is_some() {
+            self.register_removed_element(&removed);
+        }
+
+        Ok(removed)
     }
 
     pub(crate) fn get_element_map_size(&self) -> usize {
@@ -298,6 +317,30 @@ impl CrdtRoot {
         {
             pair.element = element;
         }
+    }
+
+    fn refresh_element_pair_and_ancestors(&mut self, created_at: &TimeTicket) {
+        let mut current = Some(created_at.clone());
+
+        while let Some(created_at) = current {
+            current = self
+                .find_element_pair_by_created_at(&created_at)
+                .and_then(|pair| pair.parent())
+                .map(|parent| parent.created_at().clone());
+
+            self.refresh_element_pair(&created_at);
+        }
+    }
+
+    fn object_parent_error(&self, parent_created_at: &TimeTicket) -> YorkieError {
+        if self.find_by_created_at(parent_created_at).is_some() {
+            return YorkieError::UnexpectedCrdtElement {
+                id: parent_created_at.to_id_string(),
+                expected: "object",
+            };
+        }
+
+        YorkieError::MissingCrdtElement(parent_created_at.to_id_string())
     }
 
     fn register_element_internal(&mut self, element: &CrdtElement, parent: Option<&CrdtElement>) {
