@@ -69,6 +69,12 @@ impl JsonObject {
         self.members.remove(key)
     }
 
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, &JsonValue)> {
+        self.members
+            .iter()
+            .map(|(key, value)| (key.as_str(), value))
+    }
+
     pub fn get_array_mut(&mut self, key: &str) -> Result<&mut JsonArray> {
         match self.members.get_mut(key) {
             Some(JsonValue::Array(value)) => Ok(value),
