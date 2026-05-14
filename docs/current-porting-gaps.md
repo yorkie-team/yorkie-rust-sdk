@@ -5,6 +5,8 @@ Last reviewed: 2026-05-14
 This document records known differences between the current Rust SDK and the
 JS/Go implementations. It is intentionally practical: each section explains
 what is different today, why it matters, and what should be aligned later.
+Detailed per-element CRDT checklists live in
+`docs/crdt-parity/README.md`.
 
 The JS SDK remains the behavioral source of truth. The Go implementation should
 be used as a typed cross-check, especially for CRDT internals, operation

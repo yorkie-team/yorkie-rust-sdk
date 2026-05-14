@@ -6,6 +6,8 @@ This directory captures the development contract for the Rust SDK.
   direction rules.
 - [Current Porting Gaps](current-porting-gaps.md): known differences between
   the current Rust implementation and the JS/Go implementations.
+- [CRDT Parity Checklists](crdt-parity/README.md): per-element CRDT parity
+  status, missing tests, and next checks.
 - [Porting from the JS SDK](porting-from-js-sdk.md): source-of-truth rules,
   Go SDK cross-check policy, naming policy, and the test-driven porting
   workflow.
