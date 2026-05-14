@@ -135,6 +135,10 @@ impl JsonArray {
         self.elements.is_empty()
     }
 
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &JsonValue> {
+        self.elements.iter()
+    }
+
     pub fn to_sorted_json(&self) -> String {
         let elements = self
             .elements

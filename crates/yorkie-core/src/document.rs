@@ -1,4 +1,5 @@
 use crate::change::{Change, ChangeContext, ChangeId, ChangePack, Checkpoint};
+use crate::crdt::array::CrdtArray;
 use crate::crdt::element::CrdtElement;
 use crate::crdt::object::CrdtObject;
 use crate::crdt::primitive::{CrdtPrimitive, PrimitiveValue};
@@ -147,13 +148,7 @@ fn collect_object_changes(
 
     for (key, after_value) in after.iter() {
         let Some(before_value) = before.get(key) else {
-            push_set_or_remove_unsupported(
-                context,
-                crdt_root,
-                parent_created_at,
-                key,
-                after_value,
-            )?;
+            push_set_or_remove_unsupported(context, parent_created_at, key, after_value)?;
             continue;
         };
 
@@ -178,7 +173,7 @@ fn collect_object_changes(
             }
         }
 
-        push_set_or_remove_unsupported(context, crdt_root, parent_created_at, key, after_value)?;
+        push_set_or_remove_unsupported(context, parent_created_at, key, after_value)?;
     }
 
     Ok(())
@@ -186,21 +181,12 @@ fn collect_object_changes(
 
 fn push_set_or_remove_unsupported(
     context: &mut ChangeContext,
-    crdt_root: &CrdtRoot,
     parent_created_at: &TimeTicket,
     key: &str,
     value: &JsonValue,
 ) -> Result<()> {
-    if matches!(value, JsonValue::Array(_)) {
-        push_remove_operation(context, crdt_root, parent_created_at, key)?;
-        return Ok(());
-    }
-
     let created_at = context.issue_time_ticket();
-    let Some(element) = json_value_to_crdt_element(value, created_at.clone(), context)? else {
-        push_remove_operation(context, crdt_root, parent_created_at, key)?;
-        return Ok(());
-    };
+    let element = json_value_to_crdt_element(value, created_at.clone(), context)?;
 
     context.push(Operation::Set(SetOperation::create(
         key.to_owned(),
@@ -236,7 +222,7 @@ fn json_value_to_crdt_element(
     value: &JsonValue,
     created_at: TimeTicket,
     context: &mut ChangeContext,
-) -> Result<Option<CrdtElement>> {
+) -> Result<CrdtElement> {
     let element = match value {
         JsonValue::Null => primitive(PrimitiveValue::Null, created_at),
         JsonValue::Bool(value) => primitive(PrimitiveValue::Boolean(*value), created_at),
@@ -247,23 +233,28 @@ fn json_value_to_crdt_element(
         JsonValue::Object(value) => {
             let mut members = Vec::new();
             for (key, value) in value.iter() {
-                if matches!(value, JsonValue::Array(_)) {
-                    continue;
-                }
-
                 let member_created_at = context.issue_time_ticket();
-                if let Some(element) =
-                    json_value_to_crdt_element(value, member_created_at, context)?
-                {
-                    members.push((key.to_owned(), element));
-                }
+                let element = json_value_to_crdt_element(value, member_created_at, context)?;
+                members.push((key.to_owned(), element));
             }
             CrdtElement::object(CrdtObject::create_with_members(created_at, members))
         }
-        JsonValue::Array(_) => return Ok(None),
+        JsonValue::Array(value) => {
+            let mut elements = Vec::new();
+            for value in value.iter() {
+                let element_created_at = context.issue_time_ticket();
+                elements.push(json_value_to_crdt_element(
+                    value,
+                    element_created_at,
+                    context,
+                )?);
+            }
+
+            CrdtElement::array(CrdtArray::create_with_elements(created_at, elements)?)
+        }
     };
 
-    Ok(Some(element))
+    Ok(element)
 }
 
 fn primitive(value: PrimitiveValue, created_at: TimeTicket) -> CrdtElement {
@@ -284,6 +275,13 @@ fn crdt_element_to_json_value(element: &CrdtElement) -> Result<JsonValue> {
     let value = match element {
         CrdtElement::Primitive(value) => value.to_json_value(),
         CrdtElement::Object(value) => JsonValue::Object(crdt_object_to_json_object(value)?),
+        CrdtElement::Array(value) => {
+            let mut array = crate::JsonArray::new();
+            for element in value.iter() {
+                array.push(crdt_element_to_json_value(element)?);
+            }
+            JsonValue::Array(array)
+        }
     };
 
     Ok(value)
@@ -293,7 +291,7 @@ fn crdt_element_to_json_value(element: &CrdtElement) -> Result<JsonValue> {
 mod tests {
     use super::Document;
     use crate::change::ChangePack;
-    use crate::{Checkpoint, JsonObject, Result, VersionVector, YorkieError};
+    use crate::{Checkpoint, JsonArray, JsonObject, Result, VersionVector, YorkieError};
 
     #[test]
     fn creates_document_with_the_given_key() {
@@ -368,6 +366,33 @@ mod tests {
         assert_eq!(
             "1:00:1.REMOVE.1:00:2,1:00:1.SET.active=true",
             doc.local_changes[1].to_test_string()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn records_arrays_as_crdt_elements() -> Result<()> {
+        let mut doc = Document::new("doc-key");
+
+        doc.update(|root| {
+            let mut profile = JsonObject::new();
+            profile.set("name", "yorkie")?;
+
+            let mut todos = JsonArray::new();
+            todos.push("write tests").push(profile);
+            root.set("todos", todos)?;
+            Ok(())
+        })?;
+
+        assert_eq!(
+            r#"{"todos":["write tests",{"name":"yorkie"}]}"#,
+            doc.to_sorted_json()
+        );
+        assert_eq!(doc.to_sorted_json(), doc.crdt_root.to_sorted_json());
+        assert_eq!(5, doc.crdt_root.get_element_map_size());
+        assert_eq!(
+            r#"0:00:0.SET.todos=["write tests",{"name":"yorkie"}]"#,
+            doc.local_changes[0].to_test_string()
         );
         Ok(())
     }
@@ -463,6 +488,35 @@ mod tests {
         assert_eq!(Checkpoint::new(1, 0), target.checkpoint());
         assert_eq!(2, target.change_id.lamport());
         assert_eq!(r#"{"profile":{"name":"yorkie"}}"#, target.to_sorted_json());
+        assert_eq!(target.crdt_root.to_sorted_json(), target.to_sorted_json());
+        Ok(())
+    }
+
+    #[test]
+    fn applies_remote_array_changes_from_change_pack() -> Result<()> {
+        let mut source = Document::new("source-doc");
+        let mut target = Document::new("target-doc");
+
+        source.update(|root| {
+            let mut array = JsonArray::new();
+            array.push("sync").push(false);
+            root.set("items", array)?;
+            Ok(())
+        })?;
+
+        let source_pack = source.create_change_pack();
+        let remote_pack = ChangePack::create(
+            "target-doc",
+            Checkpoint::new(1, 0),
+            false,
+            source_pack.changes().to_vec(),
+            source_pack.version_vector().cloned(),
+            None,
+        );
+
+        target.apply_change_pack(&remote_pack)?;
+
+        assert_eq!(r#"{"items":["sync",false]}"#, target.to_sorted_json());
         assert_eq!(target.crdt_root.to_sorted_json(), target.to_sorted_json());
         Ok(())
     }
