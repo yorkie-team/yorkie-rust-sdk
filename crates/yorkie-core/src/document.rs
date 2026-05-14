@@ -1,4 +1,4 @@
-use crate::change::{Change, ChangeContext, ChangeId};
+use crate::change::{Change, ChangeContext, ChangeId, ChangePack, Checkpoint};
 use crate::crdt::element::CrdtElement;
 use crate::crdt::object::CrdtObject;
 use crate::crdt::primitive::{CrdtPrimitive, PrimitiveValue};
@@ -12,6 +12,7 @@ pub struct Document {
     key: String,
     root: JsonObject,
     crdt_root: CrdtRoot,
+    checkpoint: Checkpoint,
     change_id: ChangeId,
     local_changes: Vec<Change>,
 }
@@ -23,6 +24,7 @@ impl Document {
             key: key.into(),
             root: JsonObject::new(),
             crdt_root: CrdtRoot::create(),
+            checkpoint: Checkpoint::initial(),
             change_id: ChangeId::initial(),
             local_changes: Vec::new(),
         }
@@ -64,6 +66,30 @@ impl Document {
     /// Returns an immutable view of the document root.
     pub fn get_root(&self) -> &JsonObject {
         &self.root
+    }
+
+    /// Returns this document's checkpoint.
+    pub fn checkpoint(&self) -> Checkpoint {
+        self.checkpoint
+    }
+
+    /// Returns whether this document has local changes waiting to be synced.
+    pub fn has_local_changes(&self) -> bool {
+        !self.local_changes.is_empty()
+    }
+
+    /// Creates a pack of local changes to send to the remote.
+    pub fn create_change_pack(&self) -> ChangePack {
+        let changes = self.local_changes.clone();
+        let checkpoint = self.checkpoint.increase_client_seq(changes.len() as u32);
+        ChangePack::create(
+            self.key.clone(),
+            checkpoint,
+            false,
+            changes,
+            Some(self.change_id.version_vector().clone()),
+            None,
+        )
     }
 
     /// Serializes the document root with object keys sorted lexicographically.
@@ -213,12 +239,14 @@ fn primitive(value: PrimitiveValue, created_at: TimeTicket) -> CrdtElement {
 #[cfg(test)]
 mod tests {
     use super::Document;
-    use crate::{JsonObject, Result};
+    use crate::{Checkpoint, JsonObject, Result};
 
     #[test]
     fn creates_document_with_the_given_key() {
         let doc = Document::new("doc-key");
         assert_eq!("doc-key", doc.key());
+        assert_eq!(Checkpoint::initial(), doc.checkpoint());
+        assert!(!doc.has_local_changes());
     }
 
     #[test]
@@ -230,6 +258,7 @@ mod tests {
         assert_eq!(r#"{"title":"hello"}"#, doc.to_sorted_json());
         assert_eq!(r#"{"title":"hello"}"#, doc.crdt_root.to_sorted_json());
         assert_eq!(1, doc.local_changes.len());
+        assert!(doc.has_local_changes());
         assert_eq!(1, doc.change_id.client_seq());
         assert_eq!(1, doc.change_id.lamport());
         assert_eq!(
@@ -285,6 +314,32 @@ mod tests {
         assert_eq!(
             "1:00:1.REMOVE.1:00:2,1:00:1.SET.active=true",
             doc.local_changes[1].to_test_string()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn creates_change_pack_from_local_changes() -> Result<()> {
+        let mut doc = Document::new("doc-key");
+
+        doc.update(|root| root.set("title", "hello").map(|_| ()))?;
+        doc.update(|root| root.set("done", false).map(|_| ()))?;
+
+        let pack = doc.create_change_pack();
+
+        assert_eq!("doc-key", pack.document_key());
+        assert_eq!(Checkpoint::new(0, 2), pack.checkpoint());
+        assert!(!pack.is_removed());
+        assert!(pack.has_changes());
+        assert_eq!(2, pack.change_size());
+        assert_eq!(2, pack.changes().len());
+        assert_eq!(2, pack.operations_len());
+        assert_eq!(Checkpoint::initial(), doc.checkpoint());
+        assert!(doc.has_local_changes());
+        assert_eq!(
+            Some(2),
+            pack.version_vector()
+                .and_then(|vector| vector.get(doc.change_id.actor_id().as_str()))
         );
         Ok(())
     }

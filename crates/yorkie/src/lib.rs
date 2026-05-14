@@ -3,7 +3,7 @@
 
 pub use yorkie_client::{Client, ClientOptions};
 pub use yorkie_core::{
-    ActorId, Document, JsonArray, JsonObject, JsonValue, Result, TimeTicket, TimeTicketStruct,
-    VersionVector, YorkieError,
+    ActorId, ChangePack, Checkpoint, Document, JsonArray, JsonObject, JsonValue, Result,
+    TimeTicket, TimeTicketStruct, VersionVector, YorkieError,
 };
 pub use yorkie_protocol::YORKIE_PROTO_PACKAGE;

@@ -83,8 +83,10 @@ it has:
 | `TimeTicket` | `packages/sdk/src/document/time/ticket.ts` | Logical timestamp ordered by lamport, actor, then delimiter. |
 | `VersionVector` | `packages/sdk/src/document/time/version_vector.ts` | Actor-to-lamport vector used for causal visibility checks. |
 | `ChangeId` | `packages/sdk/src/document/change/change_id.ts` | Change identifier with client sequence, server sequence, actor, lamport, and version vector. |
+| `Checkpoint` | `packages/sdk/src/document/change/checkpoint.ts` | Tracks sent and received client/server sequences for sync. |
 | `ChangeContext` | `packages/sdk/src/document/change/context.ts` | Records operations during a local edit and issues time tickets from the next change ID. |
 | `Change` | `packages/sdk/src/document/change/change.ts` | Unit of document modification that executes operations and collects operation info and reverse operations. |
+| `ChangePack` | `packages/sdk/src/document/change/change_pack.ts` | Bundle of document key, checkpoint, changes, version vector, removal flag, and optional snapshot for sync. |
 | `CrdtElementMeta` | `packages/sdk/src/document/crdt/element.ts` | Rust metadata holder for CRDT element timestamps. |
 | `CrdtElement` | `packages/sdk/src/document/crdt/element.ts` | Internal enum that exposes common element behavior across CRDT value types. |
 | `CrdtPrimitive` | `packages/sdk/src/document/crdt/primitive.ts` | Internal CRDT element for leaf primitive values. |

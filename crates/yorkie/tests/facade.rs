@@ -1,4 +1,6 @@
-use yorkie::{ActorId, Document, Result, TimeTicket, TimeTicketStruct, VersionVector};
+use yorkie::{
+    ActorId, ChangePack, Checkpoint, Document, Result, TimeTicket, TimeTicketStruct, VersionVector,
+};
 
 #[test]
 fn facade_exports_document_api() -> Result<()> {
@@ -10,6 +12,11 @@ fn facade_exports_document_api() -> Result<()> {
     })?;
 
     assert_eq!(r#"{"title":"hello"}"#, doc.to_sorted_json());
+    assert_eq!(Checkpoint::initial(), doc.checkpoint());
+
+    let pack: ChangePack = doc.create_change_pack();
+    assert_eq!("test-doc", pack.document_key());
+    assert_eq!(Checkpoint::new(0, 1), pack.checkpoint());
 
     Ok(())
 }

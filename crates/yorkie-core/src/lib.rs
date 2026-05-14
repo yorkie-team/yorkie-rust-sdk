@@ -12,6 +12,10 @@ mod json;
 mod operation;
 mod time;
 
+pub use change::{
+    ChangePack, Checkpoint, INITIAL_CHECKPOINT, INITIAL_CLIENT_SEQ, INITIAL_SERVER_SEQ,
+    MAX_CHECKPOINT, MAX_CLIENT_SEQ, MAX_SERVER_SEQ,
+};
 pub use document::Document;
 pub use error::{Result, YorkieError};
 pub use json::{JsonArray, JsonObject, JsonValue};
