@@ -65,7 +65,8 @@ impl IncreaseOperation {
             None
         };
 
-        root.increase_counter(self.parent_created_at(), &value)?;
+        let actor = (!self.actor.is_empty()).then_some(self.actor.as_str());
+        root.increase_counter(self.parent_created_at(), &value, actor)?;
 
         let path = root.create_path(self.parent_created_at())?;
         Ok(Some(ExecutionResult {
@@ -301,6 +302,82 @@ mod tests {
 
         assert_eq!(r#"{"cnt":1}"#, root.to_json());
         assert!(result.reverse_op.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn increases_dedup_counter_with_actor() -> crate::Result<()> {
+        let mut root = CrdtRoot::create();
+        let counter_at = ticket(1, "a");
+        let first_at = ticket(2, "a");
+        let duplicate_at = ticket(3, "a");
+        let second_at = ticket(4, "a");
+
+        create_counter(
+            &mut root,
+            "uv",
+            counter_at.clone(),
+            CounterType::IntegerDedup,
+            CounterValue::Integer(0),
+        )?;
+
+        let result = IncreaseOperation::create_with_actor(
+            counter_at.clone(),
+            primitive(PrimitiveValue::Integer(1), first_at.clone()),
+            Some(first_at),
+            "user-1",
+        )
+        .execute(&mut root, OpSource::Remote)?
+        .unwrap();
+        assert_eq!(r#"{"uv":1}"#, root.to_json());
+        assert!(result.reverse_op.is_none());
+
+        IncreaseOperation::create_with_actor(
+            counter_at.clone(),
+            primitive(PrimitiveValue::Integer(1), duplicate_at.clone()),
+            Some(duplicate_at),
+            "user-1",
+        )
+        .execute(&mut root, OpSource::Remote)?;
+        assert_eq!(r#"{"uv":1}"#, root.to_json());
+
+        IncreaseOperation::create_with_actor(
+            counter_at,
+            primitive(PrimitiveValue::Integer(1), second_at.clone()),
+            Some(second_at),
+            "user-2",
+        )
+        .execute(&mut root, OpSource::Remote)?;
+        assert_eq!(r#"{"uv":2}"#, root.to_json());
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_dedup_counter_without_actor() -> crate::Result<()> {
+        let mut root = CrdtRoot::create();
+        let counter_at = ticket(1, "a");
+        let increase_at = ticket(2, "a");
+
+        create_counter(
+            &mut root,
+            "uv",
+            counter_at.clone(),
+            CounterType::IntegerDedup,
+            CounterValue::Integer(0),
+        )?;
+
+        let err = IncreaseOperation::create(
+            counter_at,
+            primitive(PrimitiveValue::Integer(1), increase_at.clone()),
+            Some(increase_at),
+        )
+        .execute(&mut root, OpSource::Remote)
+        .unwrap_err();
+
+        assert_eq!(
+            YorkieError::InvalidCounterOperation("dedup counter requires actor".to_owned()),
+            err
+        );
         Ok(())
     }
 

@@ -1,4 +1,5 @@
 use super::element::{CrdtElementMeta, DataSize};
+use super::hll::Hll;
 use super::primitive::{CrdtPrimitive, PrimitiveValue};
 use crate::{Result, TimeTicket, YorkieError};
 
@@ -6,6 +7,7 @@ use crate::{Result, TimeTicket, YorkieError};
 pub(crate) enum CounterType {
     Integer,
     Long,
+    IntegerDedup,
 }
 
 impl CounterType {
@@ -13,6 +15,7 @@ impl CounterType {
         match self {
             Self::Integer => "integer counter",
             Self::Long => "long counter",
+            Self::IntegerDedup => "integer dedup counter",
         }
     }
 }
@@ -29,6 +32,7 @@ pub(crate) struct CrdtCounter {
     meta: CrdtElementMeta,
     value_type: CounterType,
     value: CounterValue,
+    hll: Option<Hll>,
 }
 
 impl CrdtCounter {
@@ -41,6 +45,7 @@ impl CrdtCounter {
             meta: CrdtElementMeta::new(created_at),
             value_type,
             value: normalize_value(value_type, value),
+            hll: value_type.is_dedup().then(Hll::new),
         }
     }
 
@@ -57,7 +62,7 @@ impl CrdtCounter {
         bytes: &[u8],
     ) -> Result<CounterValue> {
         match counter_type {
-            CounterType::Integer => {
+            CounterType::Integer | CounterType::IntegerDedup => {
                 let bytes = fixed_bytes::<4>(counter_type, bytes)?;
                 Ok(CounterValue::Integer(i32::from_le_bytes(bytes)))
             }
@@ -111,9 +116,13 @@ impl CrdtCounter {
     pub(crate) fn data_size(&self) -> DataSize {
         DataSize {
             data: match self.value_type {
-                CounterType::Integer => 4,
+                CounterType::Integer | CounterType::IntegerDedup => 4,
                 CounterType::Long => 8,
-            },
+            } + self
+                .hll
+                .as_ref()
+                .map(|hll| hll.to_bytes().len())
+                .unwrap_or(0),
             meta: self.meta_usage(),
         }
     }
@@ -127,10 +136,23 @@ impl CrdtCounter {
     }
 
     pub(crate) fn is_numeric_type(&self) -> bool {
-        matches!(self.value_type, CounterType::Integer | CounterType::Long)
+        matches!(
+            self.value_type,
+            CounterType::Integer | CounterType::Long | CounterType::IntegerDedup
+        )
+    }
+
+    pub(crate) fn is_dedup(&self) -> bool {
+        self.value_type.is_dedup()
     }
 
     pub(crate) fn increase(&mut self, operand: &CrdtPrimitive) -> Result<()> {
+        if self.is_dedup() {
+            return Err(YorkieError::InvalidCounterOperation(
+                "dedup counter requires actor".to_owned(),
+            ));
+        }
+
         if !self.is_numeric_type() || !operand.is_numeric_type() {
             return Err(YorkieError::UnexpectedCrdtElement {
                 id: operand.created_at().to_id_string(),
@@ -147,9 +169,58 @@ impl CrdtCounter {
                 let current = long_value(self.value);
                 CounterValue::Long(current.wrapping_add(primitive_to_long(operand)?))
             }
+            CounterType::IntegerDedup => unreachable!("dedup counters require actor"),
         };
 
         Ok(())
+    }
+
+    pub(crate) fn increase_dedup(&mut self, operand: &CrdtPrimitive, actor: &str) -> Result<()> {
+        if !self.is_dedup() {
+            return self.increase(operand);
+        }
+
+        if !operand.is_numeric_type() {
+            return Err(YorkieError::UnexpectedCrdtElement {
+                id: operand.created_at().to_id_string(),
+                expected: "numeric primitive",
+            });
+        }
+
+        if actor.is_empty() {
+            return Err(YorkieError::InvalidCounterOperation(
+                "dedup counter requires actor".to_owned(),
+            ));
+        }
+
+        if !is_unit_increment(operand.value()) {
+            return Err(YorkieError::InvalidCounterOperation(
+                "dedup counter only supports increment by 1".to_owned(),
+            ));
+        }
+
+        if self.hll.get_or_insert_with(Hll::new).add(actor) {
+            self.recompute_dedup_value();
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn hll_bytes(&self) -> Option<Vec<u8>> {
+        self.hll.as_ref().map(Hll::to_bytes)
+    }
+
+    pub(crate) fn restore_hll(&mut self, data: &[u8]) -> Result<()> {
+        let hll = self.hll.get_or_insert_with(Hll::new);
+        hll.restore(data)?;
+        self.recompute_dedup_value();
+        Ok(())
+    }
+
+    fn recompute_dedup_value(&mut self) {
+        if let (CounterType::IntegerDedup, Some(hll)) = (self.value_type, self.hll.as_ref()) {
+            self.value = CounterValue::Integer(hll.count() as i32);
+        }
     }
 
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
@@ -177,10 +248,26 @@ impl CrdtCounter {
     }
 }
 
+impl CounterType {
+    fn is_dedup(self) -> bool {
+        matches!(self, Self::IntegerDedup)
+    }
+}
+
 fn normalize_value(value_type: CounterType, value: CounterValue) -> CounterValue {
     match value_type {
         CounterType::Integer => CounterValue::Integer(integer_value(value)),
         CounterType::Long => CounterValue::Long(long_value(value)),
+        CounterType::IntegerDedup => CounterValue::Integer(0),
+    }
+}
+
+fn is_unit_increment(value: &PrimitiveValue) -> bool {
+    match value {
+        PrimitiveValue::Integer(value) => *value == 1,
+        PrimitiveValue::Long(value) => *value == 1,
+        PrimitiveValue::Double(value) => *value == 1.0,
+        _ => false,
     }
 }
 
@@ -256,7 +343,7 @@ fn fixed_bytes<const N: usize>(counter_type: CounterType, bytes: &[u8]) -> Resul
 mod tests {
     use super::{CounterType, CounterValue, CrdtCounter};
     use crate::crdt::primitive::{CrdtPrimitive, PrimitiveValue};
-    use crate::{TimeTicket, TIME_TICKET_SIZE};
+    use crate::{TimeTicket, YorkieError, TIME_TICKET_SIZE};
 
     #[test]
     fn creates_integer_and_long_counters() {
@@ -277,6 +364,16 @@ mod tests {
         assert_eq!(CounterType::Long, long.counter_type());
         assert_eq!(CounterValue::Long(10), long.value());
         assert_eq!("10", long.to_json());
+
+        let dedup = CrdtCounter::create(
+            CounterType::IntegerDedup,
+            CounterValue::Integer(10),
+            TimeTicket::initial(),
+        );
+        assert_eq!(CounterType::IntegerDedup, dedup.counter_type());
+        assert!(dedup.is_dedup());
+        assert_eq!(CounterValue::Integer(0), dedup.value());
+        assert_eq!("0", dedup.to_json());
     }
 
     #[test]
@@ -340,6 +437,11 @@ mod tests {
         let integer =
             CrdtCounter::create(CounterType::Integer, CounterValue::Integer(-1), ticket(1));
         let long = CrdtCounter::create(CounterType::Long, CounterValue::Long(-1), ticket(2));
+        let dedup = CrdtCounter::create(
+            CounterType::IntegerDedup,
+            CounterValue::Integer(0),
+            ticket(3),
+        );
 
         assert_eq!(
             CounterValue::Integer(-1),
@@ -349,6 +451,85 @@ mod tests {
             CounterValue::Long(-1),
             CrdtCounter::value_from_bytes(CounterType::Long, &long.to_bytes())?
         );
+        assert_eq!(
+            CounterValue::Integer(0),
+            CrdtCounter::value_from_bytes(CounterType::IntegerDedup, &dedup.to_bytes())?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn increases_dedup_counters_once_per_actor() -> crate::Result<()> {
+        let mut counter = CrdtCounter::create(
+            CounterType::IntegerDedup,
+            CounterValue::Integer(0),
+            ticket(1),
+        );
+        let operand = primitive(PrimitiveValue::Integer(1), ticket(2));
+
+        counter.increase_dedup(&operand, "user-1")?;
+        counter.increase_dedup(&operand, "user-1")?;
+        counter.increase_dedup(&operand, "user-2")?;
+        counter.increase_dedup(&operand, "user-3")?;
+
+        assert_eq!(CounterValue::Integer(3), counter.value());
+        assert_eq!("3", counter.to_json());
+        assert_eq!(4 + 16_384, counter.data_size().data);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_invalid_dedup_increases() {
+        let mut counter = CrdtCounter::create(
+            CounterType::IntegerDedup,
+            CounterValue::Integer(0),
+            ticket(1),
+        );
+
+        let missing_actor = counter
+            .increase_dedup(&primitive(PrimitiveValue::Integer(1), ticket(2)), "")
+            .unwrap_err();
+        assert_eq!(
+            YorkieError::InvalidCounterOperation("dedup counter requires actor".to_owned()),
+            missing_actor
+        );
+
+        let non_unit = counter
+            .increase_dedup(&primitive(PrimitiveValue::Integer(2), ticket(3)), "user-1")
+            .unwrap_err();
+        assert_eq!(
+            YorkieError::InvalidCounterOperation(
+                "dedup counter only supports increment by 1".to_owned()
+            ),
+            non_unit
+        );
+    }
+
+    #[test]
+    fn restores_hll_state_and_deepcopies_independently() -> crate::Result<()> {
+        let mut counter = CrdtCounter::create(
+            CounterType::IntegerDedup,
+            CounterValue::Integer(0),
+            ticket(1),
+        );
+        let operand = primitive(PrimitiveValue::Integer(1), ticket(2));
+        counter.increase_dedup(&operand, "user-1")?;
+        counter.increase_dedup(&operand, "user-2")?;
+
+        let bytes = counter.hll_bytes().unwrap();
+        let mut restored = CrdtCounter::create(
+            CounterType::IntegerDedup,
+            CounterValue::Integer(0),
+            ticket(3),
+        );
+        restored.restore_hll(&bytes)?;
+        assert_eq!(CounterValue::Integer(2), restored.value());
+
+        let copy = restored.deepcopy();
+        restored.increase_dedup(&operand, "user-3")?;
+
+        assert_eq!(CounterValue::Integer(3), restored.value());
+        assert_eq!(CounterValue::Integer(2), copy.value());
         Ok(())
     }
 

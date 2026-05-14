@@ -600,6 +600,7 @@ impl CrdtRoot {
         &mut self,
         created_at: &TimeTicket,
         value: &CrdtPrimitive,
+        actor: Option<&str>,
     ) -> Result<()> {
         if self.counter_by_created_at(created_at).is_none() {
             return Err(self.counter_parent_error(created_at));
@@ -610,7 +611,11 @@ impl CrdtRoot {
                 .counter_by_created_at_mut(created_at)
                 .ok_or_else(|| YorkieError::MissingCrdtElement(created_at.to_id_string()))?;
             let previous_size = counter.data_size();
-            counter.increase(value)?;
+            if counter.is_dedup() {
+                counter.increase_dedup(value, actor.unwrap_or_default())?;
+            } else {
+                counter.increase(value)?;
+            }
             (previous_size, counter.data_size())
         };
 

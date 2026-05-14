@@ -38,6 +38,9 @@ pub enum YorkieError {
     /// A requested text position or range is not valid for the current text.
     InvalidTextPosition(String),
 
+    /// A counter operation is invalid for the current counter mode.
+    InvalidCounterOperation(String),
+
     /// Snapshot application has not been implemented yet.
     UnsupportedSnapshot,
 }
@@ -73,6 +76,9 @@ impl Display for YorkieError {
                 write!(f, "unexpected type for key {key:?}: expected {expected}")
             }
             Self::InvalidTextPosition(message) => write!(f, "invalid text position: {message}"),
+            Self::InvalidCounterOperation(message) => {
+                write!(f, "invalid counter operation: {message}")
+            }
             Self::UnsupportedSnapshot => write!(f, "snapshot application is not supported yet"),
         }
     }

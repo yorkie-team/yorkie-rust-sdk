@@ -231,20 +231,24 @@ Expected direction:
 Current Rust behavior:
 
 - `CrdtCounter` exists for regular integer and long counters.
+- Integer dedup counters are backed by an internal HLL with precision 14,
+  xxhash64 seed 0, max-merge, 16KB register serialization, and restore support.
 - Counter values normalize constructor input and numeric operands to fixed-width
   signed integer behavior with wrapping.
 - `CrdtElement` can hold counters, and `CrdtRoot` can find and refresh counter
   elements by creation time.
 - `IncreaseOperation` applies primitive numeric operands through `CrdtRoot`,
-  emits internal increase op info, and creates a reverse increase operation for
-  undo/redo wiring.
+  emits internal increase op info, creates a reverse increase operation for
+  undo/redo wiring, and applies actor-based dedup increases without reverse
+  operations.
 
 JS/Go behavior:
 
 - JS exposes public `Counter` and `DedupCounter` facades that create counter
   CRDT elements and increase operations directly inside `Document.update`.
 - JS and Go support regular int/long counters plus dedup counters backed by
-  HLL registers.
+  HLL registers. JS accepts numeric `1` for dedup increments, while Go's typed
+  helper rejects float operands for dedup increments.
 - Increase operations are converted to/from protocol payloads and are exercised
   through sync, history, and event tests.
 
@@ -252,7 +256,6 @@ Gap:
 
 - Rust does not yet expose a public counter facade, so application code cannot
   create counters through `Document::update`.
-- Dedup counters and HLL register serialization are not implemented.
 - Counter and increase operation wire conversion is missing.
 - Change-level concurrent counter tests are still missing because the public
   editing path and history stack are not complete.
@@ -263,7 +266,7 @@ Expected direction:
   place.
 - Port JS counter integration tests incrementally, using Go for typed CRDT
   edge cases such as bytes, data size, and dedup behavior.
-- Keep regular counter semantics stable before adding HLL-backed dedup mode.
+- Add protocol conversion for dedup HLL register bytes and increase actors.
 
 ## Object and ElementRHT
 

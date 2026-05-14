@@ -22,8 +22,9 @@ operation, concurrent increments, JSON output, data size, and protocol mapping.
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| CRDT counter element | partial | Rust has regular integer and long counters, element dispatch, JSON output, bytes, deep copy, and data size. Dedup/HLL is not implemented yet. |
-| Increase operation | partial | Rust has operation-level increase for primitive numeric operands, op info, reverse op generation, and root index refresh. Dedup actor handling only suppresses reverse op for now because dedup counters do not exist yet. |
+| CRDT counter element | partial | Rust has regular integer, long, and integer-dedup counters, element dispatch, JSON output, bytes, deep copy, HLL restore, and data size. Public/wire construction is still missing. |
+| HLL dedup core | covered | Rust uses precision 14, xxhash64 seed 0, register max-merge, 16KB register serialization, and restore behavior matching JS/Go. |
+| Increase operation | partial | Rust has operation-level increase for primitive numeric operands, op info, reverse op generation, root index refresh, and actor-based dedup increases. Public/history integration is still missing. |
 | Public JSON counter facade | missing | Depends on public editing model. |
 | Concurrent increment tests | missing | Port after change-level/public counter paths exist. |
 | Wire conversion | missing | Depends on operation conversion. |
@@ -38,8 +39,11 @@ operation, concurrent increments, JSON output, data size, and protocol mapping.
   operand. Rust cannot represent a primitive integer outside `i32`, so the
   `i32::MIN` reverse operand is represented as a long with the same JSON value
   that JS emits.
-- Dedup counters, HLL register serialization, and actor-based dedup increment
-  semantics remain future work.
+- Dedup counters require an actor and only accept unit increments. Rust accepts
+  integer, long, or double `1` as a unit increment, following JS behavior; Go's
+  typed helper currently rejects float operands for dedup increments.
+- HLL-backed dedup counters include serialized register bytes in data size,
+  matching JS/Go.
 
 ## Next Checks
 
@@ -48,4 +52,4 @@ operation, concurrent increments, JSON output, data size, and protocol mapping.
 - Port concurrent counter tests through `Change` and document history when
   undo/redo is available.
 - Add wire conversion tests for counter element and increase operation.
-- Implement dedup/HLL only after regular counter behavior is stable.
+- Add protocol conversion for HLL register payloads and dedup increase actors.

@@ -90,6 +90,8 @@ it has:
 | `CrdtElementMeta` | `packages/sdk/src/document/crdt/element.ts` | Rust metadata holder for CRDT element timestamps. |
 | `CrdtElement` | `packages/sdk/src/document/crdt/element.ts` | Internal enum that exposes common element behavior across primitive, object, array, text, counter, and tree values. |
 | `CrdtPrimitive` | `packages/sdk/src/document/crdt/primitive.ts` | Internal CRDT element for leaf primitive values. |
+| `Hll` | `packages/sdk/src/document/crdt/hll.ts` | Internal HyperLogLog register set for dedup counters, using precision 14 and xxhash64 seed 0. |
+| `CrdtCounter` | `packages/sdk/src/document/crdt/counter.ts` | Internal CRDT counter element for integer, long, and integer-dedup counters. |
 | `ElementRht` | `packages/sdk/src/document/crdt/element_rht.ts` | Internal replicated hash table for object members, keyed by visible key and element creation time. |
 | `CrdtObject` | `packages/sdk/src/document/crdt/object.ts` | Internal CRDT container for object members stored in `ElementRht`. |
 | `RhtNode` | `packages/sdk/src/document/crdt/rht.ts` | Internal node for string attributes used by text and tree values. |
