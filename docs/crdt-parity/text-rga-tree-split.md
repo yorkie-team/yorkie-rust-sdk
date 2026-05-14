@@ -36,7 +36,7 @@ behavior, public text facade, and operation info output.
 | Text GC pairs | covered | Removed text nodes and removed attributes are registered and purged. |
 | Operation execution | partial | Edit/style operations execute and register GC pairs, but operation info shape is not final. |
 | Public Text facade | missing | No public context-backed text API yet. |
-| Splay/LLRB optimization | partial | Rust has a weighted splay utility, but `RgaTreeSplit` still uses linear structures and does not yet maintain an ID tree. |
+| Splay/ID lookup optimization | partial | `RgaTreeSplit` now keeps `tree_by_index` and `tree_by_id` equivalents and uses weighted splay lookup for text indexes. Structural mutations still rebuild indexes around the current `Vec` storage instead of using stable linked-node handles. |
 | History and multi-client scenarios | partial | Important integration-style cases still need operation-level replay tests. |
 | Wire conversion | missing | No text operation protocol conversion yet. |
 
@@ -46,5 +46,5 @@ behavior, public text facade, and operation info output.
   implementation before exposing events.
 - Add operation-level replay tests for multi-change text scenarios.
 - Decide how Rust should represent invalid UTF-16 surrogate edges.
-- Attach the weighted splay utility to `RgaTreeSplit` after explicit node
-  handles and ID lookup are in place.
+- Replace rebuild-on-mutation indexing with stable node handles to align the
+  write-side implementation more closely with JS/Go.

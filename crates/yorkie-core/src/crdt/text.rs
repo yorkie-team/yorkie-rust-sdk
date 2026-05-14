@@ -851,6 +851,22 @@ mod tests {
     }
 
     #[test]
+    fn copied_text_keeps_index_lookup_after_splits() -> crate::Result<()> {
+        let mut text = CrdtText::create(ticket(1));
+        text.edit_by_index(0, 0, "ABCDE", None, ticket(2), None)?;
+        text.edit_by_index(1, 4, "xyz", None, ticket(3), None)?;
+
+        let copy = text.deepcopy();
+        let range = copy.index_range_to_pos_range(1, 4)?;
+
+        assert_eq!(text.to_json(), copy.to_json());
+        assert_eq!((4, 4), copy.find_indexes_from_range(&range)?);
+        assert_eq!("2:a:0:0:1", copy.index_to_pos(1)?.to_test_string());
+        assert_eq!("3:a:0:0:2", copy.index_to_pos(3)?.to_test_string());
+        Ok(())
+    }
+
+    #[test]
     fn inserts_newline_between_split_blocks_with_attributes() -> crate::Result<()> {
         let mut text = CrdtText::create(ticket(1));
         let mut attrs = BTreeMap::new();

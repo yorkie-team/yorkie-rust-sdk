@@ -24,13 +24,13 @@ RGA text/list and Tree path/index conversion.
 | Text cursor lookup | covered | `find_for_text` follows the JS/Go boundary behavior where cursor positions can land at node edges. |
 | Array index lookup | covered | `find_for_array` skips tombstoned nodes by weight and rejects out-of-range lookups. |
 | RGA list integration | partial | `RgaTreeList` keeps position/element maps and uses weighted splay lookup for visible indexes and paths. Structural mutations rebuild the index around the current `Vec` storage instead of using stable linked-node handles. |
-| RGA text integration | missing | `RgaTreeSplit` still uses linear vectors. |
+| RGA text integration | partial | `RgaTreeSplit` keeps `tree_by_index` and `tree_by_id` equivalents and uses weighted splay lookup for text indexes. Structural mutations rebuild indexes around the current `Vec` storage instead of using stable linked-node handles. |
 | Tree `IndexTree` integration | missing | Tree path/index conversion still needs the JS `IndexTree` / Go `pkg/index` model. |
 
 ## Next Checks
 
-- Add explicit node handles to `RgaTreeSplit` before replacing linear index
-  lookup with `SplayTree`.
+- Move `RgaTreeSplit` from rebuild-on-mutation indexing to stable node handles
+  when aligning the write-side implementation with JS/Go.
 - Move `RgaTreeList` from rebuild-on-mutation indexing to stable node handles
   when aligning the write-side implementation with JS/Go.
 - Port Tree path/index conversion separately because its index model includes

@@ -1,6 +1,31 @@
 use super::element::DataSize;
+use super::splay::{NodeId as SplayNodeId, SplayTree, SplayValue};
 use crate::{Result, TimeTicket, VersionVector, YorkieError, TIME_TICKET_SIZE};
+use std::cell::RefCell;
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SplitIndexValue {
+    node_index: usize,
+    len: usize,
+}
+
+impl SplitIndexValue {
+    fn new(node_index: usize, len: usize) -> Self {
+        Self { node_index, len }
+    }
+}
+
+impl SplayValue for SplitIndexValue {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn to_test_string(&self) -> String {
+        self.node_index.to_string()
+    }
+}
 
 pub(crate) trait RgaTreeSplitValue: Clone + PartialEq {
     fn split(&mut self, offset: usize) -> Self;
@@ -236,6 +261,9 @@ where
     V: RgaTreeSplitValue,
 {
     nodes: Vec<RgaTreeSplitNode<V>>,
+    tree_by_index: RefCell<SplayTree<SplitIndexValue>>,
+    tree_by_id: BTreeMap<RgaTreeSplitNodeId, usize>,
+    splay_node_by_id: BTreeMap<RgaTreeSplitNodeId, SplayNodeId>,
 }
 
 impl<V> RgaTreeSplit<V>
@@ -243,9 +271,14 @@ where
     V: RgaTreeSplitValue,
 {
     pub(crate) fn new(initial_head: RgaTreeSplitNode<V>) -> Self {
-        Self {
+        let mut split = Self {
             nodes: vec![initial_head],
-        }
+            tree_by_index: RefCell::new(SplayTree::new()),
+            tree_by_id: BTreeMap::new(),
+            splay_node_by_id: BTreeMap::new(),
+        };
+        split.rebuild_indexes();
+        split
     }
 
     pub(crate) fn initial_head(&self) -> &RgaTreeSplitNode<V> {
@@ -253,7 +286,7 @@ where
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.nodes.iter().skip(1).map(RgaTreeSplitNode::len).sum()
+        self.tree_by_index.borrow().len()
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -509,6 +542,7 @@ where
             }
         }
 
+        self.rebuild_indexes();
         true
     }
 
@@ -524,21 +558,18 @@ where
             return Ok(RgaTreeSplitPos::new(self.initial_head().id().clone(), 0));
         }
 
-        let mut cursor = 0;
-        for node in self.iter() {
-            let node_len = node.len();
-            if node_len == 0 {
-                continue;
-            }
+        let (node_index, offset) = {
+            let mut tree = self.tree_by_index.borrow_mut();
+            let (splay_node, offset) = tree.find_for_text(index)?.ok_or_else(|| {
+                YorkieError::InvalidTextPosition("text index tree is empty".to_owned())
+            })?;
+            (tree.value(splay_node).node_index, offset)
+        };
+        let node = self.nodes.get(node_index).ok_or_else(|| {
+            YorkieError::InvalidTextPosition(format!("node index {node_index} not found"))
+        })?;
 
-            if index <= cursor + node_len {
-                return Ok(RgaTreeSplitPos::new(node.id().clone(), index - cursor));
-            }
-
-            cursor += node_len;
-        }
-
-        Ok(RgaTreeSplitPos::new(self.initial_head().id().clone(), 0))
+        Ok(RgaTreeSplitPos::new(node.id().clone(), offset))
     }
 
     fn pos_to_index(&self, pos: &RgaTreeSplitPos, prefer_to_left: bool) -> Result<usize> {
@@ -554,10 +585,25 @@ where
             })?
         };
 
-        let mut cursor = 0;
-        for node in self.nodes.iter().skip(1).take(index.saturating_sub(1)) {
-            cursor += node.len();
-        }
+        let splay_node = *self
+            .splay_node_by_id
+            .get(self.nodes[index].id())
+            .ok_or_else(|| {
+                YorkieError::InvalidTextPosition(format!(
+                    "index node not found for {}",
+                    self.nodes[index].id().to_test_string()
+                ))
+            })?;
+        let cursor = self
+            .tree_by_index
+            .borrow_mut()
+            .index_of(splay_node)
+            .ok_or_else(|| {
+                YorkieError::InvalidTextPosition(format!(
+                    "index node is detached for {}",
+                    self.nodes[index].id().to_test_string()
+                ))
+            })?;
 
         let offset = if self.nodes[index].is_removed() {
             0
@@ -585,22 +631,17 @@ where
     }
 
     fn find_floor_node(&self, id: &RgaTreeSplitNodeId) -> Option<usize> {
-        let (index, node) = self
-            .nodes
-            .iter()
-            .enumerate()
-            .filter(|(_, node)| node.id() <= id)
-            .max_by(|(_, left), (_, right)| left.id().cmp(right.id()))?;
+        let (floor_id, index) = self.tree_by_id.range(..=id.clone()).next_back()?;
 
-        if node.id() != id && !node.id().has_same_created_at(id) {
+        if floor_id != id && !floor_id.has_same_created_at(id) {
             return None;
         }
 
-        Some(index)
+        Some(*index)
     }
 
     fn find_node_index(&self, id: &RgaTreeSplitNodeId) -> Option<usize> {
-        self.nodes.iter().position(|node| node.id() == id)
+        self.tree_by_id.get(id).copied()
     }
 
     fn split_node(&mut self, index: usize, offset: usize) -> Result<DataSize> {
@@ -644,6 +685,7 @@ where
     fn insert_after_index(&mut self, prev_index: usize, node: RgaTreeSplitNode<V>) -> usize {
         let insert_index = prev_index + 1;
         self.nodes.insert(insert_index, node);
+        self.rebuild_indexes();
         insert_index
     }
 
@@ -686,11 +728,28 @@ where
             }
         }
 
+        self.rebuild_indexes();
         removed_nodes
     }
 
     fn next_index(&self, index: usize) -> Option<usize> {
         (index + 1 < self.nodes.len()).then_some(index + 1)
+    }
+
+    fn rebuild_indexes(&mut self) {
+        let mut tree_by_index = SplayTree::new();
+        let mut tree_by_id = BTreeMap::new();
+        let mut splay_node_by_id = BTreeMap::new();
+
+        for (index, node) in self.nodes.iter().enumerate() {
+            let splay_node = tree_by_index.insert(SplitIndexValue::new(index, node.len()));
+            tree_by_id.insert(node.id().clone(), index);
+            splay_node_by_id.insert(node.id().clone(), splay_node);
+        }
+
+        self.tree_by_index = RefCell::new(tree_by_index);
+        self.tree_by_id = tree_by_id;
+        self.splay_node_by_id = splay_node_by_id;
     }
 }
 

@@ -366,6 +366,8 @@ Current Rust behavior:
   receive the enclosing change's version vector, register removed text or
   attribute nodes as GC pairs, update root document size through `acc`, emit
   internal operation info, and create reverse operations for undo/redo wiring.
+- `RgaTreeSplit` now keeps JS/Go-shaped index structures: a weighted splay tree
+  for text index lookup and a node-ID map for floor lookup.
 - Unit tests cover the Go text CRDT smoke tests and matching JS scenarios:
   split-position lookup, Korean composition replacement, deletion with removed
   boundary nodes, deletion of last nodes, concurrent insert/delete with original
@@ -385,8 +387,10 @@ JS/Go behavior:
 
 Gap:
 
-- Rust `RgaTreeSplit` currently uses a linear `Vec` backing structure instead
-  of the available weighted splay utility and a node-ID tree.
+- `RgaTreeSplit` rebuilds its splay and node-ID indexes after structural
+  mutations instead of using JS/Go-style linked nodes with stable per-node index
+  handles. Read lookup now follows the same splay/ID-map route, but write-side
+  index maintenance is still conservative.
 - Rust `CrdtText` is not yet exposed through a public Text facade or wire
   conversion.
 - `StyleOperation` emits per-block style operation info from the text helper,
@@ -407,9 +411,9 @@ Expected direction:
 - Align edit operation info with the JS value-change list before exposing text
   watch/event APIs.
 - Continue porting JS history and multi-client text scenarios at the operation
-  layer before optimizing the backing indexes.
-- Attach `RgaTreeSplit` index lookup to the weighted splay utility once node
-  handles and ID lookup are explicit.
+  layer.
+- Replace rebuild-on-mutation indexing with stable node handles to align the
+  write-side implementation more closely with JS/Go.
 
 ## Tree
 
