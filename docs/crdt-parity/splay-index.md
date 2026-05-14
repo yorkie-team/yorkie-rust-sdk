@@ -23,14 +23,15 @@ RGA text/list and Tree path/index conversion.
 | Weighted splay core | covered | Rust has an arena-backed splay tree with weighted nodes, insert, insert-after, splay, index lookup, delete, range reweighting, weight checks, and JS/Go-shaped tests. |
 | Text cursor lookup | covered | `find_for_text` follows the JS/Go boundary behavior where cursor positions can land at node edges. |
 | Array index lookup | covered | `find_for_array` skips tombstoned nodes by weight and rejects out-of-range lookups. |
-| RGA integration | missing | `RgaTreeList` and `RgaTreeSplit` still use linear vectors. |
+| RGA list integration | partial | `RgaTreeList` keeps position/element maps and uses weighted splay lookup for visible indexes and paths. Structural mutations rebuild the index around the current `Vec` storage instead of using stable linked-node handles. |
+| RGA text integration | missing | `RgaTreeSplit` still uses linear vectors. |
 | Tree `IndexTree` integration | missing | Tree path/index conversion still needs the JS `IndexTree` / Go `pkg/index` model. |
 
 ## Next Checks
 
 - Add explicit node handles to `RgaTreeSplit` before replacing linear index
   lookup with `SplayTree`.
-- Add explicit position and element ID indexes to `RgaTreeList`, then attach
-  visible array index lookup to `SplayTree`.
+- Move `RgaTreeList` from rebuild-on-mutation indexing to stable node handles
+  when aligning the write-side implementation with JS/Go.
 - Port Tree path/index conversion separately because its index model includes
   element padding and hierarchical paths, not only flat weighted lookup.

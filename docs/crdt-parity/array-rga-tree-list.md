@@ -41,7 +41,7 @@ application, public array mutation APIs, and sync-level convergence.
 | Operation-level matrix | covered | Add/move/array-set/remove pairs are applied through `CrdtRoot` in both orders and checked for JSON, path, root stats, and GC convergence. |
 | Operation position anchors | covered | Rust ports Go position-confusion regressions for move-front/move-last followed by push or insert. |
 | Public `JsonArray` facade | blocked | Current public array is not context-backed, so operation intent is not preserved. |
-| Splay/index optimization | partial | Rust has a JS/Go-shaped weighted splay utility, but `RgaTreeList` still uses linear `Vec` scans. |
+| Splay/index optimization | partial | `RgaTreeList` now keeps JS/Go-shaped position and element maps and uses weighted splay lookup for visible indexes and paths. Structural mutations still rebuild the indexes around the Rust `Vec` backing store instead of maintaining linked node handles incrementally. |
 | Snapshot restoration | partial | Root rebuild tests cover moved positions, dead positions, path lookup, and GC after copy; protocol snapshot conversion is still missing. |
 | Wire conversion | missing | No operation/protocol conversion yet. |
 
@@ -49,5 +49,7 @@ application, public array mutation APIs, and sync-level convergence.
 
 - Build the context-backed public `JsonArray` facade before porting JS public
   array tests.
-- Add explicit position and element indexes, then attach array index lookup to
-  the weighted splay utility.
+- Replace the rebuild-on-mutation indexing strategy with stable node handles to
+  match the JS/Go write-side implementation more closely.
+- Keep porting JS/Go array replay and snapshot restoration scenarios around
+  duplicate position IDs, moved positions, and dead position GC.

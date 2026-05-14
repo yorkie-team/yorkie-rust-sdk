@@ -147,7 +147,9 @@ Current Rust behavior:
 - `RgaTreeList` preserves the important concepts of position nodes, element
   identity, moved position timestamps, removed elements, and dead move
   positions.
-- The backing structure is a `Vec` with linear scans.
+- The backing storage is still a `Vec`, but `RgaTreeList` now keeps
+  JS/Go-shaped position and element maps plus a weighted splay tree for visible
+  index and path lookup.
 - A weighted `SplayTree` utility now exists with JS/Go-shaped insert, splay,
   text cursor lookup, array index lookup, delete, range reweighting, and weight
   verification tests.
@@ -172,25 +174,22 @@ JS/Go behavior:
 
 Gap:
 
-- `RgaTreeList` is not yet attached to the weighted splay utility. Index lookup
-  and path creation are still O(n).
-- Rust does not yet keep explicit maps for position IDs and element IDs. Linear
-  lookup preserves simple behavior, but duplicate replay/idempotency cases are
-  not fully covered.
+- `RgaTreeList` rebuilds its maps and splay index after structural mutations
+  instead of using JS/Go-style linked nodes with stable per-node index handles.
+  Read lookup now follows the same map/splay route, but write-side performance
+  is still conservative.
 - Public API array tests still need to be connected once `JsonArray` becomes a
   context-backed editing facade.
-- Snapshot restoration behavior for moved elements and dead positions is not
-  implemented, so `addDeadPosition`/`addMovedElement` parity is only modeled
-  internally.
+- Protocol snapshot conversion is still missing, so `addDeadPosition` and
+  `addMovedElement` parity is covered internally but not through wire
+  snapshots yet.
 
 Expected direction:
 
-- Add focused tests from JS/Go array and RGA behavior before optimizing the
-  data structure.
-- Add explicit position and element indexes when replay/idempotency tests need
-  them, or when performance becomes a real concern.
-- Attach `RgaTreeList` visible-index lookup to the weighted splay utility after
-  the explicit position/element indexes exist.
+- Keep adding focused JS/Go array replay and snapshot tests around duplicate
+  position IDs, moved positions, dead positions, and GC.
+- Replace rebuild-on-mutation indexing with stable node handles to align the
+  write-side implementation more closely with JS/Go.
 
 ## Array Operations
 

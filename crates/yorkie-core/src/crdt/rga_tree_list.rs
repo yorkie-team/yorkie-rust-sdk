@@ -1,5 +1,33 @@
 use super::element::{CrdtElement, DataSize};
+use super::splay::{NodeId as SplayNodeId, SplayTree, SplayValue};
 use crate::{Result, TimeTicket, YorkieError, TIME_TICKET_SIZE};
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListIndexValue {
+    position_index: usize,
+    len: usize,
+}
+
+impl ListIndexValue {
+    fn new(position_index: usize, len: usize) -> Self {
+        Self {
+            position_index,
+            len,
+        }
+    }
+}
+
+impl SplayValue for ListIndexValue {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn to_test_string(&self) -> String {
+        self.position_index.to_string()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RgaTreeListNode {
@@ -101,6 +129,10 @@ impl RgaTreeListNode {
 pub(crate) struct RgaTreeList {
     dummy_head: RgaTreeListNode,
     nodes: Vec<RgaTreeListNode>,
+    node_map_by_index: RefCell<SplayTree<ListIndexValue>>,
+    node_map_by_created_at: BTreeMap<String, usize>,
+    element_map_by_created_at: BTreeMap<String, usize>,
+    splay_node_by_created_at: BTreeMap<String, SplayNodeId>,
 }
 
 impl RgaTreeList {
@@ -116,10 +148,16 @@ impl RgaTreeList {
             .unwrap()
             .set_removed_at(Some(TimeTicket::initial()));
 
-        Self {
+        let mut list = Self {
             dummy_head,
             nodes: Vec::new(),
-        }
+            node_map_by_index: RefCell::new(SplayTree::new()),
+            node_map_by_created_at: BTreeMap::new(),
+            element_map_by_created_at: BTreeMap::new(),
+            splay_node_by_created_at: BTreeMap::new(),
+        };
+        list.rebuild_indexes();
+        list
     }
 
     pub(crate) fn create() -> Self {
@@ -139,6 +177,7 @@ impl RgaTreeList {
         let mut node = RgaTreeListNode::bare_position(position_created_at);
         node.set_removed_at(removed_at);
         self.nodes.push(node);
+        self.rebuild_indexes();
     }
 
     pub(crate) fn add_moved_element(
@@ -151,6 +190,7 @@ impl RgaTreeList {
         node.position_moved_at = Some(position_moved_at);
         node.element = Some(element);
         self.nodes.push(node);
+        self.rebuild_indexes();
     }
 
     pub(crate) fn insert_after(
@@ -169,6 +209,7 @@ impl RgaTreeList {
         let insert_index = node_index_after_position(prev_position);
         let node = RgaTreeListNode::with_element(element);
         self.nodes.insert(insert_index, node.clone());
+        self.rebuild_indexes();
         Ok(node)
     }
 
@@ -206,7 +247,9 @@ impl RgaTreeList {
             let dead_position = self.insert_position_after(prev_created_at, executed_at.clone())?;
             let dead_node = &mut self.nodes[dead_position - 1];
             dead_node.set_removed_at(executed_at);
-            return Ok(Some(dead_node.clone()));
+            let dead_node = dead_node.clone();
+            self.rebuild_indexes();
+            return Ok(Some(dead_node));
         }
 
         let inserted_position = self.insert_position_after(prev_created_at, executed_at.clone())?;
@@ -227,64 +270,71 @@ impl RgaTreeList {
         self.nodes[new_index].position_moved_at = Some(executed_at);
         self.nodes[new_index].element = Some(element);
 
+        self.rebuild_indexes();
         Ok(Some(old_node))
     }
 
     pub(crate) fn get_by_id(&self, created_at: &TimeTicket) -> Option<&RgaTreeListNode> {
-        self.nodes
-            .iter()
-            .find(|node| node.element_created_at() == Some(created_at))
-            .or_else(|| {
-                self.nodes
-                    .iter()
-                    .find(|node| node.position_created_at() == created_at)
-            })
+        self.element_map_by_created_at
+            .get(&created_at.to_id_string())
+            .or_else(|| self.node_map_by_created_at.get(&created_at.to_id_string()))
+            .and_then(|position_index| self.node_at_position_index(*position_index))
     }
 
     pub(crate) fn get_by_index(&self, index: usize) -> Option<&RgaTreeListNode> {
-        self.nodes
-            .iter()
-            .filter(|node| node.element.is_some() && !node.is_removed())
-            .nth(index)
+        let position_index = {
+            let mut tree = self.node_map_by_index.borrow_mut();
+            let node_id = tree.find_for_array(index).ok().flatten()?;
+            tree.value(node_id).position_index
+        };
+        self.node_at_position_index(position_index)
     }
 
     pub(crate) fn get_by_index_mut(&mut self, index: usize) -> Option<&mut RgaTreeListNode> {
-        self.nodes
-            .iter_mut()
-            .filter(|node| node.element.is_some() && !node.is_removed())
-            .nth(index)
+        let position_index = {
+            let mut tree = self.node_map_by_index.borrow_mut();
+            let node_id = tree.find_for_array(index).ok().flatten()?;
+            tree.value(node_id).position_index
+        };
+        self.node_at_position_index_mut(position_index)
     }
 
     pub(crate) fn sub_path_of(&self, created_at: &TimeTicket) -> Option<String> {
-        let target_index = self
-            .node_index_by_element_created_at(created_at)
-            .or_else(|| self.node_index_by_position_created_at(created_at))?;
-
-        let visible_index = self.nodes[..target_index]
-            .iter()
-            .filter(|node| node.element.is_some() && !node.is_removed())
-            .count();
-
+        let position_index = self
+            .element_map_by_created_at
+            .get(&created_at.to_id_string())
+            .or_else(|| self.node_map_by_created_at.get(&created_at.to_id_string()))?;
+        let key = self.node_at_position_index(*position_index)?.id_string();
+        let splay_node = *self.splay_node_by_created_at.get(&key)?;
+        let visible_index = self.node_map_by_index.borrow_mut().index_of(splay_node)?;
         Some(visible_index.to_string())
     }
 
     pub(crate) fn purge(&mut self, element: &CrdtElement) -> Result<()> {
         let created_id = element.created_at().to_id_string();
-        let index = self
-            .node_index_by_element_created_at(element.created_at())
+        let position_index = self
+            .element_map_by_created_at
+            .get(&created_id)
+            .copied()
             .ok_or_else(|| YorkieError::MissingCrdtElement(created_id))?;
-        self.nodes.remove(index);
+        self.remove_at_position_index(position_index);
+        self.rebuild_indexes();
         Ok(())
     }
 
     pub(crate) fn purge_by_id(&mut self, child_id: &str) -> bool {
-        let Some(index) = self.nodes.iter().position(|node| {
-            node.element.is_none() && node.removed_at.is_some() && node.id_string() == child_id
-        }) else {
+        let Some(position_index) = self.node_map_by_created_at.get(child_id).copied() else {
             return false;
         };
+        let Some(node) = self.node_at_position_index(position_index) else {
+            return false;
+        };
+        if node.element.is_some() || node.removed_at.is_none() {
+            return false;
+        }
 
-        self.nodes.remove(index);
+        self.remove_at_position_index(position_index);
+        self.rebuild_indexes();
         true
     }
 
@@ -293,17 +343,21 @@ impl RgaTreeList {
         created_at: &TimeTicket,
         removed_at: TimeTicket,
     ) -> Result<CrdtElement> {
+        let position_index = self
+            .position_index_by_element_created_at(created_at)
+            .ok_or_else(|| YorkieError::MissingCrdtElement(created_at.to_id_string()))?;
         let node = self
-            .nodes
-            .iter_mut()
-            .find(|node| node.element_created_at() == Some(created_at))
+            .node_at_position_index_mut(position_index)
             .ok_or_else(|| YorkieError::MissingCrdtElement(created_at.to_id_string()))?;
 
         node.remove(removed_at);
-        node.element
+        let removed = node
+            .element
             .as_ref()
             .map(CrdtElement::deepcopy)
-            .ok_or_else(|| YorkieError::MissingCrdtElement(created_at.to_id_string()))
+            .ok_or_else(|| YorkieError::MissingCrdtElement(created_at.to_id_string()))?;
+        self.rebuild_indexes();
+        Ok(removed)
     }
 
     pub(crate) fn delete_by_index(
@@ -316,7 +370,9 @@ impl RgaTreeList {
         };
 
         node.remove(removed_at);
-        Ok(node.element.as_ref().map(CrdtElement::deepcopy))
+        let removed = node.element.as_ref().map(CrdtElement::deepcopy);
+        self.rebuild_indexes();
+        Ok(removed)
     }
 
     pub(crate) fn set(
@@ -350,10 +406,11 @@ impl RgaTreeList {
     }
 
     pub(crate) fn pos_created_at(&self, element_created_at: &TimeTicket) -> Result<TimeTicket> {
+        let position_index = self
+            .position_index_by_element_created_at(element_created_at)
+            .ok_or_else(|| YorkieError::MissingCrdtElement(element_created_at.to_id_string()))?;
         let node = self
-            .nodes
-            .iter()
-            .find(|node| node.element_created_at() == Some(element_created_at))
+            .node_at_position_index(position_index)
             .ok_or_else(|| YorkieError::MissingCrdtElement(element_created_at.to_id_string()))?;
 
         Ok(node.position_created_at().clone())
@@ -367,10 +424,7 @@ impl RgaTreeList {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.nodes
-            .iter()
-            .filter(|node| node.element.is_some() && !node.is_removed())
-            .count()
+        self.node_map_by_index.borrow().len()
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -392,10 +446,16 @@ impl RgaTreeList {
     }
 
     pub(crate) fn deepcopy(&self) -> Self {
-        Self {
+        let mut copied = Self {
             dummy_head: self.dummy_head.clone(),
             nodes: self.nodes.clone(),
-        }
+            node_map_by_index: RefCell::new(SplayTree::new()),
+            node_map_by_created_at: BTreeMap::new(),
+            element_map_by_created_at: BTreeMap::new(),
+            splay_node_by_created_at: BTreeMap::new(),
+        };
+        copied.rebuild_indexes();
+        copied
     }
 
     pub(crate) fn to_json(&self) -> String {
@@ -426,6 +486,7 @@ impl RgaTreeList {
         let insert_index = node_index_after_position(prev_position);
         self.nodes
             .insert(insert_index, RgaTreeListNode::bare_position(executed_at));
+        self.rebuild_indexes();
         Ok(insert_index + 1)
     }
 
@@ -446,33 +507,25 @@ impl RgaTreeList {
     }
 
     fn position_index_by_position_created_at(&self, created_at: &TimeTicket) -> Option<usize> {
-        if self.dummy_head.position_created_at() == created_at {
-            return Some(0);
-        }
-
-        self.node_index_by_position_created_at(created_at)
-            .map(|index| index + 1)
+        self.node_map_by_created_at
+            .get(&created_at.to_id_string())
+            .copied()
     }
 
     fn position_index_by_element_created_at(&self, created_at: &TimeTicket) -> Option<usize> {
-        if self.dummy_head.element_created_at() == Some(created_at) {
-            return Some(0);
-        }
-
-        self.node_index_by_element_created_at(created_at)
-            .map(|index| index + 1)
+        self.element_map_by_created_at
+            .get(&created_at.to_id_string())
+            .copied()
     }
 
     fn node_index_by_position_created_at(&self, created_at: &TimeTicket) -> Option<usize> {
-        self.nodes
-            .iter()
-            .position(|node| node.position_created_at() == created_at)
+        self.position_index_by_position_created_at(created_at)
+            .and_then(position_index_to_node_index)
     }
 
     fn node_index_by_element_created_at(&self, created_at: &TimeTicket) -> Option<usize> {
-        self.nodes
-            .iter()
-            .position(|node| node.element_created_at() == Some(created_at))
+        self.position_index_by_element_created_at(created_at)
+            .and_then(position_index_to_node_index)
     }
 
     fn node_at_position_index(&self, position_index: usize) -> Option<&RgaTreeListNode> {
@@ -482,11 +535,59 @@ impl RgaTreeList {
 
         self.nodes.get(position_index - 1)
     }
+
+    fn node_at_position_index_mut(
+        &mut self,
+        position_index: usize,
+    ) -> Option<&mut RgaTreeListNode> {
+        if position_index == 0 {
+            return Some(&mut self.dummy_head);
+        }
+
+        self.nodes.get_mut(position_index - 1)
+    }
+
+    fn remove_at_position_index(&mut self, position_index: usize) -> Option<RgaTreeListNode> {
+        let index = position_index_to_node_index(position_index)?;
+        Some(self.nodes.remove(index))
+    }
+
+    fn rebuild_indexes(&mut self) {
+        let mut tree = SplayTree::new();
+        let mut node_map_by_created_at = BTreeMap::new();
+        let mut element_map_by_created_at = BTreeMap::new();
+        let mut splay_node_by_created_at = BTreeMap::new();
+
+        let dummy_key = self.dummy_head.position_created_at().to_id_string();
+        let dummy_splay = tree.insert(ListIndexValue::new(0, self.dummy_head.index_len()));
+        node_map_by_created_at.insert(dummy_key.clone(), 0);
+        splay_node_by_created_at.insert(dummy_key, dummy_splay);
+
+        for (index, node) in self.nodes.iter().enumerate() {
+            let position_index = index + 1;
+            let key = node.position_created_at().to_id_string();
+            let splay_node = tree.insert(ListIndexValue::new(position_index, node.index_len()));
+            node_map_by_created_at.insert(key.clone(), position_index);
+            splay_node_by_created_at.insert(key, splay_node);
+            if let Some(created_at) = node.element_created_at() {
+                element_map_by_created_at.insert(created_at.to_id_string(), position_index);
+            }
+        }
+
+        self.node_map_by_index = RefCell::new(tree);
+        self.node_map_by_created_at = node_map_by_created_at;
+        self.element_map_by_created_at = element_map_by_created_at;
+        self.splay_node_by_created_at = splay_node_by_created_at;
+    }
 }
 
 impl RgaTreeListNode {
     fn element_created_at(&self) -> Option<&TimeTicket> {
         self.element.as_ref().map(CrdtElement::created_at)
+    }
+
+    fn index_len(&self) -> usize {
+        usize::from(self.element.is_some() && !self.is_removed())
     }
 }
 
@@ -498,6 +599,10 @@ impl Default for RgaTreeList {
 
 fn node_index_after_position(position_index: usize) -> usize {
     position_index
+}
+
+fn position_index_to_node_index(position_index: usize) -> Option<usize> {
+    position_index.checked_sub(1)
 }
 
 #[cfg(test)]
@@ -609,6 +714,34 @@ mod tests {
         assert!(!list.purge_by_id(&child_id));
         assert_eq!(r#"["two","one"]"#, list.to_json());
         assert_eq!(Some("1".to_owned()), list.sub_path_of(&t1));
+        Ok(())
+    }
+
+    #[test]
+    fn rebuilds_indexes_for_copied_moved_positions() -> crate::Result<()> {
+        let mut list = RgaTreeList::new();
+        let t1 = ticket(1, "a");
+        let t2 = ticket(2, "a");
+        let t3 = ticket(3, "a");
+
+        list.add(primitive("one", t1.clone()))?;
+        list.add(primitive("two", t2.clone()))?;
+        let dead_node = list.move_after(&t2, &t1, t3.clone())?.unwrap();
+
+        let copy = list.deepcopy();
+
+        assert_eq!(r#"["two","one"]"#, copy.to_json());
+        assert_eq!(t3, copy.pos_created_at(&t1)?);
+        assert_eq!(Some("1".to_owned()), copy.sub_path_of(&t1));
+        assert_eq!(
+            "\"two\"",
+            copy.get_by_index(0).unwrap().element().unwrap().to_json()
+        );
+        assert_eq!(
+            "\"one\"",
+            copy.get_by_index(1).unwrap().element().unwrap().to_json()
+        );
+        assert_eq!(Some(&t3), dead_node.removed_at());
         Ok(())
     }
 
