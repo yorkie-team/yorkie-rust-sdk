@@ -1,6 +1,7 @@
 mod add_operation;
 mod array_set_operation;
 mod edit_operation;
+mod increase_operation;
 mod move_operation;
 mod remove_operation;
 mod set_operation;
@@ -9,11 +10,13 @@ mod style_operation;
 pub(crate) use add_operation::AddOperation;
 pub(crate) use array_set_operation::ArraySetOperation;
 pub(crate) use edit_operation::EditOperation;
+pub(crate) use increase_operation::IncreaseOperation;
 pub(crate) use move_operation::MoveOperation;
 pub(crate) use remove_operation::RemoveOperation;
 pub(crate) use set_operation::SetOperation;
 pub(crate) use style_operation::StyleOperation;
 
+use crate::crdt::primitive::PrimitiveValue;
 use crate::crdt::root::CrdtRoot;
 use crate::time::ActorId;
 use crate::{TimeTicket, VersionVector};
@@ -28,7 +31,7 @@ pub(crate) enum OpSource {
     UndoRedo,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum OpInfo {
     Set {
         path: String,
@@ -45,6 +48,10 @@ pub(crate) enum OpInfo {
     Add {
         path: String,
         index: usize,
+    },
+    Increase {
+        path: String,
+        value: PrimitiveValue,
     },
     Move {
         path: String,
@@ -75,6 +82,7 @@ pub(crate) enum Operation {
     Set(SetOperation),
     Remove(RemoveOperation),
     Add(AddOperation),
+    Increase(IncreaseOperation),
     Move(MoveOperation),
     ArraySet(ArraySetOperation),
     Edit(EditOperation),
@@ -100,6 +108,7 @@ impl Operation {
             Self::Set(operation) => operation.execute(root, source),
             Self::Remove(operation) => operation.execute(root, source),
             Self::Add(operation) => operation.execute(root, source),
+            Self::Increase(operation) => operation.execute(root, source),
             Self::Move(operation) => operation.execute(root, source),
             Self::ArraySet(operation) => operation.execute(root, source),
             Self::Edit(operation) => operation.execute(root, source, version_vector),
@@ -113,6 +122,7 @@ impl Operation {
             Self::Set(operation) => operation.set_actor(actor_id),
             Self::Remove(operation) => operation.set_actor(actor_id),
             Self::Add(operation) => operation.set_actor(actor_id),
+            Self::Increase(operation) => operation.set_actor(actor_id),
             Self::Move(operation) => operation.set_actor(actor_id),
             Self::ArraySet(operation) => operation.set_actor(actor_id),
             Self::Edit(operation) => operation.set_actor(actor_id),
@@ -125,6 +135,7 @@ impl Operation {
             Self::Set(operation) => operation.to_test_string(),
             Self::Remove(operation) => operation.to_test_string(),
             Self::Add(operation) => operation.to_test_string(),
+            Self::Increase(operation) => operation.to_test_string(),
             Self::Move(operation) => operation.to_test_string(),
             Self::ArraySet(operation) => operation.to_test_string(),
             Self::Edit(operation) => operation.to_test_string(),

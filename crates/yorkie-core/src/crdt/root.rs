@@ -1,5 +1,7 @@
+use super::counter::CrdtCounter;
 use super::element::{CrdtElement, DataSize};
 use super::object::CrdtObject;
+use super::primitive::CrdtPrimitive;
 use super::rga_tree_list::RgaTreeListNode;
 use super::text::CrdtText;
 use crate::{Result, TimeTicket, YorkieError, TIME_TICKET_SIZE};
@@ -571,6 +573,40 @@ impl CrdtRoot {
         self.root_object.find_text_by_created_at_mut(created_at)
     }
 
+    pub(crate) fn counter_by_created_at(&self, created_at: &TimeTicket) -> Option<&CrdtCounter> {
+        self.root_object.find_counter_by_created_at(created_at)
+    }
+
+    pub(crate) fn counter_by_created_at_mut(
+        &mut self,
+        created_at: &TimeTicket,
+    ) -> Option<&mut CrdtCounter> {
+        self.root_object.find_counter_by_created_at_mut(created_at)
+    }
+
+    pub(crate) fn increase_counter(
+        &mut self,
+        created_at: &TimeTicket,
+        value: &CrdtPrimitive,
+    ) -> Result<()> {
+        if self.counter_by_created_at(created_at).is_none() {
+            return Err(self.counter_parent_error(created_at));
+        }
+
+        let (previous_size, current_size) = {
+            let counter = self
+                .counter_by_created_at_mut(created_at)
+                .ok_or_else(|| YorkieError::MissingCrdtElement(created_at.to_id_string()))?;
+            let previous_size = counter.data_size();
+            counter.increase(value)?;
+            (previous_size, counter.data_size())
+        };
+
+        self.refresh_element_pair_and_ancestors(created_at);
+        adjust_data_size(&mut self.doc_size.live, previous_size, current_size);
+        Ok(())
+    }
+
     pub(crate) fn doc_size(&self) -> DocSize {
         self.doc_size
     }
@@ -641,7 +677,7 @@ impl CrdtRoot {
                     self.refresh_element_pair_tree(child, Some(element));
                 }
             }
-            CrdtElement::Primitive(_) | CrdtElement::Text(_) => {}
+            CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Text(_) => {}
         }
     }
 
@@ -691,6 +727,17 @@ impl CrdtRoot {
         YorkieError::MissingCrdtElement(parent_created_at.to_id_string())
     }
 
+    fn counter_parent_error(&self, parent_created_at: &TimeTicket) -> YorkieError {
+        if self.find_by_created_at(parent_created_at).is_some() {
+            return YorkieError::UnexpectedCrdtElement {
+                id: parent_created_at.to_id_string(),
+                expected: "counter",
+            };
+        }
+
+        YorkieError::MissingCrdtElement(parent_created_at.to_id_string())
+    }
+
     fn remove_array_element(
         &mut self,
         parent_created_at: &TimeTicket,
@@ -731,7 +778,7 @@ impl CrdtRoot {
                     self.register_element_internal(child, Some(element));
                 }
             }
-            CrdtElement::Primitive(_) | CrdtElement::Text(_) => {}
+            CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Text(_) => {}
         }
     }
 
@@ -753,7 +800,7 @@ impl CrdtRoot {
                     self.deregister_element_internal(child, count);
                 }
             }
-            CrdtElement::Primitive(_) | CrdtElement::Text(_) => {}
+            CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Text(_) => {}
         }
     }
 
@@ -784,7 +831,7 @@ impl CrdtRoot {
                     self.register_element_for_rebuild(child, Some(element), descendant_removed);
                 }
             }
-            CrdtElement::Primitive(_) | CrdtElement::Text(_) => {}
+            CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Text(_) => {}
         }
     }
 
@@ -810,7 +857,7 @@ impl CrdtRoot {
                     self.register_removed_descendants_for_rebuild(child);
                 }
             }
-            CrdtElement::Primitive(_) | CrdtElement::Text(_) => {}
+            CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Text(_) => {}
         }
     }
 
@@ -836,7 +883,7 @@ impl CrdtRoot {
                     self.register_gc_pair_by_id(child_id, child_size, removed_at);
                 }
             }
-            CrdtElement::Primitive(_) => {}
+            CrdtElement::Primitive(_) | CrdtElement::Counter(_) => {}
         }
     }
 
@@ -849,7 +896,7 @@ fn sub_path_of(parent: &CrdtElement, created_at: &TimeTicket) -> Option<String> 
     match parent {
         CrdtElement::Object(object) => object.sub_path_of(created_at).map(ToOwned::to_owned),
         CrdtElement::Array(array) => array.sub_path_of(created_at),
-        CrdtElement::Primitive(_) | CrdtElement::Text(_) => None,
+        CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Text(_) => None,
     }
 }
 
@@ -867,7 +914,7 @@ fn collect_descendant_ids(element: &CrdtElement, seen: &mut BTreeSet<String>) {
                 collect_descendant_ids(child, seen);
             }
         }
-        CrdtElement::Primitive(_) | CrdtElement::Text(_) => {}
+        CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Text(_) => {}
     }
 }
 

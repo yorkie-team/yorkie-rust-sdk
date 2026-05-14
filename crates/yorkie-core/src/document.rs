@@ -1,5 +1,6 @@
 use crate::change::{Change, ChangeContext, ChangeId, ChangePack, Checkpoint};
 use crate::crdt::array::CrdtArray;
+use crate::crdt::counter::CounterValue;
 use crate::crdt::element::CrdtElement;
 use crate::crdt::object::CrdtObject;
 use crate::crdt::primitive::{CrdtPrimitive, PrimitiveValue};
@@ -274,6 +275,11 @@ fn crdt_object_to_json_object(object: &CrdtObject) -> Result<JsonObject> {
 fn crdt_element_to_json_value(element: &CrdtElement) -> Result<JsonValue> {
     let value = match element {
         CrdtElement::Primitive(value) => value.to_json_value(),
+        CrdtElement::Counter(value) => match value.value() {
+            CounterValue::Integer(value) => JsonValue::Integer(value),
+            CounterValue::Long(value) => JsonValue::Long(value),
+            CounterValue::Double(value) => JsonValue::Double(value),
+        },
         CrdtElement::Object(value) => JsonValue::Object(crdt_object_to_json_object(value)?),
         CrdtElement::Array(value) => {
             let mut array = crate::JsonArray::new();
@@ -292,6 +298,7 @@ fn crdt_element_to_json_value(element: &CrdtElement) -> Result<JsonValue> {
 mod tests {
     use super::{crdt_element_to_json_value, Document};
     use crate::change::ChangePack;
+    use crate::crdt::counter::{CounterType, CounterValue, CrdtCounter};
     use crate::crdt::element::CrdtElement;
     use crate::crdt::text::CrdtText;
     use crate::{Checkpoint, JsonArray, JsonObject, Result, VersionVector, YorkieError};
@@ -331,6 +338,20 @@ mod tests {
         let value = crdt_element_to_json_value(&CrdtElement::text(text))?;
 
         assert_eq!(r#"[{"val":"Hi"}]"#, value.to_sorted_json());
+        Ok(())
+    }
+
+    #[test]
+    fn converts_crdt_counter_to_public_json_number() -> Result<()> {
+        let counter = CrdtCounter::create(
+            CounterType::Long,
+            CounterValue::Long(10),
+            crate::TimeTicket::new(1, 0, "a"),
+        );
+
+        let value = crdt_element_to_json_value(&CrdtElement::counter(counter))?;
+
+        assert_eq!("10", value.to_sorted_json());
         Ok(())
     }
 

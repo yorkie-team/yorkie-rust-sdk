@@ -21,13 +21,13 @@ size, and container dispatch.
 | Creation and ID access | covered | Rust exposes element identity through `created_at` and ID strings. |
 | Removed timestamp LWW behavior | covered | Element tests cover later remove time behavior. |
 | Moved timestamp LWW behavior | covered | Element tests cover later move time behavior. |
-| Dispatch to primitive/object/array/text | partial | Primitive and text delegation are covered; tree/counter variants are missing. |
+| Dispatch to primitive/object/array/text/counter | partial | Primitive, text, and counter delegation are covered; tree variant is missing. |
 | Deep copy | partial | Implemented for current variants; ownership model may change later. |
-| Data size | partial | Covered for implemented variants only. |
+| Data size | partial | Covered for implemented variants, including counter; tree is missing. |
 | Wire conversion | missing | No CRDT element protocol conversion yet. |
 
 ## Next Checks
 
-- Add tree and counter variants before treating element dispatch as complete.
+- Add tree variant before treating element dispatch as complete.
 - Add wire conversion tests once operation/change protobuf conversion begins.
 - Keep root index refresh tests close to any new element variant.

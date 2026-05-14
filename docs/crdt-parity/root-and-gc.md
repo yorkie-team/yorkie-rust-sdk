@@ -32,7 +32,7 @@ deep copy/rebuild.
 | Array dead position GC | covered | Dead RGA position nodes are registered, copied, and purged. |
 | Text node/attribute GC | covered | Root rebuilds and purges text internal GC pairs. |
 | Document size accounting | partial | Current tests cover narrow slices, including array move/remove size consistency after root rebuild. Broad JS/Go size tests remain. |
-| Deep copy index rebuild | partial | Covered for current variants, including array moved/dead position lookup; tree/counter missing. |
+| Deep copy index rebuild | partial | Covered for current variants, including array moved/dead position lookup and counter root refresh; tree is missing. |
 | Sync lifecycle GC | blocked | Requires client/sync lifecycle and server version vectors. |
 | Snapshot GC rebuild | partial | Array moved/dead positions and text internal pairs rebuild through copied root objects; snapshot application is missing. |
 

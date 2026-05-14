@@ -1,4 +1,5 @@
 use super::array::CrdtArray;
+use super::counter::CrdtCounter;
 use super::element::{CrdtElement, CrdtElementMeta, DataSize};
 use super::element_rht::ElementRht;
 use super::text::CrdtText;
@@ -144,7 +145,7 @@ impl CrdtObject {
                         return Some(element);
                     }
                 }
-                CrdtElement::Primitive(_) | CrdtElement::Text(_) => {}
+                CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Text(_) => {}
             }
         }
 
@@ -168,7 +169,7 @@ impl CrdtObject {
                         return Some(object);
                     }
                 }
-                CrdtElement::Primitive(_) | CrdtElement::Text(_) => {}
+                CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Text(_) => {}
             }
         }
 
@@ -195,7 +196,7 @@ impl CrdtObject {
                         return Some(object);
                     }
                 }
-                CrdtElement::Primitive(_) | CrdtElement::Text(_) => {}
+                CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Text(_) => {}
             }
         }
 
@@ -219,7 +220,7 @@ impl CrdtObject {
                         return Some(array);
                     }
                 }
-                CrdtElement::Primitive(_) | CrdtElement::Text(_) => {}
+                CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Text(_) => {}
             }
         }
 
@@ -246,7 +247,7 @@ impl CrdtObject {
                         return Some(array);
                     }
                 }
-                CrdtElement::Primitive(_) | CrdtElement::Text(_) => {}
+                CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Text(_) => {}
             }
         }
 
@@ -271,7 +272,7 @@ impl CrdtObject {
                         return Some(text);
                     }
                 }
-                CrdtElement::Primitive(_) => {}
+                CrdtElement::Primitive(_) | CrdtElement::Counter(_) => {}
             }
         }
 
@@ -299,7 +300,63 @@ impl CrdtObject {
                         return Some(text);
                     }
                 }
-                CrdtElement::Primitive(_) => {}
+                CrdtElement::Primitive(_) | CrdtElement::Counter(_) => {}
+            }
+        }
+
+        None
+    }
+
+    pub(crate) fn find_counter_by_created_at(
+        &self,
+        created_at: &TimeTicket,
+    ) -> Option<&CrdtCounter> {
+        for (_, child) in self.iter_all() {
+            match child {
+                CrdtElement::Counter(counter) => {
+                    if counter.created_at() == created_at {
+                        return Some(counter);
+                    }
+                }
+                CrdtElement::Object(object) => {
+                    if let Some(counter) = object.find_counter_by_created_at(created_at) {
+                        return Some(counter);
+                    }
+                }
+                CrdtElement::Array(array) => {
+                    if let Some(counter) = array.find_counter_by_created_at(created_at) {
+                        return Some(counter);
+                    }
+                }
+                CrdtElement::Primitive(_) | CrdtElement::Text(_) => {}
+            }
+        }
+
+        None
+    }
+
+    pub(crate) fn find_counter_by_created_at_mut(
+        &mut self,
+        created_at: &TimeTicket,
+    ) -> Option<&mut CrdtCounter> {
+        for node in self.member_nodes.iter_mut() {
+            match node.value_mut() {
+                CrdtElement::Counter(counter) => {
+                    if counter.created_at() == created_at {
+                        return Some(counter);
+                    }
+                }
+                CrdtElement::Object(object) => {
+                    if let Some(counter) = object.find_counter_by_created_at_mut(created_at) {
+                        return Some(counter);
+                    }
+                }
+                CrdtElement::Array(array) => {
+                    if let Some(counter) = array.find_counter_by_created_at_mut(created_at) {
+                        return Some(counter);
+                    }
+                }
+                CrdtElement::Primitive(_) | CrdtElement::Text(_) => {}
             }
         }
 
@@ -324,7 +381,7 @@ impl CrdtObject {
                         return true;
                     }
                 }
-                CrdtElement::Primitive(_) => {}
+                CrdtElement::Primitive(_) | CrdtElement::Counter(_) => {}
             }
         }
 
