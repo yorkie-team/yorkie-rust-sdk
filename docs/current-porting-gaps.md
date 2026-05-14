@@ -435,12 +435,18 @@ Current Rust behavior:
   sizing, active attribute data size, and internal GC pair discovery.
 - `CrdtTree` can convert between linear tree indexes, paths, and CRDT tree
   positions using the JS/Go element padding and text-child path rules.
+- `CrdtTree` can apply simple style/remove-style ranges to visible element
+  tokens, ignore text-only ranges, collect tree style operation info, and
+  report reverse-operation inputs.
 - `CrdtElement::Tree` participates in metadata dispatch, JSON conversion,
   data-size accounting, removal, and deep copy.
 - `CrdtRoot` can find tree elements by creation time, rebuild tree internal GC
   pairs from an existing root object, deep-copy them, and physically purge
   removed tree nodes or removed tree attributes once a version vector covers
   their removal time.
+- `TreeStyleOperation` executes tree style/remove-style operations, registers
+  removed attribute GC pairs, accumulates root size diff, and creates reverse
+  tree style operations.
 
 JS/Go behavior:
 
@@ -456,12 +462,16 @@ JS/Go behavior:
 Gap:
 
 - Tree path/index conversion exists for the current in-memory tree, but it is
-  not yet maintained by tree edit/style operations and still needs broader
+  not yet maintained by tree edit operations and still needs broader
   removed-node and mixed child coverage.
-- Rust Tree edit/style operations are not implemented.
+- Rust Tree style operation is only partial. It does not yet split text at
+  style boundaries, advance unknown split siblings, or propagate style/remove
+  style across unknown split siblings the way JS/Go do for concurrent Tree
+  split cases.
+- Rust Tree edit operation is not implemented.
 - Split and merge metadata is stored but not yet maintained by edit operations.
-- Operation-time GC registration for removed tree nodes and removed tree
-  attributes is pending tree edit/style operations.
+- Operation-time GC registration for removed tree nodes is pending tree edit
+  operations.
 - Public Tree facade and wire conversion are missing.
 - Tree attribute JSON/XML output follows the same scalar parsing helper as
   Text, but object/array attribute values still need broader JS parity tests
@@ -473,8 +483,8 @@ Expected direction:
   element/text children so edit/style operations can reuse the same position
   semantics.
 - Add Tree edit operation tests from JS/Go before exposing public Tree methods.
-- Reuse `Rht` exactly as Text does, and register removed attribute nodes through
-  root GC during operation execution.
+- Extend Tree style parity after edit/split support lands, especially around
+  version vectors and split sibling propagation.
 
 ## Change, ChangeContext, and ChangePack
 

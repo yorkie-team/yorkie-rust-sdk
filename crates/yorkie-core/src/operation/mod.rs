@@ -6,6 +6,7 @@ mod move_operation;
 mod remove_operation;
 mod set_operation;
 mod style_operation;
+mod tree_style_operation;
 
 pub(crate) use add_operation::AddOperation;
 pub(crate) use array_set_operation::ArraySetOperation;
@@ -15,6 +16,7 @@ pub(crate) use move_operation::MoveOperation;
 pub(crate) use remove_operation::RemoveOperation;
 pub(crate) use set_operation::SetOperation;
 pub(crate) use style_operation::StyleOperation;
+pub(crate) use tree_style_operation::TreeStyleOperation;
 
 use crate::crdt::primitive::PrimitiveValue;
 use crate::crdt::root::CrdtRoot;
@@ -75,6 +77,15 @@ pub(crate) enum OpInfo {
         attributes: BTreeMap<String, String>,
         attributes_to_remove: Vec<String>,
     },
+    TreeStyle {
+        path: String,
+        from: usize,
+        to: usize,
+        from_path: Vec<usize>,
+        to_path: Vec<usize>,
+        attributes: BTreeMap<String, String>,
+        attributes_to_remove: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -87,6 +98,7 @@ pub(crate) enum Operation {
     ArraySet(ArraySetOperation),
     Edit(EditOperation),
     Style(StyleOperation),
+    TreeStyle(TreeStyleOperation),
 }
 
 impl Operation {
@@ -113,6 +125,7 @@ impl Operation {
             Self::ArraySet(operation) => operation.execute(root, source),
             Self::Edit(operation) => operation.execute(root, source, version_vector),
             Self::Style(operation) => operation.execute(root, source, version_vector),
+            Self::TreeStyle(operation) => operation.execute(root, source, version_vector),
         }
     }
 
@@ -127,6 +140,7 @@ impl Operation {
             Self::ArraySet(operation) => operation.set_actor(actor_id),
             Self::Edit(operation) => operation.set_actor(actor_id),
             Self::Style(operation) => operation.set_actor(actor_id),
+            Self::TreeStyle(operation) => operation.set_actor(actor_id),
         }
     }
 
@@ -140,6 +154,7 @@ impl Operation {
             Self::ArraySet(operation) => operation.to_test_string(),
             Self::Edit(operation) => operation.to_test_string(),
             Self::Style(operation) => operation.to_test_string(),
+            Self::TreeStyle(operation) => operation.to_test_string(),
         }
     }
 }

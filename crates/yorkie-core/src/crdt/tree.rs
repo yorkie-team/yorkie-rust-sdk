@@ -3,7 +3,7 @@ use super::rht::{Rht, RhtNode};
 use crate::json::escape_json_string;
 use crate::{JsonValue, Result, TimeTicket, YorkieError, TIME_TICKET_SIZE};
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const ELEMENT_PADDING_SIZE: usize = 2;
 const DEFAULT_ROOT_TYPE: &str = "root";
@@ -235,6 +235,20 @@ impl TreeNode {
 
     pub(crate) fn is_removed(&self) -> bool {
         self.removed_at.is_some()
+    }
+
+    pub(crate) fn can_style(&self, edited_at: &TimeTicket, client_lamport_at_change: i64) -> bool {
+        if self.is_text() {
+            return false;
+        }
+
+        let node_existed = self.id.created_at().lamport() <= client_lamport_at_change;
+        node_existed
+            && self
+                .removed_at
+                .as_ref()
+                .map(|removed_at| edited_at.after(removed_at))
+                .unwrap_or(true)
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -489,6 +503,16 @@ pub(crate) struct CrdtTree {
     node_by_id: BTreeMap<TreeNodeId, TreeNode>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TreeStyleChange {
+    pub(crate) from: usize,
+    pub(crate) to: usize,
+    pub(crate) from_path: Vec<usize>,
+    pub(crate) to_path: Vec<usize>,
+    pub(crate) attributes: BTreeMap<String, String>,
+    pub(crate) attributes_to_remove: Vec<String>,
+}
+
 impl CrdtTree {
     pub(crate) fn new(root: TreeNode, created_at: TimeTicket) -> Self {
         let mut tree = Self {
@@ -597,6 +621,159 @@ impl CrdtTree {
         ))
     }
 
+    pub(crate) fn style_by_range_with_changes(
+        &mut self,
+        range: (TreePos, TreePos),
+        attributes: BTreeMap<String, String>,
+        edited_at: TimeTicket,
+        version_vector: Option<&crate::VersionVector>,
+    ) -> Result<(
+        Vec<RhtNode>,
+        DataSize,
+        Vec<TreeStyleChange>,
+        BTreeMap<String, String>,
+        Vec<String>,
+    )> {
+        let from_idx = self.pos_to_index(&range.0)?;
+        let to_idx = self.pos_to_index(&range.1)?;
+        let targets = self.style_target_paths(from_idx, to_idx, &edited_at, version_vector);
+
+        let mut diff = DataSize::default();
+        let mut gc_nodes = Vec::new();
+        let mut changes = Vec::new();
+        let mut previous_attributes = BTreeMap::new();
+        let mut attributes_to_remove = Vec::new();
+        let mut captured_previous = false;
+
+        for target in targets {
+            let node = node_at_visible_path_mut(&mut self.root, &target.path)?;
+            if !node.can_style(
+                &edited_at,
+                client_lamport(version_vector, node.id().created_at()),
+            ) {
+                continue;
+            }
+
+            if !captured_previous {
+                for key in attributes.keys() {
+                    if let Some(attrs) = node.attrs() {
+                        if attrs.has(key) {
+                            if let Some(value) = attrs.get(key) {
+                                previous_attributes.insert(key.clone(), value.to_owned());
+                            }
+                            continue;
+                        }
+                    }
+                    attributes_to_remove.push(key.clone());
+                }
+                captured_previous = true;
+            }
+
+            let mut affected_attrs = BTreeMap::new();
+            for (key, value) in &attributes {
+                let (prev, curr) = node.set_attr(key.clone(), value.clone(), edited_at.clone());
+                if let Some(prev) = prev {
+                    gc_nodes.push(prev);
+                }
+                if let Some(curr) = curr {
+                    affected_attrs.insert(key.clone(), value.clone());
+                    add_data_size(&mut diff, curr.data_size());
+                }
+            }
+
+            if !affected_attrs.is_empty() {
+                changes.push(TreeStyleChange {
+                    from: target.from,
+                    to: target.to,
+                    from_path: self.index_to_path(target.from)?,
+                    to_path: self.index_to_path(target.to)?,
+                    attributes: affected_attrs,
+                    attributes_to_remove: Vec::new(),
+                });
+            }
+        }
+
+        self.rebuild_node_map();
+
+        Ok((
+            gc_nodes,
+            diff,
+            changes,
+            previous_attributes,
+            attributes_to_remove,
+        ))
+    }
+
+    pub(crate) fn remove_style_by_range_with_changes(
+        &mut self,
+        range: (TreePos, TreePos),
+        attributes_to_remove: &[String],
+        edited_at: TimeTicket,
+        version_vector: Option<&crate::VersionVector>,
+    ) -> Result<(
+        Vec<RhtNode>,
+        DataSize,
+        Vec<TreeStyleChange>,
+        BTreeMap<String, String>,
+    )> {
+        let from_idx = self.pos_to_index(&range.0)?;
+        let to_idx = self.pos_to_index(&range.1)?;
+        let targets = self.style_target_paths(from_idx, to_idx, &edited_at, version_vector);
+
+        let mut diff = DataSize::default();
+        let mut gc_nodes = Vec::new();
+        let mut changes = Vec::new();
+        let mut previous_attributes = BTreeMap::new();
+        let mut captured_previous = false;
+
+        for target in targets {
+            let node = node_at_visible_path_mut(&mut self.root, &target.path)?;
+            if !node.can_style(
+                &edited_at,
+                client_lamport(version_vector, node.id().created_at()),
+            ) {
+                continue;
+            }
+
+            if !captured_previous {
+                for key in attributes_to_remove {
+                    if let Some(attrs) = node.attrs() {
+                        if attrs.has(key) {
+                            if let Some(value) = attrs.get(key) {
+                                previous_attributes.insert(key.clone(), value.to_owned());
+                            }
+                        }
+                    }
+                }
+                captured_previous = true;
+            }
+
+            let mut removed_any = false;
+            for key in attributes_to_remove {
+                for removed in node.remove_attr(key, edited_at.clone()) {
+                    add_data_size(&mut diff, removed.data_size());
+                    gc_nodes.push(removed);
+                    removed_any = true;
+                }
+            }
+
+            if removed_any || !attributes_to_remove.is_empty() {
+                changes.push(TreeStyleChange {
+                    from: target.from,
+                    to: target.to,
+                    from_path: self.index_to_path(target.from)?,
+                    to_path: self.index_to_path(target.to)?,
+                    attributes: BTreeMap::new(),
+                    attributes_to_remove: attributes_to_remove.to_vec(),
+                });
+            }
+        }
+
+        self.rebuild_node_map();
+
+        Ok((gc_nodes, diff, changes, previous_attributes))
+    }
+
     pub(crate) fn data_size(&self) -> DataSize {
         let mut size = DataSize {
             data: 0,
@@ -654,6 +831,41 @@ impl CrdtTree {
         nodes.into_iter()
     }
 
+    fn pos_to_index(&self, pos: &TreePos) -> Result<usize> {
+        for index in 0..=self.root.len() {
+            if self.find_pos(index, true)? == *pos {
+                return Ok(index);
+            }
+        }
+
+        Err(YorkieError::InvalidTreePosition(
+            "position is not visible in the current tree".to_owned(),
+        ))
+    }
+
+    fn style_target_paths(
+        &self,
+        from_idx: usize,
+        to_idx: usize,
+        edited_at: &TimeTicket,
+        version_vector: Option<&crate::VersionVector>,
+    ) -> Vec<StyleTarget> {
+        let mut targets = Vec::new();
+        let mut seen = BTreeSet::new();
+        collect_style_targets(
+            &self.root,
+            Vec::new(),
+            0,
+            from_idx,
+            to_idx,
+            edited_at,
+            version_vector,
+            &mut seen,
+            &mut targets,
+        );
+        targets
+    }
+
     fn rebuild_node_map(&mut self) {
         let mut map = BTreeMap::new();
         collect_node_map(&self.root, &mut map);
@@ -670,6 +882,13 @@ impl CrdtTree {
         rebuild_merge_state_in_node(&mut self.root, &merged_pairs);
         self.rebuild_node_map();
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StyleTarget {
+    path: Vec<usize>,
+    from: usize,
+    to: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -911,8 +1130,27 @@ fn node_at_visible_path<'a>(root: &'a TreeNode, path: &[usize]) -> Result<&'a Tr
     Ok(node)
 }
 
+fn node_at_visible_path_mut<'a>(
+    root: &'a mut TreeNode,
+    path: &[usize],
+) -> Result<&'a mut TreeNode> {
+    let mut node = root;
+    for offset in path {
+        node = visible_child_mut(node, *offset)
+            .ok_or_else(|| YorkieError::InvalidTreePosition("unacceptable path".to_owned()))?;
+    }
+    Ok(node)
+}
+
 fn visible_child(node: &TreeNode, offset: usize) -> Option<&TreeNode> {
     node.children().nth(offset)
+}
+
+fn visible_child_mut(node: &mut TreeNode, offset: usize) -> Option<&mut TreeNode> {
+    node.children
+        .iter_mut()
+        .filter(|child| !child.is_removed())
+        .nth(offset)
 }
 
 fn visible_child_count(node: &TreeNode) -> usize {
@@ -936,6 +1174,85 @@ fn collect_node_map(node: &TreeNode, map: &mut BTreeMap<TreeNodeId, TreeNode>) {
     for child in node.all_children() {
         collect_node_map(child, map);
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_style_targets(
+    node: &TreeNode,
+    path: Vec<usize>,
+    start_index: usize,
+    from_idx: usize,
+    to_idx: usize,
+    edited_at: &TimeTicket,
+    version_vector: Option<&crate::VersionVector>,
+    seen: &mut BTreeSet<String>,
+    targets: &mut Vec<StyleTarget>,
+) -> usize {
+    if node.is_text() {
+        return start_index + node.len();
+    }
+
+    let mut cursor = start_index;
+    if !path.is_empty() {
+        let end_index = start_index + node.padded_size(false) - 1;
+        let key = node.id_string();
+        if (range_contains(from_idx, to_idx, start_index)
+            || range_contains(from_idx, to_idx, end_index))
+            && node.can_style(
+                edited_at,
+                client_lamport(version_vector, node.id().created_at()),
+            )
+            && seen.insert(key)
+        {
+            targets.push(StyleTarget {
+                path: path.clone(),
+                from: start_index,
+                to: start_index + 1,
+            });
+        }
+        cursor += 1;
+    }
+
+    for (visible_index, child) in node.children().enumerate() {
+        let mut child_path = path.clone();
+        child_path.push(visible_index);
+        cursor = collect_style_targets(
+            child,
+            child_path,
+            cursor,
+            from_idx,
+            to_idx,
+            edited_at,
+            version_vector,
+            seen,
+            targets,
+        );
+    }
+
+    if !path.is_empty() {
+        cursor += 1;
+    }
+
+    cursor
+}
+
+fn range_contains(from_idx: usize, to_idx: usize, index: usize) -> bool {
+    from_idx <= index && index < to_idx
+}
+
+fn client_lamport(version_vector: Option<&crate::VersionVector>, created_at: &TimeTicket) -> i64 {
+    version_vector
+        .and_then(|vector| vector.get(created_at.actor_id().as_str()))
+        .unwrap_or(if version_vector.is_some() {
+            0
+        } else {
+            i64::MAX
+        })
+}
+
+fn add_data_size(target: &mut DataSize, size: DataSize) {
+    target.data += size.data;
+    target.meta += size.meta;
 }
 
 fn collect_merge_pairs(node: &TreeNode, pairs: &mut Vec<(TreeNodeId, TreeNodeId)>) {
@@ -1071,6 +1388,7 @@ mod tests {
     use super::{CrdtTree, TreeNode, TreeNodeId};
     use crate::crdt::rht::Rht;
     use crate::{TimeTicket, TIME_TICKET_SIZE};
+    use std::collections::BTreeMap;
 
     #[test]
     fn creates_tree_nodes_and_serializes_json_and_xml() {
@@ -1207,6 +1525,110 @@ mod tests {
         assert_eq!(0, tree.data_size().data);
         assert_eq!(1, tree.gc_pair_entries().len());
         assert_eq!(removed_at, tree.gc_pair_entries()[0].2);
+    }
+
+    #[test]
+    fn styles_element_tokens_and_ignores_text_only_ranges() -> crate::Result<()> {
+        let mut tree = CrdtTree::create(
+            TreeNode::create_element(
+                node_id(1, 0),
+                "root",
+                None,
+                vec![
+                    TreeNode::create_element(
+                        node_id(2, 0),
+                        "p",
+                        None,
+                        vec![TreeNode::create_text(node_id(3, 0), "ab")],
+                    ),
+                    TreeNode::create_element(
+                        node_id(4, 0),
+                        "p",
+                        None,
+                        vec![TreeNode::create_text(node_id(5, 0), "cd")],
+                    ),
+                ],
+            ),
+            ticket(1, "a"),
+        );
+
+        let opening = (tree.find_pos(0, true)?, tree.find_pos(1, true)?);
+        tree.style_by_range_with_changes(
+            opening,
+            BTreeMap::from([("weight".to_owned(), "bold".to_owned())]),
+            ticket(10, "a"),
+            None,
+        )?;
+        assert_eq!(
+            r#"<root><p weight="bold">ab</p><p>cd</p></root>"#,
+            tree.to_xml()
+        );
+
+        let closing = (tree.find_pos(3, true)?, tree.find_pos(4, true)?);
+        tree.style_by_range_with_changes(
+            closing,
+            BTreeMap::from([("color".to_owned(), "red".to_owned())]),
+            ticket(11, "a"),
+            None,
+        )?;
+        assert_eq!(
+            r#"<root><p color="red" weight="bold">ab</p><p>cd</p></root>"#,
+            tree.to_xml()
+        );
+
+        let text_only = (tree.find_pos(1, true)?, tree.find_pos(3, true)?);
+        let (_, _, changes, _, _) = tree.style_by_range_with_changes(
+            text_only,
+            BTreeMap::from([("ignored".to_owned(), "true".to_owned())]),
+            ticket(12, "a"),
+            None,
+        )?;
+        assert!(changes.is_empty());
+        assert_eq!(
+            r#"<root><p color="red" weight="bold">ab</p><p>cd</p></root>"#,
+            tree.to_xml()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn removes_tree_style_attributes() -> crate::Result<()> {
+        let mut tree = CrdtTree::create(
+            TreeNode::create_element(
+                node_id(1, 0),
+                "root",
+                None,
+                vec![TreeNode::create_element(
+                    node_id(2, 0),
+                    "p",
+                    {
+                        let mut attrs = Rht::new();
+                        attrs.set("bold", "true", ticket(3, "a"));
+                        Some(attrs)
+                    },
+                    vec![TreeNode::create_text(node_id(4, 0), "hello")],
+                )],
+            ),
+            ticket(1, "a"),
+        );
+
+        let range = (tree.find_pos(0, true)?, tree.find_pos(1, true)?);
+        let (removed, _, changes, previous) = tree.remove_style_by_range_with_changes(
+            range,
+            &["bold".to_owned(), "missing".to_owned()],
+            ticket(10, "a"),
+            None,
+        )?;
+
+        assert_eq!(2, removed.len());
+        assert_eq!(
+            BTreeMap::from([("bold".to_owned(), "true".to_owned())]),
+            previous
+        );
+        assert_eq!(1, changes.len());
+        assert_eq!(r#"<root><p>hello</p></root>"#, tree.to_xml());
+        Ok(())
     }
 
     fn node_id(lamport: i64, offset: usize) -> TreeNodeId {
