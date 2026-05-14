@@ -9,14 +9,19 @@ Use the following order when deciding how a concept should work:
 
 1. JS SDK tests for observable behavior.
 2. JS SDK implementation for field names, state flow, and event semantics.
-3. Yorkie protobuf files for wire format.
-4. Go server and Go client code for algorithmic background only.
+3. Go SDK/client implementation for cross-checking typed SDK flow, CRDT
+   internals, and edge cases.
+4. Yorkie protobuf files for wire format.
+5. Go server internals for algorithmic background only.
 
 In the local development workspace, the main references are:
 
 - JS SDK public facade: `../yorkie-js-sdk/packages/sdk/src/yorkie.ts`
 - JS SDK source: `../yorkie-js-sdk/packages/sdk/src/`
 - JS SDK tests: `../yorkie-js-sdk/packages/sdk/test/`
+- Go SDK/client source: `../yorkie/client/`
+- Go SDK document source: `../yorkie/pkg/document/`
+- Go SDK document tests: `../yorkie/pkg/document/**/*_test.go`
 - Yorkie proto files: `../yorkie/api/yorkie/v1/`
 - Yorkie design docs: `../yorkie/docs/design/`
 
@@ -34,6 +39,10 @@ In the local development workspace, the main references are:
 - Do not use the Go client as the behavioral source of truth when it differs
   from the JS SDK. Go is useful for CRDT internals and server-side context, but
   JS defines the SDK behavior we are porting.
+- Cross-check the Go SDK/client when the JS implementation relies on
+  JavaScript-specific runtime behavior, proxies, reference sharing, or dynamic
+  typing. Use Go to clarify how the same concept works in a typed SDK, then
+  keep the Rust behavior aligned with JS.
 - Public Rust APIs may be idiomatic Rust, but their semantics must match the JS
   SDK. For example, a Rust method may be named `to_sorted_json`, but it maps to
   JS `toSortedJSON()`.
@@ -47,10 +56,13 @@ In the local development workspace, the main references are:
 2. Add a Rust test that states the same observable behavior.
 3. Keep source references in docs and planning notes, not in public code
    comments unless they are necessary for maintainability.
-4. Implement the smallest Rust code needed to pass the test.
-5. Keep the Rust names mapped to JS names. Add a mapping note when the Rust name
+4. Cross-check the corresponding Go SDK/client implementation when the feature
+   touches CRDT internals, operation application, typed API flow, ownership-like
+   structure, or error handling.
+5. Implement the smallest Rust code needed to pass the test.
+6. Keep the Rust names mapped to JS names. Add a mapping note when the Rust name
    differs for idiomatic reasons.
-6. Run `cargo fmt` and `cargo test`.
+7. Run `cargo fmt` and `cargo test`.
 
 Prefer vertical slices over broad scaffolding. A small feature is done only when
 it has:
@@ -107,6 +119,8 @@ Before adding or changing a Rust SDK concept:
 
 - Which JS SDK file is the source of truth?
 - Which JS SDK test or behavior is being ported?
+- Which Go SDK/client file was cross-checked, if the feature has a comparable
+  implementation?
 - Does the Rust name map clearly to the JS name?
 - Is this a public API or an internal implementation detail?
 - If this is a new internal abstraction, which JS concept does it support?
