@@ -250,6 +250,8 @@ Current Rust behavior:
   an existing CRDT tree.
 - Root garbage collection can physically purge removed text attribute nodes
   once the synced version vector covers their removal time.
+- `StyleOperation` registers removed text attribute nodes as root GC pairs when
+  applying or removing text styles through the operation layer.
 - Unit tests cover the JS RHT test flow for set/get/has, remove, remove of
   missing keys, set after remove, repeated remove, deep copy, purge, and escaped
   JSON output.
@@ -266,8 +268,8 @@ JS/Go behavior:
 Gap:
 
 - Rust `Rht` is connected to internal `TextValue`, but not yet to tree nodes.
-- Text style/edit operations are not ported yet, so new removed `RhtNode`
-  values are not registered through a change-context operation path.
+- Public Text facade methods are not connected yet, so users cannot create
+  text style operations from the public document API.
 - Rust `Rht::to_json` uses deterministic key ordering through `BTreeMap`.
   This matches Go marshaling and text's sorted attribute output, but JS
   `RHT.toJSON` itself follows `Map` insertion order.
@@ -276,8 +278,7 @@ Gap:
 Expected direction:
 
 - Use this `Rht` directly in the upcoming tree node port.
-- Register removed attribute nodes as root GC pairs from `StyleOperation` and
-  any future public Text style API.
+- Connect public Text style APIs to `StyleOperation`.
 - Keep Text output aligned with JS `CRDTTextValue.toJSON`, including parsing
   attribute values from JSON strings before serializing visible attributes.
 
@@ -301,6 +302,10 @@ Current Rust behavior:
   text attribute nodes when it is created from an existing CRDT tree.
 - Root garbage collection can physically purge removed text nodes and removed
   text attribute nodes.
+- Internal `EditOperation` and `StyleOperation` now execute against `CrdtText`,
+  receive the enclosing change's version vector, register removed text or
+  attribute nodes as GC pairs, update root document size through `acc`, emit
+  internal operation info, and create reverse operations for undo/redo wiring.
 - Unit tests cover the Go text CRDT smoke tests and matching JS scenarios:
   split-position lookup, Korean composition replacement, deletion with removed
   boundary nodes, deletion of last nodes, concurrent insert/delete with original
@@ -322,25 +327,25 @@ Gap:
 
 - Rust `RgaTreeSplit` currently uses a linear `Vec` backing structure instead
   of splay/LLRB indexes.
-- Rust `CrdtText` is not yet exposed through a public Text facade, operation
-  structs, or wire conversion.
-- Rust style/edit helpers do not yet emit operation info or reverse operations.
-- Text edit/style operations are not ported yet, so root indexes and document
-  sizes are not updated through the full JS operation flow during live text
-  edits.
+- Rust `CrdtText` is not yet exposed through a public Text facade or wire
+  conversion.
+- `StyleOperation` emits per-block style operation info from the text helper,
+  but `EditOperation` still emits a single requested range instead of the full
+  value-change list produced by JS `RGATreeSplit.edit`.
+- Text operation info is still internal and shaped for Rust tests; it has not
+  yet been aligned with the external watch/event payload shape.
 - Version-vector-aware edit/style conflict behavior is modeled at the internal
-  helper level and has focused parity tests, but it still needs broader replay
-  coverage once `EditOperation` and `StyleOperation` are ported.
+  helper level and is passed through `Change`, but it still needs broader
+  multi-change replay coverage at the operation layer.
 - Rust strings cannot represent invalid standalone UTF-16 surrogate halves, so
   splitting inside a surrogate pair currently uses lossy UTF-16 decoding. Exact
   JS string parity for that edge case needs a deliberate representation choice.
 
 Expected direction:
 
-- Port `EditOperation` and `StyleOperation`, then connect public Text methods
-  through `ChangeContext`.
-- Register new removed text nodes and removed attribute nodes as root GC pairs
-  from those operations.
+- Connect public Text methods through `ChangeContext`.
+- Align edit operation info with the JS value-change list before exposing text
+  watch/event APIs.
 - Continue porting JS history and multi-client text scenarios at the operation
   layer before optimizing the backing indexes.
 

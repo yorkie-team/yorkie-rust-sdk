@@ -38,7 +38,12 @@ impl Change {
         let mut reverse_ops = Vec::new();
 
         for operation in &self.operations {
-            let Some(execution_result) = operation.execute(root, source)? else {
+            let Some(execution_result) = operation.execute_with_version_vector(
+                root,
+                source,
+                Some(self.id.version_vector()),
+            )?
+            else {
                 continue;
             };
 

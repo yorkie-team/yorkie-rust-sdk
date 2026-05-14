@@ -155,6 +155,14 @@ pub(crate) struct CrdtText {
     rga_tree_split: RgaTreeSplit<TextValue>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TextStyleChange {
+    pub(crate) from: usize,
+    pub(crate) to: usize,
+    pub(crate) attributes: BTreeMap<String, String>,
+    pub(crate) attributes_to_remove: Vec<String>,
+}
+
 impl CrdtText {
     pub(crate) fn new(created_at: TimeTicket, rga_tree_split: RgaTreeSplit<TextValue>) -> Self {
         Self {
@@ -301,6 +309,24 @@ impl CrdtText {
         edited_at: TimeTicket,
         version_vector: Option<&VersionVector>,
     ) -> Result<(Vec<RhtNode>, DataSize)> {
+        let (gc_nodes, diff, _, _, _) =
+            self.set_style_by_range_with_changes(range, attributes, edited_at, version_vector)?;
+        Ok((gc_nodes, diff))
+    }
+
+    pub(crate) fn set_style_by_range_with_changes(
+        &mut self,
+        range: RgaTreeSplitPosRange,
+        attributes: BTreeMap<String, String>,
+        edited_at: TimeTicket,
+        version_vector: Option<&VersionVector>,
+    ) -> Result<(
+        Vec<RhtNode>,
+        DataSize,
+        Vec<TextStyleChange>,
+        BTreeMap<String, String>,
+        Vec<String>,
+    )> {
         let mut diff = DataSize::default();
         let (_, diff_to, to_right) = self
             .rga_tree_split
@@ -341,6 +367,45 @@ impl CrdtText {
             if node.can_style(&edited_at, client_lamport_at_change) {
                 to_be_styled.push(index);
             }
+        }
+
+        let mut changes = Vec::new();
+        let mut previous_attributes = BTreeMap::new();
+        let mut attributes_to_remove = Vec::new();
+        let mut captured_previous = false;
+
+        for index in &to_be_styled {
+            let node = self
+                .rga_tree_split
+                .node(*index)
+                .expect("candidate index comes from rga tree split");
+            if node.is_removed() {
+                continue;
+            }
+
+            if !captured_previous {
+                for key in attributes.keys() {
+                    let attrs = node.value().attributes();
+                    if attrs.has(key) {
+                        if let Some(value) = attrs.get(key) {
+                            previous_attributes.insert(key.clone(), value.to_owned());
+                        }
+                    } else {
+                        attributes_to_remove.push(key.clone());
+                    }
+                }
+                captured_previous = true;
+            }
+
+            let (from, to) = self
+                .rga_tree_split
+                .find_indexes_from_range(&node.create_pos_range())?;
+            changes.push(TextStyleChange {
+                from,
+                to,
+                attributes: attributes.clone(),
+                attributes_to_remove: Vec::new(),
+            });
         }
 
         let mut gc_nodes = Vec::new();
@@ -366,7 +431,13 @@ impl CrdtText {
             }
         }
 
-        Ok((gc_nodes, diff))
+        Ok((
+            gc_nodes,
+            diff,
+            changes,
+            previous_attributes,
+            attributes_to_remove,
+        ))
     }
 
     pub(crate) fn remove_style_by_index(
@@ -388,6 +459,27 @@ impl CrdtText {
         edited_at: TimeTicket,
         version_vector: Option<&VersionVector>,
     ) -> Result<(Vec<RhtNode>, DataSize)> {
+        let (gc_nodes, diff, _, _) = self.remove_style_by_range_with_changes(
+            range,
+            attributes_to_remove,
+            edited_at,
+            version_vector,
+        )?;
+        Ok((gc_nodes, diff))
+    }
+
+    pub(crate) fn remove_style_by_range_with_changes(
+        &mut self,
+        range: RgaTreeSplitPosRange,
+        attributes_to_remove: &[String],
+        edited_at: TimeTicket,
+        version_vector: Option<&VersionVector>,
+    ) -> Result<(
+        Vec<RhtNode>,
+        DataSize,
+        Vec<TextStyleChange>,
+        BTreeMap<String, String>,
+    )> {
         let mut diff = DataSize::default();
         let (_, diff_to, to_right) = self
             .rga_tree_split
@@ -430,6 +522,42 @@ impl CrdtText {
             }
         }
 
+        let mut changes = Vec::new();
+        let mut previous_attributes = BTreeMap::new();
+        let mut captured_previous = false;
+
+        for index in &to_be_styled {
+            let node = self
+                .rga_tree_split
+                .node(*index)
+                .expect("candidate index comes from rga tree split");
+            if node.is_removed() {
+                continue;
+            }
+
+            if !captured_previous {
+                for key in attributes_to_remove {
+                    let attrs = node.value().attributes();
+                    if attrs.has(key) {
+                        if let Some(value) = attrs.get(key) {
+                            previous_attributes.insert(key.clone(), value.to_owned());
+                        }
+                    }
+                }
+                captured_previous = true;
+            }
+
+            let (from, to) = self
+                .rga_tree_split
+                .find_indexes_from_range(&node.create_pos_range())?;
+            changes.push(TextStyleChange {
+                from,
+                to,
+                attributes: BTreeMap::new(),
+                attributes_to_remove: attributes_to_remove.to_vec(),
+            });
+        }
+
         let mut gc_nodes = Vec::new();
         for index in to_be_styled {
             let node = self
@@ -448,7 +576,7 @@ impl CrdtText {
             }
         }
 
-        Ok((gc_nodes, diff))
+        Ok((gc_nodes, diff, changes, previous_attributes))
     }
 
     pub(crate) fn data_size(&self) -> DataSize {

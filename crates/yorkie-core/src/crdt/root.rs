@@ -169,6 +169,10 @@ impl CrdtRoot {
         self.gc_pair_by_child_id.insert(child_id, pair);
     }
 
+    pub(crate) fn acc(&mut self, diff: DataSize) {
+        add_data_size(&mut self.doc_size.live, diff);
+    }
+
     pub(crate) fn get_object_member(
         &self,
         parent_created_at: &TimeTicket,

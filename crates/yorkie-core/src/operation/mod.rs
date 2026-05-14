@@ -1,20 +1,25 @@
 mod add_operation;
 mod array_set_operation;
+mod edit_operation;
 mod move_operation;
 mod remove_operation;
 mod set_operation;
+mod style_operation;
 
 pub(crate) use add_operation::AddOperation;
 pub(crate) use array_set_operation::ArraySetOperation;
+pub(crate) use edit_operation::EditOperation;
 pub(crate) use move_operation::MoveOperation;
 pub(crate) use remove_operation::RemoveOperation;
 pub(crate) use set_operation::SetOperation;
+pub(crate) use style_operation::StyleOperation;
 
 use crate::crdt::root::CrdtRoot;
 use crate::time::ActorId;
-use crate::TimeTicket;
+use crate::{TimeTicket, VersionVector};
 
 use crate::Result;
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OpSource {
@@ -49,6 +54,20 @@ pub(crate) enum OpInfo {
     ArraySet {
         path: String,
     },
+    Edit {
+        path: String,
+        from: usize,
+        to: usize,
+        content: String,
+        attributes: BTreeMap<String, String>,
+    },
+    Style {
+        path: String,
+        from: usize,
+        to: usize,
+        attributes: BTreeMap<String, String>,
+        attributes_to_remove: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -58,6 +77,8 @@ pub(crate) enum Operation {
     Add(AddOperation),
     Move(MoveOperation),
     ArraySet(ArraySetOperation),
+    Edit(EditOperation),
+    Style(StyleOperation),
 }
 
 impl Operation {
@@ -66,12 +87,23 @@ impl Operation {
         root: &mut CrdtRoot,
         source: OpSource,
     ) -> Result<Option<ExecutionResult>> {
+        self.execute_with_version_vector(root, source, None)
+    }
+
+    pub(crate) fn execute_with_version_vector(
+        &self,
+        root: &mut CrdtRoot,
+        source: OpSource,
+        version_vector: Option<&VersionVector>,
+    ) -> Result<Option<ExecutionResult>> {
         match self {
             Self::Set(operation) => operation.execute(root, source),
             Self::Remove(operation) => operation.execute(root, source),
             Self::Add(operation) => operation.execute(root, source),
             Self::Move(operation) => operation.execute(root, source),
             Self::ArraySet(operation) => operation.execute(root, source),
+            Self::Edit(operation) => operation.execute(root, source, version_vector),
+            Self::Style(operation) => operation.execute(root, source, version_vector),
         }
     }
 
@@ -83,6 +115,8 @@ impl Operation {
             Self::Add(operation) => operation.set_actor(actor_id),
             Self::Move(operation) => operation.set_actor(actor_id),
             Self::ArraySet(operation) => operation.set_actor(actor_id),
+            Self::Edit(operation) => operation.set_actor(actor_id),
+            Self::Style(operation) => operation.set_actor(actor_id),
         }
     }
 
@@ -93,6 +127,8 @@ impl Operation {
             Self::Add(operation) => operation.to_test_string(),
             Self::Move(operation) => operation.to_test_string(),
             Self::ArraySet(operation) => operation.to_test_string(),
+            Self::Edit(operation) => operation.to_test_string(),
+            Self::Style(operation) => operation.to_test_string(),
         }
     }
 }
