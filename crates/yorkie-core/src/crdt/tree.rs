@@ -3119,6 +3119,41 @@ mod tests {
     }
 
     #[test]
+    fn applies_concurrent_inserts_around_split_positions() -> crate::Result<()> {
+        assert_concurrent_split_insert(2, r#"<root><p>ac</p><p>b</p></root>"#)?;
+        assert_concurrent_split_insert(1, r#"<root><p>ca</p><p>b</p></root>"#)?;
+        assert_concurrent_split_insert(3, r#"<root><p>a</p><p>bc</p></root>"#)?;
+        Ok(())
+    }
+
+    #[test]
+    fn applies_concurrent_delete_inside_split_node() -> crate::Result<()> {
+        let mut tree = text_tree("ab");
+        let split_pos = tree.find_pos(2, true)?;
+        let delete_range = (tree.find_pos(2, true)?, tree.find_pos(3, true)?);
+
+        tree.edit_by_range_with_changes(
+            (split_pos.clone(), split_pos),
+            None,
+            1,
+            ticket(10, "b"),
+            None,
+        )?;
+        let mut version_vector = VersionVector::new();
+        version_vector.set("a", 10);
+        tree.edit_by_range_with_changes(
+            delete_range,
+            None,
+            0,
+            ticket(20, "c"),
+            Some(&version_vector),
+        )?;
+
+        assert_eq!(r#"<root><p>a</p><p></p></root>"#, tree.to_xml());
+        Ok(())
+    }
+
+    #[test]
     fn merges_tree_content_by_path() -> crate::Result<()> {
         let mut tree = nested_tree();
 
@@ -3179,6 +3214,32 @@ mod tests {
             ),
             ticket(1, "a"),
         )
+    }
+
+    fn assert_concurrent_split_insert(insert_index: usize, expected: &str) -> crate::Result<()> {
+        let mut tree = text_tree("ab");
+        let split_pos = tree.find_pos(2, true)?;
+        let insert_pos = tree.find_pos(insert_index, true)?;
+
+        tree.edit_by_range_with_changes(
+            (split_pos.clone(), split_pos),
+            None,
+            1,
+            ticket(10, "b"),
+            None,
+        )?;
+        let mut version_vector = VersionVector::new();
+        version_vector.set("a", 10);
+        tree.edit_by_range_with_changes(
+            (insert_pos.clone(), insert_pos),
+            Some(vec![TreeNode::create_text(node_id(20, 0), "c")]),
+            0,
+            ticket(20, "c"),
+            Some(&version_vector),
+        )?;
+
+        assert_eq!(expected, tree.to_xml());
+        Ok(())
     }
 
     fn text_tree(value: &str) -> CrdtTree {

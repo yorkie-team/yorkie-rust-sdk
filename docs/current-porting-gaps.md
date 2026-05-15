@@ -456,6 +456,9 @@ Current Rust behavior:
 - `CrdtTree` covers representative concurrent split cases ported from JS/Go:
   same-position splits, different-position splits on the same node, and
   different-level splits.
+- `CrdtTree` also covers representative concurrent insert/delete cases around
+  split positions, including inserts into the original node, split boundary, and
+  split node.
 - `CrdtElement::Tree` participates in metadata dispatch, JSON conversion,
   data-size accounting, removal, and deep copy.
 - `CrdtRoot` can find tree elements by creation time, rebuild tree internal GC
@@ -495,10 +498,10 @@ Gap:
   concurrent style matrices and range-narrowing edge cases are not yet ported.
 - Rust Tree edit operation is still partial. It now supports text split ranges,
   multi-level element split, visible element-boundary merge, representative
-  concurrent split siblings, range narrowing, and basic merge metadata, but
+  concurrent split/insert/delete cases, range narrowing, and basic merge metadata, but
   redo tagging after split undo, full `insPrevID`/`insNextID` maintenance across
-  existing neighbors, insert-into-split-position, and the broader concurrent
-  edit matrix still need JS/Go parity work.
+  existing neighbors, and the broader concurrent edit matrix still need JS/Go
+  parity work.
 - Like `CrdtText`, Tree text-node splitting uses valid Rust strings. Splitting
   inside an invalid standalone UTF-16 surrogate edge would need the same
   deliberate representation choice as Text.
@@ -520,9 +523,8 @@ Expected direction:
   element/text children so edit/style operations can reuse the same position
   semantics.
 - Add Tree edit operation tests from JS/Go around redo after split undo,
-  insert-into-split-position, removed-node ranges, mixed-level merge cases, and
-  the broader generated concurrent edit matrix before exposing public Tree
-  methods.
+  removed-node ranges, mixed-level merge cases, and the broader generated
+  concurrent edit matrix before exposing public Tree methods.
 - Extend Tree style parity from direct split-sibling propagation toward the full
   version-vector and concurrent style matrices in JS/Go.
 
