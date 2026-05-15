@@ -47,8 +47,10 @@ Current Rust behavior:
   that clone, diffs the before/after JSON values, then creates operations from
   the diff.
 - Object member changes can produce `SetOperation` and `RemoveOperation`.
-- Arrays can now be converted into CRDT arrays, but public array mutation still
-  appears as a whole object-member replacement through the diff bridge.
+- Existing array changes can now produce `AddOperation`, `RemoveOperation`, and
+  `ArraySetOperation` when the diff can infer push/insert/remove/set intent.
+- Nested object and array changes inside existing arrays can recurse into the
+  matching CRDT containers.
 
 JS/Go behavior:
 
@@ -59,12 +61,11 @@ JS/Go behavior:
 
 Gap:
 
-- Rust does not yet preserve operation intent from public array methods.
-  For example, public `JsonArray::push` inside `Document::update` does not emit
-  `AddOperation`; it is currently represented by replacing the containing
-  object member.
-- Rust cannot yet represent in-place array `move`, `set`, or `remove` from the
-  public JSON API.
+- Rust still infers existing array edits after the update callback rather than
+  recording intent at the mutation site, so ambiguous value-level edits can map
+  differently from the user's exact method sequence.
+- Rust cannot yet represent ID-based array `move`, `insertAfter`, `deleteByID`,
+  or stable CRDT identity lookup from the public JSON API.
 - Rust update flow does not yet expose the same context-backed editing model as
   JS/Go. This is the biggest semantic gap for future local editing behavior.
 
@@ -83,7 +84,9 @@ Current Rust behavior:
 
 - `JsonObject` supports `set`, `get`, `get_mut`, `remove`,
   `get_object_mut`, and `get_array_mut`.
-- `JsonArray` supports `push`, `len`, `is_empty`, and internal iteration.
+- `JsonArray` supports `push`, index `get`/`get_mut`, `set`, `insert`,
+  `remove`, nested `get_object_mut`/`get_array_mut`, `len`, `is_empty`, and
+  internal iteration.
 - `JsonValue` is a simple enum wrapper around primitive, object, and array
   values.
 
@@ -98,8 +101,8 @@ Gap:
 
 - Rust `JsonArray` is still a plain value container, not a CRDT-aware editing
   facade.
-- Rust lacks public APIs for array index access, index removal, index set,
-  insert-after, move-after, and stable CRDT identity lookup.
+- Rust lacks public APIs for element-ID access, insert-after by ID,
+  delete-by-ID, move-after, move-front/last, and stable CRDT identity lookup.
 - Rust nested array/object values do not carry a live connection to their CRDT
   element.
 
@@ -184,8 +187,8 @@ Gap:
   instead of using JS/Go-style linked nodes with stable per-node index handles.
   Read lookup now follows the same map/splay route, but write-side performance
   is still conservative.
-- Public API array tests still need to be connected once `JsonArray` becomes a
-  context-backed editing facade.
+- ID-based public array tests still need to be connected once `JsonArray`
+  becomes a context-backed editing facade.
 - Protocol snapshot conversion is still missing, so `addDeadPosition` and
   `addMovedElement` parity is covered internally but not through wire
   snapshots yet.
@@ -210,6 +213,9 @@ Current Rust behavior:
   move's position.
 - Cross-operation tests cover add/move/array-set/remove matrix convergence at
   the root operation layer.
+- Document tests verify that existing public arrays can produce add, remove,
+  array-set, delete-plus-push, insert, and nested object operations through the
+  temporary diff bridge.
 
 JS/Go behavior:
 
@@ -220,7 +226,9 @@ JS/Go behavior:
 
 Gap:
 
-- Rust array operations are not yet created by public `JsonArray` methods.
+- Rust array operations can be inferred from public `JsonArray` value changes
+  for common push/insert/remove/set cases, but they are not created directly by
+  context-backed mutation methods yet.
 - `Change` passes a version vector to operation execution, but array operations
   do not yet use version-vector visibility rules.
 - Rust operation structs do not yet convert to/from protobuf or wire-level
@@ -231,7 +239,8 @@ Gap:
 
 Expected direction:
 
-- Connect public array editing methods to these operations.
+- Replace inferred array operation creation with context-backed public array
+  editing methods.
 - Add version-vector parameters to operation execution when sync/replay
   behavior is ported.
 - Align event/op-info shape before exposing watch or local event APIs.
@@ -678,9 +687,11 @@ Gap:
 
 - Rust tests are hand-picked slices, not a systematic JS test port.
 - No automated parity harness exists.
-- Array tests do not yet cover the full JS/Go RGA matrix.
-- Document tests do not yet verify public array operation intent because the
-  public JSON layer cannot emit those operations yet.
+- Array/RGA and operation tests now cover the JS/Go-style insert/move/set/remove
+  matrix at CRDT and root-operation layers.
+- Document tests verify common public array operation intent, but do not yet
+  cover ID-based move/insert/delete APIs because the public array facade is not
+  context-backed.
 
 Expected direction:
 
@@ -691,8 +702,8 @@ Expected direction:
 
 ## Safe Assumptions for Future Work
 
-- Treat current array CRDT behavior as a semantic scaffold, not a finished
-  performance implementation.
+- Treat current array CRDT behavior as semantically covered for the ported
+  internal matrix, but not as a finished performance implementation.
 - Do not expose current operation event shapes as stable public API.
 - Route CRDT mutations through `CrdtRoot` to keep the copied root index fresh.
 - Prefer adding missing public JSON behavior before expanding network/client

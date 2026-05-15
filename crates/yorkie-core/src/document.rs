@@ -6,8 +6,10 @@ use crate::crdt::object::CrdtObject;
 use crate::crdt::primitive::{CrdtPrimitive, PrimitiveValue};
 use crate::crdt::root::CrdtRoot;
 use crate::crdt::tree::{attribute_value_to_json_value, TreeNode};
-use crate::operation::{OpSource, Operation, RemoveOperation, SetOperation};
-use crate::{JsonObject, JsonValue, Result, TimeTicket, YorkieError};
+use crate::operation::{
+    AddOperation, ArraySetOperation, OpSource, Operation, RemoveOperation, SetOperation,
+};
+use crate::{JsonArray, JsonObject, JsonValue, Result, TimeTicket, YorkieError};
 
 /// A local Yorkie document.
 #[derive(Debug, Clone, PartialEq)]
@@ -175,10 +177,240 @@ fn collect_object_changes(
             }
         }
 
+        if let (JsonValue::Array(before_array), JsonValue::Array(after_array)) =
+            (before_value, after_value)
+        {
+            if let Some(CrdtElement::Array(array)) =
+                crdt_root.get_object_member(parent_created_at, key)?
+            {
+                collect_array_changes(
+                    context,
+                    crdt_root,
+                    array.created_at(),
+                    before_array,
+                    after_array,
+                )?;
+                continue;
+            }
+        }
+
         push_set_or_remove_unsupported(context, parent_created_at, key, after_value)?;
     }
 
     Ok(())
+}
+
+fn collect_array_changes(
+    context: &mut ChangeContext,
+    crdt_root: &CrdtRoot,
+    parent_created_at: &TimeTicket,
+    before: &JsonArray,
+    after: &JsonArray,
+) -> Result<()> {
+    if before == after {
+        return Ok(());
+    }
+
+    if before.len() == after.len() {
+        let pairs = lcs_pairs(before.as_slice(), after.as_slice());
+        if pairs
+            .iter()
+            .any(|(before_index, after_index)| before_index != after_index)
+        {
+            return collect_sequence_array_changes(
+                context,
+                crdt_root,
+                parent_created_at,
+                before,
+                after,
+            );
+        }
+
+        collect_same_length_array_changes(context, crdt_root, parent_created_at, before, after)?;
+        return Ok(());
+    }
+
+    collect_sequence_array_changes(context, crdt_root, parent_created_at, before, after)
+}
+
+fn collect_same_length_array_changes(
+    context: &mut ChangeContext,
+    crdt_root: &CrdtRoot,
+    parent_created_at: &TimeTicket,
+    before: &JsonArray,
+    after: &JsonArray,
+) -> Result<()> {
+    for index in 0..before.len() {
+        let before_value = before.get(index).ok_or_else(|| {
+            YorkieError::InvalidIndex(format!("missing before array index {index}"))
+        })?;
+        let after_value = after.get(index).ok_or_else(|| {
+            YorkieError::InvalidIndex(format!("missing after array index {index}"))
+        })?;
+        if before_value == after_value {
+            continue;
+        }
+
+        let current = crdt_root
+            .array_by_created_at(parent_created_at)
+            .and_then(|array| array.get(index))
+            .ok_or_else(|| {
+                YorkieError::InvalidIndex(format!("missing CRDT array index {index}"))
+            })?;
+
+        match (before_value, after_value, current) {
+            (
+                JsonValue::Object(before_object),
+                JsonValue::Object(after_object),
+                CrdtElement::Object(object),
+            ) => {
+                collect_object_changes(
+                    context,
+                    crdt_root,
+                    object.created_at(),
+                    before_object,
+                    after_object,
+                )?;
+            }
+            (
+                JsonValue::Array(before_array),
+                JsonValue::Array(after_array),
+                CrdtElement::Array(array),
+            ) => {
+                collect_array_changes(
+                    context,
+                    crdt_root,
+                    array.created_at(),
+                    before_array,
+                    after_array,
+                )?;
+            }
+            _ => {
+                push_array_set_operation(
+                    context,
+                    parent_created_at,
+                    current.created_at().clone(),
+                    after_value,
+                )?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_sequence_array_changes(
+    context: &mut ChangeContext,
+    crdt_root: &CrdtRoot,
+    parent_created_at: &TimeTicket,
+    before: &JsonArray,
+    after: &JsonArray,
+) -> Result<()> {
+    let pairs = lcs_pairs(before.as_slice(), after.as_slice());
+    let mut before_matched = vec![false; before.len()];
+    let mut after_created_at = vec![None; after.len()];
+
+    for (before_index, after_index) in pairs {
+        before_matched[before_index] = true;
+        let created_at = crdt_root
+            .array_by_created_at(parent_created_at)
+            .and_then(|array| array.get(before_index))
+            .map(CrdtElement::created_at)
+            .ok_or_else(|| {
+                YorkieError::InvalidIndex(format!("missing CRDT array index {before_index}"))
+            })?
+            .clone();
+        after_created_at[after_index] = Some(created_at);
+    }
+
+    for (index, matched) in before_matched.iter().enumerate() {
+        if *matched {
+            continue;
+        }
+
+        let created_at = crdt_root
+            .array_by_created_at(parent_created_at)
+            .and_then(|array| array.get(index))
+            .map(CrdtElement::created_at)
+            .ok_or_else(|| YorkieError::InvalidIndex(format!("missing CRDT array index {index}")))?
+            .clone();
+        let executed_at = context.issue_time_ticket();
+        context.push(Operation::Remove(RemoveOperation::new(
+            parent_created_at.clone(),
+            created_at,
+            Some(executed_at),
+        )));
+    }
+
+    let mut prev_created_at = TimeTicket::initial();
+    for (index, after_value) in after.as_slice().iter().enumerate() {
+        if let Some(created_at) = &after_created_at[index] {
+            prev_created_at = crdt_root
+                .array_by_created_at(parent_created_at)
+                .and_then(|array| array.pos_created_at(created_at).ok())
+                .unwrap_or_else(|| created_at.clone());
+            continue;
+        }
+
+        let created_at = context.issue_time_ticket();
+        let element = json_value_to_crdt_element(after_value, created_at.clone(), context)?;
+        context.push(Operation::Add(AddOperation::create(
+            parent_created_at.clone(),
+            prev_created_at,
+            element,
+            Some(created_at.clone()),
+        )));
+        prev_created_at = created_at;
+    }
+
+    Ok(())
+}
+
+fn push_array_set_operation(
+    context: &mut ChangeContext,
+    parent_created_at: &TimeTicket,
+    created_at: TimeTicket,
+    value: &JsonValue,
+) -> Result<()> {
+    let executed_at = context.issue_time_ticket();
+    let element = json_value_to_crdt_element(value, executed_at.clone(), context)?;
+    context.push(Operation::ArraySet(ArraySetOperation::create(
+        parent_created_at.clone(),
+        created_at,
+        element,
+        Some(executed_at),
+    )));
+    Ok(())
+}
+
+fn lcs_pairs(before: &[JsonValue], after: &[JsonValue]) -> Vec<(usize, usize)> {
+    let mut lengths = vec![vec![0; after.len() + 1]; before.len() + 1];
+    for before_index in (0..before.len()).rev() {
+        for after_index in (0..after.len()).rev() {
+            lengths[before_index][after_index] = if before[before_index] == after[after_index] {
+                lengths[before_index + 1][after_index + 1] + 1
+            } else {
+                lengths[before_index + 1][after_index].max(lengths[before_index][after_index + 1])
+            };
+        }
+    }
+
+    let mut pairs = Vec::new();
+    let mut before_index = 0;
+    let mut after_index = 0;
+    while before_index < before.len() && after_index < after.len() {
+        if before[before_index] == after[after_index] {
+            pairs.push((before_index, after_index));
+            before_index += 1;
+            after_index += 1;
+        } else if lengths[before_index + 1][after_index] >= lengths[before_index][after_index + 1] {
+            before_index += 1;
+        } else {
+            after_index += 1;
+        }
+    }
+
+    pairs
 }
 
 fn push_set_or_remove_unsupported(
@@ -334,7 +566,7 @@ mod tests {
     use crate::crdt::rht::Rht;
     use crate::crdt::text::CrdtText;
     use crate::crdt::tree::{CrdtTree, TreeNode, TreeNodeId};
-    use crate::{Checkpoint, JsonArray, JsonObject, Result, VersionVector, YorkieError};
+    use crate::{Checkpoint, JsonArray, JsonObject, JsonValue, Result, VersionVector, YorkieError};
 
     #[test]
     fn creates_document_with_the_given_key() {
@@ -492,6 +724,160 @@ mod tests {
         assert_eq!(
             r#"0:00:0.SET.todos=["write tests",{"name":"yorkie"}]"#,
             doc.local_changes[0].to_test_string()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn records_existing_array_pushes_as_add_operations() -> Result<()> {
+        let mut doc = Document::new("doc-key");
+
+        doc.update(|root| {
+            let mut items = JsonArray::new();
+            items.push("one");
+            root.set("items", items)?;
+            Ok(())
+        })?;
+        doc.update(|root| {
+            root.get_array_mut("items")?.push("two");
+            Ok(())
+        })?;
+
+        assert_eq!(r#"{"items":["one","two"]}"#, doc.to_sorted_json());
+        assert_eq!(doc.to_sorted_json(), doc.crdt_root.to_sorted_json());
+        assert_eq!(2, doc.local_changes.len());
+        assert_eq!(r#"1:00:1.ADD."two""#, doc.local_changes[1].to_test_string());
+        Ok(())
+    }
+
+    #[test]
+    fn records_existing_array_removes_as_remove_operations() -> Result<()> {
+        let mut doc = Document::new("doc-key");
+
+        doc.update(|root| {
+            let mut items = JsonArray::new();
+            items.push("one").push("two").push("three");
+            root.set("items", items)?;
+            Ok(())
+        })?;
+        doc.update(|root| {
+            assert_eq!(
+                Some(JsonValue::String("two".to_owned())),
+                root.get_array_mut("items")?.remove(1)
+            );
+            Ok(())
+        })?;
+
+        assert_eq!(r#"{"items":["one","three"]}"#, doc.to_sorted_json());
+        assert_eq!(doc.to_sorted_json(), doc.crdt_root.to_sorted_json());
+        assert_eq!(
+            "1:00:1.REMOVE.1:00:3",
+            doc.local_changes[1].to_test_string()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn records_existing_array_delete_and_push_as_remove_and_add_operations() -> Result<()> {
+        let mut doc = Document::new("doc-key");
+
+        doc.update(|root| {
+            let mut items = JsonArray::new();
+            items.push("one").push("two").push("three");
+            root.set("items", items)?;
+            Ok(())
+        })?;
+        doc.update(|root| {
+            let items = root.get_array_mut("items")?;
+            assert_eq!(Some(JsonValue::String("two".to_owned())), items.remove(1));
+            items.push("four");
+            Ok(())
+        })?;
+
+        assert_eq!(r#"{"items":["one","three","four"]}"#, doc.to_sorted_json());
+        assert_eq!(doc.to_sorted_json(), doc.crdt_root.to_sorted_json());
+        assert_eq!(
+            r#"1:00:1.REMOVE.1:00:3,1:00:1.ADD."four""#,
+            doc.local_changes[1].to_test_string()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn records_existing_array_sets_as_array_set_operations() -> Result<()> {
+        let mut doc = Document::new("doc-key");
+
+        doc.update(|root| {
+            let mut items = JsonArray::new();
+            items.push("one").push("two");
+            root.set("items", items)?;
+            Ok(())
+        })?;
+        doc.update(|root| {
+            root.get_array_mut("items")?.set(1, "updated")?;
+            Ok(())
+        })?;
+
+        assert_eq!(r#"{"items":["one","updated"]}"#, doc.to_sorted_json());
+        assert_eq!(doc.to_sorted_json(), doc.crdt_root.to_sorted_json());
+        assert_eq!(
+            r#"1:00:1.ARRAY_SET.1:00:3="updated""#,
+            doc.local_changes[1].to_test_string()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn records_existing_array_inserts_as_add_operations() -> Result<()> {
+        let mut doc = Document::new("doc-key");
+
+        doc.update(|root| {
+            let mut items = JsonArray::new();
+            items.push("one").push("three");
+            root.set("items", items)?;
+            Ok(())
+        })?;
+        doc.update(|root| {
+            root.get_array_mut("items")?.insert(1, "two")?;
+            Ok(())
+        })?;
+
+        assert_eq!(r#"{"items":["one","two","three"]}"#, doc.to_sorted_json());
+        assert_eq!(doc.to_sorted_json(), doc.crdt_root.to_sorted_json());
+        assert_eq!(r#"1:00:1.ADD."two""#, doc.local_changes[1].to_test_string());
+        Ok(())
+    }
+
+    #[test]
+    fn records_nested_object_changes_inside_arrays() -> Result<()> {
+        let mut doc = Document::new("doc-key");
+
+        doc.update(|root| {
+            let mut profile = JsonObject::new();
+            profile.set("name", "yorkie")?;
+            let mut items = JsonArray::new();
+            items.push(profile);
+            root.set("items", items)?;
+            Ok(())
+        })?;
+        doc.update(|root| {
+            root.get_array_mut("items")?
+                .get_object_mut(0)?
+                .set("active", true)?;
+            Ok(())
+        })?;
+
+        assert_eq!(
+            r#"{"items":[{"active":true,"name":"yorkie"}]}"#,
+            doc.to_sorted_json()
+        );
+        assert_eq!(
+            r#"{"items":[{"name":"yorkie","active":true}]}"#,
+            doc.crdt_root.to_json()
+        );
+        assert_eq!(
+            "1:00:2.SET.active=true",
+            doc.local_changes[1].to_test_string()
         );
         Ok(())
     }

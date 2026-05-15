@@ -144,8 +144,80 @@ impl JsonArray {
         self.elements.is_empty()
     }
 
+    pub fn get(&self, index: usize) -> Option<&JsonValue> {
+        self.elements.get(index)
+    }
+
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut JsonValue> {
+        self.elements.get_mut(index)
+    }
+
+    pub fn set(&mut self, index: usize, value: impl Into<JsonValue>) -> Result<&mut Self> {
+        let len = self.elements.len();
+        let Some(element) = self.elements.get_mut(index) else {
+            return Err(YorkieError::InvalidIndex(format!(
+                "array index {index} out of bounds for length {len}"
+            )));
+        };
+
+        *element = value.into();
+        Ok(self)
+    }
+
+    pub fn insert(&mut self, index: usize, value: impl Into<JsonValue>) -> Result<&mut Self> {
+        if index > self.elements.len() {
+            return Err(YorkieError::InvalidIndex(format!(
+                "array index {index} out of bounds for length {}",
+                self.elements.len()
+            )));
+        }
+
+        self.elements.insert(index, value.into());
+        Ok(self)
+    }
+
+    pub fn remove(&mut self, index: usize) -> Option<JsonValue> {
+        if index >= self.elements.len() {
+            return None;
+        }
+
+        Some(self.elements.remove(index))
+    }
+
+    pub fn get_array_mut(&mut self, index: usize) -> Result<&mut JsonArray> {
+        let len = self.elements.len();
+        match self.elements.get_mut(index) {
+            Some(JsonValue::Array(value)) => Ok(value),
+            Some(_) => Err(YorkieError::UnexpectedType {
+                key: index.to_string(),
+                expected: "array",
+            }),
+            None => Err(YorkieError::InvalidIndex(format!(
+                "array index {index} out of bounds for length {len}"
+            ))),
+        }
+    }
+
+    pub fn get_object_mut(&mut self, index: usize) -> Result<&mut JsonObject> {
+        let len = self.elements.len();
+        match self.elements.get_mut(index) {
+            Some(JsonValue::Object(value)) => Ok(value),
+            Some(_) => Err(YorkieError::UnexpectedType {
+                key: index.to_string(),
+                expected: "object",
+            }),
+            None => Err(YorkieError::InvalidIndex(format!(
+                "array index {index} out of bounds for length {len}"
+            ))),
+        }
+    }
+
     pub(crate) fn iter(&self) -> impl Iterator<Item = &JsonValue> {
         self.elements.iter()
+    }
+
+    pub(crate) fn as_slice(&self) -> &[JsonValue] {
+        &self.elements
     }
 
     pub fn to_sorted_json(&self) -> String {
@@ -251,7 +323,7 @@ pub(crate) fn escape_json_string(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{JsonArray, JsonObject};
+    use super::{JsonArray, JsonObject, JsonValue};
     use crate::{Result, YorkieError};
 
     #[test]
@@ -274,6 +346,20 @@ mod tests {
         array.push("one").push(child);
 
         assert_eq!(r#"["one",{"name":"yorkie"}]"#, array.to_sorted_json());
+
+        Ok(())
+    }
+
+    #[test]
+    fn updates_array_values_by_index() -> Result<()> {
+        let mut array = JsonArray::new();
+        array.push("one").push("three");
+        array.insert(1, "two")?;
+        array.set(2, "four")?;
+
+        assert_eq!(Some(&JsonValue::String("two".to_owned())), array.get(1));
+        assert_eq!(Some(JsonValue::String("one".to_owned())), array.remove(0));
+        assert_eq!(r#"["two","four"]"#, array.to_sorted_json());
 
         Ok(())
     }
