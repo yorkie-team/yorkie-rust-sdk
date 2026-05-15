@@ -442,6 +442,9 @@ Current Rust behavior:
 - `CrdtTree` can apply split-free element insert/delete edits and text-node
   split insert/delete edits, collect tree edit operation info, register removed
   node GC pairs, and report reverse operation inputs.
+- `CrdtTree` can apply simple `splitLevel=1` element splits by cloning the
+  split element type and attributes and moving the right-side children into the
+  new sibling.
 - `CrdtElement::Tree` participates in metadata dispatch, JSON conversion,
   data-size accounting, removal, and deep copy.
 - `CrdtRoot` can find tree elements by creation time, rebuild tree internal GC
@@ -452,9 +455,10 @@ Current Rust behavior:
   text-boundary splits, registers removed attribute GC pairs, accumulates root
   size diff, and creates reverse tree style operations.
 - `TreeEditOperation` executes split-free element insert/delete operations and
-  text-node split insert/delete operations, registers removed tree-node GC
-  pairs, accumulates root size diff for inserted nodes and text splits, and
-  creates reverse tree edit operations.
+  text-node split insert/delete operations plus simple `splitLevel=1` element
+  split operations, registers removed tree-node GC pairs, accumulates root size
+  diff for inserted nodes and splits, and creates reverse tree edit operations
+  for insert/delete cases.
 
 JS/Go behavior:
 
@@ -477,14 +481,16 @@ Gap:
   style/remove-style across unknown split siblings the way JS/Go do for
   concurrent Tree split cases.
 - Rust Tree edit operation is only partial. It can split text nodes for simple
-  insert/delete ranges, but it does not split element nodes, merge element
-  boundaries, fully maintain `insPrevID`/`insNextID` across existing neighbors,
-  propagate merge metadata, or handle unknown split siblings like JS/Go.
+  insert/delete ranges and can perform simple `splitLevel=1` element splits,
+  but it does not support multi-level element split, merge element boundaries,
+  pure-split reverse operations, full `insPrevID`/`insNextID` maintenance
+  across existing neighbors, merge metadata propagation, or unknown split
+  siblings like JS/Go.
 - Like `CrdtText`, Tree text-node splitting uses valid Rust strings. Splitting
   inside an invalid standalone UTF-16 surrogate edge would need the same
   deliberate representation choice as Text.
-- Split and merge metadata is stored, and new text split nodes receive the
-  basic split identity/link metadata, but broader split/merge metadata
+- Split and merge metadata is stored, and new text/element split nodes receive
+  the basic split identity/link metadata, but broader split/merge metadata
   maintenance is still incomplete.
 - Operation-time GC registration exists for split-free tree-node deletion and
   text-node split deletion, but element split/merge deletion paths still need
@@ -499,8 +505,9 @@ Expected direction:
 - Extend path/index conversion tests around removed nodes and mixed
   element/text children so edit/style operations can reuse the same position
   semantics.
-- Add Tree edit operation tests from JS/Go around element split, merge, and
-  unknown split sibling cases before exposing public Tree methods.
+- Add Tree edit operation tests from JS/Go around multi-level element split,
+  merge, pure-split undo/redo, and unknown split sibling cases before exposing
+  public Tree methods.
 - Extend Tree style parity from text-boundary split support toward version
   vectors, unknown split siblings, and split sibling propagation.
 

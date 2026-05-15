@@ -296,29 +296,45 @@ impl TreeNode {
         visible_offset: usize,
         node: TreeNode,
     ) -> Result<()> {
-        let visible_count = self.children().count();
-        if visible_offset > visible_count {
+        let physical_offset = self.physical_child_offset(visible_offset)?;
+        self.children.insert(physical_offset, node);
+        Ok(())
+    }
+
+    pub(crate) fn split_element_at(
+        &mut self,
+        visible_offset: usize,
+        id: TreeNodeId,
+    ) -> Result<(TreeNode, DataSize)> {
+        if self.is_text() {
             return Err(YorkieError::InvalidTreePosition(
-                "insert offset is out of range".to_owned(),
+                "text node cannot be split as element".to_owned(),
             ));
         }
 
-        let physical_offset = if visible_offset == visible_count {
-            self.children.len()
-        } else {
-            self.children
-                .iter()
-                .enumerate()
-                .filter(|(_, child)| !child.is_removed())
-                .nth(visible_offset)
-                .map(|(index, _)| index)
-                .ok_or_else(|| {
-                    YorkieError::InvalidTreePosition("insert offset is out of range".to_owned())
-                })?
-        };
+        let physical_offset = self.physical_child_offset(visible_offset)?;
+        let prev_size = self.data_size();
+        let right_children = self.children.split_off(physical_offset);
+        let mut right = TreeNode::create_element(
+            id,
+            self.node_type.clone(),
+            self.attrs.clone(),
+            right_children,
+        );
+        right.removed_at = self.removed_at.clone();
+        right.ins_prev_id = Some(self.id.clone());
+        right.ins_next_id = self.ins_next_id.clone();
+        self.ins_next_id = Some(right.id.clone());
 
-        self.children.insert(physical_offset, node);
-        Ok(())
+        let left_size = self.data_size();
+        let right_size = right.data_size();
+        Ok((
+            right,
+            DataSize {
+                data: left_size.data + right_size.data - prev_size.data,
+                meta: left_size.meta + right_size.meta - prev_size.meta,
+            },
+        ))
     }
 
     pub(crate) fn split_text_child_at(
@@ -375,6 +391,29 @@ impl TreeNode {
             data: left_size.data + right_size.data - prev_size.data,
             meta: left_size.meta + right_size.meta - prev_size.meta,
         })
+    }
+
+    fn physical_child_offset(&self, visible_offset: usize) -> Result<usize> {
+        let visible_count = self.children().count();
+        if visible_offset > visible_count {
+            return Err(YorkieError::InvalidTreePosition(
+                "child offset is out of range".to_owned(),
+            ));
+        }
+
+        if visible_offset == visible_count {
+            return Ok(self.children.len());
+        }
+
+        self.children
+            .iter()
+            .enumerate()
+            .filter(|(_, child)| !child.is_removed())
+            .nth(visible_offset)
+            .map(|(index, _)| index)
+            .ok_or_else(|| {
+                YorkieError::InvalidTreePosition("child offset is out of range".to_owned())
+            })
     }
 
     pub(crate) fn remove(&mut self, removed_at: TimeTicket) -> bool {
@@ -912,9 +951,9 @@ impl CrdtTree {
         edited_at: TimeTicket,
         version_vector: Option<&crate::VersionVector>,
     ) -> Result<TreeEditResult> {
-        if split_level > 0 {
+        if split_level > 1 {
             return Err(YorkieError::InvalidTreePosition(
-                "tree split edit is not implemented yet".to_owned(),
+                "multi-level tree split edit is not implemented yet".to_owned(),
             ));
         }
 
@@ -936,6 +975,15 @@ impl CrdtTree {
                 let node = node_at_visible_path_mut(&mut self.root, &path)?;
                 node.remove_recursively(edited_at.clone(), &mut gc_pairs, &mut removed_nodes);
             }
+        }
+
+        if split_level > 0 {
+            let contents_len = contents.as_ref().map(Vec::len).unwrap_or_default();
+            let split_id = TreeNodeId::new(split_issue_ticket(&edited_at, contents_len, 0), 0);
+            add_data_size(
+                &mut diff,
+                self.split_element_at_position(&range.0, split_id)?,
+            );
         }
 
         let mut inserted_size = 0;
@@ -1118,6 +1166,23 @@ impl CrdtTree {
         };
 
         parent.split_text_child_at(child_index, split_offset)
+    }
+
+    fn split_element_at_position(&mut self, pos: &TreePos, id: TreeNodeId) -> Result<DataSize> {
+        let (node_path, offset) = self.position_to_parent_offset(pos)?;
+        let Some((parent_path, visible_index)) = split_parent_path(&node_path) else {
+            return Err(YorkieError::InvalidTreePosition(
+                "root node cannot be split".to_owned(),
+            ));
+        };
+        let parent = node_at_visible_path_mut(&mut self.root, &parent_path)?;
+        let physical_index = parent.physical_child_offset(visible_index)?;
+        let node = parent.children.get_mut(physical_index).ok_or_else(|| {
+            YorkieError::InvalidTreePosition("split element not found".to_owned())
+        })?;
+        let (right, diff) = node.split_element_at(offset, id)?;
+        parent.children.insert(physical_index + 1, right);
+        Ok(diff)
     }
 
     fn position_to_parent_offset(&self, pos: &TreePos) -> Result<(Vec<usize>, usize)> {
@@ -1713,6 +1778,22 @@ fn split_utf16(value: &str, offset: usize) -> (String, String) {
     )
 }
 
+fn split_issue_ticket(
+    edited_at: &TimeTicket,
+    contents_len: usize,
+    split_index: usize,
+) -> TimeTicket {
+    TimeTicket::new(
+        edited_at.lamport(),
+        edited_at
+            .delimiter()
+            .saturating_add(contents_len as u32)
+            .saturating_add(split_index as u32)
+            .saturating_add(1),
+        edited_at.actor_id().clone(),
+    )
+}
+
 fn escape_xml_text(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -2206,6 +2287,40 @@ mod tests {
         assert_eq!(5, result.to_idx);
         assert_eq!(1, result.removed_nodes.len());
         assert_eq!(1, result.gc_pairs.len());
+        assert_eq!(5, tree.node_map_len());
+        Ok(())
+    }
+
+    #[test]
+    fn edits_tree_by_splitting_element_nodes() -> crate::Result<()> {
+        let mut attrs = Rht::new();
+        attrs.set("bold", "true", ticket(4, "a"));
+        let mut tree = CrdtTree::create(
+            TreeNode::create_element(
+                node_id(1, 0),
+                "root",
+                None,
+                vec![TreeNode::create_element(
+                    node_id(2, 0),
+                    "p",
+                    Some(attrs),
+                    vec![TreeNode::create_text(node_id(3, 0), "helloworld")],
+                )],
+            ),
+            ticket(1, "a"),
+        );
+        let pos = tree.find_pos(6, true)?;
+
+        let result =
+            tree.edit_by_range_with_changes((pos.clone(), pos), None, 1, ticket(10, "a"), None)?;
+
+        assert_eq!(
+            r#"<root><p bold="true">hello</p><p bold="true">world</p></root>"#,
+            tree.to_xml()
+        );
+        assert_eq!(6, result.from_idx);
+        assert_eq!(6, result.to_idx);
+        assert_eq!(Some(1), result.changes[0].split_level);
         assert_eq!(5, tree.node_map_len());
         Ok(())
     }
