@@ -764,11 +764,11 @@ impl CrdtTree {
         BTreeMap<String, String>,
         Vec<String>,
     )> {
+        let mut diff = self.split_text_range(&range)?;
         let from_idx = self.pos_to_index(&range.0)?;
         let to_idx = self.pos_to_index(&range.1)?;
         let targets = self.style_target_paths(from_idx, to_idx, &edited_at, version_vector);
 
-        let mut diff = DataSize::default();
         let mut gc_nodes = Vec::new();
         let mut changes = Vec::new();
         let mut previous_attributes = BTreeMap::new();
@@ -846,11 +846,11 @@ impl CrdtTree {
         Vec<TreeStyleChange>,
         BTreeMap<String, String>,
     )> {
+        let mut diff = self.split_text_range(&range)?;
         let from_idx = self.pos_to_index(&range.0)?;
         let to_idx = self.pos_to_index(&range.1)?;
         let targets = self.style_target_paths(from_idx, to_idx, &edited_at, version_vector);
 
-        let mut diff = DataSize::default();
         let mut gc_nodes = Vec::new();
         let mut changes = Vec::new();
         let mut previous_attributes = BTreeMap::new();
@@ -1090,6 +1090,14 @@ impl CrdtTree {
             &mut targets,
         );
         remove_descendant_paths(targets)
+    }
+
+    fn split_text_range(&mut self, range: &(TreePos, TreePos)) -> Result<DataSize> {
+        let mut diff = DataSize::default();
+        add_data_size(&mut diff, self.split_text_at_position(&range.0)?);
+        add_data_size(&mut diff, self.split_text_at_position(&range.1)?);
+        self.rebuild_node_map();
+        Ok(diff)
     }
 
     fn split_text_at_position(&mut self, pos: &TreePos) -> Result<DataSize> {
@@ -2018,6 +2026,32 @@ mod tests {
     }
 
     #[test]
+    fn styles_text_only_ranges_by_splitting_boundaries() -> crate::Result<()> {
+        let mut tree = text_tree("hello");
+        let range = (tree.find_pos(2, true)?, tree.find_pos(4, true)?);
+
+        let (_, diff, changes, previous, attributes_to_remove) = tree.style_by_range_with_changes(
+            range,
+            BTreeMap::from([("bold".to_owned(), "true".to_owned())]),
+            ticket(10, "a"),
+            None,
+        )?;
+
+        assert!(changes.is_empty());
+        assert!(previous.is_empty());
+        assert!(attributes_to_remove.is_empty());
+        assert_eq!(0, diff.data);
+        assert_eq!(TIME_TICKET_SIZE * 2, diff.meta);
+        assert_eq!(5, tree.node_map_len());
+        assert_eq!(r#"<root><p>hello</p></root>"#, tree.to_xml());
+        assert_eq!(
+            r#"{"type":"root","children":[{"type":"p","children":[{"type":"text","value":"h"},{"type":"text","value":"el"},{"type":"text","value":"lo"}]}]}"#,
+            tree.to_json()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn removes_tree_style_attributes() -> crate::Result<()> {
         let mut tree = CrdtTree::create(
             TreeNode::create_element(
@@ -2052,6 +2086,28 @@ mod tests {
             previous
         );
         assert_eq!(1, changes.len());
+        assert_eq!(r#"<root><p>hello</p></root>"#, tree.to_xml());
+        Ok(())
+    }
+
+    #[test]
+    fn removes_style_from_text_only_ranges_by_splitting_boundaries() -> crate::Result<()> {
+        let mut tree = text_tree("hello");
+        let range = (tree.find_pos(2, true)?, tree.find_pos(4, true)?);
+
+        let (removed, diff, changes, previous) = tree.remove_style_by_range_with_changes(
+            range,
+            &["bold".to_owned()],
+            ticket(10, "a"),
+            None,
+        )?;
+
+        assert!(removed.is_empty());
+        assert!(changes.is_empty());
+        assert!(previous.is_empty());
+        assert_eq!(0, diff.data);
+        assert_eq!(TIME_TICKET_SIZE * 2, diff.meta);
+        assert_eq!(5, tree.node_map_len());
         assert_eq!(r#"<root><p>hello</p></root>"#, tree.to_xml());
         Ok(())
     }

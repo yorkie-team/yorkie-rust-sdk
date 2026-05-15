@@ -32,9 +32,9 @@ concurrency, and protocol conversion.
 | Area | Status | Notes |
 | --- | --- | --- |
 | Tree node ID and floor lookup | covered | Rust `TreeNodeId` orders by creation ticket then offset and `CrdtTree::find_floor_node` only returns nodes with the same creation ticket, matching JS/Go split-node lookup. |
-| Node JSON/XML/data size | partial | Rust covers root/element/text serialization, UTF-16 text size, active attribute size, hidden removed children, and text-node split size deltas during tree edits. Element split/merge size deltas are not implemented yet. |
-| CRDT tree element | partial | `CrdtElement::Tree` delegates metadata, JSON, data size, removal, deep copy, initial style/remove-style behavior, split-free element insert/delete edit behavior, and text-node split insert/delete edit behavior. |
-| Tree style operation | partial | Rust has `TreeStyleOperation` for element attribute set/remove, reverse operation creation, op info, and removed attribute GC registration. It covers simple visible element-token ranges but does not yet split text, advance unknown split siblings, or propagate style across split siblings. |
+| Node JSON/XML/data size | partial | Rust covers root/element/text serialization, UTF-16 text size, active attribute size, hidden removed children, and text-node split size deltas during tree edit/style operations. Element split/merge size deltas are not implemented yet. |
+| CRDT tree element | partial | `CrdtElement::Tree` delegates metadata, JSON, data size, removal, deep copy, split-free element insert/delete edit behavior, text-node split insert/delete edit behavior, and text-boundary split style/remove-style behavior. |
+| Tree style operation | partial | Rust has `TreeStyleOperation` for element attribute set/remove, text-boundary split, reverse operation creation, op info, and removed attribute GC registration. Advancing unknown split siblings and propagating style/remove-style across split siblings are still missing. |
 | Tree edit operation | partial | Rust has `TreeEditOperation` for split-free element insert/delete and text-node split insert/delete, reverse operation creation, op info, and tree-node GC registration. Element split, merge, full `insPrevID`/`insNextID` maintenance, and unknown split sibling handling are still missing. |
 | Attribute RHT reuse | partial | Tree nodes now reuse `Rht`; visible attributes serialize deterministically, and removed attribute nodes become root GC pairs through tree style operations. |
 | Tree GC | partial | Removed tree nodes and removed tree attributes are registered and purged through root GC when rebuilding from an existing root object. Tree style operations register removed attribute GC pairs; tree edit operations register removed tree-node GC pairs for split-free element deletion and text-node split deletion. |
@@ -47,9 +47,9 @@ concurrency, and protocol conversion.
 
 - Extend tree index/path coverage with removed-node and mixed element/text
   scenarios before public tree editing.
-- Extend tree style operation tests around version-vector-aware styling,
-  unknown split siblings, and split text now that Tree edit can split text
-  nodes.
+- Extend tree style operation tests from text-boundary split toward
+  version-vector-aware styling, unknown split siblings, and split sibling
+  propagation.
 - Extend tree edit operation tests from text-node split insert/delete toward
   element split, merge, and concurrent split sibling cases before public facade
   tests.

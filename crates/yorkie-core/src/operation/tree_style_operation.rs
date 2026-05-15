@@ -284,6 +284,33 @@ mod tests {
     }
 
     #[test]
+    fn styles_text_only_range_by_splitting_boundaries() -> crate::Result<()> {
+        let tree_at = ticket(1, "a");
+        let mut root = seeded_root(tree_at.clone());
+        let range = {
+            let tree = root.tree_by_created_at(&tree_at).unwrap();
+            (tree.find_pos(2, true)?, tree.find_pos(4, true)?)
+        };
+
+        let result = TreeStyleOperation::create(
+            tree_at.clone(),
+            range.0,
+            range.1,
+            BTreeMap::from([("bold".to_owned(), "true".to_owned())]),
+            Some(ticket(10, "a")),
+        )
+        .execute(&mut root, OpSource::Remote, None)?
+        .unwrap();
+
+        let tree = root.tree_by_created_at(&tree_at).unwrap();
+        assert_eq!(r#"<root><p>hello</p></root>"#, tree.to_xml());
+        assert_eq!(5, tree.node_map_len());
+        assert!(result.op_infos.is_empty());
+        assert!(result.reverse_op.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn removes_tree_style_and_registers_gc() -> crate::Result<()> {
         let tree_at = ticket(1, "a");
         let mut root = seeded_root(tree_at.clone());

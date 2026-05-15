@@ -436,8 +436,9 @@ Current Rust behavior:
 - `CrdtTree` can convert between linear tree indexes, paths, and CRDT tree
   positions using the JS/Go element padding and text-child path rules.
 - `CrdtTree` can apply simple style/remove-style ranges to visible element
-  tokens, ignore text-only ranges, collect tree style operation info, and
-  report reverse-operation inputs.
+  tokens, split text nodes at style boundaries, ignore text-only ranges after
+  applying the boundary splits, collect tree style operation info, and report
+  reverse-operation inputs.
 - `CrdtTree` can apply split-free element insert/delete edits and text-node
   split insert/delete edits, collect tree edit operation info, register removed
   node GC pairs, and report reverse operation inputs.
@@ -447,9 +448,9 @@ Current Rust behavior:
   pairs from an existing root object, deep-copy them, and physically purge
   removed tree nodes or removed tree attributes once a version vector covers
   their removal time.
-- `TreeStyleOperation` executes tree style/remove-style operations, registers
-  removed attribute GC pairs, accumulates root size diff, and creates reverse
-  tree style operations.
+- `TreeStyleOperation` executes tree style/remove-style operations, applies
+  text-boundary splits, registers removed attribute GC pairs, accumulates root
+  size diff, and creates reverse tree style operations.
 - `TreeEditOperation` executes split-free element insert/delete operations and
   text-node split insert/delete operations, registers removed tree-node GC
   pairs, accumulates root size diff for inserted nodes and text splits, and
@@ -471,10 +472,10 @@ Gap:
 - Tree path/index conversion exists for the current in-memory tree, but it is
   not yet maintained by tree edit operations and still needs broader
   removed-node and mixed child coverage.
-- Rust Tree style operation is only partial. It does not yet split text at
-  style boundaries, advance unknown split siblings, or propagate style/remove
-  style across unknown split siblings the way JS/Go do for concurrent Tree
-  split cases.
+- Rust Tree style operation is only partial. It splits text nodes at style
+  boundaries, but it does not yet advance unknown split siblings or propagate
+  style/remove-style across unknown split siblings the way JS/Go do for
+  concurrent Tree split cases.
 - Rust Tree edit operation is only partial. It can split text nodes for simple
   insert/delete ranges, but it does not split element nodes, merge element
   boundaries, fully maintain `insPrevID`/`insNextID` across existing neighbors,
@@ -500,8 +501,8 @@ Expected direction:
   semantics.
 - Add Tree edit operation tests from JS/Go around element split, merge, and
   unknown split sibling cases before exposing public Tree methods.
-- Extend Tree style parity on top of text split support, especially around
-  version vectors and split sibling propagation.
+- Extend Tree style parity from text-boundary split support toward version
+  vectors, unknown split siblings, and split sibling propagation.
 
 ## Change, ChangeContext, and ChangePack
 
