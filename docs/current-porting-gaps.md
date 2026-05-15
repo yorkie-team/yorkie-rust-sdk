@@ -438,13 +438,17 @@ Current Rust behavior:
 - `CrdtTree` can apply simple style/remove-style ranges to visible element
   tokens, split text nodes at style boundaries, ignore text-only ranges after
   applying the boundary splits, collect tree style operation info, and report
-  reverse-operation inputs.
+  reverse-operation inputs. It also has the first version-vector-aware split
+  sibling propagation used by JS/Go for style/remove-style collection.
 - `CrdtTree` can apply split-free element insert/delete edits and text-node
   split insert/delete edits, collect tree edit operation info, register removed
   node GC pairs, and report reverse operation inputs.
-- `CrdtTree` can apply simple `splitLevel=1` element splits by cloning the
-  split element type and attributes and moving the right-side children into the
-  new sibling.
+- `CrdtTree` can apply multi-level element splits by cloning the split element
+  type and attributes, moving the right-side children into new siblings, and
+  issuing split node IDs with the same delimiter progression used by JS/Go.
+- `CrdtTree` can merge visible element boundaries by tombstoning merge source
+  elements, moving live children into the left-side parent, and recording basic
+  `mergedFrom`, `mergedAt`, and `mergedInto` metadata.
 - `CrdtElement::Tree` participates in metadata dispatch, JSON conversion,
   data-size accounting, removal, and deep copy.
 - `CrdtRoot` can find tree elements by creation time, rebuild tree internal GC
@@ -455,10 +459,10 @@ Current Rust behavior:
   text-boundary splits, registers removed attribute GC pairs, accumulates root
   size diff, and creates reverse tree style operations.
 - `TreeEditOperation` executes split-free element insert/delete operations and
-  text-node split insert/delete operations plus simple `splitLevel=1` element
-  split operations, registers removed tree-node GC pairs, accumulates root size
-  diff for inserted nodes and splits, and creates reverse tree edit operations
-  for insert/delete cases.
+  text-node split insert/delete operations plus multi-level element split and
+  visible-boundary merge operations, registers removed tree-node GC pairs,
+  accumulates root size diff for inserted nodes and splits, and creates reverse
+  tree edit operations for insert/delete cases.
 
 JS/Go behavior:
 
@@ -473,28 +477,28 @@ JS/Go behavior:
 
 Gap:
 
-- Tree path/index conversion exists for the current in-memory tree, but it is
-  not yet maintained by tree edit operations and still needs broader
-  removed-node and mixed child coverage.
-- Rust Tree style operation is only partial. It splits text nodes at style
-  boundaries, but it does not yet advance unknown split siblings or propagate
-  style/remove-style across unknown split siblings the way JS/Go do for
-  concurrent Tree split cases.
-- Rust Tree edit operation is only partial. It can split text nodes for simple
-  insert/delete ranges and can perform simple `splitLevel=1` element splits,
-  but it does not support multi-level element split, merge element boundaries,
-  pure-split reverse operations, full `insPrevID`/`insNextID` maintenance
-  across existing neighbors, merge metadata propagation, or unknown split
-  siblings like JS/Go.
+- Tree path/index conversion exists for the current in-memory tree, and edit
+  and style collection now use JS/Go-like token traversal. Rust still recomputes
+  over the current tree instead of maintaining the same stable `IndexTree`
+  structure, so removed-node and mixed child coverage needs to keep expanding.
+- Rust Tree style operation is still partial. It now propagates style/remove
+  style to direct unknown split siblings in the JS/Go shape, but the broader
+  concurrent style matrices and range-narrowing edge cases are not yet ported.
+- Rust Tree edit operation is still partial. It now supports text split ranges,
+  multi-level element split, visible element-boundary merge, and basic merge
+  metadata, but pure-split reverse operations, full `insPrevID`/`insNextID`
+  maintenance across existing neighbors, and concurrent unknown split sibling
+  cases still need JS/Go parity work.
 - Like `CrdtText`, Tree text-node splitting uses valid Rust strings. Splitting
   inside an invalid standalone UTF-16 surrogate edge would need the same
   deliberate representation choice as Text.
-- Split and merge metadata is stored, and new text/element split nodes receive
-  the basic split identity/link metadata, but broader split/merge metadata
-  maintenance is still incomplete.
-- Operation-time GC registration exists for split-free tree-node deletion and
-  text-node split deletion, but element split/merge deletion paths still need
-  JS/Go parity.
+- Split and merge metadata is stored, new text/element split nodes receive the
+  basic split identity/link metadata, and merge source children receive basic
+  merge metadata. Neighbor-link maintenance and concurrent split/merge metadata
+  still need broader parity coverage.
+- Operation-time GC registration exists for split-free tree-node deletion,
+  text-node split deletion, and visible-boundary merge source tombstones, but
+  concurrent element split/merge deletion paths still need JS/Go parity.
 - Public Tree facade and wire conversion are missing.
 - Tree attribute JSON/XML output follows the same scalar parsing helper as
   Text, but object/array attribute values still need broader JS parity tests
@@ -505,11 +509,11 @@ Expected direction:
 - Extend path/index conversion tests around removed nodes and mixed
   element/text children so edit/style operations can reuse the same position
   semantics.
-- Add Tree edit operation tests from JS/Go around multi-level element split,
-  merge, pure-split undo/redo, and unknown split sibling cases before exposing
-  public Tree methods.
-- Extend Tree style parity from text-boundary split support toward version
-  vectors, unknown split siblings, and split sibling propagation.
+- Add Tree edit operation tests from JS/Go around pure-split undo/redo,
+  concurrent split siblings, removed-node ranges, and mixed-level merge cases
+  before exposing public Tree methods.
+- Extend Tree style parity from direct split-sibling propagation toward the full
+  version-vector and concurrent style matrices in JS/Go.
 
 ## Change, ChangeContext, and ChangePack
 

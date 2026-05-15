@@ -254,10 +254,8 @@ mod tests {
     fn removes_tree_element_content() -> crate::Result<()> {
         let tree_at = ticket(1, "a");
         let mut root = seeded_root(tree_at.clone(), vec![paragraph_node()]);
-        let range = root
-            .tree_by_created_at(&tree_at)
-            .unwrap()
-            .path_to_pos_range(&[0])?;
+        let tree = root.tree_by_created_at(&tree_at).unwrap();
+        let range = (tree.path_to_pos(&[0])?, tree.path_to_pos(&[1])?);
 
         let result = TreeEditOperation::create(
             tree_at.clone(),
@@ -279,9 +277,9 @@ mod tests {
             vec![OpInfo::TreeEdit {
                 path: "$.body".to_owned(),
                 from: 0,
-                to: 1,
+                to: 7,
                 from_path: vec![0],
-                to_path: vec![0, 0],
+                to_path: vec![1],
                 value: None,
                 split_level: None,
             }],
@@ -431,9 +429,130 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn splits_tree_content_across_multiple_levels() -> crate::Result<()> {
+        let tree_at = ticket(1, "a");
+        let mut root = seeded_nested_root(tree_at.clone());
+        let pos = root
+            .tree_by_created_at(&tree_at)
+            .unwrap()
+            .path_to_pos(&[0, 0, 0, 2])?;
+
+        let result = TreeEditOperation::create(
+            tree_at.clone(),
+            pos.clone(),
+            pos,
+            None,
+            2,
+            Some(ticket(20, "a")),
+        )
+        .execute(&mut root, OpSource::Remote, None)?
+        .unwrap();
+
+        assert_eq!(
+            r#"<doc><tc><p><tn>12</tn></p><p><tn>34</tn></p><p><tn>5678</tn></p></tc></doc>"#,
+            root.tree_by_created_at(&tree_at).unwrap().to_xml()
+        );
+        assert!(result.reverse_op.is_none());
+        assert_eq!(1, result.op_infos.len());
+        match &result.op_infos[0] {
+            OpInfo::TreeEdit { split_level, .. } => {
+                assert_eq!(Some(2), *split_level);
+            }
+            other => panic!("unexpected op info: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn merges_tree_content_between_paths() -> crate::Result<()> {
+        let tree_at = ticket(1, "a");
+        let mut root = seeded_nested_root(tree_at.clone());
+        let range = {
+            let tree = root.tree_by_created_at(&tree_at).unwrap();
+            (tree.path_to_pos(&[0, 0, 1])?, tree.path_to_pos(&[0, 1, 0])?)
+        };
+
+        let result = TreeEditOperation::create(
+            tree_at.clone(),
+            range.0,
+            range.1,
+            None,
+            0,
+            Some(ticket(20, "a")),
+        )
+        .execute(&mut root, OpSource::Remote, None)?
+        .unwrap();
+
+        assert_eq!(
+            r#"<doc><tc><p><tn>1234</tn><tn>5678</tn></p></tc></doc>"#,
+            root.tree_by_created_at(&tree_at).unwrap().to_xml()
+        );
+        assert_eq!(1, root.get_garbage_len());
+        assert_eq!(1, result.op_infos.len());
+        match &result.op_infos[0] {
+            OpInfo::TreeEdit { value, .. } => {
+                assert!(value.is_none());
+            }
+            other => panic!("unexpected op info: {other:?}"),
+        }
+        Ok(())
+    }
+
     fn seeded_root(tree_at: TimeTicket, children: Vec<TreeNode>) -> CrdtRoot {
         let tree = CrdtTree::create(
             TreeNode::create_element(TreeNodeId::new(tree_at.clone(), 0), "root", None, children),
+            tree_at,
+        );
+
+        CrdtRoot::new(CrdtObject::create_with_members(
+            TimeTicket::initial(),
+            [("body", CrdtElement::tree(tree))],
+        ))
+    }
+
+    fn seeded_nested_root(tree_at: TimeTicket) -> CrdtRoot {
+        let tree = CrdtTree::create(
+            TreeNode::create_element(
+                TreeNodeId::new(tree_at.clone(), 0),
+                "doc",
+                None,
+                vec![TreeNode::create_element(
+                    TreeNodeId::new(ticket(2, "a"), 0),
+                    "tc",
+                    None,
+                    vec![
+                        TreeNode::create_element(
+                            TreeNodeId::new(ticket(3, "a"), 0),
+                            "p",
+                            None,
+                            vec![TreeNode::create_element(
+                                TreeNodeId::new(ticket(4, "a"), 0),
+                                "tn",
+                                None,
+                                vec![TreeNode::create_text(
+                                    TreeNodeId::new(ticket(5, "a"), 0),
+                                    "1234",
+                                )],
+                            )],
+                        ),
+                        TreeNode::create_element(
+                            TreeNodeId::new(ticket(6, "a"), 0),
+                            "p",
+                            None,
+                            vec![TreeNode::create_element(
+                                TreeNodeId::new(ticket(7, "a"), 0),
+                                "tn",
+                                None,
+                                vec![TreeNode::create_text(
+                                    TreeNodeId::new(ticket(8, "a"), 0),
+                                    "5678",
+                                )],
+                            )],
+                        ),
+                    ],
+                )],
+            ),
             tree_at,
         );
 

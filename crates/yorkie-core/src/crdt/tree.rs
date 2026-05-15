@@ -815,50 +815,78 @@ impl CrdtTree {
         let mut captured_previous = false;
 
         for target in targets {
-            let node = node_at_visible_path_mut(&mut self.root, &target.path)?;
-            if !node.can_style(
-                &edited_at,
-                client_lamport(version_vector, node.id().created_at()),
-            ) {
+            if target.kind == TreeTokenKind::End
+                && self.has_unknown_split_sibling(&target.path, version_vector)?
+            {
                 continue;
             }
 
-            if !captured_previous {
-                for key in attributes.keys() {
-                    if let Some(attrs) = node.attrs() {
-                        if attrs.has(key) {
-                            if let Some(value) = attrs.get(key) {
-                                previous_attributes.insert(key.clone(), value.to_owned());
+            let mut apply_targets = vec![(target.path.clone(), target.from, target.to, true)];
+            if target.kind == TreeTokenKind::Start {
+                for sibling_path in
+                    self.unknown_split_sibling_paths(&target.path, version_vector)?
+                {
+                    if let Some(visible_path) = physical_to_visible_path(&self.root, &sibling_path)
+                    {
+                        let from = self.path_to_index(&visible_path)?;
+                        apply_targets.push((sibling_path, from, from + 1, false));
+                    }
+                }
+            }
+
+            for (path, from, to, is_primary) in apply_targets {
+                let node = node_at_path_mut(&mut self.root, &path)?;
+                if is_primary
+                    && !node.can_style(
+                        &edited_at,
+                        client_lamport(version_vector, node.id().created_at()),
+                    )
+                {
+                    continue;
+                }
+                if !is_primary && node.is_removed() {
+                    continue;
+                }
+
+                if is_primary && !captured_previous {
+                    for key in attributes.keys() {
+                        if let Some(attrs) = node.attrs() {
+                            if attrs.has(key) {
+                                if let Some(value) = attrs.get(key) {
+                                    previous_attributes.insert(key.clone(), value.to_owned());
+                                }
+                                continue;
                             }
-                            continue;
+                        }
+                        attributes_to_remove.push(key.clone());
+                    }
+                    captured_previous = true;
+                }
+
+                let mut affected_attrs = BTreeMap::new();
+                for (key, value) in &attributes {
+                    let (prev, curr) = node.set_attr(key.clone(), value.clone(), edited_at.clone());
+                    if let Some(prev) = prev {
+                        gc_nodes.push(prev);
+                    }
+                    if let Some(curr) = curr {
+                        affected_attrs.insert(key.clone(), value.clone());
+                        if target.kind != TreeTokenKind::End || !is_primary {
+                            add_data_size(&mut diff, curr.data_size());
                         }
                     }
-                    attributes_to_remove.push(key.clone());
                 }
-                captured_previous = true;
-            }
 
-            let mut affected_attrs = BTreeMap::new();
-            for (key, value) in &attributes {
-                let (prev, curr) = node.set_attr(key.clone(), value.clone(), edited_at.clone());
-                if let Some(prev) = prev {
-                    gc_nodes.push(prev);
+                if !affected_attrs.is_empty() {
+                    changes.push(TreeStyleChange {
+                        from,
+                        to,
+                        from_path: self.index_to_path(from)?,
+                        to_path: self.index_to_path(to)?,
+                        attributes: affected_attrs,
+                        attributes_to_remove: Vec::new(),
+                    });
                 }
-                if let Some(curr) = curr {
-                    affected_attrs.insert(key.clone(), value.clone());
-                    add_data_size(&mut diff, curr.data_size());
-                }
-            }
-
-            if !affected_attrs.is_empty() {
-                changes.push(TreeStyleChange {
-                    from: target.from,
-                    to: target.to,
-                    from_path: self.index_to_path(target.from)?,
-                    to_path: self.index_to_path(target.to)?,
-                    attributes: affected_attrs,
-                    attributes_to_remove: Vec::new(),
-                });
             }
         }
 
@@ -896,45 +924,71 @@ impl CrdtTree {
         let mut captured_previous = false;
 
         for target in targets {
-            let node = node_at_visible_path_mut(&mut self.root, &target.path)?;
-            if !node.can_style(
-                &edited_at,
-                client_lamport(version_vector, node.id().created_at()),
-            ) {
+            if target.kind == TreeTokenKind::End
+                && self.has_unknown_split_sibling(&target.path, version_vector)?
+            {
                 continue;
             }
 
-            if !captured_previous {
-                for key in attributes_to_remove {
-                    if let Some(attrs) = node.attrs() {
-                        if attrs.has(key) {
-                            if let Some(value) = attrs.get(key) {
-                                previous_attributes.insert(key.clone(), value.to_owned());
+            let mut apply_targets = vec![(target.path.clone(), target.from, target.to, true)];
+            if target.kind == TreeTokenKind::Start {
+                for sibling_path in
+                    self.unknown_split_sibling_paths(&target.path, version_vector)?
+                {
+                    if let Some(visible_path) = physical_to_visible_path(&self.root, &sibling_path)
+                    {
+                        let from = self.path_to_index(&visible_path)?;
+                        apply_targets.push((sibling_path, from, from + 1, false));
+                    }
+                }
+            }
+
+            for (path, from, to, is_primary) in apply_targets {
+                let node = node_at_path_mut(&mut self.root, &path)?;
+                if is_primary
+                    && !node.can_style(
+                        &edited_at,
+                        client_lamport(version_vector, node.id().created_at()),
+                    )
+                {
+                    continue;
+                }
+                if !is_primary && node.is_removed() {
+                    continue;
+                }
+
+                if is_primary && !captured_previous {
+                    for key in attributes_to_remove {
+                        if let Some(attrs) = node.attrs() {
+                            if attrs.has(key) {
+                                if let Some(value) = attrs.get(key) {
+                                    previous_attributes.insert(key.clone(), value.to_owned());
+                                }
                             }
                         }
                     }
+                    captured_previous = true;
                 }
-                captured_previous = true;
-            }
 
-            let mut removed_any = false;
-            for key in attributes_to_remove {
-                for removed in node.remove_attr(key, edited_at.clone()) {
-                    add_data_size(&mut diff, removed.data_size());
-                    gc_nodes.push(removed);
-                    removed_any = true;
+                let mut removed_any = false;
+                for key in attributes_to_remove {
+                    for removed in node.remove_attr(key, edited_at.clone()) {
+                        add_data_size(&mut diff, removed.data_size());
+                        gc_nodes.push(removed);
+                        removed_any = true;
+                    }
                 }
-            }
 
-            if removed_any || !attributes_to_remove.is_empty() {
-                changes.push(TreeStyleChange {
-                    from: target.from,
-                    to: target.to,
-                    from_path: self.index_to_path(target.from)?,
-                    to_path: self.index_to_path(target.to)?,
-                    attributes: BTreeMap::new(),
-                    attributes_to_remove: attributes_to_remove.to_vec(),
-                });
+                if removed_any || !attributes_to_remove.is_empty() {
+                    changes.push(TreeStyleChange {
+                        from,
+                        to,
+                        from_path: self.index_to_path(from)?,
+                        to_path: self.index_to_path(to)?,
+                        attributes: BTreeMap::new(),
+                        attributes_to_remove: attributes_to_remove.to_vec(),
+                    });
+                }
             }
         }
 
@@ -951,12 +1005,6 @@ impl CrdtTree {
         edited_at: TimeTicket,
         version_vector: Option<&crate::VersionVector>,
     ) -> Result<TreeEditResult> {
-        if split_level > 1 {
-            return Err(YorkieError::InvalidTreePosition(
-                "multi-level tree split edit is not implemented yet".to_owned(),
-            ));
-        }
-
         let from_idx = self.pos_to_index(&range.0)?;
         let to_idx = self.pos_to_index(&range.1)?;
         let from_path = self.index_to_path(from_idx)?;
@@ -967,22 +1015,27 @@ impl CrdtTree {
         self.rebuild_node_map();
         let mut gc_pairs = Vec::new();
         let mut removed_nodes = Vec::new();
+        let from_parent_path = self
+            .physical_path_by_node_id(range.0.parent_id())
+            .ok_or_else(|| YorkieError::InvalidTreePosition("parent not found".to_owned()))?;
 
         if from_idx < to_idx {
-            let target_paths =
-                self.edit_delete_target_paths(from_idx, to_idx, &edited_at, version_vector);
-            for path in target_paths.into_iter().rev() {
-                let node = node_at_visible_path_mut(&mut self.root, &path)?;
-                node.remove_recursively(edited_at.clone(), &mut gc_pairs, &mut removed_nodes);
+            let targets = self.edit_targets(from_idx, to_idx, &edited_at, version_vector);
+            for path in targets.remove_paths.iter().rev() {
+                let node = node_at_path_mut(&mut self.root, path)?;
+                if node.remove(edited_at.clone()) {
+                    gc_pairs.push((node.id_string(), node.data_size(), edited_at.clone()));
+                    removed_nodes.push(node.clone());
+                }
             }
+            self.merge_nodes(&from_parent_path, &targets.merge_paths, &edited_at)?;
         }
 
         if split_level > 0 {
             let contents_len = contents.as_ref().map(Vec::len).unwrap_or_default();
-            let split_id = TreeNodeId::new(split_issue_ticket(&edited_at, contents_len, 0), 0);
             add_data_size(
                 &mut diff,
-                self.split_element_at_position(&range.0, split_id)?,
+                self.split_elements_at_position(&range.0, split_level, &edited_at, contents_len)?,
             );
         }
 
@@ -1103,41 +1156,89 @@ impl CrdtTree {
     ) -> Vec<StyleTarget> {
         let mut targets = Vec::new();
         let mut seen = BTreeSet::new();
-        collect_style_targets(
-            &self.root,
-            Vec::new(),
-            0,
-            from_idx,
-            to_idx,
-            edited_at,
-            version_vector,
-            &mut seen,
-            &mut targets,
-        );
+        for token in collect_tokens_between(&self.root, from_idx, to_idx, false) {
+            if token.kind == TreeTokenKind::Text {
+                continue;
+            }
+            let Ok(node) = node_at_path(&self.root, &token.path) else {
+                continue;
+            };
+            let key = node.id_string();
+            if node.can_style(
+                edited_at,
+                client_lamport(version_vector, node.id().created_at()),
+            ) && seen.insert(key)
+            {
+                targets.push(StyleTarget {
+                    path: token.path,
+                    from: token.index,
+                    to: token.index + 1,
+                    kind: token.kind,
+                });
+            }
+        }
         targets
     }
 
-    fn edit_delete_target_paths(
+    fn edit_targets(
         &self,
         from_idx: usize,
         to_idx: usize,
         edited_at: &TimeTicket,
         version_vector: Option<&crate::VersionVector>,
-    ) -> Vec<Vec<usize>> {
-        let mut targets = Vec::new();
-        let mut seen = BTreeSet::new();
-        collect_edit_delete_targets(
-            &self.root,
-            Vec::new(),
-            0,
-            from_idx,
-            to_idx,
-            edited_at,
-            version_vector,
-            &mut seen,
-            &mut targets,
-        );
-        remove_descendant_paths(targets)
+    ) -> EditTargets {
+        let mut targets = EditTargets::default();
+        let mut removed = BTreeSet::new();
+        let mut merged = BTreeSet::new();
+
+        for token in collect_tokens_between(&self.root, from_idx, to_idx, true) {
+            let Ok(node) = node_at_path(&self.root, &token.path) else {
+                continue;
+            };
+
+            if token.kind == TreeTokenKind::Start
+                && !token.ended
+                && ticket_known(version_vector, node.id().created_at())
+            {
+                targets.merge_paths.push(token.path.clone());
+                merged.insert(token.path.clone());
+            }
+
+            let parent_removed = split_parent_path(&token.path)
+                .map(|(parent_path, _)| {
+                    removed.contains(&parent_path) && !merged.contains(&parent_path)
+                })
+                .unwrap_or(false);
+
+            if node_can_delete(node, edited_at, version_vector) || parent_removed {
+                if matches!(token.kind, TreeTokenKind::Text | TreeTokenKind::Start)
+                    && removed.insert(token.path.clone())
+                {
+                    targets.remove_paths.push(token.path.clone());
+
+                    if !node.is_text()
+                        && node.ins_next_id().is_some()
+                        && !merged.contains(&token.path)
+                    {
+                        for split_path in self
+                            .unknown_split_sibling_paths(&token.path, version_vector)
+                            .unwrap_or_default()
+                        {
+                            if removed.insert(split_path.clone()) {
+                                targets.remove_paths.push(split_path.clone());
+                            }
+                            for descendant_path in descendant_paths(&self.root, &split_path) {
+                                if removed.insert(descendant_path.clone()) {
+                                    targets.remove_paths.push(descendant_path);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        targets
     }
 
     fn split_text_range(&mut self, range: &(TreePos, TreePos)) -> Result<DataSize> {
@@ -1168,21 +1269,89 @@ impl CrdtTree {
         parent.split_text_child_at(child_index, split_offset)
     }
 
-    fn split_element_at_position(&mut self, pos: &TreePos, id: TreeNodeId) -> Result<DataSize> {
-        let (node_path, offset) = self.position_to_parent_offset(pos)?;
-        let Some((parent_path, visible_index)) = split_parent_path(&node_path) else {
-            return Err(YorkieError::InvalidTreePosition(
-                "root node cannot be split".to_owned(),
-            ));
-        };
-        let parent = node_at_visible_path_mut(&mut self.root, &parent_path)?;
-        let physical_index = parent.physical_child_offset(visible_index)?;
-        let node = parent.children.get_mut(physical_index).ok_or_else(|| {
-            YorkieError::InvalidTreePosition("split element not found".to_owned())
-        })?;
-        let (right, diff) = node.split_element_at(offset, id)?;
-        parent.children.insert(physical_index + 1, right);
+    fn split_elements_at_position(
+        &mut self,
+        pos: &TreePos,
+        split_level: usize,
+        edited_at: &TimeTicket,
+        contents_len: usize,
+    ) -> Result<DataSize> {
+        let (mut parent_path, mut offset) = self.position_to_parent_offset(pos)?;
+        let mut diff = DataSize::default();
+
+        for split_index in 0..split_level {
+            if parent_path.is_empty() {
+                return Err(YorkieError::InvalidTreePosition(
+                    "root node cannot be split".to_owned(),
+                ));
+            }
+
+            let Some((grand_parent_path, visible_index)) = split_parent_path(&parent_path) else {
+                return Err(YorkieError::InvalidTreePosition(
+                    "root node cannot be split".to_owned(),
+                ));
+            };
+            let split_id =
+                TreeNodeId::new(split_issue_ticket(edited_at, contents_len, split_index), 0);
+            let parent = node_at_visible_path_mut(&mut self.root, &grand_parent_path)?;
+            let physical_index = parent.physical_child_offset(visible_index)?;
+            let node = parent.children.get_mut(physical_index).ok_or_else(|| {
+                YorkieError::InvalidTreePosition("split element not found".to_owned())
+            })?;
+            let (right, split_diff) = node.split_element_at(offset, split_id)?;
+            add_data_size(&mut diff, split_diff);
+            parent.children.insert(physical_index + 1, right);
+
+            offset = visible_index + 1;
+            parent_path = grand_parent_path;
+        }
+
         Ok(diff)
+    }
+
+    fn merge_nodes(
+        &mut self,
+        from_parent_path: &[usize],
+        merge_paths: &[Vec<usize>],
+        edited_at: &TimeTicket,
+    ) -> Result<()> {
+        if merge_paths.is_empty() {
+            return Ok(());
+        }
+
+        let from_parent_id = node_at_path(&self.root, from_parent_path)?.id().clone();
+        for merge_path in merge_paths {
+            if merge_path == from_parent_path {
+                continue;
+            }
+
+            let moved_children = {
+                let source = node_at_path_mut(&mut self.root, merge_path)?;
+                let source_id = source.id().clone();
+                source.set_merged_into(Some(from_parent_id.clone()));
+
+                let mut moved = Vec::new();
+                let mut remaining = Vec::new();
+                for mut child in source.children.drain(..) {
+                    if child.is_removed() {
+                        remaining.push(child);
+                    } else {
+                        child.set_merged_from(Some(source_id.clone()));
+                        child.set_merged_at(Some(edited_at.clone()));
+                        moved.push(child);
+                    }
+                }
+                source.children = remaining;
+                moved
+            };
+
+            if !moved_children.is_empty() {
+                let target = node_at_path_mut(&mut self.root, from_parent_path)?;
+                target.children.extend(moved_children);
+            }
+        }
+
+        Ok(())
     }
 
     fn position_to_parent_offset(&self, pos: &TreePos) -> Result<(Vec<usize>, usize)> {
@@ -1224,6 +1393,120 @@ impl CrdtTree {
         find_visible_path_by_node_id(&self.root, id, &mut Vec::new(), &mut path).then_some(path)
     }
 
+    fn physical_path_by_node_id(&self, id: &TreeNodeId) -> Option<Vec<usize>> {
+        let mut path = Vec::new();
+        find_path_by_node_id(&self.root, id, &mut Vec::new(), &mut path).then_some(path)
+    }
+
+    fn floor_node_path(&self, id: &TreeNodeId) -> Option<Vec<usize>> {
+        let (key, _) = self.node_by_id.range(..=id.clone()).next_back()?;
+        if !key.has_same_created_at(id) {
+            return None;
+        }
+
+        self.physical_path_by_node_id(key)
+    }
+
+    fn advance_past_unknown_split_siblings(
+        &self,
+        path: &[usize],
+        version_vector: Option<&crate::VersionVector>,
+        relax_parent_check: bool,
+        skip_actor_id: Option<&str>,
+    ) -> Result<Vec<usize>> {
+        let Some(version_vector) = version_vector else {
+            return Ok(path.to_vec());
+        };
+
+        let mut current_path = path.to_vec();
+        loop {
+            let current = node_at_path(&self.root, &current_path)?;
+            let Some(ins_next_id) = current.ins_next_id().cloned() else {
+                break;
+            };
+            let Some(next_path) = self.floor_node_path(&ins_next_id) else {
+                break;
+            };
+            let next = node_at_path(&self.root, &next_path)?;
+            if next.is_text() {
+                break;
+            }
+
+            if !relax_parent_check
+                && split_parent_path(&next_path).map(|(path, _)| path)
+                    != split_parent_path(&current_path).map(|(path, _)| path)
+            {
+                break;
+            }
+
+            let actor_id = next.id().created_at().actor_id().as_str();
+            if skip_actor_id.is_some_and(|skip| skip == actor_id) {
+                break;
+            }
+
+            if version_vector.after_or_equal(next.id().created_at()) {
+                break;
+            }
+
+            current_path = next_path;
+        }
+
+        Ok(current_path)
+    }
+
+    fn has_unknown_split_sibling(
+        &self,
+        path: &[usize],
+        version_vector: Option<&crate::VersionVector>,
+    ) -> Result<bool> {
+        let Some(version_vector) = version_vector else {
+            return Ok(false);
+        };
+        let node = node_at_path(&self.root, path)?;
+        let Some(ins_next_id) = node.ins_next_id() else {
+            return Ok(false);
+        };
+        let Some(next_path) = self.floor_node_path(ins_next_id) else {
+            return Ok(false);
+        };
+        let next = node_at_path(&self.root, &next_path)?;
+        if next.is_text() {
+            return Ok(false);
+        }
+
+        Ok(!version_vector.after_or_equal(next.id().created_at()))
+    }
+
+    fn unknown_split_sibling_paths(
+        &self,
+        path: &[usize],
+        version_vector: Option<&crate::VersionVector>,
+    ) -> Result<Vec<Vec<usize>>> {
+        let Some(version_vector) = version_vector else {
+            return Ok(Vec::new());
+        };
+
+        let mut paths = Vec::new();
+        let mut current_path = path.to_vec();
+        loop {
+            let current = node_at_path(&self.root, &current_path)?;
+            let Some(ins_next_id) = current.ins_next_id() else {
+                break;
+            };
+            let Some(next_path) = self.floor_node_path(ins_next_id) else {
+                break;
+            };
+            let next = node_at_path(&self.root, &next_path)?;
+            if next.is_text() || version_vector.after_or_equal(next.id().created_at()) {
+                break;
+            }
+            paths.push(next_path.clone());
+            current_path = next_path;
+        }
+
+        Ok(paths)
+    }
+
     fn rebuild_node_map(&mut self) {
         let mut map = BTreeMap::new();
         collect_node_map(&self.root, &mut map);
@@ -1247,6 +1530,28 @@ struct StyleTarget {
     path: Vec<usize>,
     from: usize,
     to: usize,
+    kind: TreeTokenKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TreeTokenKind {
+    Start,
+    End,
+    Text,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TreeTokenTarget {
+    path: Vec<usize>,
+    kind: TreeTokenKind,
+    ended: bool,
+    index: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct EditTargets {
+    remove_paths: Vec<Vec<usize>>,
+    merge_paths: Vec<Vec<usize>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1500,6 +1805,48 @@ fn node_at_visible_path_mut<'a>(
     Ok(node)
 }
 
+fn node_at_path<'a>(root: &'a TreeNode, path: &[usize]) -> Result<&'a TreeNode> {
+    let mut node = root;
+    for offset in path {
+        node = node
+            .children
+            .get(*offset)
+            .ok_or_else(|| YorkieError::InvalidTreePosition("unacceptable path".to_owned()))?;
+    }
+    Ok(node)
+}
+
+fn node_at_path_mut<'a>(root: &'a mut TreeNode, path: &[usize]) -> Result<&'a mut TreeNode> {
+    let mut node = root;
+    for offset in path {
+        node = node
+            .children
+            .get_mut(*offset)
+            .ok_or_else(|| YorkieError::InvalidTreePosition("unacceptable path".to_owned()))?;
+    }
+    Ok(node)
+}
+
+fn physical_to_visible_path(root: &TreeNode, path: &[usize]) -> Option<Vec<usize>> {
+    let mut node = root;
+    let mut visible_path = Vec::new();
+    for offset in path {
+        let child = node.children.get(*offset)?;
+        if child.is_removed() {
+            return None;
+        }
+        let visible_offset = node
+            .children
+            .iter()
+            .take(*offset)
+            .filter(|sibling| !sibling.is_removed())
+            .count();
+        visible_path.push(visible_offset);
+        node = child;
+    }
+    Some(visible_path)
+}
+
 fn visible_child(node: &TreeNode, offset: usize) -> Option<&TreeNode> {
     node.children().nth(offset)
 }
@@ -1534,126 +1881,97 @@ fn collect_node_map(node: &TreeNode, map: &mut BTreeMap<TreeNodeId, TreeNode>) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn collect_style_targets(
-    node: &TreeNode,
-    path: Vec<usize>,
-    start_index: usize,
+fn collect_tokens_between(
+    root: &TreeNode,
     from_idx: usize,
     to_idx: usize,
-    edited_at: &TimeTicket,
-    version_vector: Option<&crate::VersionVector>,
-    seen: &mut BTreeSet<String>,
-    targets: &mut Vec<StyleTarget>,
-) -> usize {
-    if node.is_text() {
-        return start_index + node.len();
+    include_removed: bool,
+) -> Vec<TreeTokenTarget> {
+    if from_idx == to_idx {
+        return Vec::new();
     }
 
-    let mut cursor = start_index;
-    if !path.is_empty() {
-        let end_index = start_index + node.padded_size(false) - 1;
-        let key = node.id_string();
-        if (range_contains(from_idx, to_idx, start_index)
-            || range_contains(from_idx, to_idx, end_index))
-            && node.can_style(
-                edited_at,
-                client_lamport(version_vector, node.id().created_at()),
-            )
-            && seen.insert(key)
-        {
-            targets.push(StyleTarget {
-                path: path.clone(),
-                from: start_index,
-                to: start_index + 1,
-            });
-        }
-        cursor += 1;
-    }
-
-    for (visible_index, child) in node.children().enumerate() {
-        let mut child_path = path.clone();
-        child_path.push(visible_index);
-        cursor = collect_style_targets(
-            child,
-            child_path,
-            cursor,
-            from_idx,
-            to_idx,
-            edited_at,
-            version_vector,
-            seen,
-            targets,
-        );
-    }
-
-    if !path.is_empty() {
-        cursor += 1;
-    }
-
-    cursor
+    let mut tokens = Vec::new();
+    collect_tokens_between_node(
+        root,
+        Vec::new(),
+        0,
+        from_idx,
+        to_idx,
+        include_removed,
+        &mut tokens,
+    );
+    tokens
 }
 
-#[allow(clippy::too_many_arguments)]
-fn collect_edit_delete_targets(
+fn collect_tokens_between_node(
     node: &TreeNode,
     path: Vec<usize>,
-    start_index: usize,
+    base_index: usize,
     from_idx: usize,
     to_idx: usize,
-    edited_at: &TimeTicket,
-    version_vector: Option<&crate::VersionVector>,
-    seen: &mut BTreeSet<String>,
-    targets: &mut Vec<Vec<usize>>,
-) -> usize {
-    if node.is_text() {
-        let end_index = start_index + node.len();
-        let key = node.id_string();
-        if from_idx <= start_index
-            && end_index <= to_idx
-            && node_can_delete(node, edited_at, version_vector)
-            && seen.insert(key)
-        {
-            targets.push(path);
+    include_removed: bool,
+    tokens: &mut Vec<TreeTokenTarget>,
+) {
+    let mut pos = 0;
+    for (physical_index, child) in node.children.iter().enumerate() {
+        if !include_removed && child.is_removed() {
+            continue;
         }
-        return end_index;
-    }
 
-    let mut cursor = start_index;
-    if !path.is_empty() {
-        let end_index = start_index + node.padded_size(false) - 1;
-        let key = node.id_string();
-        if (range_contains(from_idx, to_idx, start_index)
-            || range_contains(from_idx, to_idx, end_index))
-            && node_can_delete(node, edited_at, version_vector)
-            && seen.insert(key)
-        {
-            targets.push(path.clone());
+        let child_size = child.padded_size(include_removed);
+        if from_idx < pos + child_size && pos < to_idx {
+            let padding = if child.is_text() { 0 } else { 1 };
+            let from_child = from_idx as isize - pos as isize - padding as isize;
+            let to_child = to_idx as isize - pos as isize - padding as isize;
+            let child_len = if include_removed {
+                child.total_len()
+            } else {
+                child.len()
+            };
+            let start_contained = !child.is_text() && from_child < 0;
+            let end_contained = !child.is_text() && to_child > child_len as isize;
+
+            let mut child_path = path.clone();
+            child_path.push(physical_index);
+
+            if child.is_text() || start_contained {
+                tokens.push(TreeTokenTarget {
+                    path: child_path.clone(),
+                    kind: if child.is_text() {
+                        TreeTokenKind::Text
+                    } else {
+                        TreeTokenKind::Start
+                    },
+                    ended: end_contained,
+                    index: base_index + pos,
+                });
+            }
+
+            let nested_from = from_child.max(0) as usize;
+            let nested_to = to_child.min(child_len as isize).max(0) as usize;
+            collect_tokens_between_node(
+                child,
+                child_path.clone(),
+                base_index + pos + padding,
+                nested_from,
+                nested_to,
+                include_removed,
+                tokens,
+            );
+
+            if end_contained {
+                tokens.push(TreeTokenTarget {
+                    path: child_path,
+                    kind: TreeTokenKind::End,
+                    ended: end_contained,
+                    index: base_index + pos + child_size - 1,
+                });
+            }
         }
-        cursor += 1;
-    }
 
-    for (visible_index, child) in node.children().enumerate() {
-        let mut child_path = path.clone();
-        child_path.push(visible_index);
-        cursor = collect_edit_delete_targets(
-            child,
-            child_path,
-            cursor,
-            from_idx,
-            to_idx,
-            edited_at,
-            version_vector,
-            seen,
-            targets,
-        );
+        pos += child_size;
     }
-
-    if !path.is_empty() {
-        cursor += 1;
-    }
-
-    cursor
 }
 
 fn node_can_delete(
@@ -1679,22 +1997,6 @@ fn ticket_known(version_vector: Option<&crate::VersionVector>, ticket: &TimeTick
         .unwrap_or(true)
 }
 
-fn remove_descendant_paths(mut paths: Vec<Vec<usize>>) -> Vec<Vec<usize>> {
-    paths.sort();
-    let mut filtered: Vec<Vec<usize>> = Vec::new();
-
-    'next_path: for path in paths {
-        for parent in &filtered {
-            if path.starts_with(parent) && path.len() > parent.len() {
-                continue 'next_path;
-            }
-        }
-        filtered.push(path);
-    }
-
-    filtered
-}
-
 fn find_visible_path_by_node_id(
     node: &TreeNode,
     id: &TreeNodeId,
@@ -1717,6 +2019,28 @@ fn find_visible_path_by_node_id(
     false
 }
 
+fn find_path_by_node_id(
+    node: &TreeNode,
+    id: &TreeNodeId,
+    current: &mut Vec<usize>,
+    result: &mut Vec<usize>,
+) -> bool {
+    if node.id() == id {
+        *result = current.clone();
+        return true;
+    }
+
+    for (index, child) in node.all_children().enumerate() {
+        current.push(index);
+        if find_path_by_node_id(child, id, current, result) {
+            return true;
+        }
+        current.pop();
+    }
+
+    false
+}
+
 fn subtree_data_size(node: &TreeNode) -> DataSize {
     let mut size = node.data_size();
     for child in node.all_children() {
@@ -1725,8 +2049,22 @@ fn subtree_data_size(node: &TreeNode) -> DataSize {
     size
 }
 
-fn range_contains(from_idx: usize, to_idx: usize, index: usize) -> bool {
-    from_idx <= index && index < to_idx
+fn descendant_paths(root: &TreeNode, path: &[usize]) -> Vec<Vec<usize>> {
+    let Ok(node) = node_at_path(root, path) else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    collect_descendant_paths(node, path.to_vec(), &mut paths);
+    paths
+}
+
+fn collect_descendant_paths(node: &TreeNode, path: Vec<usize>, paths: &mut Vec<Vec<usize>>) {
+    for (index, child) in node.all_children().enumerate() {
+        let mut child_path = path.clone();
+        child_path.push(index);
+        paths.push(child_path.clone());
+        collect_descendant_paths(child, child_path, paths);
+    }
 }
 
 fn client_lamport(version_vector: Option<&crate::VersionVector>, created_at: &TimeTicket) -> i64 {
@@ -2241,13 +2579,13 @@ mod tests {
             ),
             ticket(1, "a"),
         );
-        let range = tree.path_to_pos_range(&[0])?;
+        let range = (tree.path_to_pos(&[0])?, tree.path_to_pos(&[1])?);
 
         let result = tree.edit_by_range_with_changes(range, None, 0, ticket(10, "a"), None)?;
 
         assert_eq!(r#"<root></root>"#, tree.to_xml());
         assert_eq!(0, result.from_idx);
-        assert_eq!(1, result.to_idx);
+        assert_eq!(7, result.to_idx);
         assert_eq!(2, result.removed_nodes.len());
         assert_eq!(2, result.gc_pairs.len());
         assert_eq!(None, result.changes[0].value);
@@ -2323,6 +2661,103 @@ mod tests {
         assert_eq!(Some(1), result.changes[0].split_level);
         assert_eq!(5, tree.node_map_len());
         Ok(())
+    }
+
+    #[test]
+    fn splits_tree_content_by_path() -> crate::Result<()> {
+        let mut tree = nested_tree();
+
+        let pos = tree.path_to_pos(&[0, 0, 0, 2])?;
+        tree.edit_by_range_with_changes((pos.clone(), pos), None, 1, ticket(20, "a"), None)?;
+        assert_eq!(
+            r#"<doc><tc><p><tn>12</tn><tn>34</tn></p><p><tn>5678</tn></p></tc></doc>"#,
+            tree.to_xml()
+        );
+
+        let pos = tree.path_to_pos(&[0, 0, 1])?;
+        tree.edit_by_range_with_changes((pos.clone(), pos), None, 1, ticket(21, "a"), None)?;
+        assert_eq!(
+            r#"<doc><tc><p><tn>12</tn></p><p><tn>34</tn></p><p><tn>5678</tn></p></tc></doc>"#,
+            tree.to_xml()
+        );
+
+        let pos = tree.path_to_pos(&[0, 2, 0, 4])?;
+        tree.edit_by_range_with_changes((pos.clone(), pos), None, 1, ticket(22, "a"), None)?;
+        assert_eq!(
+            r#"<doc><tc><p><tn>12</tn></p><p><tn>34</tn></p><p><tn>5678</tn><tn></tn></p></tc></doc>"#,
+            tree.to_xml()
+        );
+
+        let pos = tree.path_to_pos(&[0, 2, 1])?;
+        tree.edit_by_range_with_changes((pos.clone(), pos), None, 1, ticket(23, "a"), None)?;
+        assert_eq!(
+            r#"<doc><tc><p><tn>12</tn></p><p><tn>34</tn></p><p><tn>5678</tn></p><p><tn></tn></p></tc></doc>"#,
+            tree.to_xml()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn merges_tree_content_by_path() -> crate::Result<()> {
+        let mut tree = nested_tree();
+
+        let range = (tree.path_to_pos(&[0, 0, 1])?, tree.path_to_pos(&[0, 1, 0])?);
+        tree.edit_by_range_with_changes(range, None, 0, ticket(20, "a"), None)?;
+        assert_eq!(
+            r#"<doc><tc><p><tn>1234</tn><tn>5678</tn></p></tc></doc>"#,
+            tree.to_xml()
+        );
+
+        let range = (
+            tree.path_to_pos(&[0, 0, 0, 4])?,
+            tree.path_to_pos(&[0, 0, 1, 0])?,
+        );
+        tree.edit_by_range_with_changes(range, None, 0, ticket(21, "a"), None)?;
+        assert_eq!(
+            r#"<doc><tc><p><tn>12345678</tn></p></tc></doc>"#,
+            tree.to_xml()
+        );
+        Ok(())
+    }
+
+    fn nested_tree() -> CrdtTree {
+        CrdtTree::create(
+            TreeNode::create_element(
+                node_id(1, 0),
+                "doc",
+                None,
+                vec![TreeNode::create_element(
+                    node_id(2, 0),
+                    "tc",
+                    None,
+                    vec![
+                        TreeNode::create_element(
+                            node_id(3, 0),
+                            "p",
+                            None,
+                            vec![TreeNode::create_element(
+                                node_id(4, 0),
+                                "tn",
+                                None,
+                                vec![TreeNode::create_text(node_id(5, 0), "1234")],
+                            )],
+                        ),
+                        TreeNode::create_element(
+                            node_id(6, 0),
+                            "p",
+                            None,
+                            vec![TreeNode::create_element(
+                                node_id(7, 0),
+                                "tn",
+                                None,
+                                vec![TreeNode::create_text(node_id(8, 0), "5678")],
+                            )],
+                        ),
+                    ],
+                )],
+            ),
+            ticket(1, "a"),
+        )
     }
 
     fn text_tree(value: &str) -> CrdtTree {

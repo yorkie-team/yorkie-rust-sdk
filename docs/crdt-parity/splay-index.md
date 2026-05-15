@@ -25,7 +25,7 @@ RGA text/list and Tree path/index conversion.
 | Array index lookup | covered | `find_for_array` skips tombstoned nodes by weight and rejects out-of-range lookups. |
 | RGA list integration | partial | `RgaTreeList` keeps position/element maps and uses weighted splay lookup for visible indexes and paths. Structural mutations rebuild the index around the current `Vec` storage instead of using stable linked-node handles. |
 | RGA text integration | partial | `RgaTreeSplit` keeps `tree_by_index` and `tree_by_id` equivalents and uses weighted splay lookup for text indexes. Structural mutations rebuild indexes around the current `Vec` storage instead of using stable linked-node handles. |
-| Tree `IndexTree` integration | partial | Tree index/path/position conversion now follows the JS `IndexTree` / Go `pkg/index` padding rules for the current in-memory tree, including simple text-node splits during tree edit/style operations and simple `splitLevel=1` element splits. Broader multi-level split/merge maintenance is still pending. |
+| Tree `IndexTree` integration | partial | Tree index/path/position conversion now follows the JS `IndexTree` / Go `pkg/index` padding rules for the current in-memory tree, including text-node splits during tree edit/style operations, multi-level element splits, visible-boundary merges, and token traversal for edit/style collection. Rust still recomputes over the tree instead of maintaining stable index nodes. |
 
 ## Next Checks
 
@@ -34,4 +34,5 @@ RGA text/list and Tree path/index conversion.
 - Move `RgaTreeList` from rebuild-on-mutation indexing to stable node handles
   when aligning the write-side implementation with JS/Go.
 - Extend Tree path/index coverage around removed nodes, mixed element/text
-  children, element split, and merge before public tree edit/style APIs.
+  children, concurrent element splits, and merge metadata before public tree
+  edit/style APIs.
