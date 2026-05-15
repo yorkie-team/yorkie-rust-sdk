@@ -1005,22 +1005,73 @@ impl CrdtTree {
         edited_at: TimeTicket,
         version_vector: Option<&crate::VersionVector>,
     ) -> Result<TreeEditResult> {
-        let from_idx = self.pos_to_index(&range.0)?;
-        let to_idx = self.pos_to_index(&range.1)?;
-        let from_path = self.index_to_path(from_idx)?;
-        let to_path = self.index_to_path(to_idx)?;
         let mut diff = DataSize::default();
         add_data_size(&mut diff, self.split_text_at_position(&range.0)?);
         add_data_size(&mut diff, self.split_text_at_position(&range.1)?);
         self.rebuild_node_map();
         let mut gc_pairs = Vec::new();
         let mut removed_nodes = Vec::new();
-        let from_parent_path = self
-            .physical_path_by_node_id(range.0.parent_id())
-            .ok_or_else(|| YorkieError::InvalidTreePosition("parent not found".to_owned()))?;
+        let (from_parent_path, from_left_raw_path) =
+            self.position_to_parent_left_paths(&range.0)?;
+        let (to_parent_path, to_left_raw_path) = self.position_to_parent_left_paths(&range.1)?;
+        let from_left_path = if from_left_raw_path != from_parent_path {
+            self.advance_past_unknown_split_siblings(
+                &from_left_raw_path,
+                version_vector,
+                false,
+                None,
+            )?
+        } else {
+            from_left_raw_path
+        };
+        let to_left_path = if to_left_raw_path != to_parent_path {
+            self.advance_past_unknown_split_siblings(
+                &to_left_raw_path,
+                version_vector,
+                false,
+                None,
+            )?
+        } else {
+            to_left_raw_path
+        };
+
+        let from_idx = self.index_after_left_path(&from_parent_path, &from_left_path)?;
+        let to_idx = self.index_after_left_path(&to_parent_path, &to_left_path)?;
+        let from_path = self.index_to_path(from_idx)?;
+        let to_path = self.index_to_path(to_idx)?;
+        let mut collect_from_parent_path = from_parent_path.clone();
+        let mut collect_from_left_path = from_left_path.clone();
+        if from_left_path != from_parent_path && from_parent_path != to_parent_path {
+            let mut current_path = from_left_path.clone();
+            loop {
+                let current = node_at_path(&self.root, &current_path)?;
+                let Some(ins_next_id) = current.ins_next_id() else {
+                    break;
+                };
+                let Some(next_path) = self.floor_node_path(ins_next_id) else {
+                    break;
+                };
+                let next = node_at_path(&self.root, &next_path)?;
+                if next.is_text() {
+                    break;
+                }
+                if split_parent_path(&next_path).map(|(path, _)| path)
+                    == Some(to_parent_path.clone())
+                {
+                    if to_left_path != to_parent_path {
+                        collect_from_left_path = next_path;
+                        collect_from_parent_path = to_parent_path.clone();
+                    }
+                    break;
+                }
+                current_path = next_path;
+            }
+        }
 
         if from_idx < to_idx {
-            let targets = self.edit_targets(from_idx, to_idx, &edited_at, version_vector);
+            let collect_from_idx =
+                self.index_after_left_path(&collect_from_parent_path, &collect_from_left_path)?;
+            let targets = self.edit_targets(collect_from_idx, to_idx, &edited_at, version_vector);
             for path in targets.remove_paths.iter().rev() {
                 let node = node_at_path_mut(&mut self.root, path)?;
                 if node.remove(edited_at.clone()) {
@@ -1029,13 +1080,32 @@ impl CrdtTree {
                 }
             }
             self.merge_nodes(&from_parent_path, &targets.merge_paths, &edited_at)?;
+            let merge_delete_paths = self.merge_delete_paths(
+                &from_parent_path,
+                &targets.remove_paths,
+                &targets.merge_paths,
+            )?;
+            for path in merge_delete_paths.iter().rev() {
+                let node = node_at_path_mut(&mut self.root, path)?;
+                if node.remove(edited_at.clone()) {
+                    gc_pairs.push((node.id_string(), node.data_size(), edited_at.clone()));
+                    removed_nodes.push(node.clone());
+                }
+            }
         }
 
         if split_level > 0 {
             let contents_len = contents.as_ref().map(Vec::len).unwrap_or_default();
             add_data_size(
                 &mut diff,
-                self.split_elements_at_position(&range.0, split_level, &edited_at, contents_len)?,
+                self.split_elements_at_position(
+                    &from_parent_path,
+                    &from_left_path,
+                    split_level,
+                    &edited_at,
+                    contents_len,
+                    version_vector,
+                )?,
             );
         }
 
@@ -1263,7 +1333,13 @@ impl CrdtTree {
                 && child.id().offset() < split_offset
                 && split_offset < child.id().offset() + child.len()
         }) else {
-            return Ok(DataSize::default());
+            let Some((parent_path, child_index)) =
+                text_child_path_for_split(&self.root, pos.left_sibling_id())
+            else {
+                return Ok(DataSize::default());
+            };
+            let parent = node_at_path_mut(&mut self.root, &parent_path)?;
+            return parent.split_text_child_at(child_index, split_offset);
         };
 
         parent.split_text_child_at(child_index, split_offset)
@@ -1271,12 +1347,15 @@ impl CrdtTree {
 
     fn split_elements_at_position(
         &mut self,
-        pos: &TreePos,
+        from_parent_path: &[usize],
+        from_left_path: &[usize],
         split_level: usize,
         edited_at: &TimeTicket,
         contents_len: usize,
+        version_vector: Option<&crate::VersionVector>,
     ) -> Result<DataSize> {
-        let (mut parent_path, mut offset) = self.position_to_parent_offset(pos)?;
+        let mut parent_path = from_parent_path.to_vec();
+        let mut left_path = from_left_path.to_vec();
         let mut diff = DataSize::default();
 
         for split_index in 0..split_level {
@@ -1285,6 +1364,37 @@ impl CrdtTree {
                     "root node cannot be split".to_owned(),
                 ));
             }
+
+            if left_path != parent_path {
+                left_path = self.advance_past_unknown_split_siblings(
+                    &left_path,
+                    version_vector,
+                    true,
+                    Some(edited_at.actor_id().as_str()),
+                )?;
+                if let Some((next_parent_path, _)) = split_parent_path(&left_path) {
+                    if next_parent_path != parent_path {
+                        parent_path = next_parent_path;
+                    }
+                }
+            }
+
+            let offset = if left_path == parent_path {
+                0
+            } else {
+                let Some((left_parent_path, physical_index)) = split_parent_path(&left_path) else {
+                    return Err(YorkieError::InvalidTreePosition(
+                        "left sibling not found".to_owned(),
+                    ));
+                };
+                if left_parent_path != parent_path {
+                    return Err(YorkieError::InvalidTreePosition(
+                        "left sibling parent mismatch".to_owned(),
+                    ));
+                }
+                let parent = node_at_path(&self.root, &parent_path)?;
+                visible_offset_for_physical_child(parent, physical_index)? + 1
+            };
 
             let Some((grand_parent_path, visible_index)) = split_parent_path(&parent_path) else {
                 return Err(YorkieError::InvalidTreePosition(
@@ -1302,7 +1412,7 @@ impl CrdtTree {
             add_data_size(&mut diff, split_diff);
             parent.children.insert(physical_index + 1, right);
 
-            offset = visible_index + 1;
+            left_path = parent_path;
             parent_path = grand_parent_path;
         }
 
@@ -1354,6 +1464,49 @@ impl CrdtTree {
         Ok(())
     }
 
+    fn merge_delete_paths(
+        &self,
+        from_parent_path: &[usize],
+        remove_paths: &[Vec<usize>],
+        merge_paths: &[Vec<usize>],
+    ) -> Result<Vec<Vec<usize>>> {
+        let from_parent_id = node_at_path(&self.root, from_parent_path)?.id().clone();
+        let merge_paths = merge_paths.iter().collect::<BTreeSet<_>>();
+        let mut paths = Vec::new();
+        let mut seen = BTreeSet::new();
+
+        for remove_path in remove_paths {
+            let node = node_at_path(&self.root, remove_path)?;
+            let Some(merged_into) = node.merged_into() else {
+                continue;
+            };
+            if merge_paths.contains(remove_path) || merged_into == &from_parent_id {
+                continue;
+            }
+            let Some(target_path) = self.physical_path_by_node_id(merged_into) else {
+                continue;
+            };
+            let target = node_at_path(&self.root, &target_path)?;
+            for (index, child) in target.all_children().enumerate() {
+                if child.merged_from() != Some(node.id()) || child.is_removed() {
+                    continue;
+                }
+                let mut child_path = target_path.clone();
+                child_path.push(index);
+                if seen.insert(child_path.clone()) {
+                    paths.push(child_path.clone());
+                }
+                for descendant_path in descendant_paths(&self.root, &child_path) {
+                    if seen.insert(descendant_path.clone()) {
+                        paths.push(descendant_path);
+                    }
+                }
+            }
+        }
+
+        Ok(paths)
+    }
+
     fn position_to_parent_offset(&self, pos: &TreePos) -> Result<(Vec<usize>, usize)> {
         let parent_path = self
             .path_by_node_id(pos.parent_id())
@@ -1383,9 +1536,65 @@ impl CrdtTree {
             }
         }
 
+        if let Some((physical_parent_path, offset)) =
+            text_position_parent_offset(&self.root, pos.left_sibling_id())
+        {
+            if let Some(visible_parent_path) =
+                physical_to_visible_path(&self.root, &physical_parent_path)
+            {
+                return Ok((visible_parent_path, offset));
+            }
+        }
+
         Err(YorkieError::InvalidTreePosition(
             "left sibling not found".to_owned(),
         ))
+    }
+
+    fn position_to_parent_left_paths(&self, pos: &TreePos) -> Result<(Vec<usize>, Vec<usize>)> {
+        let (visible_parent_path, offset) = self.position_to_parent_offset(pos)?;
+        let parent_id = node_at_visible_path(&self.root, &visible_parent_path)?
+            .id()
+            .clone();
+        let parent_path = self
+            .physical_path_by_node_id(&parent_id)
+            .ok_or_else(|| YorkieError::InvalidTreePosition("parent not found".to_owned()))?;
+
+        if offset == 0 {
+            return Ok((parent_path.clone(), parent_path));
+        }
+
+        let parent = node_at_path(&self.root, &parent_path)?;
+        let physical_index = parent.physical_child_offset(offset - 1)?;
+        let mut left_path = parent_path.clone();
+        left_path.push(physical_index);
+        Ok((parent_path, left_path))
+    }
+
+    fn index_after_left_path(&self, parent_path: &[usize], left_path: &[usize]) -> Result<usize> {
+        let parent = node_at_path(&self.root, parent_path)?;
+        let left = node_at_path(&self.root, left_path)?;
+        let left_id = if parent_path == left_path {
+            left.id().clone()
+        } else if left.is_text() {
+            left.id().split(left.len())
+        } else {
+            let Some((left_parent_path, physical_index)) = split_parent_path(left_path) else {
+                return Err(YorkieError::InvalidTreePosition(
+                    "left sibling not found".to_owned(),
+                ));
+            };
+            if left_parent_path != parent_path {
+                return Err(YorkieError::InvalidTreePosition(
+                    "left sibling parent mismatch".to_owned(),
+                ));
+            }
+            let parent = node_at_path(&self.root, parent_path)?;
+            left.id()
+                .split(visible_offset_for_physical_child(parent, physical_index)? + 1)
+        };
+        let pos = TreePos::new(parent.id().clone(), left_id);
+        self.pos_to_index(&pos)
     }
 
     fn path_by_node_id(&self, id: &TreeNodeId) -> Option<Vec<usize>> {
@@ -1784,6 +1993,23 @@ fn left_siblings_size(parent: &TreeNode, offset: usize, include_removed: bool) -
         .sum())
 }
 
+fn visible_offset_for_physical_child(parent: &TreeNode, physical_index: usize) -> Result<usize> {
+    let child = parent.children.get(physical_index).ok_or_else(|| {
+        YorkieError::InvalidTreePosition("child offset is out of range".to_owned())
+    })?;
+    if child.is_removed() {
+        return Err(YorkieError::InvalidTreePosition(
+            "removed child has no visible offset".to_owned(),
+        ));
+    }
+    Ok(parent
+        .children
+        .iter()
+        .take(physical_index)
+        .filter(|sibling| !sibling.is_removed())
+        .count())
+}
+
 fn node_at_visible_path<'a>(root: &'a TreeNode, path: &[usize]) -> Result<&'a TreeNode> {
     let mut node = root;
     for offset in path {
@@ -2041,6 +2267,79 @@ fn find_path_by_node_id(
     false
 }
 
+fn text_child_path_for_split(root: &TreeNode, id: &TreeNodeId) -> Option<(Vec<usize>, usize)> {
+    let mut result = None;
+    find_text_child_path_for_split(root, id, &mut Vec::new(), &mut result);
+    result
+}
+
+fn find_text_child_path_for_split(
+    node: &TreeNode,
+    id: &TreeNodeId,
+    current: &mut Vec<usize>,
+    result: &mut Option<(Vec<usize>, usize)>,
+) -> bool {
+    for (index, child) in node.all_children().enumerate() {
+        if child.is_text() && id.has_same_created_at(child.id()) {
+            let start = child.id().offset();
+            let end = start + child.len();
+            if start < id.offset() && id.offset() < end {
+                *result = Some((current.clone(), index));
+                return true;
+            }
+        }
+
+        current.push(index);
+        if find_text_child_path_for_split(child, id, current, result) {
+            return true;
+        }
+        current.pop();
+    }
+
+    false
+}
+
+fn text_position_parent_offset(root: &TreeNode, id: &TreeNodeId) -> Option<(Vec<usize>, usize)> {
+    let mut result = None;
+    find_text_position_parent_offset(root, id, &mut Vec::new(), &mut result);
+    result
+}
+
+fn find_text_position_parent_offset(
+    node: &TreeNode,
+    id: &TreeNodeId,
+    current: &mut Vec<usize>,
+    result: &mut Option<(Vec<usize>, usize)>,
+) -> bool {
+    for (physical_index, child) in node.all_children().enumerate() {
+        if child.is_text() && id.has_same_created_at(child.id()) {
+            let start = child.id().offset();
+            let end = start + child.len();
+            if start <= id.offset() && id.offset() <= end {
+                let Ok(visible_index) = visible_offset_for_physical_child(node, physical_index)
+                else {
+                    return false;
+                };
+                let offset = if id.offset() == start {
+                    visible_index
+                } else {
+                    visible_index + 1
+                };
+                *result = Some((current.clone(), offset));
+                return true;
+            }
+        }
+
+        current.push(physical_index);
+        if find_text_position_parent_offset(child, id, current, result) {
+            return true;
+        }
+        current.pop();
+    }
+
+    false
+}
+
 fn subtree_data_size(node: &TreeNode) -> DataSize {
     let mut size = node.data_size();
     for child in node.all_children() {
@@ -2239,7 +2538,7 @@ fn unescape_json_string(value: &str) -> String {
 mod tests {
     use super::{CrdtTree, TreeNode, TreeNodeId};
     use crate::crdt::rht::Rht;
-    use crate::{TimeTicket, TIME_TICKET_SIZE};
+    use crate::{TimeTicket, VersionVector, TIME_TICKET_SIZE};
     use std::collections::BTreeMap;
 
     #[test]
@@ -2692,6 +2991,124 @@ mod tests {
         tree.edit_by_range_with_changes((pos.clone(), pos), None, 1, ticket(23, "a"), None)?;
         assert_eq!(
             r#"<doc><tc><p><tn>12</tn></p><p><tn>34</tn></p><p><tn>5678</tn></p><p><tn></tn></p></tc></doc>"#,
+            tree.to_xml()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn applies_concurrent_splits_at_the_same_position() -> crate::Result<()> {
+        let mut tree = text_tree("ab");
+        let pos = tree.find_pos(2, true)?;
+
+        tree.edit_by_range_with_changes(
+            (pos.clone(), pos.clone()),
+            None,
+            1,
+            ticket(10, "b"),
+            None,
+        )?;
+        assert_eq!(r#"<root><p>a</p><p>b</p></root>"#, tree.to_xml());
+
+        let mut version_vector = VersionVector::new();
+        version_vector.set("a", 10);
+        tree.edit_by_range_with_changes(
+            (pos.clone(), pos),
+            None,
+            1,
+            ticket(20, "c"),
+            Some(&version_vector),
+        )?;
+
+        assert_eq!(r#"<root><p>a</p><p></p><p>b</p></root>"#, tree.to_xml());
+        Ok(())
+    }
+
+    #[test]
+    fn applies_concurrent_splits_at_different_positions() -> crate::Result<()> {
+        let mut tree = text_tree("abc");
+        let first_split = tree.find_pos(2, true)?;
+        let second_split = tree.find_pos(3, true)?;
+
+        tree.edit_by_range_with_changes(
+            (first_split.clone(), first_split),
+            None,
+            1,
+            ticket(10, "b"),
+            None,
+        )?;
+        assert_eq!(r#"<root><p>a</p><p>bc</p></root>"#, tree.to_xml());
+
+        let mut version_vector = VersionVector::new();
+        version_vector.set("a", 10);
+        tree.edit_by_range_with_changes(
+            (second_split.clone(), second_split),
+            None,
+            1,
+            ticket(20, "c"),
+            Some(&version_vector),
+        )?;
+
+        assert_eq!(r#"<root><p>a</p><p>b</p><p>c</p></root>"#, tree.to_xml());
+        Ok(())
+    }
+
+    #[test]
+    fn applies_concurrent_splits_at_different_levels() -> crate::Result<()> {
+        let mut tree = CrdtTree::create(
+            TreeNode::create_element(
+                node_id(1, 0),
+                "root",
+                None,
+                vec![TreeNode::create_element(
+                    node_id(2, 0),
+                    "p",
+                    None,
+                    vec![
+                        TreeNode::create_element(
+                            node_id(3, 0),
+                            "p",
+                            None,
+                            vec![TreeNode::create_text(node_id(4, 0), "ab")],
+                        ),
+                        TreeNode::create_element(
+                            node_id(5, 0),
+                            "p",
+                            None,
+                            vec![TreeNode::create_text(node_id(6, 0), "c")],
+                        ),
+                    ],
+                )],
+            ),
+            ticket(1, "a"),
+        );
+        let inner_split = tree.find_pos(3, true)?;
+        let outer_split = tree.find_pos(5, true)?;
+
+        tree.edit_by_range_with_changes(
+            (inner_split.clone(), inner_split),
+            None,
+            1,
+            ticket(10, "b"),
+            None,
+        )?;
+        assert_eq!(
+            r#"<root><p><p>a</p><p>b</p><p>c</p></p></root>"#,
+            tree.to_xml()
+        );
+
+        let mut version_vector = VersionVector::new();
+        version_vector.set("a", 10);
+        tree.edit_by_range_with_changes(
+            (outer_split.clone(), outer_split),
+            None,
+            1,
+            ticket(20, "c"),
+            Some(&version_vector),
+        )?;
+
+        assert_eq!(
+            r#"<root><p><p>a</p><p>b</p></p><p><p>c</p></p></root>"#,
             tree.to_xml()
         );
         Ok(())
