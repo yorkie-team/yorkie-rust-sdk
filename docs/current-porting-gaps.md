@@ -469,7 +469,8 @@ Current Rust behavior:
   text-node split insert/delete operations plus multi-level element split and
   visible-boundary merge operations, registers removed tree-node GC pairs,
   accumulates root size diff for inserted nodes and splits, and creates reverse
-  tree edit operations for insert/delete cases.
+  tree edit operations for insert/delete, pure split, and visible-boundary merge
+  cases.
 
 JS/Go behavior:
 
@@ -495,7 +496,7 @@ Gap:
 - Rust Tree edit operation is still partial. It now supports text split ranges,
   multi-level element split, visible element-boundary merge, representative
   concurrent split siblings, range narrowing, and basic merge metadata, but
-  pure-split reverse operations, full `insPrevID`/`insNextID` maintenance across
+  redo tagging after split undo, full `insPrevID`/`insNextID` maintenance across
   existing neighbors, insert-into-split-position, and the broader concurrent
   edit matrix still need JS/Go parity work.
 - Like `CrdtText`, Tree text-node splitting uses valid Rust strings. Splitting
@@ -518,7 +519,7 @@ Expected direction:
 - Extend path/index conversion tests around removed nodes and mixed
   element/text children so edit/style operations can reuse the same position
   semantics.
-- Add Tree edit operation tests from JS/Go around pure-split undo/redo,
+- Add Tree edit operation tests from JS/Go around redo after split undo,
   insert-into-split-position, removed-node ranges, mixed-level merge cases, and
   the broader generated concurrent edit matrix before exposing public Tree
   methods.

@@ -117,6 +117,35 @@ impl TreeEditOperation {
         tree: &crate::crdt::tree::CrdtTree,
         result: &TreeEditResult,
     ) -> Result<Option<Operation>> {
+        if self.split_level > 0 && result.inserted_size == 0 && result.removed_nodes.is_empty() {
+            let boundary_size = 2 * self.split_level;
+            if result.from_idx + boundary_size > tree.root().len() {
+                return Ok(None);
+            }
+            let reverse_from = tree.find_pos(result.from_idx, true)?;
+            let reverse_to = tree.find_pos(result.from_idx + boundary_size, true)?;
+            return Ok(Some(Operation::TreeEdit(Self::create(
+                self.parent_created_at().clone(),
+                reverse_from,
+                reverse_to,
+                None,
+                0,
+                None,
+            ))));
+        }
+
+        if result.merge_level > 0 {
+            let reverse_from = tree.find_pos(result.from_idx, true)?;
+            return Ok(Some(Operation::TreeEdit(Self::create(
+                self.parent_created_at().clone(),
+                reverse_from.clone(),
+                reverse_from,
+                None,
+                result.merge_level,
+                None,
+            ))));
+        }
+
         if result.inserted_size > 0 {
             let reverse_from = tree.find_pos(result.from_idx, true)?;
             let reverse_to = tree.find_pos(result.from_idx + result.inserted_size, true)?;
@@ -407,7 +436,11 @@ mod tests {
         let tree = root.tree_by_created_at(&tree_at).unwrap();
         assert_eq!(r#"<root><p>he</p><p>llo</p></root>"#, tree.to_xml());
         assert_eq!(5, tree.node_map_len());
-        assert!(result.reverse_op.is_none());
+        execute_tree_edit_reverse(&mut root, result.reverse_op, ticket(11, "a"))?;
+        assert_eq!(
+            r#"<root><p>hello</p></root>"#,
+            root.tree_by_created_at(&tree_at).unwrap().to_xml()
+        );
         assert_eq!(1, result.op_infos.len());
         match &result.op_infos[0] {
             OpInfo::TreeEdit {
@@ -453,7 +486,11 @@ mod tests {
             r#"<doc><tc><p><tn>12</tn></p><p><tn>34</tn></p><p><tn>5678</tn></p></tc></doc>"#,
             root.tree_by_created_at(&tree_at).unwrap().to_xml()
         );
-        assert!(result.reverse_op.is_none());
+        execute_tree_edit_reverse(&mut root, result.reverse_op, ticket(21, "a"))?;
+        assert_eq!(
+            r#"<doc><tc><p><tn>1234</tn></p><p><tn>5678</tn></p></tc></doc>"#,
+            root.tree_by_created_at(&tree_at).unwrap().to_xml()
+        );
         assert_eq!(1, result.op_infos.len());
         match &result.op_infos[0] {
             OpInfo::TreeEdit { split_level, .. } => {
@@ -486,6 +523,11 @@ mod tests {
 
         assert_eq!(
             r#"<doc><tc><p><tn>1234</tn><tn>5678</tn></p></tc></doc>"#,
+            root.tree_by_created_at(&tree_at).unwrap().to_xml()
+        );
+        execute_tree_edit_reverse(&mut root, result.reverse_op.clone(), ticket(21, "a"))?;
+        assert_eq!(
+            r#"<doc><tc><p><tn>1234</tn></p><p><tn>5678</tn></p></tc></doc>"#,
             root.tree_by_created_at(&tree_at).unwrap().to_xml()
         );
         assert_eq!(1, root.get_garbage_len());
@@ -560,6 +602,22 @@ mod tests {
             TimeTicket::initial(),
             [("body", CrdtElement::tree(tree))],
         ))
+    }
+
+    fn execute_tree_edit_reverse(
+        root: &mut CrdtRoot,
+        reverse_op: Option<Operation>,
+        executed_at: TimeTicket,
+    ) -> crate::Result<()> {
+        let Some(mut reverse_op) = reverse_op else {
+            panic!("expected reverse tree edit operation");
+        };
+        let Operation::TreeEdit(operation) = &mut reverse_op else {
+            panic!("unexpected reverse operation: {reverse_op:?}");
+        };
+        operation.set_executed_at(executed_at);
+        reverse_op.execute(root, OpSource::Remote)?;
+        Ok(())
     }
 
     fn paragraph_node() -> TreeNode {

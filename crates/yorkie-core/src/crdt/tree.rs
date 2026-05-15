@@ -677,6 +677,7 @@ pub(crate) struct TreeEditResult {
     pub(crate) gc_pairs: Vec<(String, DataSize, TimeTicket)>,
     pub(crate) diff: DataSize,
     pub(crate) removed_nodes: Vec<TreeNode>,
+    pub(crate) merge_level: usize,
     pub(crate) from_idx: usize,
     pub(crate) to_idx: usize,
     pub(crate) inserted_size: usize,
@@ -1041,6 +1042,7 @@ impl CrdtTree {
         let to_path = self.index_to_path(to_idx)?;
         let mut collect_from_parent_path = from_parent_path.clone();
         let mut collect_from_left_path = from_left_path.clone();
+        let mut merge_level = 0;
         if from_left_path != from_parent_path && from_parent_path != to_parent_path {
             let mut current_path = from_left_path.clone();
             loop {
@@ -1072,6 +1074,7 @@ impl CrdtTree {
             let collect_from_idx =
                 self.index_after_left_path(&collect_from_parent_path, &collect_from_left_path)?;
             let targets = self.edit_targets(collect_from_idx, to_idx, &edited_at, version_vector);
+            merge_level = targets.merge_paths.len();
             for path in targets.remove_paths.iter().rev() {
                 let node = node_at_path_mut(&mut self.root, path)?;
                 if node.remove(edited_at.clone()) {
@@ -1142,6 +1145,7 @@ impl CrdtTree {
             gc_pairs,
             diff,
             removed_nodes,
+            merge_level,
             from_idx,
             to_idx,
             inserted_size,
