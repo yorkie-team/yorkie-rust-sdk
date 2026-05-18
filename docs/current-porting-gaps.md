@@ -657,8 +657,9 @@ Current Rust behavior:
 - `yorkie_core::wire` exposes a narrow projection of internal changes and
   operations without making the internal CRDT and operation structs part of the
   public SDK facade.
-- `yorkie_protocol::yorkie::v1` is generated from vendored Yorkie protobuf
-  files at build time.
+- `yorkie_protocol::yorkie::v1` includes checked-in generated Rust sources
+  under `crates/yorkie-protocol/src/generated`, produced from vendored Yorkie
+  protobuf files.
 - `yorkie_protocol::converter::to_change_pack` converts a core `ChangePack`
   into generated protobuf payloads for set/add/move/remove/increase/array-set
   operations when their element payloads are primitive, counter, text, or tree

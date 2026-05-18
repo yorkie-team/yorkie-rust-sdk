@@ -5,7 +5,7 @@ pub mod converter;
 
 pub mod yorkie {
     pub mod v1 {
-        include!(concat!(env!("OUT_DIR"), "/yorkie.v1.rs"));
+        include!("generated/yorkie.v1.rs");
     }
 }
 

@@ -9,6 +9,3 @@ version.workspace = true
 prost = "0.14.3"
 prost-types = "0.14.3"
 yorkie-core = { path = "../yorkie-core" }
-
-[build-dependencies]
-prost-build = "0.14.3"

@@ -130,7 +130,7 @@ it has:
 | `JsonCounter` | `packages/sdk/src/document/json/counter.ts` | Public counter facade for regular increase operations and dedup actor-add operations during `Document::update`. |
 | `JsonValue` | JS JSON element/proxy values | Temporary Rust wrapper for porting primitives, counters, objects, and arrays. |
 | `Client` | `packages/sdk/src/client/client.ts` | Currently scaffolded only. Lifecycle must follow JS. |
-| `yorkie-protocol` | `packages/sdk/src/api/converter.ts`, proto files | Generated protobuf types are built from vendored Yorkie proto files; converters should track JS/proto field names and Go wire behavior. |
+| `yorkie-protocol` | `packages/sdk/src/api/converter.ts`, proto files | Checked-in generated protobuf types are produced from vendored Yorkie proto files; converters should track JS/proto field names and Go wire behavior. |
 
 Update this table whenever a new Rust type becomes part of the porting surface.
 
