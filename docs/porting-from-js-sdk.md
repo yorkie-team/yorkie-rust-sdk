@@ -92,6 +92,7 @@ it has:
 | `ChangeContext` | `packages/sdk/src/document/change/context.ts` | Records operations during a local edit and issues time tickets from the next change ID. |
 | `Change` | `packages/sdk/src/document/change/change.ts` | Unit of document modification that executes operations and collects operation info and reverse operations. |
 | `ChangePack` | `packages/sdk/src/document/change/change_pack.ts` | Bundle of document key, checkpoint, changes, version vector, removal flag, and optional snapshot for sync. |
+| `yorkie_core::wire` | `packages/sdk/src/api/converter.ts`, proto files | Narrow projection from internal core changes and operations to protocol-facing values without exposing CRDT internals through the top-level SDK facade. |
 | `CrdtElementMeta` | `packages/sdk/src/document/crdt/element.ts` | Rust metadata holder for CRDT element timestamps. |
 | `CrdtElement` | `packages/sdk/src/document/crdt/element.ts` | Internal enum that exposes common element behavior across primitive, object, array, text, counter, and tree values. |
 | `CrdtPrimitive` | `packages/sdk/src/document/crdt/primitive.ts` | Internal CRDT element for leaf primitive values. |
@@ -129,7 +130,7 @@ it has:
 | `JsonCounter` | `packages/sdk/src/document/json/counter.ts` | Public counter facade for regular increase operations and dedup actor-add operations during `Document::update`. |
 | `JsonValue` | JS JSON element/proxy values | Temporary Rust wrapper for porting primitives, counters, objects, and arrays. |
 | `Client` | `packages/sdk/src/client/client.ts` | Currently scaffolded only. Lifecycle must follow JS. |
-| `yorkie-protocol` | `packages/sdk/src/api/converter.ts`, proto files | Converter names and wire fields should track JS/proto names. |
+| `yorkie-protocol` | `packages/sdk/src/api/converter.ts`, proto files | Proto-shaped resource types and field-level converters should track JS/proto names before generated protobuf binary encoding is added. |
 
 Update this table whenever a new Rust type becomes part of the porting surface.
 

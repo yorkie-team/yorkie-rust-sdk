@@ -267,8 +267,10 @@ Gap:
   `JsonValue` mutation can still bypass the recorder.
 - `Change` passes a version vector to operation execution, but array operations
   do not yet use version-vector visibility rules.
-- Rust operation structs do not yet convert to/from protobuf or wire-level
-  operation payloads.
+- Rust now has a `yorkie_core::wire` projection for set/add/move/remove,
+  increase, and array-set operations when their payloads can be represented as
+  simple primitive/counter/text/tree element values. Full object/array element
+  payload encoding and from-wire operation construction are still missing.
 - Rust `OpInfo` currently uses a separate `ArrayRemove` enum variant for
   clarity, while JS represents array removal as a `remove` op info carrying an
   index. This internal Rust shape may need to converge before exposing events.
@@ -321,7 +323,10 @@ Gap:
 - Rust uses explicit constructors and object/array helper methods instead of
   JavaScript's `new Counter(...)` syntax or Go's dynamic `any` value
   inference. The semantics are aligned, but the public shape is Rust-specific.
-- Counter and increase operation wire conversion is missing.
+- Counter creation and increase operations now convert to proto-shaped Rust
+  payloads through `yorkie_core::wire` and `yorkie_protocol::converter`.
+  From-protocol conversion and full snapshot `JSONElement.Counter`
+  conversion with HLL register payloads are still missing.
 - Change-level concurrent counter tests are still missing because the public
   editing path does not yet include client sync/history.
 
@@ -608,7 +613,9 @@ Gap:
 - Snapshot application is explicitly unsupported.
 - `ChangePack::is_removed` is stored but document removal behavior is not
   applied.
-- Change and operation serialization is not implemented.
+- Change packs can be projected to proto-shaped Rust payloads for supported
+  set/add/move/remove/increase/array-set operations. Actual protobuf binary
+  encoding and from-protocol reconstruction are not implemented.
 - Sync/status transitions are not implemented.
 
 Expected direction:
@@ -646,9 +653,18 @@ Expected direction:
 
 Current Rust behavior:
 
-- CRDT, change, and operation types are in-memory only.
-- Protocol crates are scaffolded but not connected to operation/change
-  conversion.
+- `yorkie_core::wire` exposes a narrow projection of internal changes and
+  operations without making the internal CRDT and operation structs part of the
+  public SDK facade.
+- `yorkie_protocol::resources` mirrors the proto field shape for checkpoint,
+  time ticket, version vector, change pack, change, JSON element simple values,
+  and the currently supported operation bodies.
+- `yorkie_protocol::converter::to_change_pack` converts a core `ChangePack`
+  into proto-shaped Rust payloads for set/add/move/remove/increase/array-set
+  operations when their element payloads are primitive, counter, text, or tree
+  simple values.
+- Protocol conversion tests cover actor bytes, version-vector base64 actor
+  keys, counter set/increase operations, and dedup counter increase actors.
 
 JS/Go behavior:
 
@@ -657,14 +673,21 @@ JS/Go behavior:
 
 Gap:
 
-- No operation-to-protobuf conversion.
+- No generated protobuf structs or binary encoding are wired in yet.
 - No protobuf-to-operation conversion.
+- Object/array simple element payload bytes, full `JSONElement` payloads,
+  text/tree operation bodies, snapshots, and presence changes are not converted
+  yet.
 - No snapshot encoding/decoding.
-- No wire compatibility tests.
+- No cross-language binary compatibility tests.
 
 Expected direction:
 
-- Port operation converters after the in-memory operation set is stable.
+- Extend the proto-shaped converter in the same order as the in-memory
+  operation set: object/array bytes, full JSON element snapshots, text/tree
+  operations, then from-protocol reconstruction.
+- Add real protobuf generation/encoding once the field-level conversion is
+  stable.
 - Use JS converter files and Yorkie proto definitions as the main reference,
   with Go as a server/client cross-check.
 

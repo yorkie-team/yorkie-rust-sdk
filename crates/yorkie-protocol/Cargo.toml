@@ -6,4 +6,4 @@ repository.workspace = true
 version.workspace = true
 
 [dependencies]
-
+yorkie-core = { path = "../yorkie-core" }

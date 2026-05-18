@@ -49,6 +49,9 @@ pub enum YorkieError {
 
     /// Snapshot application has not been implemented yet.
     UnsupportedSnapshot,
+
+    /// A core value does not have protocol conversion support yet.
+    UnsupportedProtocolConversion(&'static str),
 }
 
 /// Convenient result alias for Yorkie core operations.
@@ -88,6 +91,9 @@ impl Display for YorkieError {
                 write!(f, "invalid counter operation: {message}")
             }
             Self::UnsupportedSnapshot => write!(f, "snapshot application is not supported yet"),
+            Self::UnsupportedProtocolConversion(value) => {
+                write!(f, "unsupported protocol conversion for {value}")
+            }
         }
     }
 }

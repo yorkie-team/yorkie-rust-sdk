@@ -11,6 +11,7 @@ mod json;
 #[allow(dead_code)]
 mod operation;
 mod time;
+pub mod wire;
 
 pub use change::{
     ChangePack, Checkpoint, INITIAL_CHECKPOINT, INITIAL_CLIENT_SEQ, INITIAL_SERVER_SEQ,

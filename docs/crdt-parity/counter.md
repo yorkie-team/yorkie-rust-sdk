@@ -13,7 +13,9 @@ Last reviewed: 2026-05-18
 - Rust: `crates/yorkie-core/src/crdt/counter.rs`,
   `crates/yorkie-core/src/operation/increase_operation.rs`,
   `crates/yorkie-core/src/json.rs`,
-  `crates/yorkie-core/src/document.rs`
+  `crates/yorkie-core/src/document.rs`,
+  `crates/yorkie-core/src/wire.rs`,
+  `crates/yorkie-protocol/src/converter.rs`
 
 ## Scope
 
@@ -29,7 +31,7 @@ operation, concurrent increments, JSON output, data size, and protocol mapping.
 | Increase operation | partial | Rust has operation-level increase for primitive numeric operands, op info, reverse op generation, root index refresh, actor-based dedup increases, and public recorder integration. History and sync integration are still missing. |
 | Public JSON counter facade | partial | `JsonCounter` supports regular and dedup counters through object/array helpers, same-update creation and increase, existing-counter increase, long overflow, and dedup actor-add tests. The shape is Rust-specific rather than JS constructor/proxy syntax. |
 | Concurrent increment tests | missing | Port after client sync/history paths exist. |
-| Wire conversion | missing | Depends on operation conversion. |
+| Wire conversion | partial | Counter set and increase operations convert to proto-shaped Rust payloads, including counter value types, primitive increase operands, and dedup actors. From-protocol conversion, protobuf binary encoding, and full `JSONElement.Counter` HLL register conversion are still missing. |
 
 ## Parity Notes
 
@@ -49,12 +51,17 @@ operation, concurrent increments, JSON output, data size, and protocol mapping.
 - Public `JsonCounter::add` is restricted to dedup counters, matching the
   split public shape where regular counters expose increase and dedup counters
   expose actor-add semantics.
+- `yorkie_protocol::converter::to_change_pack` follows JS/Go converter shape:
+  counter element creation uses counter value types, while increase operands
+  remain primitive numeric element-simple values.
 
 ## Next Checks
 
 - Port concurrent counter tests through client sync and document history when
   those layers are available.
-- Add wire conversion tests for counter element and increase operation.
-- Add protocol conversion for HLL register payloads and dedup increase actors.
+- Add from-protocol conversion tests for counter element and increase
+  operation.
+- Add protocol conversion for full counter `JSONElement` payloads with HLL
+  register bytes.
 - Revisit public constructor ergonomics once the top-level Rust SDK facade is
   shaped around typed document editing.
