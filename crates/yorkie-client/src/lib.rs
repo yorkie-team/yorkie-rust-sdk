@@ -20,5 +20,6 @@ pub use transport::{
     ClientTransport, DeactivateClientRequest, DeactivateClientResponse,
 };
 pub use yorkie_core::{
-    ActorId, DocStatus, Document, JsonArray, JsonObject, JsonValue, Result, YorkieError,
+    ActorId, DocStatus, Document, JsonArray, JsonObject, JsonValue, Result, SchemaRule,
+    TreeNodeRule, YorkieError,
 };

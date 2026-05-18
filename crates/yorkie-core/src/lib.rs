@@ -10,6 +10,7 @@ mod error;
 mod json;
 #[allow(dead_code)]
 mod operation;
+mod schema;
 mod time;
 pub mod wire;
 
@@ -21,6 +22,7 @@ pub use crdt::counter::{CounterType, CounterValue};
 pub use document::{DocStatus, Document};
 pub use error::{Result, YorkieError};
 pub use json::{JsonArray, JsonArrayElement, JsonCounter, JsonObject, JsonValue};
+pub use schema::{SchemaRule, TreeNodeRule};
 pub use time::{
     ActorId, TimeTicket, TimeTicketStruct, VersionVector, INITIAL_ACTOR_ID, INITIAL_DELIMITER,
     INITIAL_LAMPORT, MAX_ACTOR_ID, MAX_DELIMITER, MAX_LAMPORT, TIME_TICKET_SIZE,

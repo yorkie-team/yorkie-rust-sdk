@@ -765,11 +765,17 @@ Current Rust behavior:
   boundary; `Client::deactivate` sends client ID and synchronous flag, clears
   local attachment metadata, and marks sync/watch conditions inactive.
 - `Client::attach` sends client ID, local `ChangePack`, schema key, and shard
-  key through the transport boundary, applies the returned change pack, and
-  records attachment metadata.
+  key through the transport boundary, stores returned max-size/schema-rule
+  metadata on the document, applies the returned change pack, records
+  attachment metadata, and marks the watch loop condition active for realtime
+  sync modes.
 - `Client::has`, `detach`, and `change_sync_mode` cover local lifecycle
   bookkeeping and precondition errors for documents.
 - Document local change packs can be created and applied in-memory.
+- `Document` stores max-size and schema-rule metadata received during attach,
+  but update-time max-size/schema validation is not implemented yet.
+- `yorkie-protocol` converts schema rules between generated protobuf types and
+  Rust document metadata using the same field shape as JS/Go converters.
 
 JS/Go behavior:
 
@@ -785,6 +791,8 @@ Gap:
   boundary yet.
 - No watch stream.
 - No presence.
+- Schema rules and max-size limits are stored after attach but are not enforced
+  during `Document::update` yet.
 - Deactivation clears client attachment metadata but cannot yet update attached
   document statuses because documents are not owned by the client.
 - Sync modes are represented in attachment metadata but not executed by a sync

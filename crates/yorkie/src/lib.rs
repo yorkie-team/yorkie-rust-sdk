@@ -9,7 +9,7 @@ pub use yorkie_client::{
 };
 pub use yorkie_core::{
     ActorId, ChangePack, Checkpoint, CounterType, CounterValue, DocStatus, Document, JsonArray,
-    JsonCounter, JsonObject, JsonValue, Result, TimeTicket, TimeTicketStruct, VersionVector,
-    YorkieError,
+    JsonCounter, JsonObject, JsonValue, Result, SchemaRule, TimeTicket, TimeTicketStruct,
+    TreeNodeRule, VersionVector, YorkieError,
 };
 pub use yorkie_protocol::YORKIE_PROTO_PACKAGE;

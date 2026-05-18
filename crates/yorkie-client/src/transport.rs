@@ -1,6 +1,6 @@
 use crate::error::ClientResult;
 use std::collections::BTreeMap;
-use yorkie_core::{ActorId, ChangePack};
+use yorkie_core::{ActorId, ChangePack, SchemaRule};
 
 /// Request data for activating a client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +42,8 @@ pub struct AttachDocumentRequest {
 pub struct AttachDocumentResponse {
     pub document_id: String,
     pub change_pack: ChangePack,
+    pub max_size_per_document: usize,
+    pub schema_rules: Vec<SchemaRule>,
 }
 
 /// Transport boundary used by the client lifecycle and document attachment.

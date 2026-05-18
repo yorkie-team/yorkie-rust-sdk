@@ -153,6 +153,12 @@ impl Client {
             schema_key: options.schema.clone(),
             shard_key: self.shard_key(doc.key()),
         })?;
+        if response.max_size_per_document > 0 {
+            doc.set_max_size_per_document(response.max_size_per_document);
+        }
+        if !response.schema_rules.is_empty() {
+            doc.set_schema_rules(response.schema_rules.clone());
+        }
         doc.apply_change_pack(&response.change_pack)?;
 
         if doc.status() == DocStatus::Removed {
@@ -169,6 +175,7 @@ impl Client {
                 poll_interval_pinned,
             ),
         );
+        self.refresh_watch_loop_condition();
 
         if let Some(initial_root) = options.initial_root {
             let entries = initial_root
@@ -196,6 +203,7 @@ impl Client {
         if doc.status() != DocStatus::Removed {
             doc.apply_status(DocStatus::Detached);
         }
+        self.refresh_watch_loop_condition();
         Ok(())
     }
 
@@ -213,6 +221,7 @@ impl Client {
         if !attachment.poll_interval_pinned {
             attachment.poll_interval = default_document_poll_interval(sync_mode);
         }
+        self.refresh_watch_loop_condition();
         Ok(())
     }
 
@@ -228,6 +237,15 @@ impl Client {
 
     fn shard_key(&self, resource_key: &str) -> String {
         format!("{}/{}", self.options.api_key, resource_key)
+    }
+
+    fn refresh_watch_loop_condition(&mut self) {
+        let has_watch_attachment = self
+            .attachments
+            .values()
+            .any(|attachment| should_start_watch_loop(attachment.sync_mode));
+        self.conditions
+            .insert(ClientCondition::WatchLoop, has_watch_attachment);
     }
 
     #[cfg(test)]
@@ -255,6 +273,10 @@ fn generate_client_key() -> String {
     format!("rust-{timestamp:x}-{counter:x}")
 }
 
+fn should_start_watch_loop(sync_mode: SyncMode) -> bool {
+    sync_mode != SyncMode::Manual && sync_mode != SyncMode::Polling
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Client, ClientCondition, ClientStatus};
@@ -271,7 +293,7 @@ mod tests {
     };
     use std::collections::BTreeMap;
     use std::time::Duration;
-    use yorkie_core::{ActorId, DocStatus, Document, JsonObject};
+    use yorkie_core::{ActorId, DocStatus, Document, JsonObject, SchemaRule, TreeNodeRule};
 
     #[derive(Debug, Clone)]
     struct FakeTransport {
@@ -279,6 +301,8 @@ mod tests {
         activate_requests: Vec<ActivateClientRequest>,
         deactivate_requests: Vec<DeactivateClientRequest>,
         attach_requests: Vec<AttachDocumentRequest>,
+        attach_max_size_per_document: usize,
+        attach_schema_rules: Vec<SchemaRule>,
     }
 
     impl Default for FakeTransport {
@@ -288,6 +312,8 @@ mod tests {
                 activate_requests: Vec::new(),
                 deactivate_requests: Vec::new(),
                 attach_requests: Vec::new(),
+                attach_max_size_per_document: 0,
+                attach_schema_rules: Vec::new(),
             }
         }
     }
@@ -320,6 +346,8 @@ mod tests {
             Ok(AttachDocumentResponse {
                 document_id: "document-id".to_owned(),
                 change_pack,
+                max_size_per_document: self.attach_max_size_per_document,
+                schema_rules: self.attach_schema_rules.clone(),
             })
         }
     }
@@ -560,6 +588,8 @@ mod tests {
         assert!(doc.is_attached());
         assert_eq!("000000000000000000000001", doc.actor_id().as_str());
         assert_eq!(r#"{"title":"hello"}"#, doc.to_sorted_json());
+        assert_eq!(0, doc.max_size_per_document());
+        assert!(doc.schema_rules().is_empty());
         let attachment = client.attachments.get("doc-key").unwrap();
         assert_eq!("document-id", attachment.resource_id);
         assert_eq!(SyncMode::Polling, attachment.sync_mode);
@@ -568,6 +598,7 @@ mod tests {
             attachment.poll_interval
         );
         assert!(!attachment.poll_interval_pinned);
+        assert!(!client.condition(ClientCondition::WatchLoop));
         assert_eq!(1, transport.attach_requests.len());
         assert_eq!(
             "000000000000000000000001",
@@ -617,7 +648,15 @@ mod tests {
             key: Some("client-key".to_owned()),
             ..ClientOptions::default()
         });
-        let mut transport = FakeTransport::default();
+        let mut transport = FakeTransport {
+            attach_max_size_per_document: 4096,
+            attach_schema_rules: vec![SchemaRule::new(
+                "$.profile",
+                "object",
+                vec![TreeNodeRule::new("paragraph", "text*", "bold", "block")],
+            )],
+            ..FakeTransport::default()
+        };
         let mut doc = Document::new("doc-key");
 
         client.apply_activation("000000000000000000000001");
@@ -629,8 +668,23 @@ mod tests {
                 ..AttachOptions::default()
             },
         )?;
+
+        assert!(client.condition(ClientCondition::WatchLoop));
+        assert_eq!(4096, doc.max_size_per_document());
+        assert_eq!(
+            Some("$.profile"),
+            doc.schema_rules().first().map(|rule| rule.path.as_str())
+        );
+        assert_eq!(
+            Some("paragraph"),
+            doc.schema_rules()
+                .first()
+                .and_then(|rule| rule.tree_nodes.first())
+                .map(|rule| rule.node_type.as_str())
+        );
         client.change_sync_mode(&doc, SyncMode::Polling)?;
 
+        assert!(!client.condition(ClientCondition::WatchLoop));
         let attachment = client.attachments.get("doc-key").unwrap();
         assert_eq!(SyncMode::Polling, attachment.sync_mode);
         assert_eq!(

@@ -9,6 +9,7 @@ use yorkie_core::wire::{
     WireTreeNode, WireTreeNodeId, WireTreePos, WireValueType,
 };
 use yorkie_core::{ChangePack as CoreChangePack, Checkpoint as CoreCheckpoint};
+use yorkie_core::{SchemaRule as CoreSchemaRule, TreeNodeRule as CoreTreeNodeRule};
 use yorkie_core::{TimeTicket as CoreTimeTicket, VersionVector as CoreVersionVector, YorkieError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +121,49 @@ pub fn from_version_vector(vector: &api::VersionVector) -> Result<CoreVersionVec
         core_vector.set(actor_id, *lamport);
     }
     Ok(core_vector)
+}
+
+pub fn to_schema_rules(rules: &[CoreSchemaRule]) -> Vec<api::Rule> {
+    rules
+        .iter()
+        .map(|rule| api::Rule {
+            path: rule.path.clone(),
+            r#type: rule.rule_type.clone(),
+            tree_nodes: rule
+                .tree_nodes
+                .iter()
+                .map(|node| api::TreeNodeRule {
+                    node_type: node.node_type.clone(),
+                    content: node.content.clone(),
+                    marks: node.marks.clone(),
+                    group: node.group.clone(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+pub fn from_schema_rules(rules: &[api::Rule]) -> Vec<CoreSchemaRule> {
+    rules
+        .iter()
+        .map(|rule| {
+            CoreSchemaRule::new(
+                rule.path.clone(),
+                rule.r#type.clone(),
+                rule.tree_nodes
+                    .iter()
+                    .map(|node| {
+                        CoreTreeNodeRule::new(
+                            node.node_type.clone(),
+                            node.content.clone(),
+                            node.marks.clone(),
+                            node.group.clone(),
+                        )
+                    })
+                    .collect(),
+            )
+        })
+        .collect()
 }
 
 fn wire_change_pack_to_proto(pack: &WireChangePack) -> Result<api::ChangePack> {
@@ -1174,10 +1218,11 @@ fn base64_value(byte: u8, original: &str) -> Result<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_change_pack, encode_change_pack, from_change_pack, proto_change_pack_to_wire,
-        proto_json_element_to_wire, proto_tree_nodes_to_wire, to_change_pack, to_time_ticket,
-        to_version_vector, wire_change_pack_to_proto, wire_json_element_to_proto,
-        wire_tree_nodes_to_proto, ProtocolError,
+        decode_change_pack, encode_change_pack, from_change_pack, from_schema_rules,
+        proto_change_pack_to_wire, proto_json_element_to_wire, proto_tree_nodes_to_wire,
+        to_change_pack, to_schema_rules, to_time_ticket, to_version_vector,
+        wire_change_pack_to_proto, wire_json_element_to_proto, wire_tree_nodes_to_proto,
+        ProtocolError,
     };
     use crate::yorkie::v1::{self as api, json_element, operation::Body, ValueType};
     use prost::Message;
@@ -1188,7 +1233,7 @@ mod tests {
         WireNodeAttr, WireOperation, WireRgaNode, WireRhtNode, WireTextNode, WireTextNodeId,
         WireTextNodePos, WireTreeNode, WireTreeNodeId, WireValueType,
     };
-    use yorkie_core::{Checkpoint, Document, TimeTicket, VersionVector};
+    use yorkie_core::{Checkpoint, Document, SchemaRule, TimeTicket, TreeNodeRule, VersionVector};
 
     #[test]
     fn converts_time_tickets_to_proto_shape() -> Result<(), Box<dyn Error>> {
@@ -1210,6 +1255,30 @@ mod tests {
 
         assert_eq!(Some(&3), proto.vector.get("AAAAAAAAAAAAAAAB"));
         Ok(())
+    }
+
+    #[test]
+    fn converts_schema_rules_to_and_from_proto_shape() {
+        let rules = vec![SchemaRule::new(
+            "$.content",
+            "tree",
+            vec![TreeNodeRule::new(
+                "paragraph",
+                "text*",
+                "bold italic",
+                "block",
+            )],
+        )];
+
+        let proto = to_schema_rules(&rules);
+
+        assert_eq!("$.content", proto[0].path);
+        assert_eq!("tree", proto[0].r#type);
+        assert_eq!("paragraph", proto[0].tree_nodes[0].node_type);
+        assert_eq!("text*", proto[0].tree_nodes[0].content);
+
+        let decoded = from_schema_rules(&proto);
+        assert_eq!(rules, decoded);
     }
 
     #[test]

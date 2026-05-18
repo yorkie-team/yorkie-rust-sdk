@@ -3,7 +3,8 @@ use yorkie::{
     AttachDocumentRequest, AttachDocumentResponse, AttachOptions, ChangePack, Checkpoint, Client,
     ClientCondition, ClientError, ClientStatus, ClientTransport, CounterType, CounterValue,
     DeactivateClientRequest, DeactivateClientResponse, DeactivateOptions, DetachOptions, DocStatus,
-    Document, JsonCounter, Result, SyncMode, TimeTicket, TimeTicketStruct, VersionVector,
+    Document, JsonCounter, Result, SchemaRule, SyncMode, TimeTicket, TimeTicketStruct,
+    TreeNodeRule, VersionVector,
 };
 
 #[derive(Debug, Default)]
@@ -38,6 +39,12 @@ impl ClientTransport for FacadeTransport {
         Ok(AttachDocumentResponse {
             document_id: "document-id".to_owned(),
             change_pack: request.change_pack,
+            max_size_per_document: 1024,
+            schema_rules: vec![SchemaRule::new(
+                "$.profile",
+                "object",
+                vec![TreeNodeRule::new("paragraph", "text*", "bold", "block")],
+            )],
         })
     }
 }
@@ -121,6 +128,8 @@ fn facade_exports_client_api() {
         .attach(&mut transport, &mut doc, attach_options)
         .unwrap();
     assert!(client.has("doc-key"));
+    assert_eq!(1024, doc.max_size_per_document());
+    assert_eq!(1, doc.schema_rules().len());
     assert_eq!(1, transport.attach_requests);
     assert_eq!(
         DeactivateOptions::default(),

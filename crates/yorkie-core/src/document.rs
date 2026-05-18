@@ -12,7 +12,8 @@ use crate::operation::{
     RemoveOperation, SetOperation,
 };
 use crate::{
-    ActorId, JsonArray, JsonObject, JsonValue, Result, TimeTicket, YorkieError, INITIAL_ACTOR_ID,
+    ActorId, JsonArray, JsonObject, JsonValue, Result, SchemaRule, TimeTicket, YorkieError,
+    INITIAL_ACTOR_ID,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -27,6 +28,8 @@ pub struct Document {
     checkpoint: Checkpoint,
     change_id: ChangeId,
     local_changes: Vec<Change>,
+    max_size_per_document: usize,
+    schema_rules: Vec<SchemaRule>,
 }
 
 /// Document attachment state.
@@ -48,6 +51,8 @@ impl Document {
             checkpoint: Checkpoint::initial(),
             change_id: ChangeId::initial(),
             local_changes: Vec::new(),
+            max_size_per_document: 0,
+            schema_rules: Vec::new(),
         }
     }
 
@@ -145,6 +150,26 @@ impl Document {
     /// Returns whether this document has local changes waiting to be synced.
     pub fn has_local_changes(&self) -> bool {
         !self.local_changes.is_empty()
+    }
+
+    /// Returns the maximum size limit of this document in bytes.
+    pub fn max_size_per_document(&self) -> usize {
+        self.max_size_per_document
+    }
+
+    /// Sets the maximum size limit of this document in bytes.
+    pub fn set_max_size_per_document(&mut self, size: usize) {
+        self.max_size_per_document = size;
+    }
+
+    /// Returns the schema rules associated with this document.
+    pub fn schema_rules(&self) -> &[SchemaRule] {
+        &self.schema_rules
+    }
+
+    /// Sets the schema rules associated with this document.
+    pub fn set_schema_rules(&mut self, rules: Vec<SchemaRule>) {
+        self.schema_rules = rules;
     }
 
     /// Creates a pack of local changes to send to the remote.
@@ -811,8 +836,8 @@ mod tests {
     use crate::crdt::tree::{CrdtTree, TreeNode, TreeNodeId};
     use crate::wire::WireChangePack;
     use crate::{
-        Checkpoint, JsonArray, JsonObject, JsonValue, Result, VersionVector, YorkieError,
-        INITIAL_ACTOR_ID,
+        Checkpoint, JsonArray, JsonObject, JsonValue, Result, SchemaRule, TreeNodeRule,
+        VersionVector, YorkieError, INITIAL_ACTOR_ID,
     };
 
     #[test]
@@ -824,6 +849,24 @@ mod tests {
         assert!(!doc.is_attached());
         assert_eq!(INITIAL_ACTOR_ID, doc.actor_id().as_str());
         assert!(!doc.has_local_changes());
+        assert_eq!(0, doc.max_size_per_document());
+        assert!(doc.schema_rules().is_empty());
+    }
+
+    #[test]
+    fn stores_attach_response_document_metadata() {
+        let mut doc = Document::new("doc-key");
+        let rules = vec![SchemaRule::new(
+            "$.content",
+            "tree",
+            vec![TreeNodeRule::new("paragraph", "text*", "bold", "block")],
+        )];
+
+        doc.set_max_size_per_document(4096);
+        doc.set_schema_rules(rules.clone());
+
+        assert_eq!(4096, doc.max_size_per_document());
+        assert_eq!(rules.as_slice(), doc.schema_rules());
     }
 
     #[test]
