@@ -1,6 +1,6 @@
 # Counter Parity
 
-Last reviewed: 2026-05-18
+Last reviewed: 2026-05-19
 
 ## References
 
@@ -31,7 +31,7 @@ operation, concurrent increments, JSON output, data size, and protocol mapping.
 | Increase operation | partial | Rust has operation-level increase for primitive numeric operands, op info, reverse op generation, root index refresh, actor-based dedup increases, and public recorder integration. History and sync integration are still missing. |
 | Public JSON counter facade | partial | `JsonCounter` supports regular and dedup counters through object/array helpers, same-update creation and increase, existing-counter increase, long overflow, and dedup actor-add tests. The shape is Rust-specific rather than JS constructor/proxy syntax. |
 | Concurrent increment tests | missing | Port after client sync/history paths exist. |
-| Wire conversion | partial | Counter set and increase operations convert to/from generated protobuf payloads, including counter value types, primitive increase operands, dedup actors, binary change-pack round trips, and full `JSONElement.Counter` HLL register payloads. Cross-language binary fixtures are still missing. |
+| Wire conversion | partial | Counter set and increase operations convert to/from generated protobuf payloads, including counter value types, primitive increase operands, dedup actors, binary change-pack round trips, and full `JSONElement.Counter` HLL register payloads. Rust ports the counter portion of JS's root bytes scenario at core wire level. External binary fixtures are still missing. |
 
 ## Parity Notes
 
@@ -61,7 +61,7 @@ operation, concurrent increments, JSON output, data size, and protocol mapping.
 
 - Port concurrent counter tests through client sync and document history when
   those layers are available.
-- Add JS/Go-produced binary fixtures for counter element and increase
-  operation payloads.
+- Finish JS/Go in-repo converter test ports before adding external binary
+  fixtures for counter element and increase operation payloads.
 - Revisit public constructor ergonomics once the top-level Rust SDK facade is
   shaped around typed document editing.

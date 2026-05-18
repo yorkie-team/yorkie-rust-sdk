@@ -724,70 +724,94 @@ impl TryFrom<&CrdtElement> for WireJsonElement {
 
     fn try_from(element: &CrdtElement) -> Result<Self> {
         match element {
-            CrdtElement::Object(object) => Ok(Self::Object {
-                nodes: object
-                    .iter_all()
-                    .map(|(key, element)| {
-                        Ok(WireRhtNode {
-                            key: key.to_owned(),
-                            element: WireJsonElement::try_from(element)?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-                created_at: object.created_at().clone(),
-                moved_at: object.moved_at().cloned(),
-                removed_at: object.removed_at().cloned(),
-            }),
-            CrdtElement::Array(array) => Ok(Self::Array {
-                nodes: array
-                    .iter_all_nodes()
-                    .map(|node| {
-                        Ok(WireRgaNode {
-                            element: node.element().map(WireJsonElement::try_from).transpose()?,
-                            position_created_at: if node.element().is_none()
-                                || node.position_moved_at().is_some()
-                            {
-                                Some(node.position_created_at().clone())
-                            } else {
-                                None
-                            },
-                            position_moved_at: node.position_moved_at().cloned(),
-                            position_removed_at: node.removed_at().cloned(),
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-                created_at: array.created_at().clone(),
-                moved_at: array.moved_at().cloned(),
-                removed_at: array.removed_at().cloned(),
-            }),
-            CrdtElement::Primitive(primitive) => Ok(Self::Primitive {
-                value_type: primitive_value_type(primitive.value()),
-                value: primitive.to_bytes(),
-                created_at: primitive.created_at().clone(),
-                moved_at: primitive.moved_at().cloned(),
-                removed_at: primitive.removed_at().cloned(),
-            }),
-            CrdtElement::Text(text) => Ok(Self::Text {
-                nodes: text.nodes().map(wire_text_node_from_domain).collect(),
-                created_at: text.created_at().clone(),
-                moved_at: text.moved_at().cloned(),
-                removed_at: text.removed_at().cloned(),
-            }),
-            CrdtElement::Counter(counter) => Ok(Self::Counter {
-                value_type: counter_value_type(counter.counter_type()),
-                value: counter.to_bytes(),
-                hll_registers: counter.hll_bytes().unwrap_or_default(),
-                created_at: counter.created_at().clone(),
-                moved_at: counter.moved_at().cloned(),
-                removed_at: counter.removed_at().cloned(),
-            }),
-            CrdtElement::Tree(tree) => Ok(Self::Tree {
-                nodes: wire_tree_nodes_from_domain(tree.root()),
-                created_at: tree.created_at().clone(),
-                moved_at: tree.moved_at().cloned(),
-                removed_at: tree.removed_at().cloned(),
-            }),
+            CrdtElement::Object(object) => wire_object_from_domain(object),
+            CrdtElement::Array(array) => wire_array_from_domain(array),
+            CrdtElement::Primitive(primitive) => Ok(wire_primitive_from_domain(primitive)),
+            CrdtElement::Text(text) => Ok(wire_text_from_domain(text)),
+            CrdtElement::Counter(counter) => Ok(wire_counter_from_domain(counter)),
+            CrdtElement::Tree(tree) => Ok(wire_tree_from_domain(tree)),
         }
+    }
+}
+
+fn wire_object_from_domain(object: &CrdtObject) -> Result<WireJsonElement> {
+    Ok(WireJsonElement::Object {
+        nodes: object
+            .iter_all()
+            .map(|(key, element)| {
+                Ok(WireRhtNode {
+                    key: key.to_owned(),
+                    element: WireJsonElement::try_from(element)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+        created_at: object.created_at().clone(),
+        moved_at: object.moved_at().cloned(),
+        removed_at: object.removed_at().cloned(),
+    })
+}
+
+fn wire_array_from_domain(array: &CrdtArray) -> Result<WireJsonElement> {
+    Ok(WireJsonElement::Array {
+        nodes: array
+            .iter_all_nodes()
+            .map(|node| {
+                Ok(WireRgaNode {
+                    element: node.element().map(WireJsonElement::try_from).transpose()?,
+                    position_created_at: if node.element().is_none()
+                        || node.position_moved_at().is_some()
+                    {
+                        Some(node.position_created_at().clone())
+                    } else {
+                        None
+                    },
+                    position_moved_at: node.position_moved_at().cloned(),
+                    position_removed_at: node.removed_at().cloned(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+        created_at: array.created_at().clone(),
+        moved_at: array.moved_at().cloned(),
+        removed_at: array.removed_at().cloned(),
+    })
+}
+
+fn wire_primitive_from_domain(primitive: &CrdtPrimitive) -> WireJsonElement {
+    WireJsonElement::Primitive {
+        value_type: primitive_value_type(primitive.value()),
+        value: primitive.to_bytes(),
+        created_at: primitive.created_at().clone(),
+        moved_at: primitive.moved_at().cloned(),
+        removed_at: primitive.removed_at().cloned(),
+    }
+}
+
+fn wire_text_from_domain(text: &CrdtText) -> WireJsonElement {
+    WireJsonElement::Text {
+        nodes: text.nodes().map(wire_text_node_from_domain).collect(),
+        created_at: text.created_at().clone(),
+        moved_at: text.moved_at().cloned(),
+        removed_at: text.removed_at().cloned(),
+    }
+}
+
+fn wire_counter_from_domain(counter: &CrdtCounter) -> WireJsonElement {
+    WireJsonElement::Counter {
+        value_type: counter_value_type(counter.counter_type()),
+        value: counter.to_bytes(),
+        hll_registers: counter.hll_bytes().unwrap_or_default(),
+        created_at: counter.created_at().clone(),
+        moved_at: counter.moved_at().cloned(),
+        removed_at: counter.removed_at().cloned(),
+    }
+}
+
+fn wire_tree_from_domain(tree: &CrdtTree) -> WireJsonElement {
+    WireJsonElement::Tree {
+        nodes: wire_tree_nodes_from_domain(tree.root()),
+        created_at: tree.created_at().clone(),
+        moved_at: tree.moved_at().cloned(),
+        removed_at: tree.removed_at().cloned(),
     }
 }
 
@@ -801,87 +825,26 @@ impl TryFrom<WireJsonElement> for CrdtElement {
                 created_at,
                 moved_at,
                 removed_at,
-            } => {
-                let mut members = ElementRht::new();
-                for node in nodes {
-                    members.set_internal(node.key, CrdtElement::try_from(node.element)?);
-                }
-                Ok(with_element_meta(
-                    CrdtElement::object(CrdtObject::new(created_at, members)),
-                    moved_at,
-                    removed_at,
-                ))
-            }
+            } => crdt_object_from_wire(nodes, created_at, moved_at, removed_at),
             WireJsonElement::Array {
                 nodes,
                 created_at,
                 moved_at,
                 removed_at,
-            } => {
-                let mut elements = RgaTreeList::new();
-                for node in nodes {
-                    match (node.element, node.position_moved_at) {
-                        (None, _) => {
-                            let position_created_at = node.position_created_at.ok_or(
-                                YorkieError::UnsupportedProtocolConversion(
-                                    "dead RGA node without position_created_at",
-                                ),
-                            )?;
-                            let position_removed_at = node.position_removed_at.ok_or(
-                                YorkieError::UnsupportedProtocolConversion(
-                                    "dead RGA node without position_removed_at",
-                                ),
-                            )?;
-                            elements.add_dead_position(position_created_at, position_removed_at);
-                        }
-                        (Some(element), Some(position_moved_at)) => {
-                            let position_created_at = node.position_created_at.ok_or(
-                                YorkieError::UnsupportedProtocolConversion(
-                                    "moved RGA node without position_created_at",
-                                ),
-                            )?;
-                            elements.add_moved_element(
-                                CrdtElement::try_from(element)?,
-                                position_created_at,
-                                position_moved_at,
-                            );
-                        }
-                        (Some(element), None) => {
-                            elements.add(CrdtElement::try_from(element)?)?;
-                        }
-                    }
-                }
-                Ok(with_element_meta(
-                    CrdtElement::array(CrdtArray::new(created_at, elements)),
-                    moved_at,
-                    removed_at,
-                ))
-            }
+            } => crdt_array_from_wire(nodes, created_at, moved_at, removed_at),
             WireJsonElement::Primitive {
                 value_type,
                 value,
                 created_at,
                 moved_at,
                 removed_at,
-            } => {
-                let primitive_type = wire_value_type_to_primitive_type(value_type)?;
-                let value = CrdtPrimitive::value_from_bytes(primitive_type, &value)?;
-                Ok(with_element_meta(
-                    CrdtElement::primitive(CrdtPrimitive::new(value, created_at)),
-                    moved_at,
-                    removed_at,
-                ))
-            }
+            } => crdt_primitive_from_wire(value_type, value, created_at, moved_at, removed_at),
             WireJsonElement::Text {
                 nodes,
                 created_at,
                 moved_at,
                 removed_at,
-            } => Ok(with_element_meta(
-                CrdtElement::text(text_from_wire_nodes(created_at, nodes)?),
-                moved_at,
-                removed_at,
-            )),
+            } => crdt_text_from_wire(nodes, created_at, moved_at, removed_at),
             WireJsonElement::Counter {
                 value_type,
                 value,
@@ -889,31 +852,150 @@ impl TryFrom<WireJsonElement> for CrdtElement {
                 created_at,
                 moved_at,
                 removed_at,
-            } => {
-                let counter_type = wire_value_type_to_counter_type(value_type)?;
-                let counter_value = CrdtCounter::value_from_bytes(counter_type, &value)?;
-                let mut counter = CrdtCounter::create(counter_type, counter_value, created_at);
-                if counter.is_dedup() && !hll_registers.is_empty() {
-                    counter.restore_hll(&hll_registers)?;
-                }
-                Ok(with_element_meta(
-                    CrdtElement::counter(counter),
-                    moved_at,
-                    removed_at,
-                ))
-            }
+            } => crdt_counter_from_wire(
+                value_type,
+                value,
+                hll_registers,
+                created_at,
+                moved_at,
+                removed_at,
+            ),
             WireJsonElement::Tree {
                 nodes,
                 created_at,
                 moved_at,
                 removed_at,
-            } => Ok(with_element_meta(
-                CrdtElement::tree(CrdtTree::new(wire_tree_nodes_to_domain(nodes)?, created_at)),
-                moved_at,
-                removed_at,
-            )),
+            } => crdt_tree_from_wire(nodes, created_at, moved_at, removed_at),
         }
     }
+}
+
+fn crdt_object_from_wire(
+    nodes: Vec<WireRhtNode>,
+    created_at: TimeTicket,
+    moved_at: Option<TimeTicket>,
+    removed_at: Option<TimeTicket>,
+) -> Result<CrdtElement> {
+    let mut members = ElementRht::new();
+    for node in nodes {
+        members.set_internal(node.key, CrdtElement::try_from(node.element)?);
+    }
+
+    Ok(with_element_meta(
+        CrdtElement::object(CrdtObject::new(created_at, members)),
+        moved_at,
+        removed_at,
+    ))
+}
+
+fn crdt_array_from_wire(
+    nodes: Vec<WireRgaNode>,
+    created_at: TimeTicket,
+    moved_at: Option<TimeTicket>,
+    removed_at: Option<TimeTicket>,
+) -> Result<CrdtElement> {
+    let mut elements = RgaTreeList::new();
+    for node in nodes {
+        match (node.element, node.position_moved_at) {
+            (None, _) => {
+                let position_created_at =
+                    node.position_created_at
+                        .ok_or(YorkieError::UnsupportedProtocolConversion(
+                            "dead RGA node without position_created_at",
+                        ))?;
+                let position_removed_at =
+                    node.position_removed_at
+                        .ok_or(YorkieError::UnsupportedProtocolConversion(
+                            "dead RGA node without position_removed_at",
+                        ))?;
+                elements.add_dead_position(position_created_at, position_removed_at);
+            }
+            (Some(element), Some(position_moved_at)) => {
+                let position_created_at =
+                    node.position_created_at
+                        .ok_or(YorkieError::UnsupportedProtocolConversion(
+                            "moved RGA node without position_created_at",
+                        ))?;
+                elements.add_moved_element(
+                    CrdtElement::try_from(element)?,
+                    position_created_at,
+                    position_moved_at,
+                );
+            }
+            (Some(element), None) => {
+                elements.add(CrdtElement::try_from(element)?)?;
+            }
+        }
+    }
+
+    Ok(with_element_meta(
+        CrdtElement::array(CrdtArray::new(created_at, elements)),
+        moved_at,
+        removed_at,
+    ))
+}
+
+fn crdt_primitive_from_wire(
+    value_type: WireValueType,
+    value: Vec<u8>,
+    created_at: TimeTicket,
+    moved_at: Option<TimeTicket>,
+    removed_at: Option<TimeTicket>,
+) -> Result<CrdtElement> {
+    let primitive_type = wire_value_type_to_primitive_type(value_type)?;
+    let value = CrdtPrimitive::value_from_bytes(primitive_type, &value)?;
+    Ok(with_element_meta(
+        CrdtElement::primitive(CrdtPrimitive::new(value, created_at)),
+        moved_at,
+        removed_at,
+    ))
+}
+
+fn crdt_text_from_wire(
+    nodes: Vec<WireTextNode>,
+    created_at: TimeTicket,
+    moved_at: Option<TimeTicket>,
+    removed_at: Option<TimeTicket>,
+) -> Result<CrdtElement> {
+    Ok(with_element_meta(
+        CrdtElement::text(text_from_wire_nodes(created_at, nodes)?),
+        moved_at,
+        removed_at,
+    ))
+}
+
+fn crdt_counter_from_wire(
+    value_type: WireValueType,
+    value: Vec<u8>,
+    hll_registers: Vec<u8>,
+    created_at: TimeTicket,
+    moved_at: Option<TimeTicket>,
+    removed_at: Option<TimeTicket>,
+) -> Result<CrdtElement> {
+    let counter_type = wire_value_type_to_counter_type(value_type)?;
+    let counter_value = CrdtCounter::value_from_bytes(counter_type, &value)?;
+    let mut counter = CrdtCounter::create(counter_type, counter_value, created_at);
+    if counter.is_dedup() && !hll_registers.is_empty() {
+        counter.restore_hll(&hll_registers)?;
+    }
+    Ok(with_element_meta(
+        CrdtElement::counter(counter),
+        moved_at,
+        removed_at,
+    ))
+}
+
+fn crdt_tree_from_wire(
+    nodes: Vec<WireTreeNode>,
+    created_at: TimeTicket,
+    moved_at: Option<TimeTicket>,
+    removed_at: Option<TimeTicket>,
+) -> Result<CrdtElement> {
+    Ok(with_element_meta(
+        CrdtElement::tree(CrdtTree::new(wire_tree_nodes_to_domain(nodes)?, created_at)),
+        moved_at,
+        removed_at,
+    ))
 }
 
 impl From<&RgaTreeSplitNodeId> for WireTextNodeId {
@@ -1204,5 +1286,243 @@ fn wire_value_type_to_counter_type(value_type: WireValueType) -> Result<CounterT
         _ => Err(YorkieError::UnsupportedProtocolConversion(
             "non-counter value type",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crdt::counter::CounterValue;
+    use crate::crdt::root::CrdtRoot;
+
+    #[test]
+    fn roundtrips_full_json_element_like_converter_root_bytes() -> Result<()> {
+        // The full root fixture recursively walks object, array, text, and
+        // counter values, so give the test a stable stack independent of the
+        // test harness default.
+        std::thread::Builder::new()
+            .name("wire-root-roundtrip".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(roundtrips_full_json_element_like_converter_root_bytes_inner)
+            .expect("thread should start")
+            .join()
+            .expect("thread should finish")
+    }
+
+    fn roundtrips_full_json_element_like_converter_root_bytes_inner() -> Result<()> {
+        let mut root = CrdtRoot::create();
+
+        let object_at = ticket(1);
+        root.set_object_member(
+            &TimeTicket::initial(),
+            "k1",
+            CrdtElement::object(CrdtObject::create(object_at.clone())),
+            object_at.clone(),
+        )?;
+        root.set_object_member(
+            &object_at,
+            "k1-1",
+            primitive_bool(true, ticket(2)),
+            ticket(2),
+        )?;
+        root.set_object_member(
+            &object_at,
+            "k1-2",
+            primitive_i32(2147483647, ticket(3)),
+            ticket(3),
+        )?;
+        root.set_object_member(&object_at, "k1-5", primitive_str("4", ticket(4)), ticket(4))?;
+
+        let array_at = ticket(5);
+        root.set_object_member(
+            &TimeTicket::initial(),
+            "k2",
+            CrdtElement::array(CrdtArray::create(array_at.clone())),
+            array_at.clone(),
+        )?;
+        root.insert_array_element(
+            &array_at,
+            &TimeTicket::initial(),
+            primitive_bool(true, ticket(6)),
+            ticket(6),
+        )?;
+        root.insert_array_element(
+            &array_at,
+            &ticket(6),
+            primitive_i32(2147483647, ticket(7)),
+            ticket(7),
+        )?;
+        root.insert_array_element(
+            &array_at,
+            &ticket(7),
+            primitive_str("4", ticket(8)),
+            ticket(8),
+        )?;
+
+        let text_at = ticket(9);
+        let mut text = CrdtText::create(text_at.clone());
+        text.edit_by_index(0, 0, "\u{314e}", None, ticket(10), None)?;
+        text.edit_by_index(0, 1, "\u{d558}", None, ticket(11), None)?;
+        text.edit_by_index(0, 1, "\u{d55c}", None, ticket(12), None)?;
+        text.edit_by_index(0, 1, "\u{d558}", None, ticket(13), None)?;
+        text.edit_by_index(1, 1, "\u{b290}", None, ticket(14), None)?;
+        text.edit_by_index(1, 2, "\u{b298}", None, ticket(15), None)?;
+        let mut attrs = BTreeMap::new();
+        attrs.insert("bold".to_owned(), "true".to_owned());
+        attrs.insert("indent".to_owned(), "2".to_owned());
+        attrs.insert("italic".to_owned(), "false".to_owned());
+        attrs.insert("color".to_owned(), "red".to_owned());
+        text.set_style_by_index(0, 2, attrs, ticket(16), None)?;
+        root.set_object_member(
+            &TimeTicket::initial(),
+            "k3",
+            CrdtElement::text(text),
+            text_at.clone(),
+        )?;
+
+        let counter_at = ticket(17);
+        let mut counter = CrdtCounter::create(
+            CounterType::Integer,
+            CounterValue::Integer(0),
+            counter_at.clone(),
+        );
+        counter.increase(&CrdtPrimitive::new(PrimitiveValue::Integer(1), ticket(18)))?;
+        counter.increase(&CrdtPrimitive::new(PrimitiveValue::Integer(2), ticket(19)))?;
+        counter.increase(&CrdtPrimitive::new(PrimitiveValue::Integer(3), ticket(20)))?;
+        root.set_object_member(
+            &TimeTicket::initial(),
+            "k4",
+            CrdtElement::counter(counter),
+            counter_at.clone(),
+        )?;
+
+        let roundtripped = roundtrip_root_json_element(&root)?;
+
+        assert_eq!(root.to_sorted_json(), roundtripped.to_sorted_json());
+        assert_eq!(
+            r#"{"k1":{"k1-1":true,"k1-2":2147483647,"k1-5":"4"},"k2":[true,2147483647,"4"],"k3":[{"attrs":{"bold":true,"color":"red","indent":2,"italic":false},"val":"하"},{"attrs":{"bold":true,"color":"red","indent":2,"italic":false},"val":"늘"}],"k4":6}"#,
+            roundtripped.to_sorted_json()
+        );
+        assert_eq!(
+            "\u{d558}\u{b298}",
+            roundtripped
+                .text_by_created_at(&text_at)
+                .unwrap()
+                .to_string()
+        );
+        assert_eq!(
+            CounterValue::Integer(6),
+            roundtripped
+                .counter_by_created_at(&counter_at)
+                .unwrap()
+                .value()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn roundtrips_array_json_element_like_converter_array_bytes() -> Result<()> {
+        let mut array = CrdtArray::create(ticket(1));
+        array.insert_after(
+            &TimeTicket::initial(),
+            primitive_str("1", ticket(2)),
+            Some(ticket(2)),
+        )?;
+        array.insert_after(&ticket(2), primitive_str("2", ticket(3)), Some(ticket(3)))?;
+        array.insert_after(&ticket(3), primitive_str("3", ticket(4)), Some(ticket(4)))?;
+
+        let element = CrdtElement::array(array);
+        let wire = WireJsonElement::try_from(&element)?;
+        let roundtripped = CrdtElement::try_from(wire)?;
+
+        assert_eq!(r#"["1","2","3"]"#, element.to_sorted_json());
+        assert_eq!(r#"["1","2","3"]"#, roundtripped.to_sorted_json());
+        Ok(())
+    }
+
+    #[test]
+    fn preserves_object_gc_elements_across_json_element_roundtrip() -> Result<()> {
+        let mut root = CrdtRoot::create();
+        let object_at = ticket(1);
+        let first_at = ticket(2);
+        let second_at = ticket(3);
+
+        root.set_object_member(
+            &TimeTicket::initial(),
+            "o",
+            CrdtElement::object(CrdtObject::create(object_at.clone())),
+            object_at.clone(),
+        )?;
+        root.set_object_member(
+            &object_at,
+            "1",
+            primitive_str("a", first_at.clone()),
+            first_at,
+        )?;
+        root.set_object_member(
+            &object_at,
+            "1",
+            primitive_str("b", second_at.clone()),
+            second_at.clone(),
+        )?;
+
+        assert_eq!(r#"{"o":{"1":"b"}}"#, root.to_sorted_json());
+        assert_eq!(1, root.stats().gc_elements);
+        assert_eq!(
+            Some(&second_at),
+            root.find_by_created_at(&ticket(2)).unwrap().removed_at()
+        );
+
+        let roundtripped = roundtrip_root_json_element(&root)?;
+
+        assert_eq!(r#"{"o":{"1":"b"}}"#, roundtripped.to_sorted_json());
+        assert_eq!(1, roundtripped.stats().gc_elements);
+        assert_eq!(1, roundtripped.get_garbage_len());
+        assert_eq!(
+            Some(&second_at),
+            roundtripped
+                .find_by_created_at(&ticket(2))
+                .unwrap()
+                .removed_at()
+        );
+        Ok(())
+    }
+
+    fn roundtrip_root_json_element(root: &CrdtRoot) -> Result<CrdtRoot> {
+        let root_element = root.root_element();
+        let wire = WireJsonElement::try_from(&root_element)?;
+        let element = CrdtElement::try_from(wire)?;
+        let CrdtElement::Object(object) = element else {
+            return Err(YorkieError::UnsupportedProtocolConversion(
+                "root JSONElement must be object",
+            ));
+        };
+
+        Ok(CrdtRoot::new(*object))
+    }
+
+    fn primitive_bool(value: bool, created_at: TimeTicket) -> CrdtElement {
+        CrdtElement::primitive(CrdtPrimitive::new(
+            PrimitiveValue::Boolean(value),
+            created_at,
+        ))
+    }
+
+    fn primitive_i32(value: i32, created_at: TimeTicket) -> CrdtElement {
+        CrdtElement::primitive(CrdtPrimitive::new(
+            PrimitiveValue::Integer(value),
+            created_at,
+        ))
+    }
+
+    fn primitive_str(value: &str, created_at: TimeTicket) -> CrdtElement {
+        CrdtElement::primitive(CrdtPrimitive::new(
+            PrimitiveValue::String(value.to_owned()),
+            created_at,
+        ))
+    }
+
+    fn ticket(lamport: i64) -> TimeTicket {
+        TimeTicket::new(lamport, 0, "000000000000000000000001")
     }
 }

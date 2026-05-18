@@ -32,7 +32,7 @@ and root index integration.
 | Object nested members | partial | Nested object behavior is tested, but broad JS object scenarios remain. |
 | Root integration | partial | Root tests cover nested descendants and paths for objects. |
 | Public object facade | partial | Public object changes still use the temporary diff bridge. |
-| Wire conversion | partial | Full object `JSONElement` payloads and object-valued `JSONElementSimple` bytes now convert to/from wire values. Rust has a converter test matching the JS/Go object bytes scenario at the change-pack payload level. Snapshot application and broad JS/Go binary fixtures are still missing. |
+| Wire conversion | partial | Full object `JSONElement` payloads and object-valued `JSONElementSimple` bytes now convert to/from wire values. Rust ports the root object bytes shape for nested object members and the JS/Go object-GC bytes scenario at core wire level. External binary fixtures are still missing. |
 
 ## Next Checks
 
@@ -40,4 +40,4 @@ and root index integration.
   exists.
 - Add operation-level object set/remove replay cases with nested parents.
 - Add protocol fixture coverage for object tombstones and same-key LWW members.
-- Revisit object GC when tree/counter descendants are added.
+- Revisit object GC when tree descendants are added.

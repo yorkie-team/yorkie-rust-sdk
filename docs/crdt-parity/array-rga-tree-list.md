@@ -47,7 +47,7 @@ application, public array mutation APIs, and sync-level convergence.
 | Public `JsonArray` facade | partial | Plain value APIs cover index get/set/insert/remove, nested object/array access, read-only ID/value element lookup, value and ID search, ID-based insert/delete/move, index-based insert, and splice-like remove/insert sequences. During `Document::update`, these APIs record Add, ArraySet, Remove, and Move operations at the mutation site, including same-update parent creation, same-visible-value set calls, and nested edits after splice insertion. Mutable JS-style wrapped element proxies and live CRDT container mutation are still missing. |
 | Splay/index optimization | partial | `RgaTreeList` now keeps JS/Go-shaped position and element maps and uses weighted splay lookup for visible indexes and paths. Structural mutations still rebuild the indexes around the Rust `Vec` backing store instead of maintaining linked node handles incrementally. |
 | Snapshot restoration | partial | Root rebuild tests cover moved positions, dead positions, path lookup, and GC after copy. Protocol `JSONElement.Array` conversion now preserves live nodes, moved position nodes, and dead position nodes, and decoded snapshot roots can replace a `Document` root. Array-specific snapshot fixtures for moved/dead positions through the protocol path are still missing. |
-| Wire conversion | partial | Add/move/remove/array-set operations and full array `JSONElement` payloads convert to/from protobuf-shaped wire values. Rust has a converter test matching Go's array bytes scenario at the change-pack payload level. Broader JS/Go binary fixtures are still missing. |
+| Wire conversion | partial | Add/move/remove/array-set operations and full array `JSONElement` payloads convert to/from protobuf-shaped wire values. Rust ports Go's standalone array bytes scenario and the array portion of JS's root bytes scenario at core wire level. External binary fixtures are still missing. |
 
 ## Next Checks
 
@@ -57,4 +57,5 @@ application, public array mutation APIs, and sync-level convergence.
 - Replace the rebuild-on-mutation indexing strategy with stable node handles to
   match the JS/Go write-side implementation more closely.
 - Add protocol-level replay fixtures around duplicate position IDs, moved
-  positions, dead positions, and GC.
+  positions, dead positions, and GC after the JS/Go in-repo converter cases are
+  ported more fully.

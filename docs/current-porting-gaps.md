@@ -224,13 +224,13 @@ Gap:
   facade layer, but the implementation still replays operations after the
   callback rather than mutating live CRDT containers during the callback.
 - Protocol `JSONElement.Array` conversion now preserves live RGA nodes, moved
-  position nodes, and dead position nodes. Snapshot application is still not
-  wired into `Document::apply_change_pack`.
+  position nodes, and dead position nodes. Decoded snapshot roots can replace a
+  document root through `Document::apply_change_pack`.
 
 Expected direction:
 
-- Keep adding focused JS/Go array replay and snapshot tests around duplicate
-  position IDs, moved positions, dead positions, and GC.
+- Keep adding focused JS/Go array replay, converter, and snapshot tests around
+  duplicate position IDs, moved positions, dead positions, and GC.
 - Replace rebuild-on-mutation indexing with stable node handles to align the
   write-side implementation more closely with JS/Go.
 
@@ -692,6 +692,9 @@ Current Rust behavior:
   object/array `JSONElementSimple` full-payload bytes, protobuf-to-domain
   reconstruction, decoded snapshot application, and binary change-pack round
   trips.
+- Core wire tests now port the JS root bytes scenario for nested object, array,
+  text, and counter values, Go's standalone array bytes scenario, and the
+  JS/Go object-GC bytes scenario.
 
 JS/Go behavior:
 
@@ -705,17 +708,21 @@ Gap:
   decodes `Snapshot.root` into a core snapshot root for
   `Document::apply_change_pack`. Snapshot presences are currently ignored
   because presence is not implemented.
-- No cross-language binary compatibility tests.
+- No cross-language binary compatibility tests. This is intentionally not the
+  immediate focus while JS/Go in-repo converter scenarios are still being
+  ported.
 - JS and Go both have direct converter tests for root/object bytes and tree
   bytes. Go also has direct array bytes, change-pack, presence, and snapshot
-  converter tests. Rust currently covers object/array simple payload bytes and
-  change-pack replay plus a generated-protobuf snapshot apply path, while tree
-  bytes, presence, and cross-language snapshot fixtures remain blocked by
-  missing public tree facade, presence model, and fixture generation.
+  converter tests. Rust currently covers object/array simple payload bytes,
+  root/object bytes at core wire level, standalone array bytes at core wire
+  level, object-GC bytes at core wire level, change-pack replay, and a
+  generated-protobuf snapshot apply path. Tree bytes and presence remain
+  blocked by missing public tree facade and presence model.
 
 Expected direction:
 
-- Add JS/Go-produced binary fixtures for the current field-level converter.
+- Continue porting JS/Go in-repo converter scenarios before adding external
+  binary fixtures.
 - Add snapshot GC/presence behavior once sync and presence are pulled into the
   document lifecycle.
 - Use JS converter files and Yorkie proto definitions as the main reference,
