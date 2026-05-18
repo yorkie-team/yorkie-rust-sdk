@@ -1,6 +1,6 @@
 # Tree Parity
 
-Last reviewed: 2026-05-18
+Last reviewed: 2026-05-19
 
 ## References
 
@@ -43,7 +43,7 @@ concurrency, and protocol conversion.
 | Path/index conversion | partial | Rust now ports the JS/Go index/path/position conversion rules, including element padding, text-child paths, floor lookup for split text positions, parent/left path resolution, and token traversal for edit/style collection. It still recomputes over the current tree instead of maintaining the same stable index-tree structure as JS/Go. |
 | Upstream skipped history/unit cases | blocked | JS and Go carry skipped Tree cases around history redo, overlapping undo reconciliation, L2 split undo, mixed-level merge, and generated concurrency failures. Rust must keep these skipped or ignored until upstream unskips them. See `upstream-skipped-tests.md`. |
 | Public tree facade | missing | Depends on context-backed editing model. |
-| Wire conversion | partial | Full tree `JSONElement` payloads and tree edit/style operation bodies convert to/from protobuf-shaped wire values, including tree node IDs, positions, attributes, split links, and merge metadata. Public tree facade, snapshot application, and broad JS/Go binary fixtures are still missing. |
+| Wire conversion | partial | Full tree `JSONElement` payloads and tree edit/style operation bodies convert to/from protobuf-shaped wire values, including tree node IDs, positions, attributes, split links, and merge metadata. JS and Go both have direct tree bytes converter tests; Rust should port them after the public tree facade or a stable internal fixture builder exists. Public tree facade, snapshot application, and broad JS/Go binary fixtures are still missing. |
 
 ## Next Checks
 

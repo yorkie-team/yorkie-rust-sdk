@@ -1149,7 +1149,8 @@ mod tests {
         decode_change_pack, encode_change_pack, from_change_pack, to_change_pack, to_time_ticket,
         to_version_vector,
     };
-    use crate::yorkie::v1::{operation::Body, ValueType};
+    use crate::yorkie::v1::{json_element, operation::Body, ValueType};
+    use prost::Message;
     use std::error::Error;
     use yorkie_core::{Document, TimeTicket};
 
@@ -1234,6 +1235,74 @@ mod tests {
         let value = increase.value.as_ref().expect("increase value");
         assert_eq!(ValueType::Integer as i32, value.r#type);
         assert_eq!(1i32.to_le_bytes().to_vec(), value.value);
+        Ok(())
+    }
+
+    #[test]
+    fn encodes_object_simple_value_as_json_element_bytes() -> Result<(), Box<dyn Error>> {
+        let mut doc = Document::new("doc-key");
+
+        doc.update(|root| {
+            let mut profile = yorkie_core::JsonObject::new();
+            profile.set("name", "yorkie")?;
+            root.set("profile", profile)?;
+            Ok(())
+        })?;
+
+        let proto = to_change_pack(&doc.create_change_pack())?;
+        let Some(Body::Set(set)) = &proto.changes[0].operations[0].body else {
+            panic!("expected set operation");
+        };
+        let value = set.value.as_ref().expect("set value");
+        assert_eq!(ValueType::JsonObject as i32, value.r#type);
+
+        let element = crate::yorkie::v1::JsonElement::decode(value.value.as_slice())?;
+        let Some(json_element::Body::JsonObject(object)) = element.body else {
+            panic!("expected encoded object payload");
+        };
+
+        assert_eq!(1, object.nodes.len());
+        assert_eq!("name", object.nodes[0].key);
+
+        let mut target = Document::new("target-doc");
+        target.apply_change_pack(&from_change_pack(&proto)?)?;
+        assert_eq!(r#"{"profile":{"name":"yorkie"}}"#, target.to_sorted_json());
+        Ok(())
+    }
+
+    #[test]
+    fn encodes_array_simple_value_as_json_element_bytes() -> Result<(), Box<dyn Error>> {
+        let mut doc = Document::new("doc-key");
+
+        doc.update(|root| {
+            let mut items = yorkie_core::JsonArray::new();
+            items.push("one")?.push(2i32)?;
+            root.set("items", items)?;
+            Ok(())
+        })?;
+
+        let proto = to_change_pack(&doc.create_change_pack())?;
+        let Some(Body::Set(set)) = &proto.changes[0].operations[0].body else {
+            panic!("expected set operation");
+        };
+        let value = set.value.as_ref().expect("set value");
+        assert_eq!(ValueType::JsonArray as i32, value.r#type);
+
+        let element = crate::yorkie::v1::JsonElement::decode(value.value.as_slice())?;
+        let Some(json_element::Body::JsonArray(array)) = element.body else {
+            panic!("expected encoded array payload");
+        };
+
+        let visible_nodes = array
+            .nodes
+            .iter()
+            .filter(|node| node.element.is_some())
+            .count();
+        assert_eq!(2, visible_nodes);
+
+        let mut target = Document::new("target-doc");
+        target.apply_change_pack(&from_change_pack(&proto)?)?;
+        assert_eq!(r#"{"items":["one",2]}"#, target.to_sorted_json());
         Ok(())
     }
 

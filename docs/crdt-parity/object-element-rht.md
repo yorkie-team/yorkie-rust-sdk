@@ -1,6 +1,6 @@
 # Object and ElementRHT Parity
 
-Last reviewed: 2026-05-18
+Last reviewed: 2026-05-19
 
 ## References
 
@@ -32,7 +32,7 @@ and root index integration.
 | Object nested members | partial | Nested object behavior is tested, but broad JS object scenarios remain. |
 | Root integration | partial | Root tests cover nested descendants and paths for objects. |
 | Public object facade | partial | Public object changes still use the temporary diff bridge. |
-| Wire conversion | partial | Full object `JSONElement` payloads and object-valued `JSONElementSimple` bytes now convert to/from wire values. Snapshot application and broad JS/Go binary fixtures are still missing. |
+| Wire conversion | partial | Full object `JSONElement` payloads and object-valued `JSONElementSimple` bytes now convert to/from wire values. Rust has a converter test matching the JS/Go object bytes scenario at the change-pack payload level. Snapshot application and broad JS/Go binary fixtures are still missing. |
 
 ## Next Checks
 

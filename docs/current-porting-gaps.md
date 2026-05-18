@@ -1,6 +1,6 @@
 # Current Porting Gaps
 
-Last reviewed: 2026-05-18
+Last reviewed: 2026-05-19
 
 This document records known differences between the current Rust SDK and the
 JS/Go implementations. It is intentionally practical: each section explains
@@ -684,7 +684,8 @@ Current Rust behavior:
   `JSONElement` payload.
 - Protocol conversion tests cover actor bytes, version-vector base64 actor
   keys, counter set/increase operations, dedup counter increase actors,
-  protobuf-to-domain reconstruction, and binary change-pack round trips.
+  object/array `JSONElementSimple` full-payload bytes, protobuf-to-domain
+  reconstruction, and binary change-pack round trips.
 
 JS/Go behavior:
 
@@ -698,6 +699,12 @@ Gap:
   conversion exists for object/array/primitive/text/counter/tree payloads, but
   `Document::apply_change_pack` still rejects snapshot application.
 - No cross-language binary compatibility tests.
+- JS and Go both have direct converter tests for root/object bytes and tree
+  bytes. Go also has direct array bytes, change-pack, presence, and snapshot
+  converter tests. Rust currently covers object/array simple payload bytes and
+  change-pack replay, while tree bytes, presence, and snapshot tests remain
+  blocked by missing public tree facade, presence model, and snapshot
+  application.
 
 Expected direction:
 
