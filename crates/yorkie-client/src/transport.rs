@@ -46,6 +46,22 @@ pub struct AttachDocumentResponse {
     pub schema_rules: Vec<SchemaRule>,
 }
 
+/// Request data for detaching a document.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DetachDocumentRequest {
+    pub client_id: ActorId,
+    pub document_id: String,
+    pub change_pack: ChangePack,
+    pub remove_if_not_attached: bool,
+    pub shard_key: String,
+}
+
+/// Response data for detaching a document.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DetachDocumentResponse {
+    pub change_pack: ChangePack,
+}
+
 /// Transport boundary used by the client lifecycle and document attachment.
 pub trait ClientTransport {
     fn activate_client(
@@ -62,4 +78,9 @@ pub trait ClientTransport {
         &mut self,
         request: AttachDocumentRequest,
     ) -> ClientResult<AttachDocumentResponse>;
+
+    fn detach_document(
+        &mut self,
+        request: DetachDocumentRequest,
+    ) -> ClientResult<DetachDocumentResponse>;
 }

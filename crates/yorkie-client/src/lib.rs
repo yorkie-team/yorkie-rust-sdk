@@ -17,7 +17,8 @@ pub use options::{
 };
 pub use transport::{
     ActivateClientRequest, ActivateClientResponse, AttachDocumentRequest, AttachDocumentResponse,
-    ClientTransport, DeactivateClientRequest, DeactivateClientResponse,
+    ClientTransport, DeactivateClientRequest, DeactivateClientResponse, DetachDocumentRequest,
+    DetachDocumentResponse,
 };
 pub use yorkie_core::{
     ActorId, DocStatus, Document, JsonArray, JsonObject, JsonValue, Result, SchemaRule,

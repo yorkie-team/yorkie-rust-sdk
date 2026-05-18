@@ -2,15 +2,16 @@ use yorkie::{
     ActivateClientRequest, ActivateClientResponse, ActorId, AttachChannelOptions,
     AttachDocumentRequest, AttachDocumentResponse, AttachOptions, ChangePack, Checkpoint, Client,
     ClientCondition, ClientError, ClientStatus, ClientTransport, CounterType, CounterValue,
-    DeactivateClientRequest, DeactivateClientResponse, DeactivateOptions, DetachOptions, DocStatus,
-    Document, JsonCounter, Result, SchemaRule, SyncMode, TimeTicket, TimeTicketStruct,
-    TreeNodeRule, VersionVector,
+    DeactivateClientRequest, DeactivateClientResponse, DeactivateOptions, DetachDocumentRequest,
+    DetachDocumentResponse, DetachOptions, DocStatus, Document, JsonCounter, Result, SchemaRule,
+    SyncMode, TimeTicket, TimeTicketStruct, TreeNodeRule, VersionVector,
 };
 
 #[derive(Debug, Default)]
 struct FacadeTransport {
     activate_requests: usize,
     attach_requests: usize,
+    detach_requests: usize,
 }
 
 impl ClientTransport for FacadeTransport {
@@ -45,6 +46,16 @@ impl ClientTransport for FacadeTransport {
                 "object",
                 vec![TreeNodeRule::new("paragraph", "text*", "bold", "block")],
             )],
+        })
+    }
+
+    fn detach_document(
+        &mut self,
+        request: DetachDocumentRequest,
+    ) -> yorkie::ClientResult<DetachDocumentResponse> {
+        self.detach_requests += 1;
+        Ok(DetachDocumentResponse {
+            change_pack: request.change_pack,
         })
     }
 }
@@ -131,6 +142,11 @@ fn facade_exports_client_api() {
     assert_eq!(1024, doc.max_size_per_document());
     assert_eq!(1, doc.schema_rules().len());
     assert_eq!(1, transport.attach_requests);
+    client
+        .detach(&mut transport, &mut doc, DetachOptions)
+        .unwrap();
+    assert!(!client.has("doc-key"));
+    assert_eq!(1, transport.detach_requests);
     assert_eq!(
         DeactivateOptions::default(),
         DeactivateOptions {

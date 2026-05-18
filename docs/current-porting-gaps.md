@@ -769,8 +769,12 @@ Current Rust behavior:
   metadata on the document, applies the returned change pack, records
   attachment metadata, and marks the watch loop condition active for realtime
   sync modes.
-- `Client::has`, `detach`, and `change_sync_mode` cover local lifecycle
-  bookkeeping and precondition errors for documents.
+- `Client::detach` sends client ID, attached document ID, local `ChangePack`,
+  `remove_if_not_attached`, and shard key through the transport boundary,
+  applies the returned change pack, updates document status, removes attachment
+  metadata, and refreshes the watch loop condition.
+- `Client::has` and `change_sync_mode` cover local lifecycle bookkeeping and
+  precondition errors for documents.
 - Document local change packs can be created and applied in-memory.
 - `Document` stores max-size and schema-rule metadata received during attach,
   but update-time max-size/schema validation is not implemented yet.
@@ -785,10 +789,9 @@ JS/Go behavior:
 Gap:
 
 - No concrete RPC transport.
-- Activate/deactivate/attach use a transport trait, but there is no
+- Activate/deactivate/attach/detach use a transport trait, but there is no
   Connect/gRPC-web implementation yet.
-- Detach, remove, and push-pull sync are not connected to the transport
-  boundary yet.
+- Remove and push-pull sync are not connected to the transport boundary yet.
 - No watch stream.
 - No presence.
 - Schema rules and max-size limits are stored after attach but are not enforced
@@ -802,7 +805,7 @@ Gap:
 
 Expected direction:
 
-- Extend the transport boundary to attach, detach, remove, and push-pull sync.
+- Extend the transport boundary to remove and push-pull sync.
 - Keep Client state transitions aligned with document status and attachment
   metadata as the network layer lands.
 

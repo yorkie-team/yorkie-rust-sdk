@@ -5,6 +5,7 @@ use crate::error::{ClientError, ClientResult};
 use crate::options::{AttachOptions, ClientOptions, DeactivateOptions, DetachOptions, SyncMode};
 use crate::transport::{
     ActivateClientRequest, AttachDocumentRequest, ClientTransport, DeactivateClientRequest,
+    DetachDocumentRequest,
 };
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -195,14 +196,34 @@ impl Client {
         Ok(())
     }
 
-    pub fn detach(&mut self, doc: &mut Document, _options: DetachOptions) -> ClientResult<()> {
-        self.require_active()?;
-        if self.attachments.remove(doc.key()).is_none() {
+    pub fn detach<T>(
+        &mut self,
+        transport: &mut T,
+        doc: &mut Document,
+        _options: DetachOptions,
+    ) -> ClientResult<()>
+    where
+        T: ClientTransport,
+    {
+        let client_id = self.require_active()?.clone();
+        let Some(attachment) = self.attachments.get(doc.key()) else {
             return Err(ClientError::NotAttached(doc.key().to_owned()));
-        }
+        };
+        let document_id = attachment.resource_id.clone();
+
+        let response = transport.detach_document(DetachDocumentRequest {
+            client_id,
+            document_id,
+            change_pack: doc.create_change_pack(),
+            remove_if_not_attached: false,
+            shard_key: self.shard_key(doc.key()),
+        })?;
+        doc.apply_change_pack(&response.change_pack)?;
+
         if doc.status() != DocStatus::Removed {
             doc.apply_status(DocStatus::Detached);
         }
+        self.attachments.remove(doc.key());
         self.refresh_watch_loop_condition();
         Ok(())
     }
@@ -290,6 +311,7 @@ mod tests {
     use crate::transport::{
         ActivateClientRequest, ActivateClientResponse, AttachDocumentRequest,
         AttachDocumentResponse, ClientTransport, DeactivateClientRequest, DeactivateClientResponse,
+        DetachDocumentRequest, DetachDocumentResponse,
     };
     use std::collections::BTreeMap;
     use std::time::Duration;
@@ -301,6 +323,7 @@ mod tests {
         activate_requests: Vec<ActivateClientRequest>,
         deactivate_requests: Vec<DeactivateClientRequest>,
         attach_requests: Vec<AttachDocumentRequest>,
+        detach_requests: Vec<DetachDocumentRequest>,
         attach_max_size_per_document: usize,
         attach_schema_rules: Vec<SchemaRule>,
     }
@@ -312,6 +335,7 @@ mod tests {
                 activate_requests: Vec::new(),
                 deactivate_requests: Vec::new(),
                 attach_requests: Vec::new(),
+                detach_requests: Vec::new(),
                 attach_max_size_per_document: 0,
                 attach_schema_rules: Vec::new(),
             }
@@ -349,6 +373,15 @@ mod tests {
                 max_size_per_document: self.attach_max_size_per_document,
                 schema_rules: self.attach_schema_rules.clone(),
             })
+        }
+
+        fn detach_document(
+            &mut self,
+            request: DetachDocumentRequest,
+        ) -> ClientResult<DetachDocumentResponse> {
+            let change_pack = request.change_pack.clone();
+            self.detach_requests.push(request);
+            Ok(DetachDocumentResponse { change_pack })
         }
     }
 
@@ -614,11 +647,23 @@ mod tests {
             transport.attach_requests[0].change_pack.document_key()
         );
 
-        client.detach(&mut doc, DetachOptions)?;
+        client.detach(&mut transport, &mut doc, DetachOptions)?;
 
         assert!(!client.has("doc-key"));
         assert_eq!(DocStatus::Detached, doc.status());
         assert_eq!("000000000000000000000000", doc.actor_id().as_str());
+        assert_eq!(1, transport.detach_requests.len());
+        assert_eq!(
+            "000000000000000000000001",
+            transport.detach_requests[0].client_id.as_str()
+        );
+        assert_eq!("document-id", transport.detach_requests[0].document_id);
+        assert_eq!(
+            "doc-key",
+            transport.detach_requests[0].change_pack.document_key()
+        );
+        assert!(!transport.detach_requests[0].remove_if_not_attached);
+        assert_eq!("api-key/doc-key", transport.detach_requests[0].shard_key);
         Ok(())
     }
 
