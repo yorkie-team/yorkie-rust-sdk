@@ -4,6 +4,7 @@ use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Attachment {
+    pub(crate) resource_id: String,
     pub(crate) sync_mode: SyncMode,
     pub(crate) poll_interval: Duration,
     pub(crate) poll_interval_pinned: bool,
@@ -11,11 +12,13 @@ pub(crate) struct Attachment {
 
 impl Attachment {
     pub(crate) fn new(
+        resource_id: impl Into<String>,
         sync_mode: SyncMode,
         poll_interval: Duration,
         poll_interval_pinned: bool,
     ) -> Self {
         Self {
+            resource_id: resource_id.into(),
             sync_mode,
             poll_interval,
             poll_interval_pinned,

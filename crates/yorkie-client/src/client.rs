@@ -3,7 +3,9 @@ use crate::attachment::{
 };
 use crate::error::{ClientError, ClientResult};
 use crate::options::{AttachOptions, ClientOptions, DeactivateOptions, DetachOptions, SyncMode};
-use crate::transport::{ActivateClientRequest, ClientTransport, DeactivateClientRequest};
+use crate::transport::{
+    ActivateClientRequest, AttachDocumentRequest, ClientTransport, DeactivateClientRequest,
+};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -126,7 +128,15 @@ impl Client {
         Ok(())
     }
 
-    pub fn attach(&mut self, doc: &mut Document, options: AttachOptions) -> ClientResult<()> {
+    pub fn attach<T>(
+        &mut self,
+        transport: &mut T,
+        doc: &mut Document,
+        options: AttachOptions,
+    ) -> ClientResult<()>
+    where
+        T: ClientTransport,
+    {
         let actor_id = self.require_active()?.clone();
         if doc.status() != DocStatus::Detached {
             return Err(ClientError::NotDetached(doc.key().to_owned()));
@@ -136,11 +146,28 @@ impl Client {
         let (poll_interval, poll_interval_pinned) =
             resolve_document_poll_interval(sync_mode, options.document_poll_interval)?;
 
-        doc.set_actor(actor_id);
+        doc.set_actor(actor_id.clone());
+        let response = transport.attach_document(AttachDocumentRequest {
+            client_id: actor_id,
+            change_pack: doc.create_change_pack(),
+            schema_key: options.schema.clone(),
+            shard_key: self.shard_key(doc.key()),
+        })?;
+        doc.apply_change_pack(&response.change_pack)?;
+
+        if doc.status() == DocStatus::Removed {
+            return Ok(());
+        }
+
         doc.apply_status(DocStatus::Attached);
         self.attachments.insert(
             doc.key().to_owned(),
-            Attachment::new(sync_mode, poll_interval, poll_interval_pinned),
+            Attachment::new(
+                response.document_id,
+                sync_mode,
+                poll_interval,
+                poll_interval_pinned,
+            ),
         );
 
         if let Some(initial_root) = options.initial_root {
@@ -239,8 +266,8 @@ mod tests {
         DEFAULT_SYNC_LOOP_DURATION_MS,
     };
     use crate::transport::{
-        ActivateClientRequest, ActivateClientResponse, ClientTransport, DeactivateClientRequest,
-        DeactivateClientResponse,
+        ActivateClientRequest, ActivateClientResponse, AttachDocumentRequest,
+        AttachDocumentResponse, ClientTransport, DeactivateClientRequest, DeactivateClientResponse,
     };
     use std::collections::BTreeMap;
     use std::time::Duration;
@@ -251,6 +278,7 @@ mod tests {
         client_id: ActorId,
         activate_requests: Vec<ActivateClientRequest>,
         deactivate_requests: Vec<DeactivateClientRequest>,
+        attach_requests: Vec<AttachDocumentRequest>,
     }
 
     impl Default for FakeTransport {
@@ -259,6 +287,7 @@ mod tests {
                 client_id: ActorId::new("000000000000000000000001"),
                 activate_requests: Vec::new(),
                 deactivate_requests: Vec::new(),
+                attach_requests: Vec::new(),
             }
         }
     }
@@ -280,6 +309,18 @@ mod tests {
         ) -> ClientResult<DeactivateClientResponse> {
             self.deactivate_requests.push(request);
             Ok(DeactivateClientResponse)
+        }
+
+        fn attach_document(
+            &mut self,
+            request: AttachDocumentRequest,
+        ) -> ClientResult<AttachDocumentResponse> {
+            let change_pack = request.change_pack.clone();
+            self.attach_requests.push(request);
+            Ok(AttachDocumentResponse {
+                document_id: "document-id".to_owned(),
+                change_pack,
+            })
         }
     }
 
@@ -432,7 +473,7 @@ mod tests {
         let mut doc = Document::new("doc-key");
 
         client.activate(&mut transport)?;
-        client.attach(&mut doc, AttachOptions::default())?;
+        client.attach(&mut transport, &mut doc, AttachOptions::default())?;
         client.deactivate(
             &mut transport,
             DeactivateOptions {
@@ -470,10 +511,11 @@ mod tests {
             key: Some("client-key".to_owned()),
             ..ClientOptions::default()
         });
+        let mut transport = FakeTransport::default();
         let mut doc = Document::new("doc-key");
 
         let err = client
-            .attach(&mut doc, AttachOptions::default())
+            .attach(&mut transport, &mut doc, AttachOptions::default())
             .unwrap_err();
 
         assert_eq!(
@@ -482,24 +524,29 @@ mod tests {
         );
         assert_eq!(DocStatus::Detached, doc.status());
         assert!(!client.has("doc-key"));
+        assert!(transport.attach_requests.is_empty());
     }
 
     #[test]
-    fn attaches_and_detaches_document_with_local_lifecycle_state() -> ClientResult<()> {
+    fn attaches_document_through_transport_and_records_lifecycle_state() -> ClientResult<()> {
         let mut client = Client::new(ClientOptions {
             key: Some("client-key".to_owned()),
+            api_key: "api-key".to_owned(),
             ..ClientOptions::default()
         });
+        let mut transport = FakeTransport::default();
         let mut doc = Document::new("doc-key");
         let mut initial_root = JsonObject::new();
         initial_root.set("title", "hello")?;
 
         client.apply_activation("000000000000000000000001");
         client.attach(
+            &mut transport,
             &mut doc,
             AttachOptions {
                 initial_root: Some(initial_root),
                 sync_mode: Some(SyncMode::Polling),
+                schema: Some("schema".to_owned()),
                 ..AttachOptions::default()
             },
         )?;
@@ -514,12 +561,27 @@ mod tests {
         assert_eq!("000000000000000000000001", doc.actor_id().as_str());
         assert_eq!(r#"{"title":"hello"}"#, doc.to_sorted_json());
         let attachment = client.attachments.get("doc-key").unwrap();
+        assert_eq!("document-id", attachment.resource_id);
         assert_eq!(SyncMode::Polling, attachment.sync_mode);
         assert_eq!(
             Duration::from_millis(DEFAULT_POLLING_INTERVAL_MS),
             attachment.poll_interval
         );
         assert!(!attachment.poll_interval_pinned);
+        assert_eq!(1, transport.attach_requests.len());
+        assert_eq!(
+            "000000000000000000000001",
+            transport.attach_requests[0].client_id.as_str()
+        );
+        assert_eq!("api-key/doc-key", transport.attach_requests[0].shard_key);
+        assert_eq!(
+            Some("schema"),
+            transport.attach_requests[0].schema_key.as_deref()
+        );
+        assert_eq!(
+            "doc-key",
+            transport.attach_requests[0].change_pack.document_key()
+        );
 
         client.detach(&mut doc, DetachOptions)?;
 
@@ -535,16 +597,18 @@ mod tests {
             key: Some("client-key".to_owned()),
             ..ClientOptions::default()
         });
+        let mut transport = FakeTransport::default();
         let mut doc = Document::new("doc-key");
 
         client.apply_activation("000000000000000000000001");
         doc.apply_status(DocStatus::Attached);
 
         let err = client
-            .attach(&mut doc, AttachOptions::default())
+            .attach(&mut transport, &mut doc, AttachOptions::default())
             .unwrap_err();
 
         assert_eq!(ClientError::NotDetached("doc-key".to_owned()), err);
+        assert!(transport.attach_requests.is_empty());
     }
 
     #[test]
@@ -553,10 +617,12 @@ mod tests {
             key: Some("client-key".to_owned()),
             ..ClientOptions::default()
         });
+        let mut transport = FakeTransport::default();
         let mut doc = Document::new("doc-key");
 
         client.apply_activation("000000000000000000000001");
         client.attach(
+            &mut transport,
             &mut doc,
             AttachOptions {
                 sync_mode: Some(SyncMode::Realtime),
@@ -575,6 +641,7 @@ mod tests {
         let mut other_doc = Document::new("other-doc");
         let err = client
             .attach(
+                &mut transport,
                 &mut other_doc,
                 AttachOptions {
                     document_poll_interval: Some(Duration::ZERO),

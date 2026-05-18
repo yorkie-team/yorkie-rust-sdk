@@ -16,8 +16,8 @@ pub use options::{
     DEFAULT_SYNC_LOOP_DURATION_MS,
 };
 pub use transport::{
-    ActivateClientRequest, ActivateClientResponse, ClientTransport, DeactivateClientRequest,
-    DeactivateClientResponse,
+    ActivateClientRequest, ActivateClientResponse, AttachDocumentRequest, AttachDocumentResponse,
+    ClientTransport, DeactivateClientRequest, DeactivateClientResponse,
 };
 pub use yorkie_core::{
     ActorId, DocStatus, Document, JsonArray, JsonObject, JsonValue, Result, YorkieError,

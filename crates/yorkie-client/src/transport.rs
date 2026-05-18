@@ -1,6 +1,6 @@
 use crate::error::ClientResult;
 use std::collections::BTreeMap;
-use yorkie_core::ActorId;
+use yorkie_core::{ActorId, ChangePack};
 
 /// Request data for activating a client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,7 +28,23 @@ pub struct DeactivateClientRequest {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DeactivateClientResponse;
 
-/// Transport boundary used by the client lifecycle.
+/// Request data for attaching a document.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttachDocumentRequest {
+    pub client_id: ActorId,
+    pub change_pack: ChangePack,
+    pub schema_key: Option<String>,
+    pub shard_key: String,
+}
+
+/// Response data for attaching a document.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttachDocumentResponse {
+    pub document_id: String,
+    pub change_pack: ChangePack,
+}
+
+/// Transport boundary used by the client lifecycle and document attachment.
 pub trait ClientTransport {
     fn activate_client(
         &mut self,
@@ -39,4 +55,9 @@ pub trait ClientTransport {
         &mut self,
         request: DeactivateClientRequest,
     ) -> ClientResult<DeactivateClientResponse>;
+
+    fn attach_document(
+        &mut self,
+        request: AttachDocumentRequest,
+    ) -> ClientResult<AttachDocumentResponse>;
 }

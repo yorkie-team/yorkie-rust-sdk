@@ -1,14 +1,15 @@
 use yorkie::{
-    ActivateClientRequest, ActivateClientResponse, ActorId, AttachChannelOptions, AttachOptions,
-    ChangePack, Checkpoint, Client, ClientCondition, ClientError, ClientStatus, ClientTransport,
-    CounterType, CounterValue, DeactivateClientRequest, DeactivateClientResponse,
-    DeactivateOptions, DetachOptions, DocStatus, Document, JsonCounter, Result, SyncMode,
-    TimeTicket, TimeTicketStruct, VersionVector,
+    ActivateClientRequest, ActivateClientResponse, ActorId, AttachChannelOptions,
+    AttachDocumentRequest, AttachDocumentResponse, AttachOptions, ChangePack, Checkpoint, Client,
+    ClientCondition, ClientError, ClientStatus, ClientTransport, CounterType, CounterValue,
+    DeactivateClientRequest, DeactivateClientResponse, DeactivateOptions, DetachOptions, DocStatus,
+    Document, JsonCounter, Result, SyncMode, TimeTicket, TimeTicketStruct, VersionVector,
 };
 
 #[derive(Debug, Default)]
 struct FacadeTransport {
     activate_requests: usize,
+    attach_requests: usize,
 }
 
 impl ClientTransport for FacadeTransport {
@@ -27,6 +28,17 @@ impl ClientTransport for FacadeTransport {
         _request: DeactivateClientRequest,
     ) -> yorkie::ClientResult<DeactivateClientResponse> {
         Ok(DeactivateClientResponse)
+    }
+
+    fn attach_document(
+        &mut self,
+        request: AttachDocumentRequest,
+    ) -> yorkie::ClientResult<AttachDocumentResponse> {
+        self.attach_requests += 1;
+        Ok(AttachDocumentResponse {
+            document_id: "document-id".to_owned(),
+            change_pack: request.change_pack,
+        })
     }
 }
 
@@ -96,15 +108,20 @@ fn facade_exports_client_api() {
     assert!(!client.condition(ClientCondition::SyncLoop));
     assert_eq!(
         ClientError::ClientNotActivated(client.key().to_owned()),
-        client.attach(&mut doc, attach_options.clone()).unwrap_err()
+        client
+            .attach(&mut transport, &mut doc, attach_options.clone())
+            .unwrap_err()
     );
     client.activate(&mut transport).unwrap();
     assert_eq!(ClientStatus::Activated, client.status());
     assert_eq!(1, transport.activate_requests);
     assert_eq!(Some(SyncMode::Polling), attach_options.sync_mode);
     assert_eq!(Some(SyncMode::Realtime), channel_options.sync_mode);
-    client.attach(&mut doc, attach_options).unwrap();
+    client
+        .attach(&mut transport, &mut doc, attach_options)
+        .unwrap();
     assert!(client.has("doc-key"));
+    assert_eq!(1, transport.attach_requests);
     assert_eq!(
         DeactivateOptions::default(),
         DeactivateOptions {
