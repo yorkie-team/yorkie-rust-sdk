@@ -744,6 +744,15 @@ Expected direction:
 Current Rust behavior:
 
 - Client crates and facade are scaffolded.
+- `ClientOptions` carries the JS/Go-shaped base options that do not require a
+  network runtime yet: RPC address, client key, API key, metadata, user agent,
+  sync-loop duration, retry delay, reconnect delay, and channel heartbeat
+  interval. Defaults match the JS/Go values where both implementations already
+  agree.
+- `SyncMode`, `DeactivateOptions`, `AttachOptions`, `AttachChannelOptions`, and
+  `DetachOptions` are defined as public client-surface types, but no client
+  method consumes them yet.
+- `Client` stores a key, deactivated status, and sync/watch condition flags.
 - Document local change packs can be created and applied in-memory.
 
 JS/Go behavior:
@@ -754,11 +763,14 @@ JS/Go behavior:
 Gap:
 
 - No real client lifecycle.
+- No activate/deactivate RPC; the status is only initialized.
 - No RPC transport.
 - No watch stream.
 - No presence.
 - No document status model.
-- No sync mode handling.
+- Sync modes are represented as types but not executed by a sync loop.
+- Auth token refresh, gRPC-web/connect transport choice, Go TLS options, and
+  Go receive-size/logger options are not modeled yet.
 
 Expected direction:
 

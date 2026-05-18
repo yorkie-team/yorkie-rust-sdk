@@ -1,6 +1,7 @@
 use yorkie::{
-    ActorId, ChangePack, Checkpoint, CounterType, CounterValue, Document, JsonCounter, Result,
-    TimeTicket, TimeTicketStruct, VersionVector,
+    ActorId, AttachChannelOptions, AttachOptions, ChangePack, Checkpoint, Client, ClientCondition,
+    ClientStatus, CounterType, CounterValue, DeactivateOptions, DetachOptions, Document,
+    JsonCounter, Result, SyncMode, TimeTicket, TimeTicketStruct, VersionVector,
 };
 
 #[test]
@@ -47,4 +48,31 @@ fn facade_exports_time_api() {
     assert_eq!("1:000000000000000000000001:0", ticket.to_id_string());
     assert_eq!(ticket, TimeTicket::from_struct(ticket_struct).unwrap());
     assert!(vector.after_or_equal(&ticket));
+}
+
+#[test]
+fn facade_exports_client_api() {
+    let client = Client::default();
+    let attach_options = AttachOptions {
+        sync_mode: Some(SyncMode::Polling),
+        ..AttachOptions::default()
+    };
+    let channel_options = AttachChannelOptions {
+        sync_mode: Some(SyncMode::Realtime),
+        ..AttachChannelOptions::default()
+    };
+
+    assert!(!client.key().is_empty());
+    assert_eq!(ClientStatus::Deactivated, client.status());
+    assert!(!client.condition(ClientCondition::SyncLoop));
+    assert_eq!(Some(SyncMode::Polling), attach_options.sync_mode);
+    assert_eq!(Some(SyncMode::Realtime), channel_options.sync_mode);
+    assert_eq!(
+        DeactivateOptions::default(),
+        DeactivateOptions {
+            keepalive: false,
+            synchronous: false,
+        }
+    );
+    assert_eq!(DetachOptions, DetachOptions);
 }

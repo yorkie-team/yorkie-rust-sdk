@@ -129,7 +129,7 @@ it has:
 | `JsonArrayElement` | JS `WrappedElement` read-only lookup shape | Lightweight Rust lookup value that exposes an array element ID and borrowed JSON value. It is not a mutable proxy. |
 | `JsonCounter` | `packages/sdk/src/document/json/counter.ts` | Public counter facade for regular increase operations and dedup actor-add operations during `Document::update`. |
 | `JsonValue` | JS JSON element/proxy values | Temporary Rust wrapper for porting primitives, counters, objects, and arrays. |
-| `Client` | `packages/sdk/src/client/client.ts` | Currently scaffolded only. Lifecycle must follow JS. |
+| `Client` | `packages/sdk/src/client/client.ts` | Rust currently covers option defaults, generated/explicit client keys, deactivated status, sync/watch condition flags, sync modes, and lifecycle/attachment option types. Network lifecycle must still follow JS. |
 | `yorkie-protocol` | `packages/sdk/src/api/converter.ts`, `../yorkie/api/converter/*`, proto files | Checked-in generated protobuf types are produced from vendored Yorkie proto files; converters encode/decode `ChangePack` values and should track JS/proto field names with Go wire behavior as a typed cross-check. |
 
 Update this table whenever a new Rust type becomes part of the porting surface.
