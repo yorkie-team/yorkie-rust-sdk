@@ -1174,13 +1174,15 @@ fn base64_value(byte: u8, original: &str) -> Result<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_change_pack, encode_change_pack, from_change_pack, to_change_pack, to_time_ticket,
-        to_version_vector,
+        decode_change_pack, encode_change_pack, from_change_pack, proto_json_element_to_wire,
+        proto_tree_nodes_to_wire, to_change_pack, to_time_ticket, to_version_vector,
+        wire_json_element_to_proto, wire_tree_nodes_to_proto,
     };
     use crate::yorkie::v1::{self as api, json_element, operation::Body, ValueType};
     use prost::Message;
     use std::collections::BTreeMap;
     use std::error::Error;
+    use yorkie_core::wire::{WireJsonElement, WireNodeAttr, WireTreeNode, WireTreeNodeId};
     use yorkie_core::{Document, TimeTicket};
 
     #[test]
@@ -1336,6 +1338,87 @@ mod tests {
     }
 
     #[test]
+    fn roundtrips_tree_nodes_through_proto_shape() -> Result<(), Box<dyn Error>> {
+        let nodes = sample_tree_nodes();
+
+        let proto = wire_tree_nodes_to_proto(&nodes)?;
+        assert_eq!(5, proto.content.len());
+        assert_eq!("text", proto.content[0].r#type);
+        assert_eq!("hello", proto.content[0].value);
+        assert_eq!(2, proto.content[0].depth);
+        assert_eq!("p", proto.content[1].r#type);
+        assert_eq!(1, proto.content[1].attributes.len());
+        assert_eq!("r", proto.content[4].r#type);
+
+        let decoded = proto_tree_nodes_to_wire(&proto)?;
+        assert_eq!(nodes, decoded);
+        Ok(())
+    }
+
+    #[test]
+    fn roundtrips_tree_json_element_bytes() -> Result<(), Box<dyn Error>> {
+        let element = sample_tree_element();
+
+        let bytes = wire_json_element_to_proto(&element)?.encode_to_vec();
+        let proto = api::JsonElement::decode(bytes.as_slice())?;
+        let Some(json_element::Body::Tree(tree)) = &proto.body else {
+            panic!("expected encoded tree payload");
+        };
+
+        assert_eq!(5, tree.nodes.len());
+        let attr = tree.nodes[1].attributes.get("b").expect("tree attr");
+        assert_eq!("t", attr.value);
+        assert!(!attr.is_removed);
+
+        let decoded = proto_json_element_to_wire(&proto)?;
+        assert_eq!(element, decoded);
+        Ok(())
+    }
+
+    #[test]
+    fn roundtrips_tree_merge_metadata_through_proto_payload() -> Result<(), Box<dyn Error>> {
+        let merged_from = tree_node_id(5, 0);
+        let merged_at = ticket(10);
+        let mut moved_text = tree_text_node(tree_node_id(6, 0), "b", 2);
+        moved_text.merged_from = Some(merged_from.clone());
+        moved_text.merged_at = Some(merged_at.clone());
+
+        let mut removed_parent = tree_element_node(merged_from.clone(), "p", 1);
+        removed_parent.removed_at = Some(merged_at.clone());
+
+        let element = WireJsonElement::Tree {
+            nodes: vec![
+                tree_text_node(tree_node_id(3, 0), "a", 2),
+                moved_text,
+                tree_element_node(tree_node_id(2, 0), "p", 1),
+                removed_parent,
+                tree_element_node(tree_node_id(1, 0), "r", 0),
+            ],
+            created_at: TimeTicket::initial(),
+            moved_at: None,
+            removed_at: None,
+        };
+
+        let proto = wire_json_element_to_proto(&element)?;
+        let Some(json_element::Body::Tree(tree)) = &proto.body else {
+            panic!("expected encoded tree payload");
+        };
+        let moved_proto = tree
+            .nodes
+            .iter()
+            .find(|node| node.merged_from.is_some())
+            .expect("node with merge metadata");
+        let proto_merged_from = moved_proto.merged_from.as_ref().expect("merged_from");
+        assert_eq!(5, proto_merged_from.created_at.as_ref().unwrap().lamport);
+        assert_eq!(0, proto_merged_from.offset);
+        assert_eq!(10, moved_proto.merged_at.as_ref().unwrap().lamport);
+
+        let decoded = proto_json_element_to_wire(&proto)?;
+        assert_eq!(element, decoded);
+        Ok(())
+    }
+
+    #[test]
     fn decodes_proto_change_pack_into_core_domain() -> Result<(), Box<dyn Error>> {
         let mut source = Document::new("source-doc");
         let mut target = Document::new("target-doc");
@@ -1435,5 +1518,75 @@ mod tests {
         assert_eq!(r#"{"title":"snapshot"}"#, doc.to_sorted_json());
         assert_eq!(yorkie_core::Checkpoint::new(7, 0), doc.checkpoint());
         Ok(())
+    }
+
+    fn sample_tree_element() -> WireJsonElement {
+        WireJsonElement::Tree {
+            nodes: sample_tree_nodes(),
+            created_at: TimeTicket::initial(),
+            moved_at: None,
+            removed_at: None,
+        }
+    }
+
+    fn sample_tree_nodes() -> Vec<WireTreeNode> {
+        let mut first_paragraph = tree_element_node(tree_node_id(2, 0), "p", 1);
+        first_paragraph.attributes.insert(
+            "b".to_owned(),
+            WireNodeAttr {
+                value: "t".to_owned(),
+                updated_at: ticket(6),
+                is_removed: false,
+            },
+        );
+
+        vec![
+            tree_text_node(tree_node_id(3, 0), "hello", 2),
+            first_paragraph,
+            tree_text_node(tree_node_id(5, 0), "world", 2),
+            tree_element_node(tree_node_id(4, 0), "p", 1),
+            tree_element_node(tree_node_id(1, 0), "r", 0),
+        ]
+    }
+
+    fn tree_text_node(id: WireTreeNodeId, value: &str, depth: i32) -> WireTreeNode {
+        WireTreeNode {
+            id,
+            node_type: "text".to_owned(),
+            value: value.to_owned(),
+            removed_at: None,
+            ins_prev_id: None,
+            ins_next_id: None,
+            depth,
+            attributes: BTreeMap::new(),
+            merged_from: None,
+            merged_at: None,
+        }
+    }
+
+    fn tree_element_node(id: WireTreeNodeId, node_type: &str, depth: i32) -> WireTreeNode {
+        WireTreeNode {
+            id,
+            node_type: node_type.to_owned(),
+            value: String::new(),
+            removed_at: None,
+            ins_prev_id: None,
+            ins_next_id: None,
+            depth,
+            attributes: BTreeMap::new(),
+            merged_from: None,
+            merged_at: None,
+        }
+    }
+
+    fn tree_node_id(lamport: i64, offset: usize) -> WireTreeNodeId {
+        WireTreeNodeId {
+            created_at: ticket(lamport),
+            offset,
+        }
+    }
+
+    fn ticket(lamport: i64) -> TimeTicket {
+        TimeTicket::new(lamport, 0, "000000000000000000000001")
     }
 }

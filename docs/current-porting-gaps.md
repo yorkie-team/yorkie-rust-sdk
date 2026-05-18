@@ -691,7 +691,9 @@ Current Rust behavior:
   keys, counter set/increase operations, dedup counter increase actors,
   object/array `JSONElementSimple` full-payload bytes, protobuf-to-domain
   reconstruction, decoded snapshot application, and binary change-pack round
-  trips.
+  trips. They also cover tree node arrays and full `JSONElement.Tree` protobuf
+  payloads, including node IDs, depths, attributes, removed markers, and
+  persisted merge metadata.
 - Core wire tests now port the JS root bytes scenario for nested object, array,
   text, and counter values, Go's standalone array bytes scenario, the JS/Go
   object-GC bytes scenario, and JS/Go tree bytes scenarios around plain tree
@@ -717,9 +719,9 @@ Gap:
   converter tests. Rust currently covers object/array simple payload bytes,
   root/object bytes at core wire level, standalone array/tree bytes at core
   wire level, object-GC bytes at core wire level, tree edit/style and
-  merge-state root bytes at core wire level, change-pack replay, and a
-  generated-protobuf snapshot apply path. Presence remains blocked by the
-  missing presence model.
+  merge-state root bytes at core wire level, tree protobuf payload round trips
+  at protocol level, change-pack replay, and a generated-protobuf snapshot
+  apply path. Presence remains blocked by the missing presence model.
 
 Expected direction:
 
