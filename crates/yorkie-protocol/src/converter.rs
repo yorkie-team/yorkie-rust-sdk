@@ -1174,16 +1174,20 @@ fn base64_value(byte: u8, original: &str) -> Result<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_change_pack, encode_change_pack, from_change_pack, proto_json_element_to_wire,
-        proto_tree_nodes_to_wire, to_change_pack, to_time_ticket, to_version_vector,
-        wire_json_element_to_proto, wire_tree_nodes_to_proto,
+        decode_change_pack, encode_change_pack, from_change_pack, proto_change_pack_to_wire,
+        proto_json_element_to_wire, proto_tree_nodes_to_wire, to_change_pack, to_time_ticket,
+        to_version_vector, wire_change_pack_to_proto, wire_json_element_to_proto,
+        wire_tree_nodes_to_proto,
     };
     use crate::yorkie::v1::{self as api, json_element, operation::Body, ValueType};
     use prost::Message;
     use std::collections::BTreeMap;
     use std::error::Error;
-    use yorkie_core::wire::{WireJsonElement, WireNodeAttr, WireTreeNode, WireTreeNodeId};
-    use yorkie_core::{Document, TimeTicket};
+    use yorkie_core::wire::{
+        WireChangePack, WireJsonElement, WireNodeAttr, WireRgaNode, WireRhtNode, WireTextNode,
+        WireTextNodeId, WireTreeNode, WireTreeNodeId, WireValueType,
+    };
+    use yorkie_core::{Checkpoint, Document, TimeTicket, VersionVector};
 
     #[test]
     fn converts_time_tickets_to_proto_shape() -> Result<(), Box<dyn Error>> {
@@ -1419,6 +1423,44 @@ mod tests {
     }
 
     #[test]
+    fn roundtrips_snapshot_root_change_pack_through_proto_bytes() -> Result<(), Box<dyn Error>> {
+        let actor_id = "000000000000000000000001";
+        let mut version_vector = VersionVector::new();
+        version_vector.set(actor_id, 12);
+
+        let root = sample_snapshot_root();
+        let pack = WireChangePack {
+            document_key: "doc-key".to_owned(),
+            checkpoint: Checkpoint::new(7, 0),
+            is_removed: false,
+            changes: Vec::new(),
+            snapshot: None,
+            snapshot_root: Some(root.clone()),
+            version_vector: Some(version_vector.clone()),
+        };
+
+        let proto = wire_change_pack_to_proto(&pack)?;
+        assert!(!proto.snapshot.is_empty());
+        assert!(proto.changes.is_empty());
+
+        let snapshot = proto.snapshot.clone();
+        let decoded_wire = proto_change_pack_to_wire(&proto)?;
+        assert_eq!("doc-key", decoded_wire.document_key);
+        assert_eq!(Checkpoint::new(7, 0), decoded_wire.checkpoint);
+        assert_eq!(Some(snapshot), decoded_wire.snapshot);
+        assert_eq!(Some(root), decoded_wire.snapshot_root);
+        assert_eq!(Some(version_vector), decoded_wire.version_vector);
+
+        let mut doc = Document::new("doc-key");
+        doc.apply_change_pack(&from_change_pack(&proto)?)?;
+        assert_eq!(
+            r#"{"k1":[{"val":"B"}],"k2":[true,1,"4"],"k3":6,"meta":{"active":true,"name":"yorkie"}}"#,
+            doc.to_sorted_json()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn decodes_proto_change_pack_into_core_domain() -> Result<(), Box<dyn Error>> {
         let mut source = Document::new("source-doc");
         let mut target = Document::new("target-doc");
@@ -1518,6 +1560,119 @@ mod tests {
         assert_eq!(r#"{"title":"snapshot"}"#, doc.to_sorted_json());
         assert_eq!(yorkie_core::Checkpoint::new(7, 0), doc.checkpoint());
         Ok(())
+    }
+
+    fn sample_snapshot_root() -> WireJsonElement {
+        WireJsonElement::Object {
+            nodes: vec![
+                rht_node("k1", text_element("B", ticket(2))),
+                rht_node("k2", array_element()),
+                rht_node("k3", counter_i32(6, ticket(8))),
+                rht_node(
+                    "meta",
+                    WireJsonElement::Object {
+                        nodes: vec![
+                            rht_node("active", primitive_bool(true, ticket(10))),
+                            rht_node("name", primitive_str("yorkie", ticket(11))),
+                        ],
+                        created_at: ticket(9),
+                        moved_at: None,
+                        removed_at: None,
+                    },
+                ),
+            ],
+            created_at: TimeTicket::initial(),
+            moved_at: None,
+            removed_at: None,
+        }
+    }
+
+    fn rht_node(key: &str, element: WireJsonElement) -> WireRhtNode {
+        WireRhtNode {
+            key: key.to_owned(),
+            element,
+        }
+    }
+
+    fn array_element() -> WireJsonElement {
+        WireJsonElement::Array {
+            nodes: vec![
+                rga_node(primitive_bool(true, ticket(4))),
+                rga_node(primitive_i32(1, ticket(5))),
+                rga_node(primitive_str("4", ticket(6))),
+            ],
+            created_at: ticket(3),
+            moved_at: None,
+            removed_at: None,
+        }
+    }
+
+    fn rga_node(element: WireJsonElement) -> WireRgaNode {
+        WireRgaNode {
+            element: Some(element),
+            position_created_at: None,
+            position_moved_at: None,
+            position_removed_at: None,
+        }
+    }
+
+    fn text_element(value: &str, created_at: TimeTicket) -> WireJsonElement {
+        WireJsonElement::Text {
+            nodes: vec![WireTextNode {
+                id: WireTextNodeId {
+                    created_at: created_at.clone(),
+                    offset: 0,
+                },
+                value: value.to_owned(),
+                removed_at: None,
+                ins_prev_id: None,
+                attributes: BTreeMap::new(),
+            }],
+            created_at,
+            moved_at: None,
+            removed_at: None,
+        }
+    }
+
+    fn counter_i32(value: i32, created_at: TimeTicket) -> WireJsonElement {
+        WireJsonElement::Counter {
+            value_type: WireValueType::IntegerCnt,
+            value: value.to_le_bytes().to_vec(),
+            hll_registers: Vec::new(),
+            created_at,
+            moved_at: None,
+            removed_at: None,
+        }
+    }
+
+    fn primitive_bool(value: bool, created_at: TimeTicket) -> WireJsonElement {
+        WireJsonElement::Primitive {
+            value_type: WireValueType::Boolean,
+            value: vec![u8::from(value)],
+            created_at,
+            moved_at: None,
+            removed_at: None,
+        }
+    }
+
+    fn primitive_i32(value: i32, created_at: TimeTicket) -> WireJsonElement {
+        WireJsonElement::Primitive {
+            value_type: WireValueType::Integer,
+            value: value.to_le_bytes().to_vec(),
+            created_at,
+            moved_at: None,
+            removed_at: None,
+        }
+    }
+
+    fn primitive_str(value: &str, created_at: TimeTicket) -> WireJsonElement {
+        WireJsonElement::Primitive {
+            value_type: WireValueType::String,
+            value: value.as_bytes().to_vec(),
+            created_at,
+            moved_at: None,
+            removed_at: None,
+        }
     }
 
     fn sample_tree_element() -> WireJsonElement {
