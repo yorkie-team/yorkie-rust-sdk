@@ -693,8 +693,9 @@ Current Rust behavior:
   reconstruction, decoded snapshot application, and binary change-pack round
   trips.
 - Core wire tests now port the JS root bytes scenario for nested object, array,
-  text, and counter values, Go's standalone array bytes scenario, and the
-  JS/Go object-GC bytes scenario.
+  text, and counter values, Go's standalone array bytes scenario, the JS/Go
+  object-GC bytes scenario, and JS/Go tree bytes scenarios around plain tree
+  nodes, edit/style state, and merge metadata.
 
 JS/Go behavior:
 
@@ -714,10 +715,11 @@ Gap:
 - JS and Go both have direct converter tests for root/object bytes and tree
   bytes. Go also has direct array bytes, change-pack, presence, and snapshot
   converter tests. Rust currently covers object/array simple payload bytes,
-  root/object bytes at core wire level, standalone array bytes at core wire
-  level, object-GC bytes at core wire level, change-pack replay, and a
-  generated-protobuf snapshot apply path. Tree bytes and presence remain
-  blocked by missing public tree facade and presence model.
+  root/object bytes at core wire level, standalone array/tree bytes at core
+  wire level, object-GC bytes at core wire level, tree edit/style and
+  merge-state root bytes at core wire level, change-pack replay, and a
+  generated-protobuf snapshot apply path. Presence remains blocked by the
+  missing presence model.
 
 Expected direction:
 

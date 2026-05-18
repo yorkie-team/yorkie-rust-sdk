@@ -1441,6 +1441,180 @@ mod tests {
     }
 
     #[test]
+    fn roundtrips_tree_nodes_through_wire_shape() -> Result<()> {
+        let root = TreeNode::create_element(
+            tree_node_id(1, 0),
+            "r",
+            None,
+            vec![
+                TreeNode::create_element(
+                    tree_node_id(2, 0),
+                    "p",
+                    None,
+                    vec![TreeNode::create_text(tree_node_id(3, 0), "hello")],
+                ),
+                TreeNode::create_element(
+                    tree_node_id(4, 0),
+                    "p",
+                    None,
+                    vec![TreeNode::create_text(tree_node_id(5, 0), "world")],
+                ),
+            ],
+        );
+
+        let wire = wire_tree_nodes_from_domain(&root);
+        let roundtripped = wire_tree_nodes_to_domain(wire)?;
+
+        assert_eq!(root.to_json(), roundtripped.to_json());
+        assert_eq!(root.to_xml(), roundtripped.to_xml());
+        Ok(())
+    }
+
+    #[test]
+    fn roundtrips_tree_json_element_like_converter_tree_bytes() -> Result<()> {
+        let tree = CrdtTree::create(
+            TreeNode::create_element(
+                tree_node_id(1, 0),
+                "r",
+                None,
+                vec![
+                    TreeNode::create_element(
+                        tree_node_id(2, 0),
+                        "p",
+                        None,
+                        vec![TreeNode::create_text(tree_node_id(3, 0), "hello")],
+                    ),
+                    TreeNode::create_element(
+                        tree_node_id(4, 0),
+                        "p",
+                        None,
+                        vec![TreeNode::create_text(tree_node_id(5, 0), "world")],
+                    ),
+                ],
+            ),
+            ticket(10),
+        );
+        let element = CrdtElement::tree(tree);
+        let CrdtElement::Tree(source_tree) = &element else {
+            return Err(YorkieError::UnsupportedProtocolConversion("expected tree"));
+        };
+        let wire = WireJsonElement::try_from(&element)?;
+        let roundtripped = CrdtElement::try_from(wire)?;
+
+        assert_eq!(r#"<r><p>hello</p><p>world</p></r>"#, source_tree.to_xml());
+        assert_eq!(element.to_sorted_json(), roundtripped.to_sorted_json());
+        let CrdtElement::Tree(tree) = roundtripped else {
+            return Err(YorkieError::UnsupportedProtocolConversion("expected tree"));
+        };
+        assert_eq!(r#"<r><p>hello</p><p>world</p></r>"#, tree.to_xml());
+        Ok(())
+    }
+
+    #[test]
+    fn preserves_tree_edit_style_state_across_root_roundtrip() -> Result<()> {
+        let tree_at = ticket(1);
+        let mut tree = CrdtTree::create(
+            TreeNode::create_element(
+                tree_node_id(2, 0),
+                "r",
+                None,
+                vec![
+                    TreeNode::create_element(
+                        tree_node_id(3, 0),
+                        "p",
+                        None,
+                        vec![TreeNode::create_text(tree_node_id(4, 0), "12")],
+                    ),
+                    TreeNode::create_element(
+                        tree_node_id(5, 0),
+                        "p",
+                        None,
+                        vec![TreeNode::create_text(tree_node_id(6, 0), "34")],
+                    ),
+                ],
+            ),
+            tree_at.clone(),
+        );
+
+        let range = (tree.path_to_pos(&[0, 1])?, tree.path_to_pos(&[1, 1])?);
+        tree.edit_by_range_with_changes(range, None, 0, ticket(10), None)?;
+        let style_range = (tree.find_pos(0, true)?, tree.find_pos(1, true)?);
+        tree.style_by_range_with_changes(
+            style_range.clone(),
+            BTreeMap::from([
+                ("b".to_owned(), "t".to_owned()),
+                ("i".to_owned(), "t".to_owned()),
+            ]),
+            ticket(11),
+            None,
+        )?;
+        assert_eq!(r#"<r><p b="t" i="t">14</p></r>"#, tree.to_xml());
+        tree.remove_style_by_range_with_changes(style_range, &["i".to_owned()], ticket(12), None)?;
+        assert_eq!(r#"<r><p b="t">14</p></r>"#, tree.to_xml());
+
+        let root = CrdtRoot::new(CrdtObject::create_with_members(
+            TimeTicket::initial(),
+            [("tree", CrdtElement::tree(tree))],
+        ));
+        let roundtripped = roundtrip_root_json_element(&root)?;
+        let tree = roundtripped.tree_by_created_at(&tree_at).unwrap();
+
+        assert_eq!(r#"<r><p b="t">14</p></r>"#, tree.to_xml());
+        assert_eq!(tree.node_map_len(), tree.nodes().count());
+        assert_eq!(4, tree.root().len());
+        Ok(())
+    }
+
+    #[test]
+    fn preserves_tree_merge_state_across_root_roundtrip() -> Result<()> {
+        let tree_at = ticket(1);
+        let mut tree = CrdtTree::create(
+            TreeNode::create_element(
+                tree_node_id(2, 0),
+                "root",
+                None,
+                vec![
+                    TreeNode::create_element(
+                        tree_node_id(3, 0),
+                        "p",
+                        None,
+                        vec![TreeNode::create_text(tree_node_id(4, 0), "a")],
+                    ),
+                    TreeNode::create_element(
+                        tree_node_id(5, 0),
+                        "p",
+                        None,
+                        vec![TreeNode::create_text(tree_node_id(6, 0), "b")],
+                    ),
+                ],
+            ),
+            tree_at.clone(),
+        );
+        let range = (tree.find_pos(2, true)?, tree.find_pos(4, true)?);
+        tree.edit_by_range_with_changes(range, None, 0, ticket(10), None)?;
+        assert_eq!(r#"<root><p>ab</p></root>"#, tree.to_xml());
+
+        let root = CrdtRoot::new(CrdtObject::create_with_members(
+            TimeTicket::initial(),
+            [("t", CrdtElement::tree(tree))],
+        ));
+        let roundtripped = roundtrip_root_json_element(&root)?;
+        let tree = roundtripped.tree_by_created_at(&tree_at).unwrap();
+
+        assert_eq!(r#"<root><p>ab</p></root>"#, tree.to_xml());
+        let first_p = tree.root().all_children().next().unwrap();
+        let moved_child = first_p
+            .all_children()
+            .find(|child| child.merged_from().is_some())
+            .expect("moved child should carry merge source");
+        assert!(moved_child.merged_at().is_some());
+        let second_p = tree.root().all_children().nth(1).unwrap();
+        assert!(second_p.is_removed());
+        assert_eq!(Some(first_p.id()), second_p.merged_into());
+        Ok(())
+    }
+
+    #[test]
     fn preserves_object_gc_elements_across_json_element_roundtrip() -> Result<()> {
         let mut root = CrdtRoot::create();
         let object_at = ticket(1);
@@ -1524,5 +1698,9 @@ mod tests {
 
     fn ticket(lamport: i64) -> TimeTicket {
         TimeTicket::new(lamport, 0, "000000000000000000000001")
+    }
+
+    fn tree_node_id(lamport: i64, offset: usize) -> TreeNodeId {
+        TreeNodeId::new(ticket(lamport), offset)
     }
 }
