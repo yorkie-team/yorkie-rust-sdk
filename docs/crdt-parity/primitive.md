@@ -1,6 +1,6 @@
 # Primitive Parity
 
-Last reviewed: 2026-05-14
+Last reviewed: 2026-05-18
 
 ## References
 
@@ -9,7 +9,9 @@ Last reviewed: 2026-05-14
   `packages/sdk/test/unit/document/crdt/primitive_test.ts`
 - Go: `pkg/document/crdt/primitive.go`,
   `pkg/document/crdt/primitive_test.go`
-- Rust: `crates/yorkie-core/src/crdt/primitive.rs`
+- Rust: `crates/yorkie-core/src/crdt/primitive.rs`,
+  `crates/yorkie-core/src/wire.rs`,
+  `crates/yorkie-protocol/src/converter.rs`
 
 ## Scope
 
@@ -25,10 +27,10 @@ encoding, metadata, removal, movement, and deep copy.
 | Byte encoding | covered | Unit tests cover expected byte output and round trips. |
 | Metadata and deep copy | covered | Creation/removal metadata and deep copy are tested. |
 | Date/bytes edge cases | partial | Needs broader JS/Go parity once public JSON facade matures. |
-| Wire conversion | missing | No protocol conversion yet. |
+| Wire conversion | partial | Primitive simple elements, full primitive `JSONElement` payloads, and primitive operation operands convert to/from protobuf-shaped wire values. Cross-language binary fixtures are still missing. |
 
 ## Next Checks
 
 - Compare all JS primitive integration cases with Rust values.
 - Add date and binary edge cases if the public Rust value layer supports them.
-- Add protobuf conversion tests with exact type mapping.
+- Add JS/Go-produced protobuf fixtures with exact primitive type mapping.

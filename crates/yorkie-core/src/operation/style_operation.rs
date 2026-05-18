@@ -154,6 +154,22 @@ impl StyleOperation {
         self.meta.executed_at()
     }
 
+    pub(crate) fn from_pos(&self) -> &RgaTreeSplitPos {
+        &self.from_pos
+    }
+
+    pub(crate) fn to_pos(&self) -> &RgaTreeSplitPos {
+        &self.to_pos
+    }
+
+    pub(crate) fn attributes(&self) -> &BTreeMap<String, String> {
+        &self.attributes
+    }
+
+    pub(crate) fn attributes_to_remove(&self) -> &[String] {
+        &self.attributes_to_remove
+    }
+
     pub(crate) fn set_executed_at(&mut self, executed_at: TimeTicket) {
         self.meta.set_executed_at(executed_at);
     }

@@ -168,6 +168,26 @@ where
         self.removed_at.as_ref()
     }
 
+    pub(crate) fn ins_prev_id(&self) -> Option<&RgaTreeSplitNodeId> {
+        self.ins_prev_id.as_ref()
+    }
+
+    pub(crate) fn ins_next_id(&self) -> Option<&RgaTreeSplitNodeId> {
+        self.ins_next_id.as_ref()
+    }
+
+    pub(crate) fn set_removed_at(&mut self, removed_at: Option<TimeTicket>) {
+        self.removed_at = removed_at;
+    }
+
+    pub(crate) fn set_ins_prev_id(&mut self, id: Option<RgaTreeSplitNodeId>) {
+        self.ins_prev_id = id;
+    }
+
+    pub(crate) fn set_ins_next_id(&mut self, id: Option<RgaTreeSplitNodeId>) {
+        self.ins_next_id = id;
+    }
+
     pub(crate) fn is_removed(&self) -> bool {
         self.removed_at.is_some()
     }
@@ -484,6 +504,30 @@ where
 
     pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = &mut RgaTreeSplitNode<V>> {
         self.nodes.iter_mut().skip(1)
+    }
+
+    pub(crate) fn insert_after_id(
+        &mut self,
+        prev_id: &RgaTreeSplitNodeId,
+        node: RgaTreeSplitNode<V>,
+    ) -> Result<RgaTreeSplitNodeId> {
+        let prev_index = self.find_node_index(prev_id).ok_or_else(|| {
+            YorkieError::InvalidTextPosition(format!(
+                "node not found for {}",
+                prev_id.to_test_string()
+            ))
+        })?;
+        let inserted_id = node.id().clone();
+        self.insert_after_index(prev_index, node);
+        Ok(inserted_id)
+    }
+
+    pub(crate) fn find_node_mut_by_id(
+        &mut self,
+        id: &RgaTreeSplitNodeId,
+    ) -> Option<&mut RgaTreeSplitNode<V>> {
+        let index = self.find_node_index(id)?;
+        self.nodes.get_mut(index)
     }
 
     pub(crate) fn to_json(&self) -> String {

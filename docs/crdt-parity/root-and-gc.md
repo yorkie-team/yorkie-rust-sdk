@@ -1,6 +1,6 @@
 # Root and Garbage Collection Parity
 
-Last reviewed: 2026-05-15
+Last reviewed: 2026-05-18
 
 ## References
 
@@ -13,7 +13,9 @@ Last reviewed: 2026-05-15
   `pkg/document/crdt/gc.go`,
   `pkg/document/crdt/root_test.go`,
   `pkg/document/gc_test.go`
-- Rust: `crates/yorkie-core/src/crdt/root.rs`
+- Rust: `crates/yorkie-core/src/crdt/root.rs`,
+  `crates/yorkie-core/src/wire.rs`,
+  `crates/yorkie-protocol/src/converter.rs`
 
 ## Scope
 
@@ -35,7 +37,7 @@ deep copy/rebuild.
 | Document size accounting | partial | Current tests cover narrow slices, including array move/remove size consistency after root rebuild. Broad JS/Go size tests remain. |
 | Deep copy index rebuild | partial | Covered for current variants, including array moved/dead position lookup, counter root refresh, text GC pairs, and tree internal GC pairs. |
 | Sync lifecycle GC | blocked | Requires client/sync lifecycle and server version vectors. |
-| Snapshot GC rebuild | partial | Array moved/dead positions and text internal pairs rebuild through copied root objects; snapshot application is missing. |
+| Snapshot GC rebuild | partial | Array moved/dead positions and text/tree internal pairs rebuild through copied root objects. Full `JSONElement` protocol conversion can carry those internal nodes, but applying snapshot bytes to a document is still missing. |
 
 ## Next Checks
 

@@ -94,6 +94,22 @@ impl TreeEditOperation {
         self.meta.executed_at()
     }
 
+    pub(crate) fn from_pos(&self) -> &TreePos {
+        &self.from_pos
+    }
+
+    pub(crate) fn to_pos(&self) -> &TreePos {
+        &self.to_pos
+    }
+
+    pub(crate) fn contents(&self) -> Option<&[TreeNode]> {
+        self.contents.as_deref()
+    }
+
+    pub(crate) fn split_level(&self) -> usize {
+        self.split_level
+    }
+
     pub(crate) fn set_executed_at(&mut self, executed_at: TimeTicket) {
         self.meta.set_executed_at(executed_at);
     }

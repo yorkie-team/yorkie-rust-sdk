@@ -110,6 +110,36 @@ impl ElementRht {
         removed
     }
 
+    pub(crate) fn set_internal(&mut self, key: impl Into<String>, value: CrdtElement) {
+        let key = key.into();
+        let new_id = value.created_at().to_id_string();
+        let is_visible = !value.is_removed();
+        let positioned_at = value.positioned_at().clone();
+        let inserted = self
+            .node_by_created_at
+            .insert(new_id.clone(), ElementRhtNode::new(key.clone(), value))
+            .is_none();
+
+        if inserted {
+            self.created_order.push(new_id.clone());
+        }
+
+        if !is_visible {
+            return;
+        }
+
+        let should_be_visible = self
+            .node_by_key
+            .get(&key)
+            .and_then(|current_id| self.node_by_created_at.get(current_id))
+            .map(|current| positioned_at.after(current.value().positioned_at()))
+            .unwrap_or(true);
+
+        if should_be_visible {
+            self.node_by_key.insert(key, new_id);
+        }
+    }
+
     pub(crate) fn delete(
         &mut self,
         created_at: &TimeTicket,

@@ -225,6 +225,10 @@ impl TreeNode {
         self.merged_into = id;
     }
 
+    pub(crate) fn set_removed_at(&mut self, removed_at: Option<TimeTicket>) {
+        self.removed_at = removed_at;
+    }
+
     pub(crate) fn is_text(&self) -> bool {
         self.node_type == DEFAULT_TEXT_TYPE
     }

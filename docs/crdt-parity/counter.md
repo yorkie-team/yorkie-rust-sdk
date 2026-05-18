@@ -26,12 +26,12 @@ operation, concurrent increments, JSON output, data size, and protocol mapping.
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| CRDT counter element | partial | Rust has regular integer, long, and integer-dedup counters, element dispatch, JSON output, bytes, deep copy, HLL restore, data size, and public JSON construction paths. Wire construction is still missing. |
+| CRDT counter element | partial | Rust has regular integer, long, and integer-dedup counters, element dispatch, JSON output, bytes, deep copy, HLL restore, data size, public JSON construction paths, and full wire `JSONElement.Counter` conversion. Broader JS/Go integration fixtures are still missing. |
 | HLL dedup core | covered | Rust uses precision 14, xxhash64 seed 0, register max-merge, 16KB register serialization, and restore behavior matching JS/Go. |
 | Increase operation | partial | Rust has operation-level increase for primitive numeric operands, op info, reverse op generation, root index refresh, actor-based dedup increases, and public recorder integration. History and sync integration are still missing. |
 | Public JSON counter facade | partial | `JsonCounter` supports regular and dedup counters through object/array helpers, same-update creation and increase, existing-counter increase, long overflow, and dedup actor-add tests. The shape is Rust-specific rather than JS constructor/proxy syntax. |
 | Concurrent increment tests | missing | Port after client sync/history paths exist. |
-| Wire conversion | partial | Counter set and increase operations convert to generated protobuf payloads, including counter value types, primitive increase operands, and dedup actors. From-protocol conversion, protobuf binary round-trip tests, and full `JSONElement.Counter` HLL register conversion are still missing. |
+| Wire conversion | partial | Counter set and increase operations convert to/from generated protobuf payloads, including counter value types, primitive increase operands, dedup actors, binary change-pack round trips, and full `JSONElement.Counter` HLL register payloads. Cross-language binary fixtures are still missing. |
 
 ## Parity Notes
 
@@ -54,14 +54,14 @@ operation, concurrent increments, JSON output, data size, and protocol mapping.
 - `yorkie_protocol::converter::to_change_pack` follows JS/Go converter shape:
   counter element creation uses counter value types, while increase operands
   remain primitive numeric element-simple values.
+- `yorkie_protocol::converter::from_change_pack` reconstructs counter set and
+  increase operations back into core domain operations before document replay.
 
 ## Next Checks
 
 - Port concurrent counter tests through client sync and document history when
   those layers are available.
-- Add from-protocol conversion tests for counter element and increase
-  operation.
-- Add protocol conversion for full counter `JSONElement` payloads with HLL
-  register bytes.
+- Add JS/Go-produced binary fixtures for counter element and increase
+  operation payloads.
 - Revisit public constructor ergonomics once the top-level Rust SDK facade is
   shaped around typed document editing.

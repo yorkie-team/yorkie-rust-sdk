@@ -20,7 +20,9 @@ Last reviewed: 2026-05-18
   `crates/yorkie-core/src/operation/add_operation.rs`,
   `crates/yorkie-core/src/operation/move_operation.rs`,
   `crates/yorkie-core/src/operation/array_set_operation.rs`,
-  `crates/yorkie-core/src/operation/remove_operation.rs`
+  `crates/yorkie-core/src/operation/remove_operation.rs`,
+  `crates/yorkie-core/src/wire.rs`,
+  `crates/yorkie-protocol/src/converter.rs`
 
 ## Scope
 
@@ -44,8 +46,8 @@ application, public array mutation APIs, and sync-level convergence.
 | Upstream skipped history cases | blocked | JS skips array history undo matrix cases where a move is followed by a set. Rust must keep these skipped or ignored until upstream unskips them. See `upstream-skipped-tests.md`. |
 | Public `JsonArray` facade | partial | Plain value APIs cover index get/set/insert/remove, nested object/array access, read-only ID/value element lookup, value and ID search, ID-based insert/delete/move, index-based insert, and splice-like remove/insert sequences. During `Document::update`, these APIs record Add, ArraySet, Remove, and Move operations at the mutation site, including same-update parent creation, same-visible-value set calls, and nested edits after splice insertion. Mutable JS-style wrapped element proxies and live CRDT container mutation are still missing. |
 | Splay/index optimization | partial | `RgaTreeList` now keeps JS/Go-shaped position and element maps and uses weighted splay lookup for visible indexes and paths. Structural mutations still rebuild the indexes around the Rust `Vec` backing store instead of maintaining linked node handles incrementally. |
-| Snapshot restoration | partial | Root rebuild tests cover moved positions, dead positions, path lookup, and GC after copy; protocol snapshot conversion is still missing. |
-| Wire conversion | missing | No operation/protocol conversion yet. |
+| Snapshot restoration | partial | Root rebuild tests cover moved positions, dead positions, path lookup, and GC after copy. Protocol `JSONElement.Array` conversion now preserves live nodes, moved position nodes, and dead position nodes; applying snapshot bytes to a `Document` is still missing. |
+| Wire conversion | partial | Add/move/remove/array-set operations and full array `JSONElement` payloads convert to/from protobuf-shaped wire values. Broader JS/Go binary fixtures are still missing. |
 
 ## Next Checks
 
@@ -54,5 +56,5 @@ application, public array mutation APIs, and sync-level convergence.
   iterators or slices.
 - Replace the rebuild-on-mutation indexing strategy with stable node handles to
   match the JS/Go write-side implementation more closely.
-- Keep porting JS/Go array replay and snapshot restoration scenarios around
-  duplicate position IDs, moved positions, and dead position GC.
+- Add protocol-level replay fixtures around duplicate position IDs, moved
+  positions, dead positions, and GC.

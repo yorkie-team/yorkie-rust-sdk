@@ -223,9 +223,9 @@ Gap:
 - Public ID-based and splice-like array tests are connected at the recorder
   facade layer, but the implementation still replays operations after the
   callback rather than mutating live CRDT containers during the callback.
-- Protocol snapshot conversion is still missing, so `addDeadPosition` and
-  `addMovedElement` parity is covered internally but not through wire
-  snapshots yet.
+- Protocol `JSONElement.Array` conversion now preserves live RGA nodes, moved
+  position nodes, and dead position nodes. Snapshot application is still not
+  wired into `Document::apply_change_pack`.
 
 Expected direction:
 
@@ -267,10 +267,11 @@ Gap:
   `JsonValue` mutation can still bypass the recorder.
 - `Change` passes a version vector to operation execution, but array operations
   do not yet use version-vector visibility rules.
-- Rust now has a `yorkie_core::wire` projection for set/add/move/remove,
-  increase, and array-set operations when their payloads can be represented as
-  simple primitive/counter/text/tree element values. Full object/array element
-  payload encoding and from-wire operation construction are still missing.
+- Rust now has `yorkie_core::wire` projections for set/add/move/remove,
+  edit/style/increase/tree-edit/tree-style/array-set operations, including
+  protobuf-shaped object/array/tree payload bytes and from-wire operation
+  construction. Broader replay tests for text/tree operation payloads are still
+  needed before treating this as full sync parity.
 - Rust `OpInfo` currently uses a separate `ArrayRemove` enum variant for
   clarity, while JS represents array removal as a `remove` op info carrying an
   index. This internal Rust shape may need to converge before exposing events.
@@ -323,11 +324,11 @@ Gap:
 - Rust uses explicit constructors and object/array helper methods instead of
   JavaScript's `new Counter(...)` syntax or Go's dynamic `any` value
   inference. The semantics are aligned, but the public shape is Rust-specific.
-- Counter creation and increase operations now convert to generated protobuf
-  payloads through `yorkie_core::wire` and `yorkie_protocol::converter`.
-  From-protocol conversion, protobuf binary round-trip tests, and full
-  snapshot `JSONElement.Counter` conversion with HLL register payloads are
-  still missing.
+- Counter creation and increase operations now convert to and from generated
+  protobuf payloads through `yorkie_core::wire` and
+  `yorkie_protocol::converter`. Binary `ChangePack` round-trip tests cover
+  counter replay, and full `JSONElement.Counter` conversion carries HLL
+  register payloads for dedup counters.
 - Change-level concurrent counter tests are still missing because the public
   editing path does not yet include client sync/history.
 
@@ -335,7 +336,8 @@ Expected direction:
 
 - Port JS counter integration tests incrementally, using Go for typed CRDT
   edge cases such as bytes, data size, and dedup behavior.
-- Add protocol conversion for dedup HLL register bytes and increase actors.
+- Add cross-language protocol fixtures for dedup HLL register bytes and
+  increase actors.
 
 ## Object and ElementRHT
 
@@ -399,7 +401,11 @@ Gap:
 - Rust `Rht::to_json` uses deterministic key ordering through `BTreeMap`.
   This matches Go marshaling and text's sorted attribute output, but JS
   `RHT.toJSON` itself follows `Map` insertion order.
-- Wire conversion for tree/text attributes is not implemented.
+- Wire conversion now maps text and tree attribute `Rht` nodes to protobuf
+  `NodeAttr` payloads. Text attributes follow the JS/Go text-node converter
+  shape where removed attribute flags are not restored through `TextNode`
+  attributes; tree attributes preserve `is_removed` through full `RHT`
+  conversion.
 
 Expected direction:
 
@@ -456,8 +462,10 @@ Gap:
   mutations instead of using JS/Go-style linked nodes with stable per-node index
   handles. Read lookup now follows the same splay/ID-map route, but write-side
   index maintenance is still conservative.
-- Rust `CrdtText` is not yet exposed through a public Text facade or wire
-  conversion.
+- Rust `CrdtText` is not yet exposed through a public Text facade. Wire
+  conversion exists for full `JSONElement.Text` snapshots and text
+  edit/style operation bodies, but replay coverage is still narrower than
+  JS/Go integration tests.
 - `StyleOperation` emits per-block style operation info from the text helper,
   but `EditOperation` still emits a single requested range instead of the full
   value-change list produced by JS `RGATreeSplit.edit`.
@@ -571,7 +579,9 @@ Gap:
 - Operation-time GC registration exists for split-free tree-node deletion,
   text-node split deletion, and visible-boundary merge source tombstones, but
   concurrent element split/merge deletion paths still need JS/Go parity.
-- Public Tree facade and wire conversion are missing.
+- Public Tree facade is missing. Wire conversion exists for full
+  `JSONElement.Tree` payloads and tree edit/style operation bodies, but
+  broader JS/Go protocol replay fixtures are still needed.
 - Tree attribute JSON/XML output follows the same scalar parsing helper as
   Text, but object/array attribute values still need broader JS parity tests
   before public style APIs expose them.
@@ -614,9 +624,10 @@ Gap:
 - Snapshot application is explicitly unsupported.
 - `ChangePack::is_removed` is stored but document removal behavior is not
   applied.
-- Change packs can be projected to generated protobuf payloads for supported
-  set/add/move/remove/increase/array-set operations. From-protocol
-  reconstruction and binary compatibility tests are not implemented.
+- Change packs can be projected to generated protobuf payloads and
+  reconstructed back into core `ChangePack` values for the current operation
+  set. Binary round-trip tests cover nested object/array/counter replay through
+  `Document::apply_change_pack`.
 - Sync/status transitions are not implemented.
 
 Expected direction:
@@ -654,18 +665,26 @@ Expected direction:
 
 Current Rust behavior:
 
-- `yorkie_core::wire` exposes a narrow projection of internal changes and
-  operations without making the internal CRDT and operation structs part of the
-  public SDK facade.
+- `yorkie_core::wire` exposes protocol-shaped projections of internal changes,
+  operations, simple elements, full JSON elements, RGA/RHT nodes, text nodes,
+  tree nodes, and positions without making the internal CRDT and operation
+  structs part of the public SDK facade.
 - `yorkie_protocol::yorkie::v1` includes checked-in generated Rust sources
   under `crates/yorkie-protocol/src/generated`, produced from vendored Yorkie
   protobuf files.
 - `yorkie_protocol::converter::to_change_pack` converts a core `ChangePack`
-  into generated protobuf payloads for set/add/move/remove/increase/array-set
-  operations when their element payloads are primitive, counter, text, or tree
-  simple values.
+  into generated protobuf payloads for set/add/move/remove/edit/style/increase/
+  tree-edit/tree-style/array-set operations.
+- `yorkie_protocol::converter::from_change_pack` reconstructs core
+  `ChangePack` values from generated protobuf payloads.
+- `encode_change_pack` and `decode_change_pack` provide prost binary
+  round-trip helpers.
+- Object, array, and tree simple element values follow the JS/Go converter
+  shape: the `JSONElementSimple.value` field contains an encoded full
+  `JSONElement` payload.
 - Protocol conversion tests cover actor bytes, version-vector base64 actor
-  keys, counter set/increase operations, and dedup counter increase actors.
+  keys, counter set/increase operations, dedup counter increase actors,
+  protobuf-to-domain reconstruction, and binary change-pack round trips.
 
 JS/Go behavior:
 
@@ -674,20 +693,17 @@ JS/Go behavior:
 
 Gap:
 
-- No protobuf-to-operation conversion.
-- Object/array simple element payload bytes, full `JSONElement` payloads,
-  text/tree operation bodies, snapshots, and presence changes are not converted
-  yet.
-- No snapshot encoding/decoding.
+- Presence changes are not converted yet.
+- Snapshot bytes are carried in `ChangePack`, and full `JSONElement`
+  conversion exists for object/array/primitive/text/counter/tree payloads, but
+  `Document::apply_change_pack` still rejects snapshot application.
 - No cross-language binary compatibility tests.
 
 Expected direction:
 
-- Extend the generated protobuf converter in the same order as the in-memory
-  operation set: object/array bytes, full JSON element snapshots, text/tree
-  operations, then from-protocol reconstruction.
-- Add protobuf binary compatibility tests once the field-level conversion is
-  broader.
+- Add JS/Go-produced binary fixtures for the current field-level converter.
+- Implement snapshot application against `CrdtRoot` once snapshot sync is
+  pulled into the document lifecycle.
 - Use JS converter files and Yorkie proto definitions as the main reference,
   with Go as a server/client cross-check.
 

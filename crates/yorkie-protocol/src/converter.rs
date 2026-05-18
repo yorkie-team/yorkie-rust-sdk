@@ -1,9 +1,12 @@
 use crate::yorkie::v1 as api;
+use prost::Message;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use yorkie_core::wire::{
-    WireChange, WireChangeId, WireChangePack, WireJsonElementSimple, WireOperation, WireValueType,
+    WireChange, WireChangeId, WireChangePack, WireJsonElement, WireJsonElementSimple, WireNodeAttr,
+    WireOperation, WireRgaNode, WireRhtNode, WireTextNode, WireTextNodeId, WireTextNodePos,
+    WireTreeNode, WireTreeNodeId, WireTreePos, WireValueType,
 };
 use yorkie_core::{ChangePack as CoreChangePack, Checkpoint as CoreCheckpoint};
 use yorkie_core::{TimeTicket as CoreTimeTicket, VersionVector as CoreVersionVector, YorkieError};
@@ -11,7 +14,12 @@ use yorkie_core::{TimeTicket as CoreTimeTicket, VersionVector as CoreVersionVect
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtocolError {
     Core(YorkieError),
+    Decode(String),
     InvalidActorId(String),
+    InvalidBase64(String),
+    InvalidOffset { field: &'static str, value: i32 },
+    MissingField(&'static str),
+    UnsupportedValueType(i32),
 }
 
 pub type Result<T> = std::result::Result<T, ProtocolError>;
@@ -20,7 +28,16 @@ impl Display for ProtocolError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Core(err) => Display::fmt(err, f),
+            Self::Decode(err) => write!(f, "protobuf decode failed: {err}"),
             Self::InvalidActorId(actor_id) => write!(f, "invalid actor id {actor_id:?}"),
+            Self::InvalidBase64(value) => write!(f, "invalid base64 value {value:?}"),
+            Self::InvalidOffset { field, value } => {
+                write!(f, "invalid negative offset for {field}: {value}")
+            }
+            Self::MissingField(field) => write!(f, "missing protobuf field {field}"),
+            Self::UnsupportedValueType(value_type) => {
+                write!(f, "unsupported protobuf value type {value_type}")
+            }
         }
     }
 }
@@ -33,9 +50,29 @@ impl From<YorkieError> for ProtocolError {
     }
 }
 
+impl From<prost::DecodeError> for ProtocolError {
+    fn from(value: prost::DecodeError) -> Self {
+        Self::Decode(value.to_string())
+    }
+}
+
 pub fn to_change_pack(pack: &CoreChangePack) -> Result<api::ChangePack> {
     let pack = WireChangePack::try_from(pack)?;
     wire_change_pack_to_proto(&pack)
+}
+
+pub fn from_change_pack(pack: &api::ChangePack) -> Result<CoreChangePack> {
+    let pack = proto_change_pack_to_wire(pack)?;
+    Ok(CoreChangePack::try_from(pack)?)
+}
+
+pub fn encode_change_pack(pack: &CoreChangePack) -> Result<Vec<u8>> {
+    Ok(to_change_pack(pack)?.encode_to_vec())
+}
+
+pub fn decode_change_pack(bytes: &[u8]) -> Result<CoreChangePack> {
+    let pack = api::ChangePack::decode(bytes)?;
+    from_change_pack(&pack)
 }
 
 pub fn to_checkpoint(checkpoint: CoreCheckpoint) -> api::Checkpoint {
@@ -45,12 +82,24 @@ pub fn to_checkpoint(checkpoint: CoreCheckpoint) -> api::Checkpoint {
     }
 }
 
+pub fn from_checkpoint(checkpoint: api::Checkpoint) -> CoreCheckpoint {
+    CoreCheckpoint::new(checkpoint.server_seq, checkpoint.client_seq)
+}
+
 pub fn to_time_ticket(ticket: &CoreTimeTicket) -> Result<api::TimeTicket> {
     Ok(api::TimeTicket {
         lamport: ticket.lamport(),
         delimiter: ticket.delimiter(),
         actor_id: actor_id_to_bytes(ticket.actor_id())?,
     })
+}
+
+pub fn from_time_ticket(ticket: &api::TimeTicket) -> CoreTimeTicket {
+    CoreTimeTicket::new(
+        ticket.lamport,
+        ticket.delimiter,
+        bytes_to_actor_id(&ticket.actor_id),
+    )
 }
 
 pub fn to_version_vector(vector: &CoreVersionVector) -> Result<api::VersionVector> {
@@ -62,6 +111,15 @@ pub fn to_version_vector(vector: &CoreVersionVector) -> Result<api::VersionVecto
     Ok(api::VersionVector {
         vector: proto_vector,
     })
+}
+
+pub fn from_version_vector(vector: &api::VersionVector) -> Result<CoreVersionVector> {
+    let mut core_vector = CoreVersionVector::new();
+    for (actor_id, lamport) in &vector.vector {
+        let actor_id = bytes_to_actor_id(&base64_decode(actor_id)?);
+        core_vector.set(actor_id, *lamport);
+    }
+    Ok(core_vector)
 }
 
 fn wire_change_pack_to_proto(pack: &WireChangePack) -> Result<api::ChangePack> {
@@ -84,6 +142,25 @@ fn wire_change_pack_to_proto(pack: &WireChangePack) -> Result<api::ChangePack> {
     })
 }
 
+fn proto_change_pack_to_wire(pack: &api::ChangePack) -> Result<WireChangePack> {
+    Ok(WireChangePack {
+        document_key: pack.document_key.clone(),
+        checkpoint: from_checkpoint(*required(&pack.checkpoint, "change_pack.checkpoint")?),
+        is_removed: pack.is_removed,
+        changes: pack
+            .changes
+            .iter()
+            .map(proto_change_to_wire)
+            .collect::<Result<Vec<_>>>()?,
+        snapshot: (!pack.snapshot.is_empty()).then(|| pack.snapshot.clone()),
+        version_vector: pack
+            .version_vector
+            .as_ref()
+            .map(from_version_vector)
+            .transpose()?,
+    })
+}
+
 fn wire_change_to_proto(change: &WireChange) -> Result<api::Change> {
     Ok(api::Change {
         id: Some(wire_change_id_to_proto(&change.id)?),
@@ -97,6 +174,18 @@ fn wire_change_to_proto(change: &WireChange) -> Result<api::Change> {
     })
 }
 
+fn proto_change_to_wire(change: &api::Change) -> Result<WireChange> {
+    Ok(WireChange {
+        id: proto_change_id_to_wire(required(&change.id, "change.id")?)?,
+        message: (!change.message.is_empty()).then(|| change.message.clone()),
+        operations: change
+            .operations
+            .iter()
+            .map(proto_operation_to_wire)
+            .collect::<Result<Vec<_>>>()?,
+    })
+}
+
 fn wire_change_id_to_proto(id: &WireChangeId) -> Result<api::ChangeId> {
     Ok(api::ChangeId {
         client_seq: id.client_seq,
@@ -104,6 +193,21 @@ fn wire_change_id_to_proto(id: &WireChangeId) -> Result<api::ChangeId> {
         lamport: id.lamport,
         actor_id: actor_id_to_bytes(&id.actor_id)?,
         version_vector: Some(to_version_vector(&id.version_vector)?),
+    })
+}
+
+fn proto_change_id_to_wire(id: &api::ChangeId) -> Result<WireChangeId> {
+    Ok(WireChangeId {
+        client_seq: id.client_seq,
+        server_seq: id.server_seq,
+        lamport: id.lamport,
+        actor_id: bytes_to_actor_id(&id.actor_id),
+        version_vector: id
+            .version_vector
+            .as_ref()
+            .map(from_version_vector)
+            .transpose()?
+            .unwrap_or_else(CoreVersionVector::new),
     })
 }
 
@@ -151,6 +255,38 @@ fn wire_operation_to_proto(operation: &WireOperation) -> Result<api::Operation> 
             created_at: Some(to_time_ticket(created_at)?),
             executed_at: Some(to_time_ticket(executed_at)?),
         }),
+        WireOperation::Edit {
+            parent_created_at,
+            from,
+            to,
+            content,
+            attributes,
+            executed_at,
+        } => api::operation::Body::Edit(api::operation::Edit {
+            parent_created_at: Some(to_time_ticket(parent_created_at)?),
+            from: Some(wire_text_node_pos_to_proto(from)?),
+            to: Some(wire_text_node_pos_to_proto(to)?),
+            created_at_map_by_actor: BTreeMap::new(),
+            content: content.clone(),
+            executed_at: Some(to_time_ticket(executed_at)?),
+            attributes: attributes.clone(),
+        }),
+        WireOperation::Style {
+            parent_created_at,
+            from,
+            to,
+            attributes,
+            attributes_to_remove,
+            executed_at,
+        } => api::operation::Body::Style(api::operation::Style {
+            parent_created_at: Some(to_time_ticket(parent_created_at)?),
+            from: Some(wire_text_node_pos_to_proto(from)?),
+            to: Some(wire_text_node_pos_to_proto(to)?),
+            attributes: attributes.clone(),
+            executed_at: Some(to_time_ticket(executed_at)?),
+            created_at_map_by_actor: BTreeMap::new(),
+            attributes_to_remove: attributes_to_remove.clone(),
+        }),
         WireOperation::Increase {
             parent_created_at,
             value,
@@ -161,6 +297,51 @@ fn wire_operation_to_proto(operation: &WireOperation) -> Result<api::Operation> 
             value: Some(wire_json_element_simple_to_proto(value)?),
             executed_at: Some(to_time_ticket(executed_at)?),
             actor: actor.clone().unwrap_or_default(),
+        }),
+        WireOperation::TreeEdit {
+            parent_created_at,
+            from,
+            to,
+            contents,
+            split_level,
+            executed_at,
+        } => api::operation::Body::TreeEdit(api::operation::TreeEdit {
+            parent_created_at: Some(to_time_ticket(parent_created_at)?),
+            from: Some(wire_tree_pos_to_proto(from)?),
+            to: Some(wire_tree_pos_to_proto(to)?),
+            created_at_map_by_actor: BTreeMap::new(),
+            contents: contents
+                .as_ref()
+                .map(|groups| {
+                    groups
+                        .iter()
+                        .map(wire_tree_nodes_to_proto)
+                        .collect::<Result<Vec<_>>>()
+                })
+                .transpose()?
+                .unwrap_or_default(),
+            split_level: i32_from_usize(*split_level, "tree_edit.split_level")?,
+            executed_at: Some(to_time_ticket(executed_at)?),
+        }),
+        WireOperation::TreeStyle {
+            parent_created_at,
+            from,
+            to,
+            attributes,
+            attributes_to_remove,
+            executed_at,
+        } => api::operation::Body::TreeStyle(api::operation::TreeStyle {
+            parent_created_at: Some(to_time_ticket(parent_created_at)?),
+            from: Some(wire_tree_pos_to_proto(from)?),
+            to: Some(wire_tree_pos_to_proto(to)?),
+            attributes: if attributes_to_remove.is_empty() {
+                attributes.clone()
+            } else {
+                BTreeMap::new()
+            },
+            executed_at: Some(to_time_ticket(executed_at)?),
+            attributes_to_remove: attributes_to_remove.clone(),
+            created_at_map_by_actor: BTreeMap::new(),
         }),
         WireOperation::ArraySet {
             parent_created_at,
@@ -178,15 +359,627 @@ fn wire_operation_to_proto(operation: &WireOperation) -> Result<api::Operation> 
     Ok(api::Operation { body: Some(body) })
 }
 
+fn proto_operation_to_wire(operation: &api::Operation) -> Result<WireOperation> {
+    let body = required(&operation.body, "operation.body")?;
+    match body {
+        api::operation::Body::Set(operation) => Ok(WireOperation::Set {
+            parent_created_at: proto_required_time_ticket(
+                &operation.parent_created_at,
+                "operation.set.parent_created_at",
+            )?,
+            key: operation.key.clone(),
+            value: proto_json_element_simple_to_wire(required(
+                &operation.value,
+                "operation.set.value",
+            )?)?,
+            executed_at: proto_required_time_ticket(
+                &operation.executed_at,
+                "operation.set.executed_at",
+            )?,
+        }),
+        api::operation::Body::Add(operation) => Ok(WireOperation::Add {
+            parent_created_at: proto_required_time_ticket(
+                &operation.parent_created_at,
+                "operation.add.parent_created_at",
+            )?,
+            prev_created_at: proto_required_time_ticket(
+                &operation.prev_created_at,
+                "operation.add.prev_created_at",
+            )?,
+            value: proto_json_element_simple_to_wire(required(
+                &operation.value,
+                "operation.add.value",
+            )?)?,
+            executed_at: proto_required_time_ticket(
+                &operation.executed_at,
+                "operation.add.executed_at",
+            )?,
+        }),
+        api::operation::Body::Move(operation) => Ok(WireOperation::Move {
+            parent_created_at: proto_required_time_ticket(
+                &operation.parent_created_at,
+                "operation.move.parent_created_at",
+            )?,
+            prev_created_at: proto_required_time_ticket(
+                &operation.prev_created_at,
+                "operation.move.prev_created_at",
+            )?,
+            created_at: proto_required_time_ticket(
+                &operation.created_at,
+                "operation.move.created_at",
+            )?,
+            executed_at: proto_required_time_ticket(
+                &operation.executed_at,
+                "operation.move.executed_at",
+            )?,
+        }),
+        api::operation::Body::Remove(operation) => Ok(WireOperation::Remove {
+            parent_created_at: proto_required_time_ticket(
+                &operation.parent_created_at,
+                "operation.remove.parent_created_at",
+            )?,
+            created_at: proto_required_time_ticket(
+                &operation.created_at,
+                "operation.remove.created_at",
+            )?,
+            executed_at: proto_required_time_ticket(
+                &operation.executed_at,
+                "operation.remove.executed_at",
+            )?,
+        }),
+        api::operation::Body::Edit(operation) => Ok(WireOperation::Edit {
+            parent_created_at: proto_required_time_ticket(
+                &operation.parent_created_at,
+                "operation.edit.parent_created_at",
+            )?,
+            from: proto_text_node_pos_to_wire(required(&operation.from, "operation.edit.from")?)?,
+            to: proto_text_node_pos_to_wire(required(&operation.to, "operation.edit.to")?)?,
+            content: operation.content.clone(),
+            attributes: operation.attributes.clone(),
+            executed_at: proto_required_time_ticket(
+                &operation.executed_at,
+                "operation.edit.executed_at",
+            )?,
+        }),
+        api::operation::Body::Style(operation) => Ok(WireOperation::Style {
+            parent_created_at: proto_required_time_ticket(
+                &operation.parent_created_at,
+                "operation.style.parent_created_at",
+            )?,
+            from: proto_text_node_pos_to_wire(required(&operation.from, "operation.style.from")?)?,
+            to: proto_text_node_pos_to_wire(required(&operation.to, "operation.style.to")?)?,
+            attributes: operation.attributes.clone(),
+            attributes_to_remove: operation.attributes_to_remove.clone(),
+            executed_at: proto_required_time_ticket(
+                &operation.executed_at,
+                "operation.style.executed_at",
+            )?,
+        }),
+        api::operation::Body::Increase(operation) => Ok(WireOperation::Increase {
+            parent_created_at: proto_required_time_ticket(
+                &operation.parent_created_at,
+                "operation.increase.parent_created_at",
+            )?,
+            value: proto_json_element_simple_to_wire(required(
+                &operation.value,
+                "operation.increase.value",
+            )?)?,
+            executed_at: proto_required_time_ticket(
+                &operation.executed_at,
+                "operation.increase.executed_at",
+            )?,
+            actor: (!operation.actor.is_empty()).then(|| operation.actor.clone()),
+        }),
+        api::operation::Body::TreeEdit(operation) => Ok(WireOperation::TreeEdit {
+            parent_created_at: proto_required_time_ticket(
+                &operation.parent_created_at,
+                "operation.tree_edit.parent_created_at",
+            )?,
+            from: proto_tree_pos_to_wire(required(&operation.from, "operation.tree_edit.from")?)?,
+            to: proto_tree_pos_to_wire(required(&operation.to, "operation.tree_edit.to")?)?,
+            contents: (!operation.contents.is_empty())
+                .then(|| {
+                    operation
+                        .contents
+                        .iter()
+                        .map(proto_tree_nodes_to_wire)
+                        .collect::<Result<Vec<_>>>()
+                })
+                .transpose()?,
+            split_level: usize_from_i32(operation.split_level, "operation.tree_edit.split_level")?,
+            executed_at: proto_required_time_ticket(
+                &operation.executed_at,
+                "operation.tree_edit.executed_at",
+            )?,
+        }),
+        api::operation::Body::TreeStyle(operation) => Ok(WireOperation::TreeStyle {
+            parent_created_at: proto_required_time_ticket(
+                &operation.parent_created_at,
+                "operation.tree_style.parent_created_at",
+            )?,
+            from: proto_tree_pos_to_wire(required(&operation.from, "operation.tree_style.from")?)?,
+            to: proto_tree_pos_to_wire(required(&operation.to, "operation.tree_style.to")?)?,
+            attributes: if operation.attributes_to_remove.is_empty() {
+                operation.attributes.clone()
+            } else {
+                BTreeMap::new()
+            },
+            attributes_to_remove: operation.attributes_to_remove.clone(),
+            executed_at: proto_required_time_ticket(
+                &operation.executed_at,
+                "operation.tree_style.executed_at",
+            )?,
+        }),
+        api::operation::Body::ArraySet(operation) => Ok(WireOperation::ArraySet {
+            parent_created_at: proto_required_time_ticket(
+                &operation.parent_created_at,
+                "operation.array_set.parent_created_at",
+            )?,
+            created_at: proto_required_time_ticket(
+                &operation.created_at,
+                "operation.array_set.created_at",
+            )?,
+            value: proto_json_element_simple_to_wire(required(
+                &operation.value,
+                "operation.array_set.value",
+            )?)?,
+            executed_at: proto_required_time_ticket(
+                &operation.executed_at,
+                "operation.array_set.executed_at",
+            )?,
+        }),
+    }
+}
+
 fn wire_json_element_simple_to_proto(
     value: &WireJsonElementSimple,
 ) -> Result<api::JsonElementSimple> {
+    let encoded_value = if let Some(element) = &value.element {
+        wire_json_element_to_proto(element)?.encode_to_vec()
+    } else {
+        value.value.clone()
+    };
+
     Ok(api::JsonElementSimple {
         created_at: Some(to_time_ticket(&value.created_at)?),
         moved_at: value.moved_at.as_ref().map(to_time_ticket).transpose()?,
         removed_at: value.removed_at.as_ref().map(to_time_ticket).transpose()?,
         r#type: wire_value_type_to_proto(value.value_type) as i32,
+        value: encoded_value,
+    })
+}
+
+fn proto_json_element_simple_to_wire(
+    value: &api::JsonElementSimple,
+) -> Result<WireJsonElementSimple> {
+    let value_type = proto_value_type_to_wire(value.r#type)?;
+    let element = if matches!(
+        value_type,
+        WireValueType::JsonObject | WireValueType::JsonArray | WireValueType::Tree
+    ) && !value.value.is_empty()
+    {
+        let element = api::JsonElement::decode(value.value.as_slice())?;
+        Some(Box::new(proto_json_element_to_wire(&element)?))
+    } else {
+        None
+    };
+
+    Ok(WireJsonElementSimple {
+        created_at: proto_required_time_ticket(
+            &value.created_at,
+            "json_element_simple.created_at",
+        )?,
+        moved_at: proto_optional_time_ticket(&value.moved_at),
+        removed_at: proto_optional_time_ticket(&value.removed_at),
+        value_type,
         value: value.value.clone(),
+        element,
+    })
+}
+
+fn wire_json_element_to_proto(element: &WireJsonElement) -> Result<api::JsonElement> {
+    let body = match element {
+        WireJsonElement::Object {
+            nodes,
+            created_at,
+            moved_at,
+            removed_at,
+        } => api::json_element::Body::JsonObject(api::json_element::JsonObject {
+            nodes: nodes
+                .iter()
+                .map(wire_rht_node_to_proto)
+                .collect::<Result<Vec<_>>>()?,
+            created_at: Some(to_time_ticket(created_at)?),
+            moved_at: moved_at.as_ref().map(to_time_ticket).transpose()?,
+            removed_at: removed_at.as_ref().map(to_time_ticket).transpose()?,
+        }),
+        WireJsonElement::Array {
+            nodes,
+            created_at,
+            moved_at,
+            removed_at,
+        } => api::json_element::Body::JsonArray(api::json_element::JsonArray {
+            nodes: nodes
+                .iter()
+                .map(wire_rga_node_to_proto)
+                .collect::<Result<Vec<_>>>()?,
+            created_at: Some(to_time_ticket(created_at)?),
+            moved_at: moved_at.as_ref().map(to_time_ticket).transpose()?,
+            removed_at: removed_at.as_ref().map(to_time_ticket).transpose()?,
+        }),
+        WireJsonElement::Primitive {
+            value_type,
+            value,
+            created_at,
+            moved_at,
+            removed_at,
+        } => api::json_element::Body::Primitive(api::json_element::Primitive {
+            r#type: wire_value_type_to_proto(*value_type) as i32,
+            value: value.clone(),
+            created_at: Some(to_time_ticket(created_at)?),
+            moved_at: moved_at.as_ref().map(to_time_ticket).transpose()?,
+            removed_at: removed_at.as_ref().map(to_time_ticket).transpose()?,
+        }),
+        WireJsonElement::Text {
+            nodes,
+            created_at,
+            moved_at,
+            removed_at,
+        } => api::json_element::Body::Text(api::json_element::Text {
+            nodes: nodes
+                .iter()
+                .map(wire_text_node_to_proto)
+                .collect::<Result<Vec<_>>>()?,
+            created_at: Some(to_time_ticket(created_at)?),
+            moved_at: moved_at.as_ref().map(to_time_ticket).transpose()?,
+            removed_at: removed_at.as_ref().map(to_time_ticket).transpose()?,
+        }),
+        WireJsonElement::Counter {
+            value_type,
+            value,
+            hll_registers,
+            created_at,
+            moved_at,
+            removed_at,
+        } => api::json_element::Body::Counter(api::json_element::Counter {
+            r#type: wire_value_type_to_proto(*value_type) as i32,
+            value: value.clone(),
+            created_at: Some(to_time_ticket(created_at)?),
+            moved_at: moved_at.as_ref().map(to_time_ticket).transpose()?,
+            removed_at: removed_at.as_ref().map(to_time_ticket).transpose()?,
+            hll_registers: hll_registers.clone(),
+        }),
+        WireJsonElement::Tree {
+            nodes,
+            created_at,
+            moved_at,
+            removed_at,
+        } => api::json_element::Body::Tree(api::json_element::Tree {
+            nodes: nodes
+                .iter()
+                .map(wire_tree_node_to_proto)
+                .collect::<Result<Vec<_>>>()?,
+            created_at: Some(to_time_ticket(created_at)?),
+            moved_at: moved_at.as_ref().map(to_time_ticket).transpose()?,
+            removed_at: removed_at.as_ref().map(to_time_ticket).transpose()?,
+        }),
+    };
+
+    Ok(api::JsonElement { body: Some(body) })
+}
+
+fn proto_json_element_to_wire(element: &api::JsonElement) -> Result<WireJsonElement> {
+    let body = required(&element.body, "json_element.body")?;
+    match body {
+        api::json_element::Body::JsonObject(object) => Ok(WireJsonElement::Object {
+            nodes: object
+                .nodes
+                .iter()
+                .map(proto_rht_node_to_wire)
+                .collect::<Result<Vec<_>>>()?,
+            created_at: proto_required_time_ticket(&object.created_at, "json_object.created_at")?,
+            moved_at: proto_optional_time_ticket(&object.moved_at),
+            removed_at: proto_optional_time_ticket(&object.removed_at),
+        }),
+        api::json_element::Body::JsonArray(array) => Ok(WireJsonElement::Array {
+            nodes: array
+                .nodes
+                .iter()
+                .map(proto_rga_node_to_wire)
+                .collect::<Result<Vec<_>>>()?,
+            created_at: proto_required_time_ticket(&array.created_at, "json_array.created_at")?,
+            moved_at: proto_optional_time_ticket(&array.moved_at),
+            removed_at: proto_optional_time_ticket(&array.removed_at),
+        }),
+        api::json_element::Body::Primitive(primitive) => Ok(WireJsonElement::Primitive {
+            value_type: proto_value_type_to_wire(primitive.r#type)?,
+            value: primitive.value.clone(),
+            created_at: proto_required_time_ticket(&primitive.created_at, "primitive.created_at")?,
+            moved_at: proto_optional_time_ticket(&primitive.moved_at),
+            removed_at: proto_optional_time_ticket(&primitive.removed_at),
+        }),
+        api::json_element::Body::Text(text) => Ok(WireJsonElement::Text {
+            nodes: text
+                .nodes
+                .iter()
+                .map(proto_text_node_to_wire)
+                .collect::<Result<Vec<_>>>()?,
+            created_at: proto_required_time_ticket(&text.created_at, "text.created_at")?,
+            moved_at: proto_optional_time_ticket(&text.moved_at),
+            removed_at: proto_optional_time_ticket(&text.removed_at),
+        }),
+        api::json_element::Body::Counter(counter) => Ok(WireJsonElement::Counter {
+            value_type: proto_value_type_to_wire(counter.r#type)?,
+            value: counter.value.clone(),
+            hll_registers: counter.hll_registers.clone(),
+            created_at: proto_required_time_ticket(&counter.created_at, "counter.created_at")?,
+            moved_at: proto_optional_time_ticket(&counter.moved_at),
+            removed_at: proto_optional_time_ticket(&counter.removed_at),
+        }),
+        api::json_element::Body::Tree(tree) => Ok(WireJsonElement::Tree {
+            nodes: tree
+                .nodes
+                .iter()
+                .map(proto_tree_node_to_wire)
+                .collect::<Result<Vec<_>>>()?,
+            created_at: proto_required_time_ticket(&tree.created_at, "tree.created_at")?,
+            moved_at: proto_optional_time_ticket(&tree.moved_at),
+            removed_at: proto_optional_time_ticket(&tree.removed_at),
+        }),
+    }
+}
+
+fn wire_rht_node_to_proto(node: &WireRhtNode) -> Result<api::RhtNode> {
+    Ok(api::RhtNode {
+        key: node.key.clone(),
+        element: Some(wire_json_element_to_proto(&node.element)?),
+    })
+}
+
+fn proto_rht_node_to_wire(node: &api::RhtNode) -> Result<WireRhtNode> {
+    Ok(WireRhtNode {
+        key: node.key.clone(),
+        element: proto_json_element_to_wire(required(&node.element, "rht_node.element")?)?,
+    })
+}
+
+fn wire_rga_node_to_proto(node: &WireRgaNode) -> Result<api::RgaNode> {
+    Ok(api::RgaNode {
+        next: None,
+        element: node
+            .element
+            .as_ref()
+            .map(wire_json_element_to_proto)
+            .transpose()?,
+        position_created_at: node
+            .position_created_at
+            .as_ref()
+            .map(to_time_ticket)
+            .transpose()?,
+        position_moved_at: node
+            .position_moved_at
+            .as_ref()
+            .map(to_time_ticket)
+            .transpose()?,
+        position_removed_at: node
+            .position_removed_at
+            .as_ref()
+            .map(to_time_ticket)
+            .transpose()?,
+    })
+}
+
+fn proto_rga_node_to_wire(node: &api::RgaNode) -> Result<WireRgaNode> {
+    Ok(WireRgaNode {
+        element: node
+            .element
+            .as_ref()
+            .map(proto_json_element_to_wire)
+            .transpose()?,
+        position_created_at: proto_optional_time_ticket(&node.position_created_at),
+        position_moved_at: proto_optional_time_ticket(&node.position_moved_at),
+        position_removed_at: proto_optional_time_ticket(&node.position_removed_at),
+    })
+}
+
+fn wire_text_node_to_proto(node: &WireTextNode) -> Result<api::TextNode> {
+    Ok(api::TextNode {
+        id: Some(wire_text_node_id_to_proto(&node.id)?),
+        value: node.value.clone(),
+        removed_at: node.removed_at.as_ref().map(to_time_ticket).transpose()?,
+        ins_prev_id: node
+            .ins_prev_id
+            .as_ref()
+            .map(wire_text_node_id_to_proto)
+            .transpose()?,
+        attributes: wire_attrs_to_proto(&node.attributes)?,
+    })
+}
+
+fn proto_text_node_to_wire(node: &api::TextNode) -> Result<WireTextNode> {
+    Ok(WireTextNode {
+        id: proto_text_node_id_to_wire(required(&node.id, "text_node.id")?)?,
+        value: node.value.clone(),
+        removed_at: proto_optional_time_ticket(&node.removed_at),
+        ins_prev_id: node
+            .ins_prev_id
+            .as_ref()
+            .map(proto_text_node_id_to_wire)
+            .transpose()?,
+        attributes: proto_attrs_to_wire(&node.attributes)?,
+    })
+}
+
+fn wire_tree_nodes_to_proto(nodes: &Vec<WireTreeNode>) -> Result<api::TreeNodes> {
+    Ok(api::TreeNodes {
+        content: nodes
+            .iter()
+            .map(wire_tree_node_to_proto)
+            .collect::<Result<Vec<_>>>()?,
+    })
+}
+
+fn proto_tree_nodes_to_wire(nodes: &api::TreeNodes) -> Result<Vec<WireTreeNode>> {
+    nodes
+        .content
+        .iter()
+        .map(proto_tree_node_to_wire)
+        .collect::<Result<Vec<_>>>()
+}
+
+fn wire_tree_node_to_proto(node: &WireTreeNode) -> Result<api::TreeNode> {
+    Ok(api::TreeNode {
+        id: Some(wire_tree_node_id_to_proto(&node.id)?),
+        r#type: node.node_type.clone(),
+        value: node.value.clone(),
+        removed_at: node.removed_at.as_ref().map(to_time_ticket).transpose()?,
+        ins_prev_id: node
+            .ins_prev_id
+            .as_ref()
+            .map(wire_tree_node_id_to_proto)
+            .transpose()?,
+        ins_next_id: node
+            .ins_next_id
+            .as_ref()
+            .map(wire_tree_node_id_to_proto)
+            .transpose()?,
+        depth: node.depth,
+        attributes: wire_attrs_to_proto(&node.attributes)?,
+        merged_from: node
+            .merged_from
+            .as_ref()
+            .map(wire_tree_node_id_to_proto)
+            .transpose()?,
+        merged_at: node.merged_at.as_ref().map(to_time_ticket).transpose()?,
+    })
+}
+
+fn proto_tree_node_to_wire(node: &api::TreeNode) -> Result<WireTreeNode> {
+    Ok(WireTreeNode {
+        id: proto_tree_node_id_to_wire(required(&node.id, "tree_node.id")?)?,
+        node_type: node.r#type.clone(),
+        value: node.value.clone(),
+        removed_at: proto_optional_time_ticket(&node.removed_at),
+        ins_prev_id: node
+            .ins_prev_id
+            .as_ref()
+            .map(proto_tree_node_id_to_wire)
+            .transpose()?,
+        ins_next_id: node
+            .ins_next_id
+            .as_ref()
+            .map(proto_tree_node_id_to_wire)
+            .transpose()?,
+        depth: node.depth,
+        attributes: proto_attrs_to_wire(&node.attributes)?,
+        merged_from: node
+            .merged_from
+            .as_ref()
+            .map(proto_tree_node_id_to_wire)
+            .transpose()?,
+        merged_at: proto_optional_time_ticket(&node.merged_at),
+    })
+}
+
+fn wire_attrs_to_proto(
+    attrs: &BTreeMap<String, WireNodeAttr>,
+) -> Result<BTreeMap<String, api::NodeAttr>> {
+    attrs
+        .iter()
+        .map(|(key, attr)| {
+            Ok((
+                key.clone(),
+                api::NodeAttr {
+                    value: attr.value.clone(),
+                    updated_at: Some(to_time_ticket(&attr.updated_at)?),
+                    is_removed: attr.is_removed,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn proto_attrs_to_wire(
+    attrs: &BTreeMap<String, api::NodeAttr>,
+) -> Result<BTreeMap<String, WireNodeAttr>> {
+    attrs
+        .iter()
+        .map(|(key, attr)| {
+            Ok((
+                key.clone(),
+                WireNodeAttr {
+                    value: attr.value.clone(),
+                    updated_at: proto_required_time_ticket(
+                        &attr.updated_at,
+                        "node_attr.updated_at",
+                    )?,
+                    is_removed: attr.is_removed,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn wire_text_node_id_to_proto(id: &WireTextNodeId) -> Result<api::TextNodeId> {
+    Ok(api::TextNodeId {
+        created_at: Some(to_time_ticket(&id.created_at)?),
+        offset: i32_from_usize(id.offset, "text_node_id.offset")?,
+    })
+}
+
+fn proto_text_node_id_to_wire(id: &api::TextNodeId) -> Result<WireTextNodeId> {
+    Ok(WireTextNodeId {
+        created_at: proto_required_time_ticket(&id.created_at, "text_node_id.created_at")?,
+        offset: usize_from_i32(id.offset, "text_node_id.offset")?,
+    })
+}
+
+fn wire_text_node_pos_to_proto(pos: &WireTextNodePos) -> Result<api::TextNodePos> {
+    Ok(api::TextNodePos {
+        created_at: Some(to_time_ticket(&pos.id.created_at)?),
+        offset: i32_from_usize(pos.id.offset, "text_node_pos.offset")?,
+        relative_offset: i32_from_usize(pos.relative_offset, "text_node_pos.relative_offset")?,
+    })
+}
+
+fn proto_text_node_pos_to_wire(pos: &api::TextNodePos) -> Result<WireTextNodePos> {
+    Ok(WireTextNodePos {
+        id: WireTextNodeId {
+            created_at: proto_required_time_ticket(&pos.created_at, "text_node_pos.created_at")?,
+            offset: usize_from_i32(pos.offset, "text_node_pos.offset")?,
+        },
+        relative_offset: usize_from_i32(pos.relative_offset, "text_node_pos.relative_offset")?,
+    })
+}
+
+fn wire_tree_node_id_to_proto(id: &WireTreeNodeId) -> Result<api::TreeNodeId> {
+    Ok(api::TreeNodeId {
+        created_at: Some(to_time_ticket(&id.created_at)?),
+        offset: i32_from_usize(id.offset, "tree_node_id.offset")?,
+    })
+}
+
+fn proto_tree_node_id_to_wire(id: &api::TreeNodeId) -> Result<WireTreeNodeId> {
+    Ok(WireTreeNodeId {
+        created_at: proto_required_time_ticket(&id.created_at, "tree_node_id.created_at")?,
+        offset: usize_from_i32(id.offset, "tree_node_id.offset")?,
+    })
+}
+
+fn wire_tree_pos_to_proto(pos: &WireTreePos) -> Result<api::TreePos> {
+    Ok(api::TreePos {
+        parent_id: Some(wire_tree_node_id_to_proto(&pos.parent_id)?),
+        left_sibling_id: Some(wire_tree_node_id_to_proto(&pos.left_sibling_id)?),
+    })
+}
+
+fn proto_tree_pos_to_wire(pos: &api::TreePos) -> Result<WireTreePos> {
+    Ok(WireTreePos {
+        parent_id: proto_tree_node_id_to_wire(required(&pos.parent_id, "tree_pos.parent_id")?)?,
+        left_sibling_id: proto_tree_node_id_to_wire(required(
+            &pos.left_sibling_id,
+            "tree_pos.left_sibling_id",
+        )?)?,
     })
 }
 
@@ -210,6 +1003,54 @@ fn wire_value_type_to_proto(value_type: WireValueType) -> api::ValueType {
     }
 }
 
+fn proto_value_type_to_wire(value_type: i32) -> Result<WireValueType> {
+    match api::ValueType::try_from(value_type)
+        .map_err(|_| ProtocolError::UnsupportedValueType(value_type))?
+    {
+        api::ValueType::Null => Ok(WireValueType::Null),
+        api::ValueType::Boolean => Ok(WireValueType::Boolean),
+        api::ValueType::Integer => Ok(WireValueType::Integer),
+        api::ValueType::Long => Ok(WireValueType::Long),
+        api::ValueType::Double => Ok(WireValueType::Double),
+        api::ValueType::String => Ok(WireValueType::String),
+        api::ValueType::Bytes => Ok(WireValueType::Bytes),
+        api::ValueType::Date => Ok(WireValueType::Date),
+        api::ValueType::JsonObject => Ok(WireValueType::JsonObject),
+        api::ValueType::JsonArray => Ok(WireValueType::JsonArray),
+        api::ValueType::Text => Ok(WireValueType::Text),
+        api::ValueType::IntegerCnt => Ok(WireValueType::IntegerCnt),
+        api::ValueType::LongCnt => Ok(WireValueType::LongCnt),
+        api::ValueType::IntegerDedupCnt => Ok(WireValueType::IntegerDedupCnt),
+        api::ValueType::Tree => Ok(WireValueType::Tree),
+    }
+}
+
+fn proto_required_time_ticket(
+    ticket: &Option<api::TimeTicket>,
+    field: &'static str,
+) -> Result<CoreTimeTicket> {
+    Ok(from_time_ticket(required(ticket, field)?))
+}
+
+fn proto_optional_time_ticket(ticket: &Option<api::TimeTicket>) -> Option<CoreTimeTicket> {
+    ticket.as_ref().map(from_time_ticket)
+}
+
+fn required<'a, T>(value: &'a Option<T>, field: &'static str) -> Result<&'a T> {
+    value.as_ref().ok_or(ProtocolError::MissingField(field))
+}
+
+fn usize_from_i32(value: i32, field: &'static str) -> Result<usize> {
+    usize::try_from(value).map_err(|_| ProtocolError::InvalidOffset { field, value })
+}
+
+fn i32_from_usize(value: usize, field: &'static str) -> Result<i32> {
+    i32::try_from(value).map_err(|_| ProtocolError::InvalidOffset {
+        field,
+        value: i32::MIN,
+    })
+}
+
 fn actor_id_to_bytes(actor_id: impl AsRef<str>) -> Result<Vec<u8>> {
     let actor_id = actor_id.as_ref();
     if actor_id.len() % 2 != 0 {
@@ -223,6 +1064,14 @@ fn actor_id_to_bytes(actor_id: impl AsRef<str>) -> Result<Vec<u8>> {
         bytes.push(byte);
     }
     Ok(bytes)
+}
+
+fn bytes_to_actor_id(bytes: &[u8]) -> String {
+    let mut actor_id = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        actor_id.push_str(&format!("{byte:02x}"));
+    }
+    actor_id
 }
 
 fn base64_encode(bytes: &[u8]) -> String {
@@ -251,9 +1100,55 @@ fn base64_encode(bytes: &[u8]) -> String {
     encoded
 }
 
+fn base64_decode(value: &str) -> Result<Vec<u8>> {
+    if value.len() % 4 != 0 {
+        return Err(ProtocolError::InvalidBase64(value.to_owned()));
+    }
+
+    let mut bytes = Vec::with_capacity(value.len() / 4 * 3);
+    for chunk in value.as_bytes().chunks(4) {
+        let first = base64_value(chunk[0], value)?;
+        let second = base64_value(chunk[1], value)?;
+        let third = if chunk[2] == b'=' {
+            None
+        } else {
+            Some(base64_value(chunk[2], value)?)
+        };
+        let fourth = if chunk[3] == b'=' {
+            None
+        } else {
+            Some(base64_value(chunk[3], value)?)
+        };
+
+        bytes.push((first << 2) | (second >> 4));
+        if let Some(third) = third {
+            bytes.push(((second & 0b0000_1111) << 4) | (third >> 2));
+            if let Some(fourth) = fourth {
+                bytes.push(((third & 0b0000_0011) << 6) | fourth);
+            }
+        }
+    }
+
+    Ok(bytes)
+}
+
+fn base64_value(byte: u8, original: &str) -> Result<u8> {
+    match byte {
+        b'A'..=b'Z' => Ok(byte - b'A'),
+        b'a'..=b'z' => Ok(byte - b'a' + 26),
+        b'0'..=b'9' => Ok(byte - b'0' + 52),
+        b'+' => Ok(62),
+        b'/' => Ok(63),
+        _ => Err(ProtocolError::InvalidBase64(original.to_owned())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{to_change_pack, to_time_ticket, to_version_vector};
+    use super::{
+        decode_change_pack, encode_change_pack, from_change_pack, to_change_pack, to_time_ticket,
+        to_version_vector,
+    };
     use crate::yorkie::v1::{operation::Body, ValueType};
     use std::error::Error;
     use yorkie_core::{Document, TimeTicket};
@@ -339,6 +1234,53 @@ mod tests {
         let value = increase.value.as_ref().expect("increase value");
         assert_eq!(ValueType::Integer as i32, value.r#type);
         assert_eq!(1i32.to_le_bytes().to_vec(), value.value);
+        Ok(())
+    }
+
+    #[test]
+    fn decodes_proto_change_pack_into_core_domain() -> Result<(), Box<dyn Error>> {
+        let mut source = Document::new("source-doc");
+        let mut target = Document::new("target-doc");
+
+        source.update(|root| {
+            let mut profile = yorkie_core::JsonObject::new();
+            profile.set("name", "yorkie")?;
+            let mut todos = yorkie_core::JsonArray::new();
+            todos.push("write protocol")?.push(false)?;
+            root.set("profile", profile)?;
+            root.set("todos", todos)?;
+            root.set_counter("count", 1)?.increase(2i32)?;
+            Ok(())
+        })?;
+
+        let proto = to_change_pack(&source.create_change_pack())?;
+        let remote_pack = from_change_pack(&proto)?;
+        target.apply_change_pack(&remote_pack)?;
+
+        assert_eq!(
+            r#"{"count":3,"profile":{"name":"yorkie"},"todos":["write protocol",false]}"#,
+            target.to_sorted_json()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn roundtrips_binary_change_pack() -> Result<(), Box<dyn Error>> {
+        let mut source = Document::new("source-doc");
+        let mut target = Document::new("target-doc");
+
+        source.update(|root| {
+            let mut array = yorkie_core::JsonArray::new();
+            array.push("sync")?.push(1i32)?;
+            root.set("items", array)?;
+            Ok(())
+        })?;
+
+        let bytes = encode_change_pack(&source.create_change_pack())?;
+        let decoded = decode_change_pack(&bytes)?;
+        target.apply_change_pack(&decoded)?;
+
+        assert_eq!(r#"{"items":["sync",1]}"#, target.to_sorted_json());
         Ok(())
     }
 }

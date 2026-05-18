@@ -92,7 +92,7 @@ it has:
 | `ChangeContext` | `packages/sdk/src/document/change/context.ts` | Records operations during a local edit and issues time tickets from the next change ID. |
 | `Change` | `packages/sdk/src/document/change/change.ts` | Unit of document modification that executes operations and collects operation info and reverse operations. |
 | `ChangePack` | `packages/sdk/src/document/change/change_pack.ts` | Bundle of document key, checkpoint, changes, version vector, removal flag, and optional snapshot for sync. |
-| `yorkie_core::wire` | `packages/sdk/src/api/converter.ts`, proto files | Narrow projection from internal core changes and operations to protocol-facing values without exposing CRDT internals through the top-level SDK facade. |
+| `yorkie_core::wire` | `packages/sdk/src/api/converter.ts`, `../yorkie/api/converter/*` | Protocol-facing projection for changes, operations, simple elements, full JSON elements, RGA/RHT nodes, text nodes, tree nodes, and positions without exposing CRDT internals through the top-level SDK facade. |
 | `CrdtElementMeta` | `packages/sdk/src/document/crdt/element.ts` | Rust metadata holder for CRDT element timestamps. |
 | `CrdtElement` | `packages/sdk/src/document/crdt/element.ts` | Internal enum that exposes common element behavior across primitive, object, array, text, counter, and tree values. |
 | `CrdtPrimitive` | `packages/sdk/src/document/crdt/primitive.ts` | Internal CRDT element for leaf primitive values. |
@@ -130,7 +130,7 @@ it has:
 | `JsonCounter` | `packages/sdk/src/document/json/counter.ts` | Public counter facade for regular increase operations and dedup actor-add operations during `Document::update`. |
 | `JsonValue` | JS JSON element/proxy values | Temporary Rust wrapper for porting primitives, counters, objects, and arrays. |
 | `Client` | `packages/sdk/src/client/client.ts` | Currently scaffolded only. Lifecycle must follow JS. |
-| `yorkie-protocol` | `packages/sdk/src/api/converter.ts`, proto files | Checked-in generated protobuf types are produced from vendored Yorkie proto files; converters should track JS/proto field names and Go wire behavior. |
+| `yorkie-protocol` | `packages/sdk/src/api/converter.ts`, `../yorkie/api/converter/*`, proto files | Checked-in generated protobuf types are produced from vendored Yorkie proto files; converters encode/decode `ChangePack` values and should track JS/proto field names with Go wire behavior as a typed cross-check. |
 
 Update this table whenever a new Rust type becomes part of the porting surface.
 

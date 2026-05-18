@@ -223,6 +223,10 @@ impl CrdtText {
         self.rga_tree_split.is_empty()
     }
 
+    pub(crate) fn nodes(&self) -> impl Iterator<Item = &RgaTreeSplitNode<TextValue>> {
+        self.rga_tree_split.iter()
+    }
+
     pub(crate) fn index_range_to_pos_range(
         &self,
         from_idx: usize,

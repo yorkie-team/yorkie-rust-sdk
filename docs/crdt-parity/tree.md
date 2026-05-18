@@ -1,6 +1,6 @@
 # Tree Parity
 
-Last reviewed: 2026-05-15
+Last reviewed: 2026-05-18
 
 ## References
 
@@ -19,7 +19,9 @@ Last reviewed: 2026-05-15
   `crates/yorkie-core/src/crdt/element.rs`,
   `crates/yorkie-core/src/crdt/root.rs`,
   `crates/yorkie-core/src/operation/tree_edit_operation.rs`,
-  `crates/yorkie-core/src/operation/tree_style_operation.rs`
+  `crates/yorkie-core/src/operation/tree_style_operation.rs`,
+  `crates/yorkie-core/src/wire.rs`,
+  `crates/yorkie-protocol/src/converter.rs`
 
 ## Scope
 
@@ -41,7 +43,7 @@ concurrency, and protocol conversion.
 | Path/index conversion | partial | Rust now ports the JS/Go index/path/position conversion rules, including element padding, text-child paths, floor lookup for split text positions, parent/left path resolution, and token traversal for edit/style collection. It still recomputes over the current tree instead of maintaining the same stable index-tree structure as JS/Go. |
 | Upstream skipped history/unit cases | blocked | JS and Go carry skipped Tree cases around history redo, overlapping undo reconciliation, L2 split undo, mixed-level merge, and generated concurrency failures. Rust must keep these skipped or ignored until upstream unskips them. See `upstream-skipped-tests.md`. |
 | Public tree facade | missing | Depends on context-backed editing model. |
-| Wire conversion | missing | Depends on tree operations and protocol conversion. |
+| Wire conversion | partial | Full tree `JSONElement` payloads and tree edit/style operation bodies convert to/from protobuf-shaped wire values, including tree node IDs, positions, attributes, split links, and merge metadata. Public tree facade, snapshot application, and broad JS/Go binary fixtures are still missing. |
 
 ## Next Checks
 
@@ -54,3 +56,4 @@ concurrency, and protocol conversion.
   scenarios toward redo tagging and the broader concurrent edit matrix.
 - Keep split/merge metadata (`insPrevID`, `insNextID`, `mergedFrom`,
   `mergedAt`, `mergedInto`) aligned with JS/Go when adding edit operations.
+- Add protocol-level tree edit/style replay fixtures from JS/Go.

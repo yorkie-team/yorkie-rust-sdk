@@ -1,6 +1,6 @@
 # RHT Attributes Parity
 
-Last reviewed: 2026-05-15
+Last reviewed: 2026-05-18
 
 ## References
 
@@ -8,7 +8,9 @@ Last reviewed: 2026-05-15
 - JS tests: `packages/sdk/test/unit/document/crdt/rht_test.ts`
 - Go: `pkg/document/crdt/rht.go`,
   `pkg/document/crdt/rht_test.go`
-- Rust: `crates/yorkie-core/src/crdt/rht.rs`
+- Rust: `crates/yorkie-core/src/crdt/rht.rs`,
+  `crates/yorkie-core/src/wire.rs`,
+  `crates/yorkie-protocol/src/converter.rs`
 
 ## Scope
 
@@ -27,7 +29,7 @@ integration.
 | Text integration | covered | Text values use `Rht`; style operations register removed attribute GC pairs. |
 | Tree integration | partial | Tree nodes use `Rht`; visible attributes serialize to JSON/XML, removed attributes become root GC pairs when rebuilding from CRDT state, and tree style operations register removed attribute GC pairs during execution. |
 | JSON ordering | partial | Rust uses deterministic key ordering; direct JS `Map` ordering differs, while text output is aligned. |
-| Wire conversion | missing | No attribute protocol conversion yet. |
+| Wire conversion | partial | Text and tree attribute nodes convert through protobuf `NodeAttr`. Tree attributes preserve `is_removed`; text attributes follow the JS/Go text-node converter shape and do not restore removed flags from text-node attributes. |
 
 ## Next Checks
 
@@ -35,4 +37,4 @@ integration.
   style ranges.
 - Keep text output parity tests focused on `CRDTTextValue` serialization rather
   than raw `RHT.toJSON` insertion order.
-- Add protocol conversion once text/tree operations are converted.
+- Add JS/Go-produced protocol fixtures for removed text/tree attributes.
