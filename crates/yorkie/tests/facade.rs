@@ -4,8 +4,9 @@ use yorkie::{
     ClientCondition, ClientError, ClientStatus, ClientTransport, CounterType, CounterValue,
     DeactivateClientRequest, DeactivateClientResponse, DeactivateOptions, DetachDocumentRequest,
     DetachDocumentResponse, DetachOptions, DocStatus, Document, JsonCounter,
-    PushPullChangesRequest, PushPullChangesResponse, Result, SchemaRule, SyncMode, SyncOptions,
-    TimeTicket, TimeTicketStruct, TreeNodeRule, VersionVector,
+    PushPullChangesRequest, PushPullChangesResponse, RemoveDocumentRequest, RemoveDocumentResponse,
+    Result, SchemaRule, SyncMode, SyncOptions, TimeTicket, TimeTicketStruct, TreeNodeRule,
+    VersionVector,
 };
 
 #[derive(Debug, Default)]
@@ -13,6 +14,7 @@ struct FacadeTransport {
     activate_requests: usize,
     attach_requests: usize,
     detach_requests: usize,
+    remove_requests: usize,
     push_pull_requests: usize,
 }
 
@@ -57,6 +59,16 @@ impl ClientTransport for FacadeTransport {
     ) -> yorkie::ClientResult<DetachDocumentResponse> {
         self.detach_requests += 1;
         Ok(DetachDocumentResponse {
+            change_pack: request.change_pack,
+        })
+    }
+
+    fn remove_document(
+        &mut self,
+        request: RemoveDocumentRequest,
+    ) -> yorkie::ClientResult<RemoveDocumentResponse> {
+        self.remove_requests += 1;
+        Ok(RemoveDocumentResponse {
             change_pack: request.change_pack,
         })
     }
@@ -160,11 +172,10 @@ fn facade_exports_client_api() {
     assert!(!doc.has_local_changes());
     assert_eq!(1, transport.push_pull_requests);
     assert_eq!(SyncOptions::default(), SyncOptions { sync_mode: None });
-    client
-        .detach(&mut transport, &mut doc, DetachOptions)
-        .unwrap();
+    client.remove(&mut transport, &mut doc).unwrap();
     assert!(!client.has("doc-key"));
-    assert_eq!(1, transport.detach_requests);
+    assert_eq!(DocStatus::Removed, doc.status());
+    assert_eq!(1, transport.remove_requests);
     assert_eq!(
         DeactivateOptions::default(),
         DeactivateOptions {
@@ -173,4 +184,5 @@ fn facade_exports_client_api() {
         }
     );
     assert_eq!(DetachOptions, DetachOptions);
+    assert_eq!(0, transport.detach_requests);
 }

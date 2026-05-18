@@ -7,7 +7,7 @@ use crate::options::{
 };
 use crate::transport::{
     ActivateClientRequest, AttachDocumentRequest, ClientTransport, DeactivateClientRequest,
-    DetachDocumentRequest, PushPullChangesRequest,
+    DetachDocumentRequest, PushPullChangesRequest, RemoveDocumentRequest,
 };
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -280,6 +280,33 @@ impl Client {
         Ok(())
     }
 
+    pub fn remove<T>(&mut self, transport: &mut T, doc: &mut Document) -> ClientResult<()>
+    where
+        T: ClientTransport,
+    {
+        let client_id = self.require_active()?.clone();
+        let Some(attachment) = self.attachments.get(doc.key()) else {
+            return Err(ClientError::NotAttached(doc.key().to_owned()));
+        };
+        let document_id = attachment.resource_id.clone();
+
+        doc.set_actor(client_id.clone());
+        let mut change_pack = doc.create_change_pack();
+        change_pack.set_removed(true);
+
+        let response = transport.remove_document(RemoveDocumentRequest {
+            client_id,
+            document_id,
+            change_pack,
+            shard_key: self.shard_key(doc.key()),
+        })?;
+
+        doc.apply_change_pack(&response.change_pack)?;
+        self.attachments.remove(doc.key());
+        self.refresh_watch_loop_condition();
+        Ok(())
+    }
+
     pub fn change_sync_mode(&mut self, doc: &Document, sync_mode: SyncMode) -> ClientResult<()> {
         self.require_active()?;
         let Some(attachment) = self.attachments.get_mut(doc.key()) else {
@@ -364,11 +391,13 @@ mod tests {
         ActivateClientRequest, ActivateClientResponse, AttachDocumentRequest,
         AttachDocumentResponse, ClientTransport, DeactivateClientRequest, DeactivateClientResponse,
         DetachDocumentRequest, DetachDocumentResponse, PushPullChangesRequest,
-        PushPullChangesResponse,
+        PushPullChangesResponse, RemoveDocumentRequest, RemoveDocumentResponse,
     };
     use std::collections::BTreeMap;
     use std::time::Duration;
-    use yorkie_core::{ActorId, DocStatus, Document, JsonObject, SchemaRule, TreeNodeRule};
+    use yorkie_core::{
+        ActorId, DocStatus, Document, JsonObject, SchemaRule, TreeNodeRule, YorkieError,
+    };
 
     #[derive(Debug, Clone)]
     struct FakeTransport {
@@ -377,6 +406,7 @@ mod tests {
         deactivate_requests: Vec<DeactivateClientRequest>,
         attach_requests: Vec<AttachDocumentRequest>,
         detach_requests: Vec<DetachDocumentRequest>,
+        remove_requests: Vec<RemoveDocumentRequest>,
         push_pull_requests: Vec<PushPullChangesRequest>,
         attach_max_size_per_document: usize,
         attach_schema_rules: Vec<SchemaRule>,
@@ -390,6 +420,7 @@ mod tests {
                 deactivate_requests: Vec::new(),
                 attach_requests: Vec::new(),
                 detach_requests: Vec::new(),
+                remove_requests: Vec::new(),
                 push_pull_requests: Vec::new(),
                 attach_max_size_per_document: 0,
                 attach_schema_rules: Vec::new(),
@@ -437,6 +468,15 @@ mod tests {
             let change_pack = request.change_pack.clone();
             self.detach_requests.push(request);
             Ok(DetachDocumentResponse { change_pack })
+        }
+
+        fn remove_document(
+            &mut self,
+            request: RemoveDocumentRequest,
+        ) -> ClientResult<RemoveDocumentResponse> {
+            let change_pack = request.change_pack.clone();
+            self.remove_requests.push(request);
+            Ok(RemoveDocumentResponse { change_pack })
         }
 
         fn push_pull_changes(
@@ -731,6 +771,81 @@ mod tests {
         assert!(!transport.detach_requests[0].remove_if_not_attached);
         assert_eq!("api-key/doc-key", transport.detach_requests[0].shard_key);
         Ok(())
+    }
+
+    #[test]
+    fn removes_document_through_transport() -> ClientResult<()> {
+        let mut client = Client::new(ClientOptions {
+            key: Some("client-key".to_owned()),
+            api_key: "api-key".to_owned(),
+            ..ClientOptions::default()
+        });
+        let mut transport = FakeTransport::default();
+        let mut doc = Document::new("doc-key");
+
+        client.apply_activation("000000000000000000000001");
+        client.attach(
+            &mut transport,
+            &mut doc,
+            AttachOptions {
+                sync_mode: Some(SyncMode::Realtime),
+                ..AttachOptions::default()
+            },
+        )?;
+        doc.update(|root| root.set("title", "hello").map(|_| ()))?;
+
+        client.remove(&mut transport, &mut doc)?;
+
+        assert_eq!(DocStatus::Removed, doc.status());
+        assert!(!client.has("doc-key"));
+        assert!(!client.condition(ClientCondition::WatchLoop));
+        assert!(!doc.has_local_changes());
+        assert_eq!(1, transport.remove_requests.len());
+        assert_eq!(
+            "000000000000000000000001",
+            transport.remove_requests[0].client_id.as_str()
+        );
+        assert_eq!("document-id", transport.remove_requests[0].document_id);
+        assert_eq!(
+            "doc-key",
+            transport.remove_requests[0].change_pack.document_key()
+        );
+        assert!(transport.remove_requests[0].change_pack.is_removed());
+        assert!(transport.remove_requests[0].change_pack.has_changes());
+        assert_eq!("api-key/doc-key", transport.remove_requests[0].shard_key);
+        assert_eq!(
+            YorkieError::DocumentRemoved("doc-key".to_owned()),
+            doc.update(|root| root.set("next", "value").map(|_| ()))
+                .unwrap_err()
+        );
+        assert_eq!(
+            ClientError::NotDetached("doc-key".to_owned()),
+            client
+                .attach(&mut transport, &mut doc, AttachOptions::default())
+                .unwrap_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_remove_when_client_is_not_active_or_document_is_not_attached() {
+        let mut client = Client::new(ClientOptions {
+            key: Some("client-key".to_owned()),
+            ..ClientOptions::default()
+        });
+        let mut transport = FakeTransport::default();
+        let mut doc = Document::new("doc-key");
+
+        let err = client.remove(&mut transport, &mut doc).unwrap_err();
+        assert_eq!(
+            ClientError::ClientNotActivated("client-key".to_owned()),
+            err
+        );
+
+        client.apply_activation("000000000000000000000001");
+        let err = client.remove(&mut transport, &mut doc).unwrap_err();
+        assert_eq!(ClientError::NotAttached("doc-key".to_owned()), err);
+        assert!(transport.remove_requests.is_empty());
     }
 
     #[test]

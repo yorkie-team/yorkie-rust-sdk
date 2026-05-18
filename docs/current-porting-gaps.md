@@ -761,7 +761,7 @@ Current Rust behavior:
 - `Client` stores a key, optional actor ID, deactivated status, sync/watch
   condition flags, and document attachment metadata.
 - `ClientTransport` is a testable transport boundary for activate/deactivate,
-  document attach/detach, and client-side push-pull sync.
+  document attach/detach/remove, and client-side push-pull sync.
   `Client::activate` sends client key, metadata, and shard key through this
   boundary; `Client::deactivate` sends client ID and synchronous flag, clears
   local attachment metadata, and marks sync/watch conditions inactive.
@@ -774,6 +774,11 @@ Current Rust behavior:
   `remove_if_not_attached`, and shard key through the transport boundary,
   applies the returned change pack, updates document status, removes attachment
   metadata, and refreshes the watch loop condition.
+- `Client::remove` sends client ID, attached document ID, local `ChangePack`
+  marked as removed, and shard key through the transport boundary, applies the
+  returned change pack, removes attachment metadata, and refreshes the watch
+  loop condition. The request/response shape follows the client-side remove
+  flow in JS, with Go client behavior used as a typed cross-check.
 - `Client::sync` and `Client::sync_with_options` send client ID, attached
   document ID, local `ChangePack`, push-only mode, and shard key through the
   transport boundary, apply the returned change pack, and remove attachment
@@ -795,9 +800,8 @@ JS/Go behavior:
 Gap:
 
 - No concrete RPC transport.
-- Activate/deactivate/attach/detach/push-pull sync use a transport trait, but
-  there is no Connect/gRPC-web implementation yet.
-- Remove is not connected to the transport boundary yet.
+- Activate/deactivate/attach/detach/remove/push-pull sync use a transport
+  trait, but there is no Connect/gRPC-web implementation yet.
 - No watch stream.
 - No presence.
 - Schema rules and max-size limits are stored after attach but are not enforced
@@ -811,7 +815,7 @@ Gap:
 
 Expected direction:
 
-- Extend the transport boundary to remove.
+- Add a concrete protocol transport for the existing client lifecycle boundary.
 - Keep Client state transitions aligned with document status and attachment
   metadata as the network layer lands.
 

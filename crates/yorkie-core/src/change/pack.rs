@@ -84,6 +84,10 @@ impl ChangePack {
         self.is_removed
     }
 
+    pub fn set_removed(&mut self, is_removed: bool) {
+        self.is_removed = is_removed;
+    }
+
     pub(crate) fn changes(&self) -> &[Change] {
         &self.changes
     }

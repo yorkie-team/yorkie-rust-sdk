@@ -6,7 +6,8 @@ pub use yorkie_client::{
     AttachDocumentResponse, AttachOptions, Client, ClientCondition, ClientError, ClientOptions,
     ClientResult, ClientStatus, ClientTransport, DeactivateClientRequest, DeactivateClientResponse,
     DeactivateOptions, DetachDocumentRequest, DetachDocumentResponse, DetachOptions,
-    PushPullChangesRequest, PushPullChangesResponse, SyncMode, SyncOptions,
+    PushPullChangesRequest, PushPullChangesResponse, RemoveDocumentRequest, RemoveDocumentResponse,
+    SyncMode, SyncOptions,
 };
 pub use yorkie_core::{
     ActorId, ChangePack, Checkpoint, CounterType, CounterValue, DocStatus, Document, JsonArray,

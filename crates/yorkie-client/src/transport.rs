@@ -62,6 +62,21 @@ pub struct DetachDocumentResponse {
     pub change_pack: ChangePack,
 }
 
+/// Request data for removing a document.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoveDocumentRequest {
+    pub client_id: ActorId,
+    pub document_id: String,
+    pub change_pack: ChangePack,
+    pub shard_key: String,
+}
+
+/// Response data for removing a document.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoveDocumentResponse {
+    pub change_pack: ChangePack,
+}
+
 /// Request data for pushing and pulling document changes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PushPullChangesRequest {
@@ -99,6 +114,11 @@ pub trait ClientTransport {
         &mut self,
         request: DetachDocumentRequest,
     ) -> ClientResult<DetachDocumentResponse>;
+
+    fn remove_document(
+        &mut self,
+        request: RemoveDocumentRequest,
+    ) -> ClientResult<RemoveDocumentResponse>;
 
     fn push_pull_changes(
         &mut self,
