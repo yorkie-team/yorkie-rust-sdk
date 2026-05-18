@@ -82,6 +82,45 @@ pub struct AttachChannelOptions {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DetachOptions;
 
+/// Request data for activating a client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivateClientRequest {
+    pub client_key: String,
+    pub metadata: BTreeMap<String, String>,
+    pub shard_key: String,
+}
+
+/// Response data for activating a client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivateClientResponse {
+    pub client_id: ActorId,
+}
+
+/// Request data for deactivating a client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeactivateClientRequest {
+    pub client_id: ActorId,
+    pub synchronous: bool,
+    pub shard_key: String,
+}
+
+/// Response data for deactivating a client.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeactivateClientResponse;
+
+/// Transport boundary used by the client lifecycle.
+pub trait ClientTransport {
+    fn activate_client(
+        &mut self,
+        request: ActivateClientRequest,
+    ) -> ClientResult<ActivateClientResponse>;
+
+    fn deactivate_client(
+        &mut self,
+        request: DeactivateClientRequest,
+    ) -> ClientResult<DeactivateClientResponse>;
+}
+
 /// Errors from the client lifecycle layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientError {
@@ -89,6 +128,7 @@ pub enum ClientError {
     NotAttached(String),
     NotDetached(String),
     InvalidArgument(String),
+    Transport(String),
     Core(YorkieError),
 }
 
@@ -101,6 +141,7 @@ impl Display for ClientError {
             Self::NotAttached(key) => write!(f, "resource {key:?} is not attached"),
             Self::NotDetached(key) => write!(f, "resource {key:?} is not detached"),
             Self::InvalidArgument(message) => write!(f, "invalid client argument: {message}"),
+            Self::Transport(message) => write!(f, "client transport error: {message}"),
             Self::Core(err) => Display::fmt(err, f),
         }
     }
@@ -206,6 +247,52 @@ impl Client {
         self.attachments.contains_key(key)
     }
 
+    pub fn activate<T>(&mut self, transport: &mut T) -> ClientResult<()>
+    where
+        T: ClientTransport,
+    {
+        if self.is_active() {
+            return Ok(());
+        }
+
+        let response = transport.activate_client(ActivateClientRequest {
+            client_key: self.key.clone(),
+            metadata: self.options.metadata.clone(),
+            shard_key: self.shard_key(&self.key),
+        })?;
+
+        self.id = Some(response.client_id);
+        self.status = ClientStatus::Activated;
+        self.conditions.insert(ClientCondition::SyncLoop, true);
+        Ok(())
+    }
+
+    pub fn deactivate<T>(
+        &mut self,
+        transport: &mut T,
+        options: DeactivateOptions,
+    ) -> ClientResult<()>
+    where
+        T: ClientTransport,
+    {
+        if self.status == ClientStatus::Deactivated {
+            return Ok(());
+        }
+
+        let client_id = self.require_active()?.clone();
+        transport.deactivate_client(DeactivateClientRequest {
+            client_id,
+            synchronous: options.synchronous,
+            shard_key: self.shard_key(&self.key),
+        })?;
+
+        self.status = ClientStatus::Deactivated;
+        self.conditions.insert(ClientCondition::SyncLoop, false);
+        self.conditions.insert(ClientCondition::WatchLoop, false);
+        self.attachments.clear();
+        Ok(())
+    }
+
     pub fn attach(&mut self, doc: &mut Document, options: AttachOptions) -> ClientResult<()> {
         let actor_id = self.require_active()?.clone();
         if doc.status() != DocStatus::Detached {
@@ -279,6 +366,10 @@ impl Client {
             .ok_or_else(|| ClientError::ClientNotActivated(self.key.clone()))
     }
 
+    fn shard_key(&self, resource_key: &str) -> String {
+        format!("{}/{}", self.options.api_key, resource_key)
+    }
+
     #[cfg(test)]
     fn apply_activation(&mut self, actor_id: impl Into<ActorId>) {
         self.id = Some(actor_id.into());
@@ -331,14 +422,53 @@ fn default_document_poll_interval(sync_mode: SyncMode) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttachChannelOptions, AttachOptions, Client, ClientCondition, ClientError, ClientOptions,
-        ClientStatus, DeactivateOptions, DetachOptions, DocStatus, Document, JsonObject, SyncMode,
+        ActivateClientRequest, ActivateClientResponse, ActorId, AttachChannelOptions,
+        AttachOptions, Client, ClientCondition, ClientError, ClientOptions, ClientStatus,
+        ClientTransport, DeactivateClientRequest, DeactivateClientResponse, DeactivateOptions,
+        DetachOptions, DocStatus, Document, JsonObject, SyncMode,
         DEFAULT_CHANNEL_HEARTBEAT_INTERVAL_MS, DEFAULT_POLLING_INTERVAL_MS,
         DEFAULT_RECONNECT_STREAM_DELAY_MS, DEFAULT_RETRY_SYNC_LOOP_DELAY_MS, DEFAULT_RPC_ADDR,
         DEFAULT_SYNC_LOOP_DURATION_MS,
     };
     use std::collections::BTreeMap;
     use std::time::Duration;
+
+    #[derive(Debug, Clone)]
+    struct FakeTransport {
+        client_id: ActorId,
+        activate_requests: Vec<ActivateClientRequest>,
+        deactivate_requests: Vec<DeactivateClientRequest>,
+    }
+
+    impl Default for FakeTransport {
+        fn default() -> Self {
+            Self {
+                client_id: ActorId::new("000000000000000000000001"),
+                activate_requests: Vec::new(),
+                deactivate_requests: Vec::new(),
+            }
+        }
+    }
+
+    impl ClientTransport for FakeTransport {
+        fn activate_client(
+            &mut self,
+            request: ActivateClientRequest,
+        ) -> super::ClientResult<ActivateClientResponse> {
+            self.activate_requests.push(request);
+            Ok(ActivateClientResponse {
+                client_id: self.client_id.clone(),
+            })
+        }
+
+        fn deactivate_client(
+            &mut self,
+            request: DeactivateClientRequest,
+        ) -> super::ClientResult<DeactivateClientResponse> {
+            self.deactivate_requests.push(request);
+            Ok(DeactivateClientResponse)
+        }
+    }
 
     #[test]
     fn creates_client_with_default_options() {
@@ -440,6 +570,85 @@ mod tests {
             Some("local"),
             client.options().metadata.get("region").map(String::as_str)
         );
+    }
+
+    #[test]
+    fn activates_client_through_transport() -> super::ClientResult<()> {
+        let mut client = Client::new(ClientOptions {
+            key: Some("client-key".to_owned()),
+            api_key: "api-key".to_owned(),
+            metadata: BTreeMap::from([("region".to_owned(), "local".to_owned())]),
+            ..ClientOptions::default()
+        });
+        let mut transport = FakeTransport::default();
+
+        client.activate(&mut transport)?;
+        client.activate(&mut transport)?;
+
+        assert_eq!(ClientStatus::Activated, client.status());
+        assert!(client.is_active());
+        assert_eq!(
+            Some("000000000000000000000001"),
+            client.id().map(|id| id.as_str())
+        );
+        assert!(client.condition(ClientCondition::SyncLoop));
+        assert_eq!(1, transport.activate_requests.len());
+        assert_eq!("client-key", transport.activate_requests[0].client_key);
+        assert_eq!(
+            "api-key/client-key",
+            transport.activate_requests[0].shard_key
+        );
+        assert_eq!(
+            Some("local"),
+            transport.activate_requests[0]
+                .metadata
+                .get("region")
+                .map(String::as_str)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn deactivates_client_through_transport() -> super::ClientResult<()> {
+        let mut client = Client::new(ClientOptions {
+            key: Some("client-key".to_owned()),
+            api_key: "api-key".to_owned(),
+            ..ClientOptions::default()
+        });
+        let mut transport = FakeTransport::default();
+        let mut doc = Document::new("doc-key");
+
+        client.activate(&mut transport)?;
+        client.attach(&mut doc, AttachOptions::default())?;
+        client.deactivate(
+            &mut transport,
+            DeactivateOptions {
+                keepalive: true,
+                synchronous: true,
+            },
+        )?;
+        client.deactivate(&mut transport, DeactivateOptions::default())?;
+
+        assert_eq!(ClientStatus::Deactivated, client.status());
+        assert!(!client.is_active());
+        assert_eq!(
+            Some("000000000000000000000001"),
+            client.id().map(|id| id.as_str())
+        );
+        assert!(!client.condition(ClientCondition::SyncLoop));
+        assert!(!client.condition(ClientCondition::WatchLoop));
+        assert!(!client.has("doc-key"));
+        assert_eq!(1, transport.deactivate_requests.len());
+        assert_eq!(
+            "000000000000000000000001",
+            transport.deactivate_requests[0].client_id.as_str()
+        );
+        assert!(transport.deactivate_requests[0].synchronous);
+        assert_eq!(
+            "api-key/client-key",
+            transport.deactivate_requests[0].shard_key
+        );
+        Ok(())
     }
 
     #[test]

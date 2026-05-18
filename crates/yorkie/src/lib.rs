@@ -2,8 +2,9 @@
 //! Public facade for the Yorkie Rust SDK.
 
 pub use yorkie_client::{
-    AttachChannelOptions, AttachOptions, Client, ClientCondition, ClientError, ClientOptions,
-    ClientResult, ClientStatus, DeactivateOptions, DetachOptions, SyncMode,
+    ActivateClientRequest, ActivateClientResponse, AttachChannelOptions, AttachOptions, Client,
+    ClientCondition, ClientError, ClientOptions, ClientResult, ClientStatus, ClientTransport,
+    DeactivateClientRequest, DeactivateClientResponse, DeactivateOptions, DetachOptions, SyncMode,
 };
 pub use yorkie_core::{
     ActorId, ChangePack, Checkpoint, CounterType, CounterValue, DocStatus, Document, JsonArray,

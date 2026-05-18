@@ -756,6 +756,10 @@ Current Rust behavior:
   `DetachOptions` are defined as public client-surface types.
 - `Client` stores a key, optional actor ID, deactivated status, sync/watch
   condition flags, and document attachment metadata.
+- `ClientTransport` is a testable transport boundary for activate/deactivate.
+  `Client::activate` sends client key, metadata, and shard key through this
+  boundary; `Client::deactivate` sends client ID and synchronous flag, clears
+  local attachment metadata, and marks sync/watch conditions inactive.
 - `Client::has`, `attach`, `detach`, and `change_sync_mode` cover local
   lifecycle bookkeeping and precondition errors for documents. These methods do
   not perform RPC yet.
@@ -768,13 +772,13 @@ JS/Go behavior:
 
 Gap:
 
-- No real client lifecycle.
-- No public activate/deactivate RPC. Client activation is still a transport
-  integration point, so attached success paths are currently exercised through
-  internal tests.
-- No RPC transport.
+- No concrete RPC transport.
+- Activate/deactivate use a transport trait, but there is no Connect/gRPC-web
+  implementation yet.
 - No watch stream.
 - No presence.
+- Deactivation clears client attachment metadata but cannot yet update attached
+  document statuses because documents are not owned by the client.
 - Sync modes are represented in attachment metadata but not executed by a sync
   loop.
 - Auth token refresh, gRPC-web/connect transport choice, Go TLS options, and
@@ -782,8 +786,7 @@ Gap:
 
 Expected direction:
 
-- Add a transport boundary for activate, attach, detach, remove, and
-  push-pull sync.
+- Extend the transport boundary to attach, detach, remove, and push-pull sync.
 - Keep Client state transitions aligned with document status and attachment
   metadata as the network layer lands.
 
