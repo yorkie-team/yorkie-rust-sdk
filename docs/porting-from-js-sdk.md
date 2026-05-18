@@ -116,6 +116,7 @@ it has:
 | `AddOperation` | `packages/sdk/src/document/operation/add_operation.ts` | Operation that inserts a CRDT element into an array after a position identity. |
 | `MoveOperation` | `packages/sdk/src/document/operation/move_operation.ts` | Operation that moves an existing array element using position-node identity. |
 | `ArraySetOperation` | `packages/sdk/src/document/operation/array_set_operation.ts` | Operation that replaces an array element by inserting a new element and tombstoning the previous one. |
+| `IncreaseOperation` | `packages/sdk/src/document/operation/increase_operation.ts` | Operation that increases regular counters with numeric operands and dedup counters with actor-scoped unit increments. |
 | `EditOperation` | `packages/sdk/src/document/operation/edit_operation.ts` | Operation that edits a text range, registers removed text-node GC pairs, and creates a reverse edit. |
 | `StyleOperation` | `packages/sdk/src/document/operation/style_operation.ts` | Operation that applies or removes text attributes, registers removed attribute GC pairs, and creates a reverse style operation. |
 | `TreeEditOperation` | `packages/sdk/src/document/operation/tree_edit_operation.ts` | Operation that edits tree content. Rust currently covers split-free element insert/delete, text-node split insert/delete, multi-level element split, visible-boundary merge, operation info, insert/delete/split/merge reverse operations, and tree-node GC registration. |
@@ -125,7 +126,8 @@ it has:
 | `JsonObject::remove` | `ObjectProxy.deleteInternal()` | Rust method for deleting an object member. Missing keys must be a no-op. |
 | `JsonArray` | `packages/sdk/src/document/json/array.ts` | Public array API maps index, ID-based, and splice-like array edits to add, array-set, remove, and move operations during `Document::update`. |
 | `JsonArrayElement` | JS `WrappedElement` read-only lookup shape | Lightweight Rust lookup value that exposes an array element ID and borrowed JSON value. It is not a mutable proxy. |
-| `JsonValue` | JS JSON element/proxy values | Temporary Rust wrapper for porting primitives, objects, and arrays. |
+| `JsonCounter` | `packages/sdk/src/document/json/counter.ts` | Public counter facade for regular increase operations and dedup actor-add operations during `Document::update`. |
+| `JsonValue` | JS JSON element/proxy values | Temporary Rust wrapper for porting primitives, counters, objects, and arrays. |
 | `Client` | `packages/sdk/src/client/client.ts` | Currently scaffolded only. Lifecycle must follow JS. |
 | `yorkie-protocol` | `packages/sdk/src/api/converter.ts`, proto files | Converter names and wire fields should track JS/proto names. |
 

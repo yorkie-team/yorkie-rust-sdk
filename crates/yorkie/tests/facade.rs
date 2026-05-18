@@ -1,5 +1,6 @@
 use yorkie::{
-    ActorId, ChangePack, Checkpoint, Document, Result, TimeTicket, TimeTicketStruct, VersionVector,
+    ActorId, ChangePack, Checkpoint, CounterType, CounterValue, Document, JsonCounter, Result,
+    TimeTicket, TimeTicketStruct, VersionVector,
 };
 
 #[test]
@@ -18,6 +19,16 @@ fn facade_exports_document_api() -> Result<()> {
     assert_eq!("test-doc", pack.document_key());
     assert_eq!(Checkpoint::new(0, 1), pack.checkpoint());
 
+    Ok(())
+}
+
+#[test]
+fn facade_exports_counter_api() -> Result<()> {
+    let mut counter = JsonCounter::integer(1);
+    counter.increase(2i32)?;
+
+    assert_eq!(CounterType::Integer, counter.value_type());
+    assert_eq!(CounterValue::Integer(3), counter.value());
     Ok(())
 }
 

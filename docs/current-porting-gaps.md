@@ -77,49 +77,54 @@ Gap:
 - Rust has ID-based array insert/delete/move APIs and splice-like array edits,
   but these still operate on the cloned public JSON view and hidden identity
   metadata rather than live CRDT containers.
-- Text, Tree, and Counter public editing methods are not connected to the edit
-  recorder yet.
+- Counter public editing methods are connected to the edit recorder. Text and
+  Tree public editing methods are not connected yet.
 
 Expected direction:
 
 - Continue moving public mutation methods onto the edit recorder.
 - Either remove the clone/diff fallback or narrow it to explicitly unsupported
   compatibility cases once direct mutable JSON escape hatches are redesigned.
-- Connect Text, Tree, and Counter public facades through the same update-time
-  operation recorder.
+- Connect Text and Tree public facades through the same update-time operation
+  recorder.
 
 ## Public JSON API
 
 Current Rust behavior:
 
 - `JsonObject` supports `set`, `get`, `get_mut`, `remove`,
-  `get_object_mut`, and `get_array_mut`.
+  `get_object_mut`, `get_array_mut`, `get_counter_mut`, `set_counter`,
+  `set_long_counter`, and `set_dedup_counter`.
 - `JsonArray` supports `push`, index `get`/`get_mut`, `set`/`set_value`,
   `insert`, `insert_after_index`, `insert_integer_after`, `remove`/`delete`,
   element-ID lookup, `get_by_id`, `get_mut_by_id`, `get_element_by_index`,
   `get_element_by_id`, `get_last`, `insert_after`, `insert_before`,
   `delete_by_id`, `move_after`, `move_before`, `move_front`, `move_last`,
   `move_after_by_index`, `splice`, nested `get_object_mut`/`get_array_mut`,
-  value search, ID search, `len`, `is_empty`, `iter`, and `as_slice`.
+  `get_counter_mut`, `push_counter`, `push_long_counter`,
+  `push_dedup_counter`, value search, ID search, `len`, `is_empty`, `iter`,
+  and `as_slice`.
   Mutation methods can return errors because they may create CRDT operations
   during `Document::update`.
-- `JsonValue` is a simple enum wrapper around primitive, object, and array
-  values.
-- During `Document::update`, public object and array values are temporarily
-  attached to a recorder and hidden CRDT identity metadata.
+- `JsonValue` is a simple enum wrapper around primitive, counter, object, and
+  array values.
+- During `Document::update`, public object, array, and counter values are
+  temporarily attached to a recorder and hidden CRDT identity metadata.
 
 JS/Go behavior:
 
 - JS arrays expose many mutation methods that map to CRDT operations, including
   insert/add, set, delete/remove, move, and nested container access.
+- JS/Go counters expose regular increase paths and dedup actor-add paths that
+  create increase operations during document updates.
 - JS/Go JSON values are tied to CRDT element identity and change context during
   document updates.
 
 Gap:
 
-- Rust public object and array values are only partially CRDT-aware. The
-  existing method calls record operations, but the values are still not stable
-  live wrappers around CRDT containers.
+- Rust public object, array, and counter values are only partially CRDT-aware.
+  The existing method calls record operations, but the values are still not
+  stable live wrappers around CRDT elements.
 - Rust public arrays now expose element-ID access and lightweight
   `JsonArrayElement` values for read-only ID/value lookup. They still do not
   expose mutable JS-style `WrappedElement` proxies tied directly to live CRDT
@@ -127,7 +132,7 @@ Gap:
 - Rust value-based array search uses `JsonValue` equality. For non-primitive
   containers, JS compares wrapped element identity; Rust callers should use the
   explicit ID search methods when identity matters.
-- Text, Tree, and Counter do not have public context-backed facades yet.
+- Text and Tree do not have public context-backed facades yet.
 
 Expected direction:
 
@@ -291,6 +296,15 @@ Current Rust behavior:
   emits internal increase op info, creates a reverse increase operation for
   undo/redo wiring, and applies actor-based dedup increases without reverse
   operations.
+- Public `JsonCounter` exists for integer, long, and integer-dedup counters.
+  `JsonObject::set_counter`, `set_long_counter`, `set_dedup_counter`,
+  `get_counter_mut`, and `JsonArray::push_counter`, `push_long_counter`,
+  `push_dedup_counter`, `get_counter_mut` provide context-backed document
+  editing paths.
+- During `Document::update`, `JsonCounter::increase` records
+  `IncreaseOperation` for regular counters and `JsonCounter::add` records
+  actor-based increase operations for dedup counters. Newly created counters
+  can be increased in the same callback.
 
 JS/Go behavior:
 
@@ -304,16 +318,15 @@ JS/Go behavior:
 
 Gap:
 
-- Rust does not yet expose a public counter facade, so application code cannot
-  create counters through `Document::update`.
+- Rust uses explicit constructors and object/array helper methods instead of
+  JavaScript's `new Counter(...)` syntax or Go's dynamic `any` value
+  inference. The semantics are aligned, but the public shape is Rust-specific.
 - Counter and increase operation wire conversion is missing.
 - Change-level concurrent counter tests are still missing because the public
-  editing path and history stack are not complete.
+  editing path does not yet include client sync/history.
 
 Expected direction:
 
-- Add a public counter value/facade once the context-backed editing model is in
-  place.
 - Port JS counter integration tests incrementally, using Go for typed CRDT
   edge cases such as bytes, data size, and dedup behavior.
 - Add protocol conversion for dedup HLL register bytes and increase actors.

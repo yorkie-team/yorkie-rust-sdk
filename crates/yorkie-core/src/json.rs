@@ -1,3 +1,5 @@
+use crate::crdt::counter::{CounterType, CounterValue, CrdtCounter};
+use crate::crdt::primitive::{CrdtPrimitive, PrimitiveValue};
 use crate::{Result, TimeTicket, YorkieError};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -43,6 +45,13 @@ pub(crate) trait JsonEditRecorder {
         prev_created_at: &TimeTicket,
         created_at: &TimeTicket,
     ) -> TimeTicket;
+
+    fn record_counter_increase(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        value: CounterValue,
+        actor: Option<&str>,
+    ) -> Result<()>;
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -75,6 +84,7 @@ pub enum JsonValue {
     Long(i64),
     Double(f64),
     String(String),
+    Counter(JsonCounter),
     Object(JsonObject),
     Array(JsonArray),
 }
@@ -113,9 +123,165 @@ impl JsonValue {
             Self::Double(value) if value.is_finite() => value.to_string(),
             Self::Double(_) => "null".to_owned(),
             Self::String(value) => format!("\"{}\"", escape_json_string(value)),
+            Self::Counter(value) => value.to_sorted_json(),
             Self::Object(value) => value.to_sorted_json(),
             Self::Array(value) => value.to_sorted_json(),
         }
+    }
+}
+
+/// A JSON counter stored in a Yorkie document root.
+#[derive(Clone)]
+pub struct JsonCounter {
+    value_type: CounterType,
+    value: CounterValue,
+    hll_bytes: Option<Vec<u8>>,
+    created_at: TimeTicket,
+    recorder: Option<JsonEditRecorderRef>,
+}
+
+impl fmt::Debug for JsonCounter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JsonCounter")
+            .field("value_type", &self.value_type)
+            .field("value", &self.value)
+            .finish()
+    }
+}
+
+impl PartialEq for JsonCounter {
+    fn eq(&self, other: &Self) -> bool {
+        self.value_type == other.value_type
+            && self.value == other.value
+            && self.hll_bytes == other.hll_bytes
+    }
+}
+
+impl JsonCounter {
+    pub fn new(value: i64) -> Self {
+        if let Ok(value) = i32::try_from(value) {
+            return Self::integer(value);
+        }
+
+        Self::long(value)
+    }
+
+    pub fn integer(value: i32) -> Self {
+        Self::new_with_type(CounterType::Integer, CounterValue::Integer(value))
+    }
+
+    pub fn long(value: i64) -> Self {
+        Self::new_with_type(CounterType::Long, CounterValue::Long(value))
+    }
+
+    pub fn dedup() -> Self {
+        Self::new_with_type(CounterType::IntegerDedup, CounterValue::Integer(0))
+    }
+
+    pub fn id(&self) -> &TimeTicket {
+        &self.created_at
+    }
+
+    pub fn value_type(&self) -> CounterType {
+        self.value_type
+    }
+
+    pub fn value(&self) -> CounterValue {
+        self.value
+    }
+
+    pub fn increase(&mut self, value: impl Into<CounterValue>) -> Result<&mut Self> {
+        let value = value.into();
+        self.apply_increase(value, None)?;
+        if let Some(recorder) = self.recorder.clone() {
+            recorder
+                .borrow_mut()
+                .record_counter_increase(&self.created_at, value, None)?;
+        }
+
+        Ok(self)
+    }
+
+    pub fn add(&mut self, actor: impl AsRef<str>) -> Result<&mut Self> {
+        if self.value_type != CounterType::IntegerDedup {
+            return Err(YorkieError::InvalidCounterOperation(
+                "add is only supported on dedup counters".to_owned(),
+            ));
+        }
+
+        let actor = actor.as_ref();
+        if actor.is_empty() {
+            return Err(YorkieError::InvalidCounterOperation(
+                "actor is required".to_owned(),
+            ));
+        }
+
+        let value = CounterValue::Integer(1);
+        self.apply_increase(value, Some(actor))?;
+        if let Some(recorder) = self.recorder.clone() {
+            recorder
+                .borrow_mut()
+                .record_counter_increase(&self.created_at, value, Some(actor))?;
+        }
+
+        Ok(self)
+    }
+
+    pub fn to_sorted_json(&self) -> String {
+        self.to_crdt_counter(self.created_at.clone()).to_json()
+    }
+
+    pub(crate) fn from_crdt(counter: &CrdtCounter) -> Self {
+        Self {
+            value_type: counter.counter_type(),
+            value: counter.value(),
+            hll_bytes: counter.hll_bytes(),
+            created_at: counter.created_at().clone(),
+            recorder: None,
+        }
+    }
+
+    pub(crate) fn to_crdt_counter(&self, created_at: TimeTicket) -> CrdtCounter {
+        let mut counter = CrdtCounter::create(self.value_type, self.value, created_at);
+        if let Some(bytes) = &self.hll_bytes {
+            counter
+                .restore_hll(bytes)
+                .expect("stored counter HLL registers should be valid");
+        }
+        counter
+    }
+
+    fn new_with_type(value_type: CounterType, value: CounterValue) -> Self {
+        let counter = CrdtCounter::create(value_type, value, TimeTicket::initial());
+        Self {
+            value_type,
+            value: counter.value(),
+            hll_bytes: counter.hll_bytes(),
+            created_at: TimeTicket::initial(),
+            recorder: None,
+        }
+    }
+
+    fn apply_increase(&mut self, value: CounterValue, actor: Option<&str>) -> Result<()> {
+        let mut counter = self.to_crdt_counter(self.created_at.clone());
+        let operand = counter_operand(value, TimeTicket::initial());
+        if let Some(actor) = actor {
+            counter.increase_dedup(&operand, actor)?;
+        } else {
+            counter.increase(&operand)?;
+        }
+
+        self.value = counter.value();
+        self.hll_bytes = counter.hll_bytes();
+        Ok(())
+    }
+
+    fn attach_recorder(&mut self, recorder: JsonEditRecorderRef) {
+        self.recorder = Some(recorder);
+    }
+
+    fn detach_recorder(&mut self) {
+        self.recorder = None;
     }
 }
 
@@ -256,6 +422,17 @@ impl JsonObject {
         }
     }
 
+    pub fn get_counter_mut(&mut self, key: &str) -> Result<&mut JsonCounter> {
+        match self.members.get_mut(key) {
+            Some(JsonValue::Counter(value)) => Ok(value),
+            Some(_) => Err(YorkieError::UnexpectedType {
+                key: key.to_owned(),
+                expected: "counter",
+            }),
+            None => Err(YorkieError::MissingKey(key.to_owned())),
+        }
+    }
+
     pub fn get_object_mut(&mut self, key: &str) -> Result<&mut JsonObject> {
         match self.members.get_mut(key) {
             Some(JsonValue::Object(value)) => Ok(value),
@@ -265,6 +442,28 @@ impl JsonObject {
             }),
             None => Err(YorkieError::MissingKey(key.to_owned())),
         }
+    }
+
+    pub fn set_counter(&mut self, key: impl Into<String>, value: i64) -> Result<&mut JsonCounter> {
+        let key = key.into();
+        self.set(key.clone(), JsonCounter::new(value))?;
+        self.get_counter_mut(&key)
+    }
+
+    pub fn set_long_counter(
+        &mut self,
+        key: impl Into<String>,
+        value: i64,
+    ) -> Result<&mut JsonCounter> {
+        let key = key.into();
+        self.set(key.clone(), JsonCounter::long(value))?;
+        self.get_counter_mut(&key)
+    }
+
+    pub fn set_dedup_counter(&mut self, key: impl Into<String>) -> Result<&mut JsonCounter> {
+        let key = key.into();
+        self.set(key.clone(), JsonCounter::dedup())?;
+        self.get_counter_mut(&key)
     }
 
     pub fn to_sorted_json(&self) -> String {
@@ -338,6 +537,21 @@ impl JsonArray {
 
     pub fn push(&mut self, value: impl Into<JsonValue>) -> Result<&mut Self> {
         self.insert(self.elements.len(), value)
+    }
+
+    pub fn push_counter(&mut self, value: i64) -> Result<&mut JsonCounter> {
+        self.push(JsonCounter::new(value))?;
+        self.get_counter_mut(self.elements.len() - 1)
+    }
+
+    pub fn push_long_counter(&mut self, value: i64) -> Result<&mut JsonCounter> {
+        self.push(JsonCounter::long(value))?;
+        self.get_counter_mut(self.elements.len() - 1)
+    }
+
+    pub fn push_dedup_counter(&mut self) -> Result<&mut JsonCounter> {
+        self.push(JsonCounter::dedup())?;
+        self.get_counter_mut(self.elements.len() - 1)
     }
 
     pub fn len(&self) -> usize {
@@ -691,6 +905,20 @@ impl JsonArray {
         }
     }
 
+    pub fn get_counter_mut(&mut self, index: usize) -> Result<&mut JsonCounter> {
+        let len = self.elements.len();
+        match self.elements.get_mut(index) {
+            Some(JsonValue::Counter(value)) => Ok(value),
+            Some(_) => Err(YorkieError::UnexpectedType {
+                key: index.to_string(),
+                expected: "counter",
+            }),
+            None => Err(YorkieError::InvalidIndex(format!(
+                "array index {index} out of bounds for length {len}"
+            ))),
+        }
+    }
+
     pub fn get_object_mut(&mut self, index: usize) -> Result<&mut JsonObject> {
         let len = self.elements.len();
         match self.elements.get_mut(index) {
@@ -825,6 +1053,7 @@ impl JsonArray {
 impl JsonValue {
     pub(crate) fn attach_recorder(&mut self, recorder: JsonEditRecorderRef) {
         match self {
+            Self::Counter(value) => value.attach_recorder(recorder),
             Self::Object(value) => value.attach_recorder(recorder),
             Self::Array(value) => value.attach_recorder(recorder),
             Self::Null
@@ -838,6 +1067,7 @@ impl JsonValue {
 
     fn detach_recorder(&mut self) {
         match self {
+            Self::Counter(value) => value.detach_recorder(),
             Self::Object(value) => value.detach_recorder(),
             Self::Array(value) => value.detach_recorder(),
             Self::Null
@@ -972,6 +1202,12 @@ impl From<JsonArray> for JsonValue {
     }
 }
 
+impl From<JsonCounter> for JsonValue {
+    fn from(value: JsonCounter) -> Self {
+        Self::Counter(value)
+    }
+}
+
 impl<T> From<Vec<T>> for JsonValue
 where
     T: Into<JsonValue>,
@@ -985,6 +1221,15 @@ where
         }
         Self::Array(array)
     }
+}
+
+pub(crate) fn counter_operand(value: CounterValue, created_at: TimeTicket) -> CrdtPrimitive {
+    let value = match value {
+        CounterValue::Integer(value) => PrimitiveValue::Integer(value),
+        CounterValue::Long(value) => PrimitiveValue::Long(value),
+        CounterValue::Double(value) => PrimitiveValue::Double(value),
+    };
+    CrdtPrimitive::new(value, created_at)
 }
 
 pub(crate) fn escape_json_string(value: &str) -> String {
@@ -1011,8 +1256,8 @@ pub(crate) fn escape_json_string(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{JsonArray, JsonObject, JsonValue};
-    use crate::{Result, YorkieError};
+    use super::{JsonArray, JsonCounter, JsonObject, JsonValue};
+    use crate::{CounterValue, Result, YorkieError};
 
     #[test]
     fn serializes_objects_with_sorted_keys() -> Result<()> {
@@ -1082,6 +1327,30 @@ mod tests {
         assert_eq!(Some(2), array.last_index_of("a", None));
         assert_eq!(Some(0), array.last_index_of("a", Some(1)));
         assert_eq!(None, array.last_index_of("a", Some(-4)));
+
+        Ok(())
+    }
+
+    #[test]
+    fn updates_counter_values_locally() -> Result<()> {
+        let mut integer = JsonCounter::new(1);
+        integer.increase(2i32)?.increase(3.5)?;
+
+        assert_eq!(CounterValue::Integer(6), integer.value());
+        assert_eq!("6", integer.to_sorted_json());
+
+        assert_eq!(
+            YorkieError::InvalidCounterOperation(
+                "add is only supported on dedup counters".to_owned()
+            ),
+            integer.add("user-1").unwrap_err()
+        );
+
+        let mut dedup = JsonCounter::dedup();
+        dedup.add("user-1")?.add("user-1")?.add("user-2")?;
+
+        assert_eq!(CounterValue::Integer(2), dedup.value());
+        assert_eq!("2", dedup.to_sorted_json());
 
         Ok(())
     }

@@ -6,10 +6,10 @@ use crate::crdt::object::CrdtObject;
 use crate::crdt::primitive::{CrdtPrimitive, PrimitiveValue};
 use crate::crdt::root::CrdtRoot;
 use crate::crdt::tree::{attribute_value_to_json_value, TreeNode};
-use crate::json::{JsonEditRecorder, JsonEditRecorderRef, RecordedJsonValue};
+use crate::json::{counter_operand, JsonEditRecorder, JsonEditRecorderRef, RecordedJsonValue};
 use crate::operation::{
-    AddOperation, ArraySetOperation, MoveOperation, OpSource, Operation, RemoveOperation,
-    SetOperation,
+    AddOperation, ArraySetOperation, IncreaseOperation, MoveOperation, OpSource, Operation,
+    RemoveOperation, SetOperation,
 };
 use crate::{JsonArray, JsonObject, JsonValue, Result, TimeTicket, YorkieError};
 use std::cell::RefCell;
@@ -259,6 +259,29 @@ impl JsonEditRecorder for DocumentEditRecorder {
             Some(executed_at.clone()),
         )));
         executed_at
+    }
+
+    fn record_counter_increase(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        value: CounterValue,
+        actor: Option<&str>,
+    ) -> Result<()> {
+        let executed_at = self.context.issue_time_ticket();
+        let value = CrdtElement::primitive(counter_operand(value, executed_at.clone()));
+        let operation = if let Some(actor) = actor {
+            IncreaseOperation::create_with_actor(
+                parent_created_at.clone(),
+                value,
+                Some(executed_at),
+                actor,
+            )
+        } else {
+            IncreaseOperation::create(parent_created_at.clone(), value, Some(executed_at))
+        };
+
+        self.context.push(Operation::Increase(operation));
+        Ok(())
     }
 }
 
@@ -589,6 +612,7 @@ fn json_value_to_crdt_element(
         JsonValue::Long(value) => primitive(PrimitiveValue::Long(*value), created_at),
         JsonValue::Double(value) => primitive(PrimitiveValue::Double(*value), created_at),
         JsonValue::String(value) => primitive(PrimitiveValue::String(value.clone()), created_at),
+        JsonValue::Counter(value) => CrdtElement::counter(value.to_crdt_counter(created_at)),
         JsonValue::Object(value) => {
             let mut members = Vec::new();
             for (key, value) in value.iter() {
@@ -646,11 +670,7 @@ fn crdt_object_to_json_object(object: &CrdtObject) -> Result<JsonObject> {
 fn crdt_element_to_json_value(element: &CrdtElement) -> Result<JsonValue> {
     let value = match element {
         CrdtElement::Primitive(value) => value.to_json_value(),
-        CrdtElement::Counter(value) => match value.value() {
-            CounterValue::Integer(value) => JsonValue::Integer(value),
-            CounterValue::Long(value) => JsonValue::Long(value),
-            CounterValue::Double(value) => JsonValue::Double(value),
-        },
+        CrdtElement::Counter(value) => JsonValue::Counter(crate::JsonCounter::from_crdt(value)),
         CrdtElement::Object(value) => JsonValue::Object(crdt_object_to_json_object(value)?),
         CrdtElement::Array(value) => {
             let mut array = crate::JsonArray::with_created_at(value.created_at().clone());
@@ -755,7 +775,7 @@ mod tests {
     }
 
     #[test]
-    fn converts_crdt_counter_to_public_json_number() -> Result<()> {
+    fn converts_crdt_counter_to_public_json_counter() -> Result<()> {
         let counter = CrdtCounter::create(
             CounterType::Long,
             CounterValue::Long(10),
@@ -765,6 +785,13 @@ mod tests {
         let value = crdt_element_to_json_value(&CrdtElement::counter(counter))?;
 
         assert_eq!("10", value.to_sorted_json());
+        match value {
+            JsonValue::Counter(counter) => {
+                assert_eq!(CounterType::Long, counter.value_type());
+                assert_eq!(CounterValue::Long(10), counter.value());
+            }
+            _ => panic!("expected counter"),
+        }
         Ok(())
     }
 
@@ -871,6 +898,125 @@ mod tests {
         assert_eq!(5, doc.crdt_root.get_element_map_size());
         assert_eq!(
             r#"0:00:0.SET.todos=["write tests",{"name":"yorkie"}]"#,
+            doc.local_changes[0].to_test_string()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn records_counter_creation_and_increase_in_the_same_update() -> Result<()> {
+        let mut doc = Document::new("doc-key");
+
+        doc.update(|root| {
+            root.set_counter("count", 1)?
+                .increase(2i32)?
+                .increase(3.5)?;
+            Ok(())
+        })?;
+
+        assert_eq!(r#"{"count":6}"#, doc.to_sorted_json());
+        assert_eq!(doc.to_sorted_json(), doc.crdt_root.to_sorted_json());
+        assert_eq!(
+            r#"0:00:0.SET.count=1,1:00:1.INCREASE.2,1:00:1.INCREASE.3.5"#,
+            doc.local_changes[0].to_test_string()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn records_existing_counter_increases() -> Result<()> {
+        let mut doc = Document::new("doc-key");
+
+        doc.update(|root| {
+            root.set_counter("count", 10)?;
+            Ok(())
+        })?;
+        doc.update(|root| {
+            let count = root.get_counter_mut("count")?;
+            assert_eq!(CounterValue::Integer(10), count.value());
+
+            count.increase(5i32)?;
+            Ok(())
+        })?;
+
+        assert_eq!(r#"{"count":15}"#, doc.to_sorted_json());
+        assert_eq!(doc.to_sorted_json(), doc.crdt_root.to_sorted_json());
+        assert_eq!(
+            r#"1:00:1.INCREASE.5"#,
+            doc.local_changes[1].to_test_string()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn records_counter_increases_inside_arrays() -> Result<()> {
+        let mut doc = Document::new("doc-key");
+
+        doc.update(|root| {
+            root.set("items", JsonArray::new())?;
+            root.get_array_mut("items")?
+                .push_counter(1)?
+                .increase(4i32)?;
+            Ok(())
+        })?;
+        doc.update(|root| {
+            root.get_array_mut("items")?
+                .get_counter_mut(0)?
+                .increase(5i32)?;
+            Ok(())
+        })?;
+
+        assert_eq!(r#"{"items":[10]}"#, doc.to_sorted_json());
+        assert_eq!(doc.to_sorted_json(), doc.crdt_root.to_sorted_json());
+        assert_eq!(
+            r#"0:00:0.SET.items=[],1:00:1.ADD.1,1:00:2.INCREASE.4"#,
+            doc.local_changes[0].to_test_string()
+        );
+        assert_eq!(
+            r#"1:00:2.INCREASE.5"#,
+            doc.local_changes[1].to_test_string()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn records_long_counter_overflow() -> Result<()> {
+        let mut doc = Document::new("doc-key");
+
+        doc.update(|root| {
+            root.set_long_counter("longCount", i64::MAX)?
+                .increase(1i64)?;
+            Ok(())
+        })?;
+
+        assert_eq!(
+            r#"{"longCount":-9223372036854775808}"#,
+            doc.to_sorted_json()
+        );
+        assert_eq!(doc.to_sorted_json(), doc.crdt_root.to_sorted_json());
+        assert_eq!(
+            r#"0:00:0.SET.longCount=9223372036854775807,1:00:1.INCREASE.1"#,
+            doc.local_changes[0].to_test_string()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn records_dedup_counter_adds_with_actor() -> Result<()> {
+        let mut doc = Document::new("doc-key");
+
+        doc.update(|root| {
+            root.set_dedup_counter("uv")?
+                .add("user-1")?
+                .add("user-1")?
+                .add("user-2")?;
+            Ok(())
+        })?;
+
+        assert_eq!(r#"{"uv":2}"#, doc.to_sorted_json());
+        assert_eq!(doc.to_sorted_json(), doc.crdt_root.to_sorted_json());
+        assert_eq!(
+            r#"0:00:0.SET.uv=0,1:00:1.INCREASE.1,1:00:1.INCREASE.1,1:00:1.INCREASE.1"#,
             doc.local_changes[0].to_test_string()
         );
         Ok(())

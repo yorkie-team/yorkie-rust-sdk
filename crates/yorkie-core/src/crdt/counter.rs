@@ -4,7 +4,7 @@ use super::primitive::{CrdtPrimitive, PrimitiveValue};
 use crate::{Result, TimeTicket, YorkieError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CounterType {
+pub enum CounterType {
     Integer,
     Long,
     IntegerDedup,
@@ -21,10 +21,28 @@ impl CounterType {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum CounterValue {
+pub enum CounterValue {
     Integer(i32),
     Long(i64),
     Double(f64),
+}
+
+impl From<i32> for CounterValue {
+    fn from(value: i32) -> Self {
+        Self::Integer(value)
+    }
+}
+
+impl From<i64> for CounterValue {
+    fn from(value: i64) -> Self {
+        Self::Long(value)
+    }
+}
+
+impl From<f64> for CounterValue {
+    fn from(value: f64) -> Self {
+        Self::Double(value)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
