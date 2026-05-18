@@ -1,4 +1,5 @@
 use super::{Change, Checkpoint};
+use crate::crdt::object::CrdtObject;
 use crate::VersionVector;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -8,6 +9,7 @@ pub struct ChangePack {
     is_removed: bool,
     changes: Vec<Change>,
     snapshot: Option<Vec<u8>>,
+    snapshot_root: Option<CrdtObject>,
     version_vector: Option<VersionVector>,
 }
 
@@ -26,6 +28,7 @@ impl ChangePack {
             is_removed,
             changes,
             snapshot,
+            snapshot_root: None,
             version_vector,
         }
     }
@@ -46,6 +49,27 @@ impl ChangePack {
             version_vector,
             snapshot,
         )
+    }
+
+    pub(crate) fn create_with_snapshot_root(
+        document_key: impl Into<String>,
+        checkpoint: Checkpoint,
+        is_removed: bool,
+        changes: Vec<Change>,
+        version_vector: Option<VersionVector>,
+        snapshot: Option<Vec<u8>>,
+        snapshot_root: Option<CrdtObject>,
+    ) -> Self {
+        let mut pack = Self::new(
+            document_key,
+            checkpoint,
+            is_removed,
+            changes,
+            version_vector,
+            snapshot,
+        );
+        pack.snapshot_root = snapshot_root;
+        pack
     }
 
     pub fn document_key(&self) -> &str {
@@ -84,10 +108,15 @@ impl ChangePack {
             .as_ref()
             .map(|snapshot| !snapshot.is_empty())
             .unwrap_or(false)
+            || self.snapshot_root.is_some()
     }
 
     pub fn snapshot(&self) -> Option<&[u8]> {
         self.snapshot.as_deref()
+    }
+
+    pub(crate) fn snapshot_root(&self) -> Option<&CrdtObject> {
+        self.snapshot_root.as_ref()
     }
 
     pub fn version_vector(&self) -> Option<&VersionVector> {

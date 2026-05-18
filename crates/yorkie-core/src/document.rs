@@ -113,11 +113,11 @@ impl Document {
     /// Applies the given change pack to this document.
     pub fn apply_change_pack(&mut self, pack: &ChangePack) -> Result<()> {
         if pack.has_snapshot() {
-            return Err(YorkieError::UnsupportedSnapshot);
+            self.apply_snapshot(pack)?;
+        } else {
+            self.apply_changes(pack.changes(), OpSource::Remote)?;
+            self.remove_pushed_local_changes(pack.checkpoint().client_seq());
         }
-
-        self.apply_changes(pack.changes(), OpSource::Remote)?;
-        self.remove_pushed_local_changes(pack.checkpoint().client_seq());
 
         self.checkpoint = self.checkpoint.forward(pack.checkpoint());
         Ok(())
@@ -135,6 +135,27 @@ impl Document {
         }
 
         self.root = crdt_object_to_json_object(self.crdt_root.object())?;
+        Ok(())
+    }
+
+    fn apply_snapshot(&mut self, pack: &ChangePack) -> Result<()> {
+        let snapshot_root = pack
+            .snapshot_root()
+            .ok_or(YorkieError::UnsupportedSnapshot)?
+            .clone();
+
+        self.crdt_root = CrdtRoot::new(snapshot_root);
+        self.root = crdt_object_to_json_object(self.crdt_root.object())?;
+
+        if let Some(version_vector) = pack.version_vector() {
+            self.change_id = self
+                .change_id
+                .set_clocks(version_vector.max_lamport(), version_vector.clone());
+        }
+
+        self.remove_pushed_local_changes(pack.checkpoint().client_seq());
+        let local_changes = self.local_changes.clone();
+        self.apply_changes(&local_changes, OpSource::Local)?;
         Ok(())
     }
 
@@ -1717,7 +1738,74 @@ mod tests {
     }
 
     #[test]
-    fn reports_snapshot_change_pack_until_snapshot_apply_is_supported() {
+    fn applies_snapshot_change_pack_to_root() -> Result<()> {
+        let mut source = Document::new("source-doc");
+        let mut target = Document::new("target-doc");
+
+        source.update(|root| {
+            root.set("title", "snapshot")?;
+            let mut items = JsonArray::new();
+            items.push("one")?.push(2i32)?;
+            root.set("items", items)?;
+            Ok(())
+        })?;
+
+        let source_pack = source.create_change_pack();
+        let snapshot_pack = ChangePack::create_with_snapshot_root(
+            "target-doc",
+            Checkpoint::new(7, 0),
+            false,
+            Vec::new(),
+            source_pack.version_vector().cloned(),
+            Some(vec![1]),
+            Some(source.crdt_root.object().clone()),
+        );
+
+        target.apply_change_pack(&snapshot_pack)?;
+
+        assert_eq!(Checkpoint::new(7, 0), target.checkpoint());
+        assert_eq!(
+            r#"{"items":["one",2],"title":"snapshot"}"#,
+            target.to_sorted_json()
+        );
+        assert_eq!(target.crdt_root.to_sorted_json(), target.to_sorted_json());
+        assert!(target.change_id.lamport() > source_pack.version_vector().unwrap().max_lamport());
+        Ok(())
+    }
+
+    #[test]
+    fn reapplies_remaining_local_changes_after_snapshot() -> Result<()> {
+        let mut source = Document::new("source-doc");
+        source.update(|root| root.set("title", "remote").map(|_| ()))?;
+
+        let mut target = Document::new("target-doc");
+        target.update(|root| root.set("acked1", "old").map(|_| ()))?;
+        target.update(|root| root.set("acked2", "old").map(|_| ()))?;
+        target.update(|root| root.set("draft", "local").map(|_| ()))?;
+
+        let source_pack = source.create_change_pack();
+        let snapshot_pack = ChangePack::create_with_snapshot_root(
+            "target-doc",
+            Checkpoint::new(7, 2),
+            false,
+            Vec::new(),
+            source_pack.version_vector().cloned(),
+            Some(vec![1]),
+            Some(source.crdt_root.object().clone()),
+        );
+
+        target.apply_change_pack(&snapshot_pack)?;
+
+        assert_eq!(1, target.local_changes.len());
+        assert_eq!(
+            r#"{"draft":"local","title":"remote"}"#,
+            target.to_sorted_json()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_raw_snapshot_bytes_without_decoded_root() {
         let mut doc = Document::new("doc-key");
         let pack = ChangePack::create(
             "doc-key",

@@ -47,7 +47,7 @@ pub enum YorkieError {
     /// A counter operation is invalid for the current counter mode.
     InvalidCounterOperation(String),
 
-    /// Snapshot application has not been implemented yet.
+    /// Snapshot bytes were provided without a decoded root object.
     UnsupportedSnapshot,
 
     /// A core value does not have protocol conversion support yet.
@@ -90,7 +90,7 @@ impl Display for YorkieError {
             Self::InvalidCounterOperation(message) => {
                 write!(f, "invalid counter operation: {message}")
             }
-            Self::UnsupportedSnapshot => write!(f, "snapshot application is not supported yet"),
+            Self::UnsupportedSnapshot => write!(f, "snapshot application requires a decoded root"),
             Self::UnsupportedProtocolConversion(value) => {
                 write!(f, "unsupported protocol conversion for {value}")
             }

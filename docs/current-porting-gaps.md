@@ -607,7 +607,9 @@ Current Rust behavior:
 - `Change` executes operations and stacks reverse operations.
 - `ChangePack` carries document key, checkpoint, changes, version vector,
   removal flag, and optional snapshot bytes.
-- `Document::apply_change_pack` applies changes and advances checkpoints.
+- `Document::apply_change_pack` applies changes or decoded snapshot roots,
+  removes acked local changes, reapplies remaining local changes after
+  snapshots, and advances checkpoints.
 
 JS/Go behavior:
 
@@ -621,19 +623,22 @@ Gap:
 - Rust change context now mediates the first public object/array mutation
   methods, but it does not yet own full live JSON/CRDT wrappers.
 - Presence changes are not implemented.
-- Snapshot application is explicitly unsupported.
 - `ChangePack::is_removed` is stored but document removal behavior is not
   applied.
 - Change packs can be projected to generated protobuf payloads and
   reconstructed back into core `ChangePack` values for the current operation
-  set. Binary round-trip tests cover nested object/array/counter replay through
+  set. Binary round-trip tests cover nested object/array/counter replay, and
+  protocol snapshot tests cover root replacement through
   `Document::apply_change_pack`.
+- Raw snapshot bytes that have not been decoded by the protocol converter are
+  still rejected by core to keep protobuf parsing out of `yorkie-core`.
 - Sync/status transitions are not implemented.
 
 Expected direction:
 
 - Add live change context before expanding public document mutation APIs.
-- Implement serialization and snapshot handling before real client sync.
+- Extend snapshot handling with presence, GC, and cross-language binary
+  fixtures before real client sync.
 - Add document removal behavior when `ChangePack::is_removed` is applied.
 
 ## Undo and Redo
@@ -685,7 +690,8 @@ Current Rust behavior:
 - Protocol conversion tests cover actor bytes, version-vector base64 actor
   keys, counter set/increase operations, dedup counter increase actors,
   object/array `JSONElementSimple` full-payload bytes, protobuf-to-domain
-  reconstruction, and binary change-pack round trips.
+  reconstruction, decoded snapshot application, and binary change-pack round
+  trips.
 
 JS/Go behavior:
 
@@ -695,22 +701,23 @@ JS/Go behavior:
 Gap:
 
 - Presence changes are not converted yet.
-- Snapshot bytes are carried in `ChangePack`, and full `JSONElement`
-  conversion exists for object/array/primitive/text/counter/tree payloads, but
-  `Document::apply_change_pack` still rejects snapshot application.
+- Snapshot bytes are carried in `ChangePack`, and the protocol converter
+  decodes `Snapshot.root` into a core snapshot root for
+  `Document::apply_change_pack`. Snapshot presences are currently ignored
+  because presence is not implemented.
 - No cross-language binary compatibility tests.
 - JS and Go both have direct converter tests for root/object bytes and tree
   bytes. Go also has direct array bytes, change-pack, presence, and snapshot
   converter tests. Rust currently covers object/array simple payload bytes and
-  change-pack replay, while tree bytes, presence, and snapshot tests remain
-  blocked by missing public tree facade, presence model, and snapshot
-  application.
+  change-pack replay plus a generated-protobuf snapshot apply path, while tree
+  bytes, presence, and cross-language snapshot fixtures remain blocked by
+  missing public tree facade, presence model, and fixture generation.
 
 Expected direction:
 
 - Add JS/Go-produced binary fixtures for the current field-level converter.
-- Implement snapshot application against `CrdtRoot` once snapshot sync is
-  pulled into the document lifecycle.
+- Add snapshot GC/presence behavior once sync and presence are pulled into the
+  document lifecycle.
 - Use JS converter files and Yorkie proto definitions as the main reference,
   with Go as a server/client cross-check.
 

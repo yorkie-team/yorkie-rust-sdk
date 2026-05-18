@@ -253,6 +253,7 @@ pub struct WireChangePack {
     pub is_removed: bool,
     pub changes: Vec<WireChange>,
     pub snapshot: Option<Vec<u8>>,
+    pub snapshot_root: Option<WireJsonElement>,
     pub version_vector: Option<VersionVector>,
 }
 
@@ -272,6 +273,10 @@ impl TryFrom<&ChangePack> for WireChangePack {
             is_removed: pack.is_removed(),
             changes,
             snapshot: pack.snapshot().map(ToOwned::to_owned),
+            snapshot_root: pack
+                .snapshot_root()
+                .map(|object| WireJsonElement::try_from(&CrdtElement::object(object.clone())))
+                .transpose()?,
             version_vector: pack.version_vector().cloned(),
         })
     }
@@ -287,13 +292,26 @@ impl TryFrom<WireChangePack> for ChangePack {
             .map(Change::try_from)
             .collect::<Result<Vec<_>>>()?;
 
-        Ok(Self::create(
+        let snapshot_root = pack
+            .snapshot_root
+            .map(CrdtElement::try_from)
+            .transpose()?
+            .map(|element| match element {
+                CrdtElement::Object(object) => Ok(*object),
+                _ => Err(YorkieError::UnsupportedProtocolConversion(
+                    "snapshot root must be object",
+                )),
+            })
+            .transpose()?;
+
+        Ok(Self::create_with_snapshot_root(
             pack.document_key,
             pack.checkpoint,
             pack.is_removed,
             changes,
             pack.version_vector,
             pack.snapshot,
+            snapshot_root,
         ))
     }
 }

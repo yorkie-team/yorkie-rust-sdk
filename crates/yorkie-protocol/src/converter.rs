@@ -123,10 +123,18 @@ pub fn from_version_vector(vector: &api::VersionVector) -> Result<CoreVersionVec
 }
 
 fn wire_change_pack_to_proto(pack: &WireChangePack) -> Result<api::ChangePack> {
+    let snapshot = if let Some(snapshot) = &pack.snapshot {
+        snapshot.clone()
+    } else if let Some(snapshot_root) = &pack.snapshot_root {
+        snapshot_root_to_bytes(snapshot_root)?
+    } else {
+        Vec::new()
+    };
+
     Ok(api::ChangePack {
         document_key: pack.document_key.clone(),
         checkpoint: Some(to_checkpoint(pack.checkpoint)),
-        snapshot: pack.snapshot.clone().unwrap_or_default(),
+        snapshot,
         changes: pack
             .changes
             .iter()
@@ -143,6 +151,12 @@ fn wire_change_pack_to_proto(pack: &WireChangePack) -> Result<api::ChangePack> {
 }
 
 fn proto_change_pack_to_wire(pack: &api::ChangePack) -> Result<WireChangePack> {
+    let snapshot_root = if pack.snapshot.is_empty() {
+        None
+    } else {
+        Some(snapshot_root_from_bytes(&pack.snapshot)?)
+    };
+
     Ok(WireChangePack {
         document_key: pack.document_key.clone(),
         checkpoint: from_checkpoint(*required(&pack.checkpoint, "change_pack.checkpoint")?),
@@ -153,12 +167,26 @@ fn proto_change_pack_to_wire(pack: &api::ChangePack) -> Result<WireChangePack> {
             .map(proto_change_to_wire)
             .collect::<Result<Vec<_>>>()?,
         snapshot: (!pack.snapshot.is_empty()).then(|| pack.snapshot.clone()),
+        snapshot_root,
         version_vector: pack
             .version_vector
             .as_ref()
             .map(from_version_vector)
             .transpose()?,
     })
+}
+
+fn snapshot_root_to_bytes(snapshot_root: &WireJsonElement) -> Result<Vec<u8>> {
+    Ok(api::Snapshot {
+        root: Some(wire_json_element_to_proto(snapshot_root)?),
+        presences: BTreeMap::new(),
+    }
+    .encode_to_vec())
+}
+
+fn snapshot_root_from_bytes(snapshot: &[u8]) -> Result<WireJsonElement> {
+    let snapshot = api::Snapshot::decode(snapshot)?;
+    proto_json_element_to_wire(required(&snapshot.root, "snapshot.root")?)
 }
 
 fn wire_change_to_proto(change: &WireChange) -> Result<api::Change> {
@@ -1149,8 +1177,9 @@ mod tests {
         decode_change_pack, encode_change_pack, from_change_pack, to_change_pack, to_time_ticket,
         to_version_vector,
     };
-    use crate::yorkie::v1::{json_element, operation::Body, ValueType};
+    use crate::yorkie::v1::{self as api, json_element, operation::Body, ValueType};
     use prost::Message;
+    use std::collections::BTreeMap;
     use std::error::Error;
     use yorkie_core::{Document, TimeTicket};
 
@@ -1350,6 +1379,61 @@ mod tests {
         target.apply_change_pack(&decoded)?;
 
         assert_eq!(r#"{"items":["sync",1]}"#, target.to_sorted_json());
+        Ok(())
+    }
+
+    #[test]
+    fn decodes_proto_snapshot_change_pack_into_document_root() -> Result<(), Box<dyn Error>> {
+        let actor_id = "000000000000000000000001";
+        let mut version_vector = yorkie_core::VersionVector::new();
+        version_vector.set(actor_id, 1);
+
+        let snapshot = api::Snapshot {
+            root: Some(api::JsonElement {
+                body: Some(json_element::Body::JsonObject(json_element::JsonObject {
+                    nodes: vec![api::RhtNode {
+                        key: "title".to_owned(),
+                        element: Some(api::JsonElement {
+                            body: Some(json_element::Body::Primitive(json_element::Primitive {
+                                r#type: ValueType::String as i32,
+                                value: b"snapshot".to_vec(),
+                                created_at: Some(to_time_ticket(&TimeTicket::new(1, 1, actor_id))?),
+                                moved_at: None,
+                                removed_at: None,
+                            })),
+                        }),
+                    }],
+                    created_at: Some(to_time_ticket(&TimeTicket::initial())?),
+                    moved_at: None,
+                    removed_at: None,
+                })),
+            }),
+            presences: BTreeMap::new(),
+        }
+        .encode_to_vec();
+
+        let proto = api::ChangePack {
+            document_key: "target-doc".to_owned(),
+            checkpoint: Some(api::Checkpoint {
+                server_seq: 7,
+                client_seq: 0,
+            }),
+            snapshot,
+            changes: Vec::new(),
+            min_synced_ticket: None,
+            is_removed: false,
+            version_vector: Some(to_version_vector(&version_vector)?),
+        };
+
+        let pack = from_change_pack(&proto)?;
+        let encoded_proto = to_change_pack(&pack)?;
+        assert_eq!(proto.snapshot, encoded_proto.snapshot);
+
+        let mut doc = Document::new("target-doc");
+        doc.apply_change_pack(&pack)?;
+
+        assert_eq!(r#"{"title":"snapshot"}"#, doc.to_sorted_json());
+        assert_eq!(yorkie_core::Checkpoint::new(7, 0), doc.checkpoint());
         Ok(())
     }
 }
