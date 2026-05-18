@@ -94,6 +94,17 @@ client orchestration -> attachment/sync/watch helpers -> protocol adapter
 document API -> change/context -> operation -> crdt/time/json data structures
 ```
 
+Current `yorkie-client` module layout follows the same split:
+
+| Module | Role |
+| --- | --- |
+| `client.rs` | Client orchestration, lifecycle state, and public client methods. |
+| `options.rs` | Client, attach, detach, channel, and sync mode option types. |
+| `attachment.rs` | Per-resource attachment metadata and sync interval helpers. |
+| `transport.rs` | Request/response DTOs and transport traits for RPC boundaries. |
+| `error.rs` | Client-layer error and result types. |
+| `lib.rs` | Crate entrypoint and public re-exports only. |
+
 Avoid sibling modules that call into each other in both directions. If that
 happens, extract the shared type or function into a lower-level module.
 
@@ -122,4 +133,3 @@ Before adding a dependency:
 - Could the shared type live in a lower-level module or crate?
 - Is this dependency visible in public API?
 - Would this make future FFI or WASM bindings harder?
-

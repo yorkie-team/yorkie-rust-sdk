@@ -747,6 +747,9 @@ Expected direction:
 Current Rust behavior:
 
 - Client crates and facade are scaffolded.
+- `yorkie-client` is split into `client`, `options`, `attachment`,
+  `transport`, and `error` modules, with `lib.rs` kept as a re-exporting crate
+  entrypoint.
 - `ClientOptions` carries the JS/Go-shaped base options that do not require a
   network runtime yet: RPC address, client key, API key, metadata, user agent,
   sync-loop duration, retry delay, reconnect delay, and channel heartbeat
