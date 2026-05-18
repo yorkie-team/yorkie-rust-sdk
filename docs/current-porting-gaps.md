@@ -693,7 +693,8 @@ Current Rust behavior:
   reconstruction, decoded snapshot application, snapshot-root `ChangePack`
   protobuf bytes, binary change-pack round trips, and mixed operation replay
   through object set/remove, array add/remove/move, text edit/style, and
-  counter increase. They also cover tree node arrays and full
+  counter increase. They also cover missing-checkpoint change-pack errors, tree
+  node arrays, and full
   `JSONElement.Tree` protobuf payloads, including node IDs, depths,
   attributes, removed markers, and persisted merge metadata.
 - Core wire tests now port the JS root bytes scenario for nested object, array,
@@ -709,6 +710,9 @@ JS/Go behavior:
 Gap:
 
 - Presence changes are not converted yet.
+- Go has a nil-pack converter error case. Rust takes `&api::ChangePack`, so
+  that exact nil case is excluded by the function signature; the missing
+  checkpoint case is covered.
 - Snapshot bytes are carried in `ChangePack`, and the protocol converter
   decodes `Snapshot.root` into a core snapshot root for
   `Document::apply_change_pack`. Snapshot presences are currently ignored

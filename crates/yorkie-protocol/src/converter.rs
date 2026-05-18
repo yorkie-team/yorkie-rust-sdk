@@ -1177,7 +1177,7 @@ mod tests {
         decode_change_pack, encode_change_pack, from_change_pack, proto_change_pack_to_wire,
         proto_json_element_to_wire, proto_tree_nodes_to_wire, to_change_pack, to_time_ticket,
         to_version_vector, wire_change_pack_to_proto, wire_json_element_to_proto,
-        wire_tree_nodes_to_proto,
+        wire_tree_nodes_to_proto, ProtocolError,
     };
     use crate::yorkie::v1::{self as api, json_element, operation::Body, ValueType};
     use prost::Message;
@@ -1609,6 +1609,13 @@ mod tests {
             doc.to_sorted_json()
         );
         Ok(())
+    }
+
+    #[test]
+    fn rejects_change_pack_without_checkpoint() {
+        let err = from_change_pack(&api::ChangePack::default()).unwrap_err();
+
+        assert_eq!(ProtocolError::MissingField("change_pack.checkpoint"), err);
     }
 
     #[test]
