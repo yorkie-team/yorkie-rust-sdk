@@ -1660,6 +1660,63 @@ mod tests {
     }
 
     #[test]
+    fn applies_remote_counter_changes_from_change_pack() -> Result<()> {
+        let mut source = Document::new("source-doc");
+        let mut target = Document::new("target-doc");
+
+        source.update(|root| {
+            root.set_counter("count", 1)?.increase(2i32)?;
+            Ok(())
+        })?;
+
+        let source_pack = source.create_change_pack();
+        let remote_pack = ChangePack::create(
+            "target-doc",
+            Checkpoint::new(1, 0),
+            false,
+            source_pack.changes().to_vec(),
+            source_pack.version_vector().cloned(),
+            None,
+        );
+
+        target.apply_change_pack(&remote_pack)?;
+
+        assert_eq!(r#"{"count":3}"#, target.to_sorted_json());
+        assert_eq!(target.crdt_root.to_sorted_json(), target.to_sorted_json());
+        Ok(())
+    }
+
+    #[test]
+    fn applies_remote_dedup_counter_changes_from_change_pack() -> Result<()> {
+        let mut source = Document::new("source-doc");
+        let mut target = Document::new("target-doc");
+
+        source.update(|root| {
+            root.set_dedup_counter("uv")?
+                .add("user-1")?
+                .add("user-1")?
+                .add("user-2")?;
+            Ok(())
+        })?;
+
+        let source_pack = source.create_change_pack();
+        let remote_pack = ChangePack::create(
+            "target-doc",
+            Checkpoint::new(1, 0),
+            false,
+            source_pack.changes().to_vec(),
+            source_pack.version_vector().cloned(),
+            None,
+        );
+
+        target.apply_change_pack(&remote_pack)?;
+
+        assert_eq!(r#"{"uv":2}"#, target.to_sorted_json());
+        assert_eq!(target.crdt_root.to_sorted_json(), target.to_sorted_json());
+        Ok(())
+    }
+
+    #[test]
     fn reports_snapshot_change_pack_until_snapshot_apply_is_supported() {
         let mut doc = Document::new("doc-key");
         let pack = ChangePack::create(
