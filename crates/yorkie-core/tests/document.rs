@@ -15,8 +15,8 @@ fn updates_a_local_document_root() -> Result<()> {
 
         root.set("todos", JsonArray::new())?;
         root.get_array_mut("todos")?
-            .push("write tests")
-            .push("sync");
+            .push("write tests")?
+            .push("sync")?;
 
         Ok(())
     })?;

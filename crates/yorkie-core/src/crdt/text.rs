@@ -605,7 +605,7 @@ impl CrdtText {
                 continue;
             }
 
-            array.push(node.value().to_json_object()?);
+            array.push(node.value().to_json_object()?)?;
         }
 
         Ok(array)

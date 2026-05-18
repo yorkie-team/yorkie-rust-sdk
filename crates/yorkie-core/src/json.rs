@@ -1,6 +1,70 @@
-use crate::{Result, YorkieError};
+use crate::{Result, TimeTicket, YorkieError};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::fmt::Write;
+use std::fmt::{self, Write};
+use std::rc::Rc;
+
+pub(crate) type JsonEditRecorderRef = Rc<RefCell<dyn JsonEditRecorder>>;
+
+pub(crate) trait JsonEditRecorder {
+    fn record_object_set(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        key: &str,
+        value: &JsonValue,
+    ) -> Result<RecordedJsonValue>;
+
+    fn record_object_remove(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        key: &str,
+        created_at: &TimeTicket,
+    );
+
+    fn record_array_insert(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        prev_created_at: &TimeTicket,
+        value: &JsonValue,
+    ) -> Result<RecordedJsonValue>;
+
+    fn record_array_set(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        created_at: &TimeTicket,
+        value: &JsonValue,
+    ) -> Result<RecordedJsonValue>;
+
+    fn record_array_remove(&mut self, parent_created_at: &TimeTicket, created_at: &TimeTicket);
+
+    fn record_array_move(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        prev_created_at: &TimeTicket,
+        created_at: &TimeTicket,
+    ) -> TimeTicket;
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RecordedJsonValue {
+    value: JsonValue,
+    created_at: TimeTicket,
+    position_created_at: TimeTicket,
+}
+
+impl RecordedJsonValue {
+    pub(crate) fn new(
+        value: JsonValue,
+        created_at: TimeTicket,
+        position_created_at: TimeTicket,
+    ) -> Self {
+        Self {
+            value,
+            created_at,
+            position_created_at,
+        }
+    }
+}
 
 /// A JSON-like value stored in a Yorkie document root.
 #[derive(Debug, Clone, PartialEq)]
@@ -13,6 +77,29 @@ pub enum JsonValue {
     String(String),
     Object(JsonObject),
     Array(JsonArray),
+}
+
+/// A JSON array element together with its CRDT identity.
+#[derive(Debug, Clone, Copy)]
+pub struct JsonArrayElement<'a> {
+    id: &'a TimeTicket,
+    value: &'a JsonValue,
+}
+
+impl<'a> JsonArrayElement<'a> {
+    pub fn new(id: &'a TimeTicket, value: &'a JsonValue) -> Self {
+        Self { id, value }
+    }
+
+    /// Returns the element ID.
+    pub fn id(&self) -> &'a TimeTicket {
+        self.id
+    }
+
+    /// Returns the JSON value of this element.
+    pub fn value(&self) -> &'a JsonValue {
+        self.value
+    }
 }
 
 impl JsonValue {
@@ -33,14 +120,49 @@ impl JsonValue {
 }
 
 /// A JSON object whose keys are emitted in sorted order.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Clone)]
 pub struct JsonObject {
     members: BTreeMap<String, JsonValue>,
+    member_created_at: BTreeMap<String, TimeTicket>,
+    created_at: TimeTicket,
+    recorder: Option<JsonEditRecorderRef>,
+}
+
+impl fmt::Debug for JsonObject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JsonObject")
+            .field("members", &self.members)
+            .finish()
+    }
+}
+
+impl Default for JsonObject {
+    fn default() -> Self {
+        Self {
+            members: BTreeMap::new(),
+            member_created_at: BTreeMap::new(),
+            created_at: TimeTicket::initial(),
+            recorder: None,
+        }
+    }
+}
+
+impl PartialEq for JsonObject {
+    fn eq(&self, other: &Self) -> bool {
+        self.members == other.members
+    }
 }
 
 impl JsonObject {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn with_created_at(created_at: TimeTicket) -> Self {
+        Self {
+            created_at,
+            ..Self::default()
+        }
     }
 
     pub fn set(
@@ -53,7 +175,22 @@ impl JsonObject {
             return Err(YorkieError::InvalidObjectKey(key));
         }
 
-        self.members.insert(key, value.into());
+        let value = value.into();
+        let value = if let Some(recorder) = self.recorder.clone() {
+            let mut recorded =
+                recorder
+                    .borrow_mut()
+                    .record_object_set(&self.created_at, &key, &value)?;
+            recorded.value.attach_recorder(recorder);
+            self.member_created_at
+                .insert(key.clone(), recorded.created_at);
+            recorded.value
+        } else {
+            self.member_created_at.remove(&key);
+            value
+        };
+
+        self.members.insert(key, value);
         Ok(self)
     }
 
@@ -66,6 +203,18 @@ impl JsonObject {
         self
     }
 
+    pub(crate) fn set_tracked_unchecked(
+        &mut self,
+        key: impl Into<String>,
+        value: impl Into<JsonValue>,
+        created_at: TimeTicket,
+    ) -> &mut Self {
+        let key = key.into();
+        self.members.insert(key.clone(), value.into());
+        self.member_created_at.insert(key, created_at);
+        self
+    }
+
     pub fn get(&self, key: &str) -> Option<&JsonValue> {
         self.members.get(key)
     }
@@ -75,7 +224,19 @@ impl JsonObject {
     }
 
     pub fn remove(&mut self, key: &str) -> Option<JsonValue> {
-        self.members.remove(key)
+        if let (Some(recorder), Some(created_at)) = (
+            self.recorder.clone(),
+            self.member_created_at.get(key).cloned(),
+        ) {
+            recorder
+                .borrow_mut()
+                .record_object_remove(&self.created_at, key, &created_at);
+        }
+
+        self.member_created_at.remove(key);
+        let mut removed = self.members.remove(key)?;
+        removed.detach_recorder();
+        Some(removed)
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, &JsonValue)> {
@@ -118,12 +279,49 @@ impl JsonObject {
 
         format!("{{{members}}}")
     }
+
+    pub(crate) fn attach_recorder(&mut self, recorder: JsonEditRecorderRef) {
+        self.recorder = Some(recorder.clone());
+        for value in self.members.values_mut() {
+            value.attach_recorder(recorder.clone());
+        }
+    }
 }
 
 /// A JSON array stored in a Yorkie document root.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Clone)]
 pub struct JsonArray {
     elements: Vec<JsonValue>,
+    element_created_at: Vec<TimeTicket>,
+    position_created_at: Vec<TimeTicket>,
+    created_at: TimeTicket,
+    recorder: Option<JsonEditRecorderRef>,
+}
+
+impl fmt::Debug for JsonArray {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JsonArray")
+            .field("elements", &self.elements)
+            .finish()
+    }
+}
+
+impl Default for JsonArray {
+    fn default() -> Self {
+        Self {
+            elements: Vec::new(),
+            element_created_at: Vec::new(),
+            position_created_at: Vec::new(),
+            created_at: TimeTicket::initial(),
+            recorder: None,
+        }
+    }
+}
+
+impl PartialEq for JsonArray {
+    fn eq(&self, other: &Self) -> bool {
+        self.elements == other.elements
+    }
 }
 
 impl JsonArray {
@@ -131,9 +329,15 @@ impl JsonArray {
         Self::default()
     }
 
-    pub fn push(&mut self, value: impl Into<JsonValue>) -> &mut Self {
-        self.elements.push(value.into());
-        self
+    pub(crate) fn with_created_at(created_at: TimeTicket) -> Self {
+        Self {
+            created_at,
+            ..Self::default()
+        }
+    }
+
+    pub fn push(&mut self, value: impl Into<JsonValue>) -> Result<&mut Self> {
+        self.insert(self.elements.len(), value)
     }
 
     pub fn len(&self) -> usize {
@@ -144,24 +348,133 @@ impl JsonArray {
         self.elements.is_empty()
     }
 
+    pub fn id(&self) -> &TimeTicket {
+        &self.created_at
+    }
+
+    pub fn element_id(&self, index: usize) -> Option<&TimeTicket> {
+        self.element_created_at.get(index)
+    }
+
+    pub fn last_id(&self) -> Option<&TimeTicket> {
+        self.element_created_at.last()
+    }
+
     pub fn get(&self, index: usize) -> Option<&JsonValue> {
         self.elements.get(index)
+    }
+
+    pub fn get_element_by_index(&self, index: usize) -> Option<JsonArrayElement<'_>> {
+        Some(JsonArrayElement::new(
+            self.element_created_at.get(index)?,
+            self.elements.get(index)?,
+        ))
+    }
+
+    pub fn get_by_id(&self, id: &TimeTicket) -> Option<&JsonValue> {
+        self.index_by_element_id(id)
+            .and_then(|index| self.elements.get(index))
+    }
+
+    pub fn get_element_by_id(&self, id: &TimeTicket) -> Option<JsonArrayElement<'_>> {
+        let index = self.index_by_element_id(id)?;
+        self.get_element_by_index(index)
+    }
+
+    pub fn get_last(&self) -> Option<JsonArrayElement<'_>> {
+        let index = self.elements.len().checked_sub(1)?;
+        self.get_element_by_index(index)
     }
 
     pub fn get_mut(&mut self, index: usize) -> Option<&mut JsonValue> {
         self.elements.get_mut(index)
     }
 
+    pub fn get_mut_by_id(&mut self, id: &TimeTicket) -> Option<&mut JsonValue> {
+        let index = self.index_by_element_id(id)?;
+        self.elements.get_mut(index)
+    }
+
+    pub fn contains(&self, value: impl Into<JsonValue>) -> bool {
+        let value = value.into();
+        self.elements.contains(&value)
+    }
+
+    pub fn index_of(
+        &self,
+        value: impl Into<JsonValue>,
+        from_index: Option<isize>,
+    ) -> Option<usize> {
+        let value = value.into();
+        let start = forward_search_start(from_index, self.elements.len())?;
+        self.elements[start..]
+            .iter()
+            .position(|element| element == &value)
+            .map(|index| start + index)
+    }
+
+    pub fn last_index_of(
+        &self,
+        value: impl Into<JsonValue>,
+        from_index: Option<isize>,
+    ) -> Option<usize> {
+        let value = value.into();
+        let start = reverse_search_start(from_index, self.elements.len())?;
+        self.elements[..=start]
+            .iter()
+            .rposition(|element| element == &value)
+    }
+
+    pub fn contains_id(&self, id: &TimeTicket) -> bool {
+        self.index_by_element_id(id).is_some()
+    }
+
+    pub fn index_of_id(&self, id: &TimeTicket, from_index: Option<isize>) -> Option<usize> {
+        let start = forward_search_start(from_index, self.element_created_at.len())?;
+        self.element_created_at[start..]
+            .iter()
+            .position(|element_id| element_id == id)
+            .map(|index| start + index)
+    }
+
+    pub fn last_index_of_id(&self, id: &TimeTicket, from_index: Option<isize>) -> Option<usize> {
+        let start = reverse_search_start(from_index, self.element_created_at.len())?;
+        self.element_created_at[..=start]
+            .iter()
+            .rposition(|element_id| element_id == id)
+    }
+
     pub fn set(&mut self, index: usize, value: impl Into<JsonValue>) -> Result<&mut Self> {
         let len = self.elements.len();
-        let Some(element) = self.elements.get_mut(index) else {
+        if index >= len {
             return Err(YorkieError::InvalidIndex(format!(
                 "array index {index} out of bounds for length {len}"
             )));
         };
 
-        *element = value.into();
+        let value = value.into();
+        let value = if let (Some(recorder), Some(created_at)) = (
+            self.recorder.clone(),
+            self.element_created_at.get(index).cloned(),
+        ) {
+            let mut recorded =
+                recorder
+                    .borrow_mut()
+                    .record_array_set(&self.created_at, &created_at, &value)?;
+            recorded.value.attach_recorder(recorder);
+            self.element_created_at[index] = recorded.created_at;
+            self.position_created_at[index] = recorded.position_created_at;
+            recorded.value
+        } else {
+            value
+        };
+
+        self.elements[index] = value;
         Ok(self)
+    }
+
+    pub fn set_value(&mut self, index: usize, value: impl Into<JsonValue>) -> Result<&mut Self> {
+        self.set(index, value)
     }
 
     pub fn insert(&mut self, index: usize, value: impl Into<JsonValue>) -> Result<&mut Self> {
@@ -172,8 +485,72 @@ impl JsonArray {
             )));
         }
 
-        self.elements.insert(index, value.into());
+        let value = value.into();
+        let value = if let Some(recorder) = self.recorder.clone() {
+            let prev_created_at = if index == 0 {
+                TimeTicket::initial()
+            } else {
+                self.position_created_at
+                    .get(index - 1)
+                    .cloned()
+                    .unwrap_or_else(TimeTicket::initial)
+            };
+            let mut recorded = recorder.borrow_mut().record_array_insert(
+                &self.created_at,
+                &prev_created_at,
+                &value,
+            )?;
+            recorded.value.attach_recorder(recorder);
+            self.element_created_at
+                .insert(index, recorded.created_at.clone());
+            self.position_created_at
+                .insert(index, recorded.position_created_at);
+            recorded.value
+        } else {
+            value
+        };
+
+        self.elements.insert(index, value);
         Ok(self)
+    }
+
+    pub fn insert_after(
+        &mut self,
+        prev_id: &TimeTicket,
+        value: impl Into<JsonValue>,
+    ) -> Result<&mut Self> {
+        let index = self.insert_index_after_anchor(prev_id)?;
+        self.insert(index, value)
+    }
+
+    pub fn insert_after_index(
+        &mut self,
+        index: usize,
+        value: impl Into<JsonValue>,
+    ) -> Result<&mut Self> {
+        let len = self.elements.len();
+        let prev_id = self.element_created_at.get(index).cloned().ok_or_else(|| {
+            YorkieError::InvalidIndex(format!(
+                "array index {index} out of bounds for length {len}"
+            ))
+        })?;
+
+        self.insert_after(&prev_id, value)
+    }
+
+    pub fn insert_integer_after(&mut self, index: usize, value: i32) -> Result<&mut Self> {
+        self.insert_after_index(index, value)
+    }
+
+    pub fn insert_before(
+        &mut self,
+        next_id: &TimeTicket,
+        value: impl Into<JsonValue>,
+    ) -> Result<&mut Self> {
+        let index = self
+            .index_by_element_id(next_id)
+            .ok_or_else(|| YorkieError::MissingCrdtElement(next_id.to_id_string()))?;
+        self.insert(index, value)
     }
 
     pub fn remove(&mut self, index: usize) -> Option<JsonValue> {
@@ -181,7 +558,123 @@ impl JsonArray {
             return None;
         }
 
-        Some(self.elements.remove(index))
+        if let (Some(recorder), Some(created_at)) = (
+            self.recorder.clone(),
+            self.element_created_at.get(index).cloned(),
+        ) {
+            recorder
+                .borrow_mut()
+                .record_array_remove(&self.created_at, &created_at);
+        }
+
+        if index < self.element_created_at.len() {
+            self.element_created_at.remove(index);
+        }
+        if index < self.position_created_at.len() {
+            self.position_created_at.remove(index);
+        }
+        let mut removed = self.elements.remove(index);
+        removed.detach_recorder();
+        Some(removed)
+    }
+
+    pub fn delete(&mut self, index: usize) -> Option<JsonValue> {
+        self.remove(index)
+    }
+
+    pub fn delete_by_id(&mut self, id: &TimeTicket) -> Option<JsonValue> {
+        let index = self.index_by_element_id(id)?;
+        self.remove(index)
+    }
+
+    pub fn move_after(&mut self, prev_id: &TimeTicket, id: &TimeTicket) -> Result<&mut Self> {
+        let insert_index = self.insert_index_after_anchor(prev_id)?;
+        let prev_created_at = self.position_created_at_for_anchor(prev_id)?;
+        self.move_to_index(prev_created_at, insert_index, id)
+    }
+
+    pub fn move_before(&mut self, next_id: &TimeTicket, id: &TimeTicket) -> Result<&mut Self> {
+        let next_index = self
+            .index_by_element_id(next_id)
+            .ok_or_else(|| YorkieError::MissingCrdtElement(next_id.to_id_string()))?;
+        let prev_created_at = if next_index == 0 {
+            TimeTicket::initial()
+        } else {
+            self.position_created_at[next_index - 1].clone()
+        };
+        self.move_to_index(prev_created_at, next_index, id)
+    }
+
+    pub fn move_after_by_index(
+        &mut self,
+        prev_index: usize,
+        target_index: usize,
+    ) -> Result<&mut Self> {
+        let len = self.elements.len();
+        let prev_created_at = self
+            .position_created_at
+            .get(prev_index)
+            .cloned()
+            .ok_or_else(|| {
+                YorkieError::InvalidIndex(format!(
+                    "array index {prev_index} out of bounds for length {len}"
+                ))
+            })?;
+        let target_id = self
+            .element_created_at
+            .get(target_index)
+            .cloned()
+            .ok_or_else(|| {
+                YorkieError::InvalidIndex(format!(
+                    "array index {target_index} out of bounds for length {len}"
+                ))
+            })?;
+
+        self.move_to_index(prev_created_at, prev_index + 1, &target_id)
+    }
+
+    pub fn move_front(&mut self, id: &TimeTicket) -> Result<&mut Self> {
+        self.move_to_index(TimeTicket::initial(), 0, id)
+    }
+
+    pub fn move_last(&mut self, id: &TimeTicket) -> Result<&mut Self> {
+        let prev_created_at = self
+            .position_created_at
+            .last()
+            .cloned()
+            .ok_or_else(|| YorkieError::MissingCrdtElement(id.to_id_string()))?;
+        self.move_to_index(prev_created_at, self.elements.len(), id)
+    }
+
+    pub fn splice<I, V>(
+        &mut self,
+        start: isize,
+        delete_count: Option<usize>,
+        items: I,
+    ) -> Result<JsonArray>
+    where
+        I: IntoIterator<Item = V>,
+        V: Into<JsonValue>,
+    {
+        let from = splice_start_index(start, self.elements.len());
+        let to = delete_count
+            .map(|count| from.saturating_add(count).min(self.elements.len()))
+            .unwrap_or_else(|| self.elements.len());
+
+        let mut removed_values = JsonArray::new();
+        for _ in from..to {
+            if let Some(removed) = self.remove(from) {
+                removed_values.push(removed)?;
+            }
+        }
+
+        let mut insert_at = from;
+        for item in items {
+            self.insert(insert_at, item)?;
+            insert_at += 1;
+        }
+
+        Ok(removed_values)
     }
 
     pub fn get_array_mut(&mut self, index: usize) -> Result<&mut JsonArray> {
@@ -212,12 +705,24 @@ impl JsonArray {
         }
     }
 
-    pub(crate) fn iter(&self) -> impl Iterator<Item = &JsonValue> {
+    pub fn iter(&self) -> impl Iterator<Item = &JsonValue> {
         self.elements.iter()
     }
 
-    pub(crate) fn as_slice(&self) -> &[JsonValue] {
+    pub fn as_slice(&self) -> &[JsonValue] {
         &self.elements
+    }
+
+    pub(crate) fn push_tracked_unchecked(
+        &mut self,
+        value: impl Into<JsonValue>,
+        created_at: TimeTicket,
+        position_created_at: TimeTicket,
+    ) -> &mut Self {
+        self.elements.push(value.into());
+        self.element_created_at.push(created_at);
+        self.position_created_at.push(position_created_at);
+        self
     }
 
     pub fn to_sorted_json(&self) -> String {
@@ -229,6 +734,187 @@ impl JsonArray {
             .join(",");
 
         format!("[{elements}]")
+    }
+
+    pub(crate) fn attach_recorder(&mut self, recorder: JsonEditRecorderRef) {
+        self.recorder = Some(recorder.clone());
+        for value in &mut self.elements {
+            value.attach_recorder(recorder.clone());
+        }
+    }
+
+    fn index_by_element_id(&self, id: &TimeTicket) -> Option<usize> {
+        self.element_created_at
+            .iter()
+            .position(|created_at| created_at == id)
+    }
+
+    fn index_by_position_id(&self, id: &TimeTicket) -> Option<usize> {
+        self.position_created_at
+            .iter()
+            .position(|created_at| created_at == id)
+    }
+
+    fn position_created_at_for_anchor(&self, id: &TimeTicket) -> Result<TimeTicket> {
+        if id == &TimeTicket::initial() {
+            return Ok(TimeTicket::initial());
+        }
+
+        if let Some(index) = self.index_by_element_id(id) {
+            return Ok(self.position_created_at[index].clone());
+        }
+
+        if self.index_by_position_id(id).is_some() {
+            return Ok(id.clone());
+        }
+
+        Err(YorkieError::MissingCrdtElement(id.to_id_string()))
+    }
+
+    fn insert_index_after_anchor(&self, id: &TimeTicket) -> Result<usize> {
+        if id == &TimeTicket::initial() {
+            return Ok(0);
+        }
+
+        if let Some(index) = self.index_by_element_id(id) {
+            return Ok(index + 1);
+        }
+
+        if let Some(index) = self.index_by_position_id(id) {
+            return Ok(index + 1);
+        }
+
+        Err(YorkieError::MissingCrdtElement(id.to_id_string()))
+    }
+
+    fn move_to_index(
+        &mut self,
+        prev_created_at: TimeTicket,
+        insert_index: usize,
+        id: &TimeTicket,
+    ) -> Result<&mut Self> {
+        let target_index = self
+            .index_by_element_id(id)
+            .ok_or_else(|| YorkieError::MissingCrdtElement(id.to_id_string()))?;
+        let position_created_at = if let Some(recorder) = self.recorder.clone() {
+            recorder
+                .borrow_mut()
+                .record_array_move(&self.created_at, &prev_created_at, id)
+        } else {
+            self.position_created_at[target_index].clone()
+        };
+
+        let value = self.elements.remove(target_index);
+        let element_created_at = self.element_created_at.remove(target_index);
+        self.position_created_at.remove(target_index);
+
+        let mut adjusted_index = insert_index;
+        if target_index < adjusted_index {
+            adjusted_index -= 1;
+        }
+
+        self.elements.insert(adjusted_index, value);
+        self.element_created_at
+            .insert(adjusted_index, element_created_at);
+        self.position_created_at
+            .insert(adjusted_index, position_created_at);
+        Ok(self)
+    }
+}
+
+impl JsonValue {
+    pub(crate) fn attach_recorder(&mut self, recorder: JsonEditRecorderRef) {
+        match self {
+            Self::Object(value) => value.attach_recorder(recorder),
+            Self::Array(value) => value.attach_recorder(recorder),
+            Self::Null
+            | Self::Bool(_)
+            | Self::Integer(_)
+            | Self::Long(_)
+            | Self::Double(_)
+            | Self::String(_) => {}
+        }
+    }
+
+    fn detach_recorder(&mut self) {
+        match self {
+            Self::Object(value) => value.detach_recorder(),
+            Self::Array(value) => value.detach_recorder(),
+            Self::Null
+            | Self::Bool(_)
+            | Self::Integer(_)
+            | Self::Long(_)
+            | Self::Double(_)
+            | Self::String(_) => {}
+        }
+    }
+}
+
+impl JsonObject {
+    fn detach_recorder(&mut self) {
+        self.recorder = None;
+        for value in self.members.values_mut() {
+            value.detach_recorder();
+        }
+    }
+}
+
+impl JsonArray {
+    fn detach_recorder(&mut self) {
+        self.recorder = None;
+        for value in &mut self.elements {
+            value.detach_recorder();
+        }
+    }
+}
+
+fn splice_start_index(start: isize, len: usize) -> usize {
+    if start >= 0 {
+        return (start as usize).min(len);
+    }
+
+    let offset = start
+        .checked_abs()
+        .map(|value| value as usize)
+        .unwrap_or(usize::MAX);
+    len.saturating_sub(offset)
+}
+
+fn forward_search_start(from_index: Option<isize>, len: usize) -> Option<usize> {
+    let start = match from_index {
+        Some(index) if index >= 0 => index as usize,
+        Some(index) => {
+            let offset = index
+                .checked_abs()
+                .map(|value| value as usize)
+                .unwrap_or(usize::MAX);
+            len.saturating_sub(offset)
+        }
+        None => 0,
+    };
+
+    (start < len).then_some(start)
+}
+
+fn reverse_search_start(from_index: Option<isize>, len: usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+
+    match from_index {
+        Some(index) if index >= 0 => Some((index as usize).min(len - 1)),
+        Some(index) => {
+            let offset = index
+                .checked_abs()
+                .map(|value| value as usize)
+                .unwrap_or(usize::MAX);
+            if offset <= len {
+                Some(len - offset)
+            } else {
+                None
+            }
+        }
+        None => Some(len - 1),
     }
 }
 
@@ -293,7 +979,9 @@ where
     fn from(values: Vec<T>) -> Self {
         let mut array = JsonArray::new();
         for value in values {
-            array.push(value);
+            array
+                .push(value)
+                .expect("untracked array push should not fail");
         }
         Self::Array(array)
     }
@@ -343,7 +1031,7 @@ mod tests {
         child.set("name", "yorkie")?;
 
         let mut array = JsonArray::new();
-        array.push("one").push(child);
+        array.push("one")?.push(child)?;
 
         assert_eq!(r#"["one",{"name":"yorkie"}]"#, array.to_sorted_json());
 
@@ -353,13 +1041,47 @@ mod tests {
     #[test]
     fn updates_array_values_by_index() -> Result<()> {
         let mut array = JsonArray::new();
-        array.push("one").push("three");
+        array.push("one")?.push("three")?;
         array.insert(1, "two")?;
         array.set(2, "four")?;
 
         assert_eq!(Some(&JsonValue::String("two".to_owned())), array.get(1));
         assert_eq!(Some(JsonValue::String("one".to_owned())), array.remove(0));
         assert_eq!(r#"["two","four"]"#, array.to_sorted_json());
+
+        Ok(())
+    }
+
+    #[test]
+    fn splices_arrays_with_javascript_index_rules() -> Result<()> {
+        let mut array = JsonArray::new();
+        array.push("one")?.push("two")?.push("three")?;
+
+        let removed = array.splice(-2, Some(1), ["inserted"])?;
+
+        assert_eq!(r#"["two"]"#, removed.to_sorted_json());
+        assert_eq!(r#"["one","inserted","three"]"#, array.to_sorted_json());
+
+        let removed = array.splice(1, None, Vec::<JsonValue>::new())?;
+
+        assert_eq!(r#"["inserted","three"]"#, removed.to_sorted_json());
+        assert_eq!(r#"["one"]"#, array.to_sorted_json());
+
+        Ok(())
+    }
+
+    #[test]
+    fn searches_array_values_with_javascript_index_rules() -> Result<()> {
+        let mut array = JsonArray::new();
+        array.push("a")?.push("b")?.push("a")?;
+
+        assert!(array.contains("a"));
+        assert_eq!(Some(0), array.index_of("a", None));
+        assert_eq!(Some(2), array.index_of("a", Some(-1)));
+        assert_eq!(None, array.index_of("a", Some(3)));
+        assert_eq!(Some(2), array.last_index_of("a", None));
+        assert_eq!(Some(0), array.last_index_of("a", Some(1)));
+        assert_eq!(None, array.last_index_of("a", Some(-4)));
 
         Ok(())
     }

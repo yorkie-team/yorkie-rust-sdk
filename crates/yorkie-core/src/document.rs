@@ -6,10 +6,14 @@ use crate::crdt::object::CrdtObject;
 use crate::crdt::primitive::{CrdtPrimitive, PrimitiveValue};
 use crate::crdt::root::CrdtRoot;
 use crate::crdt::tree::{attribute_value_to_json_value, TreeNode};
+use crate::json::{JsonEditRecorder, JsonEditRecorderRef, RecordedJsonValue};
 use crate::operation::{
-    AddOperation, ArraySetOperation, OpSource, Operation, RemoveOperation, SetOperation,
+    AddOperation, ArraySetOperation, MoveOperation, OpSource, Operation, RemoveOperation,
+    SetOperation,
 };
 use crate::{JsonArray, JsonObject, JsonValue, Result, TimeTicket, YorkieError};
+use std::cell::RefCell;
+use std::rc::Rc;
 
 /// A local Yorkie document.
 #[derive(Debug, Clone, PartialEq)]
@@ -46,25 +50,34 @@ impl Document {
         F: FnOnce(&mut JsonObject) -> Result<()>,
     {
         let mut next_root = self.root.clone();
+        let recorder = Rc::new(RefCell::new(DocumentEditRecorder::new(
+            self.change_id.clone(),
+        )));
+        let recorder_ref: JsonEditRecorderRef = recorder.clone();
+        next_root.attach_recorder(recorder_ref);
+
         update_fn(&mut next_root)?;
 
-        let mut context = ChangeContext::create(self.change_id.clone(), None);
-        collect_object_changes(
-            &mut context,
-            &self.crdt_root,
-            &TimeTicket::initial(),
-            &self.root,
-            &next_root,
-        )?;
+        let mut context = recorder.borrow().context.clone();
+        if !context.has_change() {
+            collect_object_changes(
+                &mut context,
+                &self.crdt_root,
+                &TimeTicket::initial(),
+                &self.root,
+                &next_root,
+            )?;
+        }
 
         if context.has_change() {
             let change = context.to_change();
             change.execute(&mut self.crdt_root, OpSource::Local)?;
             self.local_changes.push(change);
             self.change_id = context.next_id();
+            self.root = crdt_object_to_json_object(self.crdt_root.object())?;
+            return Ok(());
         }
 
-        self.root = next_root;
         Ok(())
     }
 
@@ -134,6 +147,118 @@ impl Document {
         {
             self.local_changes.remove(0);
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DocumentEditRecorder {
+    context: ChangeContext,
+}
+
+impl DocumentEditRecorder {
+    fn new(change_id: ChangeId) -> Self {
+        Self {
+            context: ChangeContext::create(change_id, None),
+        }
+    }
+
+    fn record_new_value(&mut self, value: &JsonValue) -> Result<(TimeTicket, CrdtElement)> {
+        let created_at = self.context.issue_time_ticket();
+        let element = json_value_to_crdt_element(value, created_at.clone(), &mut self.context)?;
+        Ok((created_at, element))
+    }
+}
+
+impl JsonEditRecorder for DocumentEditRecorder {
+    fn record_object_set(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        key: &str,
+        value: &JsonValue,
+    ) -> Result<RecordedJsonValue> {
+        let (created_at, element) = self.record_new_value(value)?;
+        self.context.push(Operation::Set(SetOperation::create(
+            key.to_owned(),
+            element.deepcopy(),
+            parent_created_at.clone(),
+            Some(created_at.clone()),
+        )));
+
+        recorded_json_value_from_crdt_element(&element)
+    }
+
+    fn record_object_remove(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        _key: &str,
+        created_at: &TimeTicket,
+    ) {
+        let executed_at = self.context.issue_time_ticket();
+        self.context.push(Operation::Remove(RemoveOperation::new(
+            parent_created_at.clone(),
+            created_at.clone(),
+            Some(executed_at),
+        )));
+    }
+
+    fn record_array_insert(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        prev_created_at: &TimeTicket,
+        value: &JsonValue,
+    ) -> Result<RecordedJsonValue> {
+        let (created_at, element) = self.record_new_value(value)?;
+        self.context.push(Operation::Add(AddOperation::create(
+            parent_created_at.clone(),
+            prev_created_at.clone(),
+            element.deepcopy(),
+            Some(created_at.clone()),
+        )));
+
+        recorded_json_value_from_crdt_element(&element)
+    }
+
+    fn record_array_set(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        created_at: &TimeTicket,
+        value: &JsonValue,
+    ) -> Result<RecordedJsonValue> {
+        let (executed_at, element) = self.record_new_value(value)?;
+        self.context
+            .push(Operation::ArraySet(ArraySetOperation::create(
+                parent_created_at.clone(),
+                created_at.clone(),
+                element.deepcopy(),
+                Some(executed_at.clone()),
+            )));
+
+        recorded_json_value_from_crdt_element(&element)
+    }
+
+    fn record_array_remove(&mut self, parent_created_at: &TimeTicket, created_at: &TimeTicket) {
+        let executed_at = self.context.issue_time_ticket();
+        self.context.push(Operation::Remove(RemoveOperation::new(
+            parent_created_at.clone(),
+            created_at.clone(),
+            Some(executed_at),
+        )));
+    }
+
+    fn record_array_move(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        prev_created_at: &TimeTicket,
+        created_at: &TimeTicket,
+    ) -> TimeTicket {
+        let executed_at = self.context.issue_time_ticket();
+        self.context.push(Operation::Move(MoveOperation::create(
+            parent_created_at.clone(),
+            prev_created_at.clone(),
+            created_at.clone(),
+            Some(executed_at.clone()),
+        )));
+        executed_at
     }
 }
 
@@ -495,11 +620,24 @@ fn primitive(value: PrimitiveValue, created_at: TimeTicket) -> CrdtElement {
     CrdtElement::primitive(CrdtPrimitive::new(value, created_at))
 }
 
+fn recorded_json_value_from_crdt_element(element: &CrdtElement) -> Result<RecordedJsonValue> {
+    let created_at = element.created_at().clone();
+    Ok(RecordedJsonValue::new(
+        crdt_element_to_json_value(element)?,
+        created_at.clone(),
+        created_at,
+    ))
+}
+
 fn crdt_object_to_json_object(object: &CrdtObject) -> Result<JsonObject> {
-    let mut json_object = JsonObject::new();
+    let mut json_object = JsonObject::with_created_at(object.created_at().clone());
 
     for (key, element) in object.iter() {
-        json_object.set(key, crdt_element_to_json_value(element)?)?;
+        json_object.set_tracked_unchecked(
+            key,
+            crdt_element_to_json_value(element)?,
+            element.created_at().clone(),
+        );
     }
 
     Ok(json_object)
@@ -515,9 +653,19 @@ fn crdt_element_to_json_value(element: &CrdtElement) -> Result<JsonValue> {
         },
         CrdtElement::Object(value) => JsonValue::Object(crdt_object_to_json_object(value)?),
         CrdtElement::Array(value) => {
-            let mut array = crate::JsonArray::new();
-            for element in value.iter() {
-                array.push(crdt_element_to_json_value(element)?);
+            let mut array = crate::JsonArray::with_created_at(value.created_at().clone());
+            for node in value.iter_all_nodes() {
+                let Some(element) = node.element() else {
+                    continue;
+                };
+                if node.is_removed() {
+                    continue;
+                }
+                array.push_tracked_unchecked(
+                    crdt_element_to_json_value(element)?,
+                    element.created_at().clone(),
+                    node.position_created_at().clone(),
+                );
             }
             JsonValue::Array(array)
         }
@@ -539,7 +687,7 @@ fn crdt_tree_node_to_json_value(node: &TreeNode) -> Result<JsonValue> {
 
     let mut children = crate::JsonArray::new();
     for child in node.children() {
-        children.push(crdt_tree_node_to_json_value(child)?);
+        children.push(crdt_tree_node_to_json_value(child)?)?;
     }
     object.set_unchecked("children", children);
 
@@ -695,7 +843,7 @@ mod tests {
             doc.crdt_root.to_sorted_json()
         );
         assert_eq!(
-            "1:00:1.REMOVE.1:00:2,1:00:1.SET.active=true",
+            "1:00:1.SET.active=true,1:00:1.REMOVE.1:00:2",
             doc.local_changes[1].to_test_string()
         );
         Ok(())
@@ -710,7 +858,7 @@ mod tests {
             profile.set("name", "yorkie")?;
 
             let mut todos = JsonArray::new();
-            todos.push("write tests").push(profile);
+            todos.push("write tests")?.push(profile)?;
             root.set("todos", todos)?;
             Ok(())
         })?;
@@ -734,12 +882,12 @@ mod tests {
 
         doc.update(|root| {
             let mut items = JsonArray::new();
-            items.push("one");
+            items.push("one")?;
             root.set("items", items)?;
             Ok(())
         })?;
         doc.update(|root| {
-            root.get_array_mut("items")?.push("two");
+            root.get_array_mut("items")?.push("two")?;
             Ok(())
         })?;
 
@@ -751,12 +899,30 @@ mod tests {
     }
 
     #[test]
+    fn records_array_push_after_object_set_in_the_same_update() -> Result<()> {
+        let mut doc = Document::new("doc-key");
+
+        doc.update(|root| {
+            root.set("items", JsonArray::new())?;
+            root.get_array_mut("items")?.push("one")?;
+            Ok(())
+        })?;
+
+        assert_eq!(r#"{"items":["one"]}"#, doc.to_sorted_json());
+        assert_eq!(
+            r#"0:00:0.SET.items=[],1:00:1.ADD."one""#,
+            doc.local_changes[0].to_test_string()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn records_existing_array_removes_as_remove_operations() -> Result<()> {
         let mut doc = Document::new("doc-key");
 
         doc.update(|root| {
             let mut items = JsonArray::new();
-            items.push("one").push("two").push("three");
+            items.push("one")?.push("two")?.push("three")?;
             root.set("items", items)?;
             Ok(())
         })?;
@@ -783,14 +949,14 @@ mod tests {
 
         doc.update(|root| {
             let mut items = JsonArray::new();
-            items.push("one").push("two").push("three");
+            items.push("one")?.push("two")?.push("three")?;
             root.set("items", items)?;
             Ok(())
         })?;
         doc.update(|root| {
             let items = root.get_array_mut("items")?;
             assert_eq!(Some(JsonValue::String("two".to_owned())), items.remove(1));
-            items.push("four");
+            items.push("four")?;
             Ok(())
         })?;
 
@@ -809,7 +975,7 @@ mod tests {
 
         doc.update(|root| {
             let mut items = JsonArray::new();
-            items.push("one").push("two");
+            items.push("one")?.push("two")?;
             root.set("items", items)?;
             Ok(())
         })?;
@@ -828,12 +994,35 @@ mod tests {
     }
 
     #[test]
+    fn records_array_set_even_when_visible_value_is_unchanged() -> Result<()> {
+        let mut doc = Document::new("doc-key");
+
+        doc.update(|root| {
+            let mut items = JsonArray::new();
+            items.push("one")?;
+            root.set("items", items)?;
+            Ok(())
+        })?;
+        doc.update(|root| {
+            root.get_array_mut("items")?.set(0, "one")?;
+            Ok(())
+        })?;
+
+        assert_eq!(r#"{"items":["one"]}"#, doc.to_sorted_json());
+        assert_eq!(
+            r#"1:00:1.ARRAY_SET.1:00:2="one""#,
+            doc.local_changes[1].to_test_string()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn records_existing_array_inserts_as_add_operations() -> Result<()> {
         let mut doc = Document::new("doc-key");
 
         doc.update(|root| {
             let mut items = JsonArray::new();
-            items.push("one").push("three");
+            items.push("one")?.push("three")?;
             root.set("items", items)?;
             Ok(())
         })?;
@@ -849,6 +1038,324 @@ mod tests {
     }
 
     #[test]
+    fn records_public_array_insert_after_and_before_by_id() -> Result<()> {
+        let mut doc = Document::new("doc-key");
+
+        doc.update(|root| {
+            let mut items = JsonArray::new();
+            items.push("one")?.push("four")?;
+            root.set("items", items)?;
+            Ok(())
+        })?;
+        doc.update(|root| {
+            let items = root.get_array_mut("items")?;
+            let one_id = items.element_id(0).unwrap().clone();
+            let four_id = items.element_id(1).unwrap().clone();
+
+            assert_eq!(
+                Some(&JsonValue::String("one".to_owned())),
+                items.get_by_id(&one_id)
+            );
+
+            items.insert_after(&one_id, "two")?;
+            items.insert_before(&four_id, "three")?;
+            Ok(())
+        })?;
+
+        assert_eq!(
+            r#"{"items":["one","two","three","four"]}"#,
+            doc.to_sorted_json()
+        );
+        assert_eq!(doc.to_sorted_json(), doc.crdt_root.to_sorted_json());
+        assert_eq!(
+            r#"1:00:1.ADD."two",1:00:1.ADD."three""#,
+            doc.local_changes[1].to_test_string()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exposes_public_array_elements_with_ids() -> Result<()> {
+        let mut doc = Document::new("doc-key");
+
+        doc.update(|root| {
+            let mut items = JsonArray::new();
+            items.push("one")?.push("two")?;
+            root.set("items", items)?;
+            Ok(())
+        })?;
+        doc.update(|root| {
+            let items = root.get_array_mut("items")?;
+            let first = items.get_element_by_index(0).unwrap();
+            let first_id = first.id().clone();
+
+            assert_eq!(&JsonValue::String("one".to_owned()), first.value());
+            assert_eq!(Some(&first_id), items.element_id(0));
+            assert!(items.contains_id(&first_id));
+            assert_eq!(Some(0), items.index_of_id(&first_id, None));
+            assert_eq!(Some(0), items.last_index_of_id(&first_id, None));
+            assert_eq!(
+                Some(&JsonValue::String("one".to_owned())),
+                items.get_by_id(&first_id)
+            );
+            assert_eq!(
+                &JsonValue::String("one".to_owned()),
+                items.get_element_by_id(&first_id).unwrap().value()
+            );
+            assert_eq!(
+                &JsonValue::String("two".to_owned()),
+                items.get_last().unwrap().value()
+            );
+            Ok(())
+        })?;
+
+        assert_eq!(1, doc.local_changes.len());
+        Ok(())
+    }
+
+    #[test]
+    fn records_public_array_insert_after_index() -> Result<()> {
+        let mut doc = Document::new("doc-key");
+
+        doc.update(|root| {
+            let mut items = JsonArray::new();
+            items.push(1i32)?.push(3i32)?;
+            root.set("items", items)?;
+            Ok(())
+        })?;
+        doc.update(|root| {
+            root.get_array_mut("items")?.insert_integer_after(0, 2)?;
+            Ok(())
+        })?;
+
+        assert_eq!(r#"{"items":[1,2,3]}"#, doc.to_sorted_json());
+        assert_eq!(doc.to_sorted_json(), doc.crdt_root.to_sorted_json());
+        assert_eq!("1:00:1.ADD.2", doc.local_changes[1].to_test_string());
+        Ok(())
+    }
+
+    #[test]
+    fn records_public_array_delete_by_id() -> Result<()> {
+        let mut doc = Document::new("doc-key");
+
+        doc.update(|root| {
+            let mut items = JsonArray::new();
+            items.push("one")?.push("two")?.push("three")?;
+            root.set("items", items)?;
+            Ok(())
+        })?;
+        doc.update(|root| {
+            let items = root.get_array_mut("items")?;
+            let two_id = items.element_id(1).unwrap().clone();
+
+            assert_eq!(
+                Some(JsonValue::String("two".to_owned())),
+                items.delete_by_id(&two_id)
+            );
+            Ok(())
+        })?;
+
+        assert_eq!(r#"{"items":["one","three"]}"#, doc.to_sorted_json());
+        assert_eq!(doc.to_sorted_json(), doc.crdt_root.to_sorted_json());
+        assert_eq!(
+            "1:00:1.REMOVE.1:00:3",
+            doc.local_changes[1].to_test_string()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn records_public_array_splice_remove_and_insert() -> Result<()> {
+        let mut doc = Document::new("doc-key");
+
+        doc.update(|root| {
+            let mut items = JsonArray::new();
+            items.push("a")?.push("b")?.push("c")?.push("d")?;
+            root.set("items", items)?;
+            Ok(())
+        })?;
+        doc.update(|root| {
+            let removed = root
+                .get_array_mut("items")?
+                .splice(1, Some(2), ["x", "y"])?;
+
+            assert_eq!(r#"["b","c"]"#, removed.to_sorted_json());
+            Ok(())
+        })?;
+
+        assert_eq!(r#"{"items":["a","x","y","d"]}"#, doc.to_sorted_json());
+        assert_eq!(doc.to_sorted_json(), doc.crdt_root.to_sorted_json());
+        assert_eq!(
+            r#"1:00:1.REMOVE.1:00:3,1:00:1.REMOVE.1:00:4,1:00:1.ADD."x",1:00:1.ADD."y""#,
+            doc.local_changes[1].to_test_string()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn records_public_array_splice_with_negative_start_and_open_delete_count() -> Result<()> {
+        let mut doc = Document::new("doc-key");
+
+        doc.update(|root| {
+            let mut items = JsonArray::new();
+            items.push("a")?.push("b")?.push("c")?;
+            root.set("items", items)?;
+            Ok(())
+        })?;
+        doc.update(|root| {
+            let removed = root
+                .get_array_mut("items")?
+                .splice(-2, None, Vec::<JsonValue>::new())?;
+
+            assert_eq!(r#"["b","c"]"#, removed.to_sorted_json());
+            Ok(())
+        })?;
+
+        assert_eq!(r#"{"items":["a"]}"#, doc.to_sorted_json());
+        assert_eq!(doc.to_sorted_json(), doc.crdt_root.to_sorted_json());
+        assert_eq!(
+            r#"1:00:1.REMOVE.1:00:3,1:00:1.REMOVE.1:00:4"#,
+            doc.local_changes[1].to_test_string()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn records_nested_object_changes_after_array_splice_insert() -> Result<()> {
+        let mut doc = Document::new("doc-key");
+
+        doc.update(|root| {
+            root.set("items", JsonArray::new())?;
+            let mut inserted = JsonObject::new();
+            inserted.set("name", "yorkie")?;
+            let removed = root
+                .get_array_mut("items")?
+                .splice(0, Some(0), [inserted])?;
+            assert_eq!("[]", removed.to_sorted_json());
+            root.get_array_mut("items")?
+                .get_object_mut(0)?
+                .set("active", true)?;
+            Ok(())
+        })?;
+
+        assert_eq!(
+            r#"{"items":[{"active":true,"name":"yorkie"}]}"#,
+            doc.to_sorted_json()
+        );
+        assert_eq!(
+            r#"0:00:0.SET.items=[],1:00:1.ADD.{"name":"yorkie"},1:00:2.SET.active=true"#,
+            doc.local_changes[0].to_test_string()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn records_public_array_move_after_by_id() -> Result<()> {
+        let mut doc = Document::new("doc-key");
+
+        doc.update(|root| {
+            let mut items = JsonArray::new();
+            items.push("one")?.push("two")?.push("three")?;
+            root.set("items", items)?;
+            Ok(())
+        })?;
+        doc.update(|root| {
+            let items = root.get_array_mut("items")?;
+            let one_id = items.element_id(0).unwrap().clone();
+            let three_id = items.element_id(2).unwrap().clone();
+
+            items.move_after(&three_id, &one_id)?;
+            Ok(())
+        })?;
+
+        assert_eq!(r#"{"items":["two","three","one"]}"#, doc.to_sorted_json());
+        assert_eq!(doc.to_sorted_json(), doc.crdt_root.to_sorted_json());
+        assert_eq!("1:00:1.MOVE", doc.local_changes[1].to_test_string());
+        Ok(())
+    }
+
+    #[test]
+    fn records_public_array_move_front_and_last() -> Result<()> {
+        let mut doc = Document::new("doc-key");
+
+        doc.update(|root| {
+            let mut items = JsonArray::new();
+            items.push("one")?.push("two")?.push("three")?;
+            root.set("items", items)?;
+            Ok(())
+        })?;
+        doc.update(|root| {
+            let items = root.get_array_mut("items")?;
+            let one_id = items.element_id(0).unwrap().clone();
+            let three_id = items.last_id().unwrap().clone();
+
+            items.move_last(&one_id)?;
+            items.move_front(&three_id)?;
+            Ok(())
+        })?;
+
+        assert_eq!(r#"{"items":["three","two","one"]}"#, doc.to_sorted_json());
+        assert_eq!(doc.to_sorted_json(), doc.crdt_root.to_sorted_json());
+        assert_eq!(
+            "1:00:1.MOVE,1:00:1.MOVE",
+            doc.local_changes[1].to_test_string()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn records_public_array_move_before_and_after_by_index() -> Result<()> {
+        let mut doc = Document::new("doc-key");
+
+        doc.update(|root| {
+            let mut items = JsonArray::new();
+            items.push("one")?.push("two")?.push("three")?;
+            root.set("items", items)?;
+            Ok(())
+        })?;
+        doc.update(|root| {
+            let items = root.get_array_mut("items")?;
+            let one_id = items.element_id(0).unwrap().clone();
+            let three_id = items.element_id(2).unwrap().clone();
+
+            items.move_before(&one_id, &three_id)?;
+            items.move_after_by_index(2, 0)?;
+            Ok(())
+        })?;
+
+        assert_eq!(r#"{"items":["one","two","three"]}"#, doc.to_sorted_json());
+        assert_eq!(doc.to_sorted_json(), doc.crdt_root.to_sorted_json());
+        assert_eq!(
+            "1:00:1.MOVE,1:00:1.MOVE",
+            doc.local_changes[1].to_test_string()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn records_nested_object_set_after_parent_set_in_the_same_update() -> Result<()> {
+        let mut doc = Document::new("doc-key");
+
+        doc.update(|root| {
+            let mut profile = JsonObject::new();
+            profile.set("name", "yorkie")?;
+            root.set("profile", profile)?;
+            root.get_object_mut("profile")?.set("active", true)?;
+            Ok(())
+        })?;
+
+        assert_eq!(
+            r#"{"profile":{"active":true,"name":"yorkie"}}"#,
+            doc.to_sorted_json()
+        );
+        assert_eq!(
+            r#"0:00:0.SET.profile={"name":"yorkie"},1:00:1.SET.active=true"#,
+            doc.local_changes[0].to_test_string()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn records_nested_object_changes_inside_arrays() -> Result<()> {
         let mut doc = Document::new("doc-key");
 
@@ -856,7 +1363,7 @@ mod tests {
             let mut profile = JsonObject::new();
             profile.set("name", "yorkie")?;
             let mut items = JsonArray::new();
-            items.push(profile);
+            items.push(profile)?;
             root.set("items", items)?;
             Ok(())
         })?;
@@ -984,7 +1491,7 @@ mod tests {
 
         source.update(|root| {
             let mut array = JsonArray::new();
-            array.push("sync").push(false);
+            array.push("sync")?.push(false)?;
             root.set("items", array)?;
             Ok(())
         })?;

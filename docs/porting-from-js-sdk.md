@@ -123,7 +123,8 @@ it has:
 | `JsonObject` | `packages/sdk/src/document/json/object.ts` | Public JSON-like object API must map to JS object behavior. |
 | `JsonObject::set` | `ObjectProxy.setInternal()` | Reject object keys containing `.` and store the new member value. |
 | `JsonObject::remove` | `ObjectProxy.deleteInternal()` | Rust method for deleting an object member. Missing keys must be a no-op. |
-| `JsonArray` | `packages/sdk/src/document/json/array.ts` | Public array API must map to JS array behavior. |
+| `JsonArray` | `packages/sdk/src/document/json/array.ts` | Public array API maps index, ID-based, and splice-like array edits to add, array-set, remove, and move operations during `Document::update`. |
+| `JsonArrayElement` | JS `WrappedElement` read-only lookup shape | Lightweight Rust lookup value that exposes an array element ID and borrowed JSON value. It is not a mutable proxy. |
 | `JsonValue` | JS JSON element/proxy values | Temporary Rust wrapper for porting primitives, objects, and arrays. |
 | `Client` | `packages/sdk/src/client/client.ts` | Currently scaffolded only. Lifecycle must follow JS. |
 | `yorkie-protocol` | `packages/sdk/src/api/converter.ts`, proto files | Converter names and wire fields should track JS/proto names. |
