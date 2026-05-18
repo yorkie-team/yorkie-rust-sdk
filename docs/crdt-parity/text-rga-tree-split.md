@@ -41,15 +41,15 @@ behavior, public text facade, and operation info output.
 | Public Text facade | missing | No public context-backed text API yet. |
 | Splay/ID lookup optimization | partial | `RgaTreeSplit` now keeps `tree_by_index` and `tree_by_id` equivalents and uses weighted splay lookup for text indexes. Structural mutations still rebuild indexes around the current `Vec` storage instead of using stable linked-node handles. |
 | History and multi-client scenarios | partial | Important integration-style cases still need operation-level replay tests. |
-| Wire conversion | partial | Full text `JSONElement` payloads and edit/style operation bodies convert to/from protobuf-shaped wire values. Rust ports the text composition/style portion of JS's root bytes scenario at core wire level. Public text facade, sync replay fixtures, and external event payload shape are still missing. |
+| Wire conversion | partial | Full text `JSONElement` payloads and edit/style operation bodies convert to/from protobuf-shaped wire values. Rust ports the text composition/style portion of JS's root bytes scenario at core wire level and covers a mixed protocol `ChangePack` replay with text edit/style operations. Public text facade, sync replay fixtures, and external event payload shape are still missing. |
 
 ## Next Checks
 
 - Align edit operation info with the value-change list from the reference
   implementation before exposing events.
 - Add operation-level replay tests for multi-change text scenarios.
-- Add protocol-level text edit/style replay fixtures from JS/Go after the
-  remaining in-repo converter tests are ported.
+- Extend protocol-level text edit/style replay from the current mixed
+  `ChangePack` fixture toward multi-change and concurrent cases.
 - Decide how Rust should represent invalid UTF-16 surrogate edges.
 - Replace rebuild-on-mutation indexing with stable node handles to align the
   write-side implementation more closely with JS/Go.

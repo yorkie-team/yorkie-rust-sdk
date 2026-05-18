@@ -691,9 +691,11 @@ Current Rust behavior:
   keys, counter set/increase operations, dedup counter increase actors,
   object/array `JSONElementSimple` full-payload bytes, protobuf-to-domain
   reconstruction, decoded snapshot application, snapshot-root `ChangePack`
-  protobuf bytes, and binary change-pack round trips. They also cover tree node
-  arrays and full `JSONElement.Tree` protobuf payloads, including node IDs,
-  depths, attributes, removed markers, and persisted merge metadata.
+  protobuf bytes, binary change-pack round trips, and mixed operation replay
+  through object set/remove, array add/remove/move, text edit/style, and
+  counter increase. They also cover tree node arrays and full
+  `JSONElement.Tree` protobuf payloads, including node IDs, depths,
+  attributes, removed markers, and persisted merge metadata.
 - Core wire tests now port the JS root bytes scenario for nested object, array,
   text, and counter values, Go's standalone array bytes scenario, the JS/Go
   object-GC bytes scenario, and JS/Go tree bytes scenarios around plain tree
@@ -721,8 +723,8 @@ Gap:
   wire level, object-GC bytes at core wire level, tree edit/style and
   merge-state root bytes at core wire level, tree protobuf payload round trips
   at protocol level, snapshot-root `ChangePack` protobuf round trips,
-  change-pack replay, and a generated-protobuf snapshot apply path. Presence
-  remains blocked by the missing presence model.
+  simple and mixed change-pack replay, and a generated-protobuf snapshot apply
+  path. Presence remains blocked by the missing presence model.
 
 Expected direction:
 

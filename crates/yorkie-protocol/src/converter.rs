@@ -1184,8 +1184,9 @@ mod tests {
     use std::collections::BTreeMap;
     use std::error::Error;
     use yorkie_core::wire::{
-        WireChangePack, WireJsonElement, WireNodeAttr, WireRgaNode, WireRhtNode, WireTextNode,
-        WireTextNodeId, WireTreeNode, WireTreeNodeId, WireValueType,
+        WireChange, WireChangeId, WireChangePack, WireJsonElement, WireJsonElementSimple,
+        WireNodeAttr, WireOperation, WireRgaNode, WireRhtNode, WireTextNode, WireTextNodeId,
+        WireTextNodePos, WireTreeNode, WireTreeNodeId, WireValueType,
     };
     use yorkie_core::{Checkpoint, Document, TimeTicket, VersionVector};
 
@@ -1461,6 +1462,156 @@ mod tests {
     }
 
     #[test]
+    fn roundtrips_mixed_change_pack_operations_through_proto_replay() -> Result<(), Box<dyn Error>>
+    {
+        let object_at = ticket(1);
+        let array_at = ticket(5);
+        let text_at = ticket(11);
+        let text_insert_at = ticket(12);
+        let counter_at = ticket(14);
+
+        let pack = WireChangePack {
+            document_key: "doc-key".to_owned(),
+            checkpoint: Checkpoint::new(0, 1),
+            is_removed: false,
+            changes: vec![WireChange {
+                id: wire_change_id(1, 30),
+                message: None,
+                operations: vec![
+                    WireOperation::Set {
+                        parent_created_at: TimeTicket::initial(),
+                        key: "k1".to_owned(),
+                        value: simple_object(object_at.clone()),
+                        executed_at: object_at.clone(),
+                    },
+                    WireOperation::Set {
+                        parent_created_at: object_at.clone(),
+                        key: "flag".to_owned(),
+                        value: simple_bool(true, ticket(2)),
+                        executed_at: ticket(2),
+                    },
+                    WireOperation::Set {
+                        parent_created_at: object_at.clone(),
+                        key: "title".to_owned(),
+                        value: simple_str("4", ticket(3)),
+                        executed_at: ticket(3),
+                    },
+                    WireOperation::Remove {
+                        parent_created_at: object_at.clone(),
+                        created_at: ticket(3),
+                        executed_at: ticket(4),
+                    },
+                    WireOperation::Set {
+                        parent_created_at: TimeTicket::initial(),
+                        key: "k2".to_owned(),
+                        value: simple_array(array_at.clone()),
+                        executed_at: array_at.clone(),
+                    },
+                    WireOperation::Add {
+                        parent_created_at: array_at.clone(),
+                        prev_created_at: TimeTicket::initial(),
+                        value: simple_bool(true, ticket(6)),
+                        executed_at: ticket(6),
+                    },
+                    WireOperation::Add {
+                        parent_created_at: array_at.clone(),
+                        prev_created_at: ticket(6),
+                        value: simple_i32(1, ticket(7)),
+                        executed_at: ticket(7),
+                    },
+                    WireOperation::Add {
+                        parent_created_at: array_at.clone(),
+                        prev_created_at: ticket(7),
+                        value: simple_str("4", ticket(8)),
+                        executed_at: ticket(8),
+                    },
+                    WireOperation::Remove {
+                        parent_created_at: array_at.clone(),
+                        created_at: ticket(8),
+                        executed_at: ticket(9),
+                    },
+                    WireOperation::Move {
+                        parent_created_at: array_at,
+                        prev_created_at: TimeTicket::initial(),
+                        created_at: ticket(7),
+                        executed_at: ticket(10),
+                    },
+                    WireOperation::Set {
+                        parent_created_at: TimeTicket::initial(),
+                        key: "k3".to_owned(),
+                        value: simple_text(text_at.clone()),
+                        executed_at: text_at.clone(),
+                    },
+                    WireOperation::Edit {
+                        parent_created_at: text_at.clone(),
+                        from: text_pos(TimeTicket::initial(), 0, 0),
+                        to: text_pos(TimeTicket::initial(), 0, 0),
+                        content: "Hello World".to_owned(),
+                        attributes: BTreeMap::new(),
+                        executed_at: text_insert_at.clone(),
+                    },
+                    WireOperation::Style {
+                        parent_created_at: text_at,
+                        from: text_pos(TimeTicket::initial(), 0, 0),
+                        to: text_pos(text_insert_at, 0, 5),
+                        attributes: BTreeMap::from([("b".to_owned(), "1".to_owned())]),
+                        attributes_to_remove: Vec::new(),
+                        executed_at: ticket(13),
+                    },
+                    WireOperation::Set {
+                        parent_created_at: TimeTicket::initial(),
+                        key: "k4".to_owned(),
+                        value: simple_counter_i32(0, counter_at.clone()),
+                        executed_at: counter_at.clone(),
+                    },
+                    WireOperation::Increase {
+                        parent_created_at: counter_at,
+                        value: simple_i32(5, ticket(15)),
+                        executed_at: ticket(15),
+                        actor: None,
+                    },
+                ],
+            }],
+            snapshot: None,
+            snapshot_root: None,
+            version_vector: Some(version_vector_with_lamport(30)),
+        };
+
+        let proto = wire_change_pack_to_proto(&pack)?;
+        assert_eq!(15, proto.changes[0].operations.len());
+        assert!(matches!(
+            &proto.changes[0].operations[9].body,
+            Some(Body::Move(_))
+        ));
+        assert!(matches!(
+            &proto.changes[0].operations[11].body,
+            Some(Body::Edit(_))
+        ));
+        assert!(matches!(
+            &proto.changes[0].operations[12].body,
+            Some(Body::Style(_))
+        ));
+        assert!(matches!(
+            &proto.changes[0].operations[14].body,
+            Some(Body::Increase(_))
+        ));
+
+        let decoded_wire = proto_change_pack_to_wire(&proto)?;
+        assert_eq!("doc-key", decoded_wire.document_key);
+        assert_eq!(Checkpoint::new(0, 1), decoded_wire.checkpoint);
+        assert_eq!(1, decoded_wire.changes.len());
+        assert_eq!(15, decoded_wire.changes[0].operations.len());
+
+        let mut doc = Document::new("doc-key");
+        doc.apply_change_pack(&from_change_pack(&proto)?)?;
+        assert_eq!(
+            r#"{"k1":{"flag":true},"k2":[1,true],"k3":[{"attrs":{"b":1},"val":"Hello"},{"val":" World"}],"k4":5}"#,
+            doc.to_sorted_json()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn decodes_proto_change_pack_into_core_domain() -> Result<(), Box<dyn Error>> {
         let mut source = Document::new("source-doc");
         let mut target = Document::new("target-doc");
@@ -1672,6 +1823,125 @@ mod tests {
             created_at,
             moved_at: None,
             removed_at: None,
+        }
+    }
+
+    fn wire_change_id(client_seq: u32, lamport: i64) -> WireChangeId {
+        WireChangeId {
+            client_seq,
+            server_seq: 0,
+            lamport,
+            actor_id: "000000000000000000000001".to_owned(),
+            version_vector: version_vector_with_lamport(lamport),
+        }
+    }
+
+    fn version_vector_with_lamport(lamport: i64) -> VersionVector {
+        let mut version_vector = VersionVector::new();
+        version_vector.set("000000000000000000000001", lamport);
+        version_vector
+    }
+
+    fn simple_object(created_at: TimeTicket) -> WireJsonElementSimple {
+        simple_full_element(
+            created_at.clone(),
+            WireValueType::JsonObject,
+            WireJsonElement::Object {
+                nodes: Vec::new(),
+                created_at,
+                moved_at: None,
+                removed_at: None,
+            },
+        )
+    }
+
+    fn simple_array(created_at: TimeTicket) -> WireJsonElementSimple {
+        simple_full_element(
+            created_at.clone(),
+            WireValueType::JsonArray,
+            WireJsonElement::Array {
+                nodes: Vec::new(),
+                created_at,
+                moved_at: None,
+                removed_at: None,
+            },
+        )
+    }
+
+    fn simple_full_element(
+        created_at: TimeTicket,
+        value_type: WireValueType,
+        element: WireJsonElement,
+    ) -> WireJsonElementSimple {
+        WireJsonElementSimple {
+            created_at,
+            moved_at: None,
+            removed_at: None,
+            value_type,
+            value: Vec::new(),
+            element: Some(Box::new(element)),
+        }
+    }
+
+    fn simple_text(created_at: TimeTicket) -> WireJsonElementSimple {
+        WireJsonElementSimple {
+            created_at,
+            moved_at: None,
+            removed_at: None,
+            value_type: WireValueType::Text,
+            value: Vec::new(),
+            element: None,
+        }
+    }
+
+    fn simple_counter_i32(value: i32, created_at: TimeTicket) -> WireJsonElementSimple {
+        WireJsonElementSimple {
+            created_at,
+            moved_at: None,
+            removed_at: None,
+            value_type: WireValueType::IntegerCnt,
+            value: value.to_le_bytes().to_vec(),
+            element: None,
+        }
+    }
+
+    fn simple_bool(value: bool, created_at: TimeTicket) -> WireJsonElementSimple {
+        WireJsonElementSimple {
+            created_at,
+            moved_at: None,
+            removed_at: None,
+            value_type: WireValueType::Boolean,
+            value: vec![u8::from(value)],
+            element: None,
+        }
+    }
+
+    fn simple_i32(value: i32, created_at: TimeTicket) -> WireJsonElementSimple {
+        WireJsonElementSimple {
+            created_at,
+            moved_at: None,
+            removed_at: None,
+            value_type: WireValueType::Integer,
+            value: value.to_le_bytes().to_vec(),
+            element: None,
+        }
+    }
+
+    fn simple_str(value: &str, created_at: TimeTicket) -> WireJsonElementSimple {
+        WireJsonElementSimple {
+            created_at,
+            moved_at: None,
+            removed_at: None,
+            value_type: WireValueType::String,
+            value: value.as_bytes().to_vec(),
+            element: None,
+        }
+    }
+
+    fn text_pos(created_at: TimeTicket, offset: usize, relative_offset: usize) -> WireTextNodePos {
+        WireTextNodePos {
+            id: WireTextNodeId { created_at, offset },
+            relative_offset,
         }
     }
 
