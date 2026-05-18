@@ -62,6 +62,22 @@ pub struct DetachDocumentResponse {
     pub change_pack: ChangePack,
 }
 
+/// Request data for pushing and pulling document changes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PushPullChangesRequest {
+    pub client_id: ActorId,
+    pub document_id: String,
+    pub change_pack: ChangePack,
+    pub push_only: bool,
+    pub shard_key: String,
+}
+
+/// Response data for pushing and pulling document changes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PushPullChangesResponse {
+    pub change_pack: ChangePack,
+}
+
 /// Transport boundary used by the client lifecycle and document attachment.
 pub trait ClientTransport {
     fn activate_client(
@@ -83,4 +99,9 @@ pub trait ClientTransport {
         &mut self,
         request: DetachDocumentRequest,
     ) -> ClientResult<DetachDocumentResponse>;
+
+    fn push_pull_changes(
+        &mut self,
+        request: PushPullChangesRequest,
+    ) -> ClientResult<PushPullChangesResponse>;
 }

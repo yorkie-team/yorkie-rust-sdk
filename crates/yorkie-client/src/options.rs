@@ -60,6 +60,12 @@ pub struct AttachChannelOptions {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DetachOptions;
 
+/// User-settable options for synchronizing documents.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SyncOptions {
+    pub sync_mode: Option<SyncMode>,
+}
+
 impl Default for ClientOptions {
     fn default() -> Self {
         Self {

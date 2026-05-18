@@ -5,7 +5,8 @@ pub use yorkie_client::{
     ActivateClientRequest, ActivateClientResponse, AttachChannelOptions, AttachDocumentRequest,
     AttachDocumentResponse, AttachOptions, Client, ClientCondition, ClientError, ClientOptions,
     ClientResult, ClientStatus, ClientTransport, DeactivateClientRequest, DeactivateClientResponse,
-    DeactivateOptions, DetachDocumentRequest, DetachDocumentResponse, DetachOptions, SyncMode,
+    DeactivateOptions, DetachDocumentRequest, DetachDocumentResponse, DetachOptions,
+    PushPullChangesRequest, PushPullChangesResponse, SyncMode, SyncOptions,
 };
 pub use yorkie_core::{
     ActorId, ChangePack, Checkpoint, CounterType, CounterValue, DocStatus, Document, JsonArray,

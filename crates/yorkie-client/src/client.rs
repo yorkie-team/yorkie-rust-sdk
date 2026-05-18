@@ -2,10 +2,12 @@ use crate::attachment::{
     default_document_poll_interval, resolve_document_poll_interval, Attachment,
 };
 use crate::error::{ClientError, ClientResult};
-use crate::options::{AttachOptions, ClientOptions, DeactivateOptions, DetachOptions, SyncMode};
+use crate::options::{
+    AttachOptions, ClientOptions, DeactivateOptions, DetachOptions, SyncMode, SyncOptions,
+};
 use crate::transport::{
     ActivateClientRequest, AttachDocumentRequest, ClientTransport, DeactivateClientRequest,
-    DetachDocumentRequest,
+    DetachDocumentRequest, PushPullChangesRequest,
 };
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -228,6 +230,56 @@ impl Client {
         Ok(())
     }
 
+    pub fn sync<T>(&mut self, transport: &mut T, doc: &mut Document) -> ClientResult<()>
+    where
+        T: ClientTransport,
+    {
+        self.sync_with_options(transport, doc, SyncOptions::default())
+    }
+
+    pub fn sync_with_options<T>(
+        &mut self,
+        transport: &mut T,
+        doc: &mut Document,
+        options: SyncOptions,
+    ) -> ClientResult<()>
+    where
+        T: ClientTransport,
+    {
+        let client_id = self.require_active()?.clone();
+        let Some(attachment) = self.attachments.get(doc.key()) else {
+            return Err(ClientError::NotAttached(doc.key().to_owned()));
+        };
+        let document_id = attachment.resource_id.clone();
+        let attachment_sync_mode = attachment.sync_mode;
+        let sync_mode = options.sync_mode.unwrap_or(SyncMode::Realtime);
+
+        let response = transport.push_pull_changes(PushPullChangesRequest {
+            client_id,
+            document_id,
+            change_pack: doc.create_change_pack(),
+            push_only: sync_mode == SyncMode::RealtimePushOnly,
+            shard_key: self.shard_key(doc.key()),
+        })?;
+
+        if response.change_pack.has_changes()
+            && matches!(
+                attachment_sync_mode,
+                SyncMode::RealtimePushOnly | SyncMode::RealtimeSyncOff
+            )
+        {
+            return Ok(());
+        }
+
+        doc.apply_change_pack(&response.change_pack)?;
+        if doc.status() == DocStatus::Removed {
+            self.attachments.remove(doc.key());
+            self.refresh_watch_loop_condition();
+        }
+
+        Ok(())
+    }
+
     pub fn change_sync_mode(&mut self, doc: &Document, sync_mode: SyncMode) -> ClientResult<()> {
         self.require_active()?;
         let Some(attachment) = self.attachments.get_mut(doc.key()) else {
@@ -304,14 +356,15 @@ mod tests {
     use crate::error::{ClientError, ClientResult};
     use crate::options::{
         AttachChannelOptions, AttachOptions, ClientOptions, DeactivateOptions, DetachOptions,
-        SyncMode, DEFAULT_CHANNEL_HEARTBEAT_INTERVAL_MS, DEFAULT_POLLING_INTERVAL_MS,
+        SyncMode, SyncOptions, DEFAULT_CHANNEL_HEARTBEAT_INTERVAL_MS, DEFAULT_POLLING_INTERVAL_MS,
         DEFAULT_RECONNECT_STREAM_DELAY_MS, DEFAULT_RETRY_SYNC_LOOP_DELAY_MS, DEFAULT_RPC_ADDR,
         DEFAULT_SYNC_LOOP_DURATION_MS,
     };
     use crate::transport::{
         ActivateClientRequest, ActivateClientResponse, AttachDocumentRequest,
         AttachDocumentResponse, ClientTransport, DeactivateClientRequest, DeactivateClientResponse,
-        DetachDocumentRequest, DetachDocumentResponse,
+        DetachDocumentRequest, DetachDocumentResponse, PushPullChangesRequest,
+        PushPullChangesResponse,
     };
     use std::collections::BTreeMap;
     use std::time::Duration;
@@ -324,6 +377,7 @@ mod tests {
         deactivate_requests: Vec<DeactivateClientRequest>,
         attach_requests: Vec<AttachDocumentRequest>,
         detach_requests: Vec<DetachDocumentRequest>,
+        push_pull_requests: Vec<PushPullChangesRequest>,
         attach_max_size_per_document: usize,
         attach_schema_rules: Vec<SchemaRule>,
     }
@@ -336,6 +390,7 @@ mod tests {
                 deactivate_requests: Vec::new(),
                 attach_requests: Vec::new(),
                 detach_requests: Vec::new(),
+                push_pull_requests: Vec::new(),
                 attach_max_size_per_document: 0,
                 attach_schema_rules: Vec::new(),
             }
@@ -383,6 +438,15 @@ mod tests {
             self.detach_requests.push(request);
             Ok(DetachDocumentResponse { change_pack })
         }
+
+        fn push_pull_changes(
+            &mut self,
+            request: PushPullChangesRequest,
+        ) -> ClientResult<PushPullChangesResponse> {
+            let change_pack = request.change_pack.clone();
+            self.push_pull_requests.push(request);
+            Ok(PushPullChangesResponse { change_pack })
+        }
     }
 
     #[test]
@@ -421,6 +485,7 @@ mod tests {
         let attach_options = AttachOptions::default();
         let attach_channel_options = AttachChannelOptions::default();
         let detach_options = DetachOptions;
+        let sync_options = SyncOptions::default();
 
         assert!(!deactivate_options.keepalive);
         assert!(!deactivate_options.synchronous);
@@ -431,6 +496,7 @@ mod tests {
         assert_eq!(None, attach_channel_options.sync_mode);
         assert_eq!(None, attach_channel_options.channel_heartbeat_interval);
         assert_eq!(DetachOptions, detach_options);
+        assert_eq!(None, sync_options.sync_mode);
         assert_eq!(
             Duration::from_millis(3000),
             Duration::from_millis(DEFAULT_POLLING_INTERVAL_MS)
@@ -664,6 +730,97 @@ mod tests {
         );
         assert!(!transport.detach_requests[0].remove_if_not_attached);
         assert_eq!("api-key/doc-key", transport.detach_requests[0].shard_key);
+        Ok(())
+    }
+
+    #[test]
+    fn syncs_document_through_push_pull_transport() -> ClientResult<()> {
+        let mut client = Client::new(ClientOptions {
+            key: Some("client-key".to_owned()),
+            api_key: "api-key".to_owned(),
+            ..ClientOptions::default()
+        });
+        let mut transport = FakeTransport::default();
+        let mut doc = Document::new("doc-key");
+
+        client.apply_activation("000000000000000000000001");
+        client.attach(&mut transport, &mut doc, AttachOptions::default())?;
+        doc.update(|root| root.set("title", "hello").map(|_| ()))?;
+        assert!(doc.has_local_changes());
+
+        client.sync(&mut transport, &mut doc)?;
+
+        assert!(!doc.has_local_changes());
+        assert_eq!(DocStatus::Attached, doc.status());
+        assert_eq!(1, transport.push_pull_requests.len());
+        assert_eq!(
+            "000000000000000000000001",
+            transport.push_pull_requests[0].client_id.as_str()
+        );
+        assert_eq!("document-id", transport.push_pull_requests[0].document_id);
+        assert_eq!(
+            "doc-key",
+            transport.push_pull_requests[0].change_pack.document_key()
+        );
+        assert!(transport.push_pull_requests[0].change_pack.has_changes());
+        assert!(!transport.push_pull_requests[0].push_only);
+        assert_eq!("api-key/doc-key", transport.push_pull_requests[0].shard_key);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_sync_when_client_is_not_active_or_document_is_not_attached() {
+        let mut client = Client::new(ClientOptions {
+            key: Some("client-key".to_owned()),
+            ..ClientOptions::default()
+        });
+        let mut transport = FakeTransport::default();
+        let mut doc = Document::new("doc-key");
+
+        let err = client.sync(&mut transport, &mut doc).unwrap_err();
+        assert_eq!(
+            ClientError::ClientNotActivated("client-key".to_owned()),
+            err
+        );
+
+        client.apply_activation("000000000000000000000001");
+        let err = client.sync(&mut transport, &mut doc).unwrap_err();
+        assert_eq!(ClientError::NotAttached("doc-key".to_owned()), err);
+        assert!(transport.push_pull_requests.is_empty());
+    }
+
+    #[test]
+    fn push_only_sync_ignores_response_changes_for_push_only_attachment() -> ClientResult<()> {
+        let mut client = Client::new(ClientOptions {
+            key: Some("client-key".to_owned()),
+            api_key: "api-key".to_owned(),
+            ..ClientOptions::default()
+        });
+        let mut transport = FakeTransport::default();
+        let mut doc = Document::new("doc-key");
+
+        client.apply_activation("000000000000000000000001");
+        client.attach(
+            &mut transport,
+            &mut doc,
+            AttachOptions {
+                sync_mode: Some(SyncMode::RealtimePushOnly),
+                ..AttachOptions::default()
+            },
+        )?;
+        doc.update(|root| root.set("title", "hello").map(|_| ()))?;
+
+        client.sync_with_options(
+            &mut transport,
+            &mut doc,
+            SyncOptions {
+                sync_mode: Some(SyncMode::RealtimePushOnly),
+            },
+        )?;
+
+        assert!(doc.has_local_changes());
+        assert_eq!(1, transport.push_pull_requests.len());
+        assert!(transport.push_pull_requests[0].push_only);
         Ok(())
     }
 

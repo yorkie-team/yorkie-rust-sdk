@@ -3,8 +3,9 @@ use yorkie::{
     AttachDocumentRequest, AttachDocumentResponse, AttachOptions, ChangePack, Checkpoint, Client,
     ClientCondition, ClientError, ClientStatus, ClientTransport, CounterType, CounterValue,
     DeactivateClientRequest, DeactivateClientResponse, DeactivateOptions, DetachDocumentRequest,
-    DetachDocumentResponse, DetachOptions, DocStatus, Document, JsonCounter, Result, SchemaRule,
-    SyncMode, TimeTicket, TimeTicketStruct, TreeNodeRule, VersionVector,
+    DetachDocumentResponse, DetachOptions, DocStatus, Document, JsonCounter,
+    PushPullChangesRequest, PushPullChangesResponse, Result, SchemaRule, SyncMode, SyncOptions,
+    TimeTicket, TimeTicketStruct, TreeNodeRule, VersionVector,
 };
 
 #[derive(Debug, Default)]
@@ -12,6 +13,7 @@ struct FacadeTransport {
     activate_requests: usize,
     attach_requests: usize,
     detach_requests: usize,
+    push_pull_requests: usize,
 }
 
 impl ClientTransport for FacadeTransport {
@@ -55,6 +57,16 @@ impl ClientTransport for FacadeTransport {
     ) -> yorkie::ClientResult<DetachDocumentResponse> {
         self.detach_requests += 1;
         Ok(DetachDocumentResponse {
+            change_pack: request.change_pack,
+        })
+    }
+
+    fn push_pull_changes(
+        &mut self,
+        request: PushPullChangesRequest,
+    ) -> yorkie::ClientResult<PushPullChangesResponse> {
+        self.push_pull_requests += 1;
+        Ok(PushPullChangesResponse {
             change_pack: request.change_pack,
         })
     }
@@ -142,6 +154,12 @@ fn facade_exports_client_api() {
     assert_eq!(1024, doc.max_size_per_document());
     assert_eq!(1, doc.schema_rules().len());
     assert_eq!(1, transport.attach_requests);
+    doc.update(|root| root.set("title", "hello").map(|_| ()))
+        .unwrap();
+    client.sync(&mut transport, &mut doc).unwrap();
+    assert!(!doc.has_local_changes());
+    assert_eq!(1, transport.push_pull_requests);
+    assert_eq!(SyncOptions::default(), SyncOptions { sync_mode: None });
     client
         .detach(&mut transport, &mut doc, DetachOptions)
         .unwrap();

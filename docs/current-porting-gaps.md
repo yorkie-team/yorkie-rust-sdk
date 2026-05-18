@@ -755,12 +755,13 @@ Current Rust behavior:
   sync-loop duration, retry delay, reconnect delay, and channel heartbeat
   interval. Defaults match the JS/Go values where both implementations already
   agree.
-- `SyncMode`, `DeactivateOptions`, `AttachOptions`, `AttachChannelOptions`, and
-  `DetachOptions` are defined as public client-surface types.
+- `SyncMode`, `DeactivateOptions`, `AttachOptions`, `AttachChannelOptions`,
+  `DetachOptions`, and `SyncOptions` are defined as public client-surface
+  types.
 - `Client` stores a key, optional actor ID, deactivated status, sync/watch
   condition flags, and document attachment metadata.
-- `ClientTransport` is a testable transport boundary for activate/deactivate
-  and document attach.
+- `ClientTransport` is a testable transport boundary for activate/deactivate,
+  document attach/detach, and client-side push-pull sync.
   `Client::activate` sends client key, metadata, and shard key through this
   boundary; `Client::deactivate` sends client ID and synchronous flag, clears
   local attachment metadata, and marks sync/watch conditions inactive.
@@ -773,6 +774,11 @@ Current Rust behavior:
   `remove_if_not_attached`, and shard key through the transport boundary,
   applies the returned change pack, updates document status, removes attachment
   metadata, and refreshes the watch loop condition.
+- `Client::sync` and `Client::sync_with_options` send client ID, attached
+  document ID, local `ChangePack`, push-only mode, and shard key through the
+  transport boundary, apply the returned change pack, and remove attachment
+  metadata when the document is removed. The push-only response guard follows
+  the client-side JS behavior.
 - `Client::has` and `change_sync_mode` cover local lifecycle bookkeeping and
   precondition errors for documents.
 - Document local change packs can be created and applied in-memory.
@@ -789,9 +795,9 @@ JS/Go behavior:
 Gap:
 
 - No concrete RPC transport.
-- Activate/deactivate/attach/detach use a transport trait, but there is no
-  Connect/gRPC-web implementation yet.
-- Remove and push-pull sync are not connected to the transport boundary yet.
+- Activate/deactivate/attach/detach/push-pull sync use a transport trait, but
+  there is no Connect/gRPC-web implementation yet.
+- Remove is not connected to the transport boundary yet.
 - No watch stream.
 - No presence.
 - Schema rules and max-size limits are stored after attach but are not enforced
@@ -805,7 +811,7 @@ Gap:
 
 Expected direction:
 
-- Extend the transport boundary to remove and push-pull sync.
+- Extend the transport boundary to remove.
 - Keep Client state transitions aligned with document status and attachment
   metadata as the network layer lands.
 
