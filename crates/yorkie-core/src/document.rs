@@ -11,7 +11,9 @@ use crate::operation::{
     AddOperation, ArraySetOperation, IncreaseOperation, MoveOperation, OpSource, Operation,
     RemoveOperation, SetOperation,
 };
-use crate::{JsonArray, JsonObject, JsonValue, Result, TimeTicket, YorkieError};
+use crate::{
+    ActorId, JsonArray, JsonObject, JsonValue, Result, TimeTicket, YorkieError, INITIAL_ACTOR_ID,
+};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -19,6 +21,7 @@ use std::rc::Rc;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Document {
     key: String,
+    status: DocStatus,
     root: JsonObject,
     crdt_root: CrdtRoot,
     checkpoint: Checkpoint,
@@ -26,11 +29,20 @@ pub struct Document {
     local_changes: Vec<Change>,
 }
 
+/// Document attachment state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocStatus {
+    Detached,
+    Attached,
+    Removed,
+}
+
 impl Document {
     /// Creates a document with the given Yorkie resource key.
     pub fn new(key: impl Into<String>) -> Self {
         Self {
             key: key.into(),
+            status: DocStatus::Detached,
             root: JsonObject::new(),
             crdt_root: CrdtRoot::create(),
             checkpoint: Checkpoint::initial(),
@@ -44,11 +56,50 @@ impl Document {
         &self.key
     }
 
+    /// Returns this document's current status.
+    pub fn status(&self) -> DocStatus {
+        self.status
+    }
+
+    /// Returns whether this document is attached to a client.
+    pub fn is_attached(&self) -> bool {
+        self.status == DocStatus::Attached
+    }
+
+    /// Returns the actor currently assigned to local changes.
+    pub fn actor_id(&self) -> &ActorId {
+        self.change_id.actor_id()
+    }
+
+    /// Assigns the actor for new local changes and pending local changes.
+    pub fn set_actor(&mut self, actor_id: impl Into<ActorId>) {
+        let actor_id = actor_id.into();
+
+        for change in &mut self.local_changes {
+            change.set_actor(actor_id.clone());
+        }
+
+        self.change_id = self.change_id.set_actor(actor_id);
+    }
+
+    /// Applies a document status transition.
+    pub fn apply_status(&mut self, status: DocStatus) {
+        self.status = status;
+
+        if status == DocStatus::Detached {
+            self.set_actor(INITIAL_ACTOR_ID);
+        }
+    }
+
     /// Updates the document root.
     pub fn update<F>(&mut self, update_fn: F) -> Result<()>
     where
         F: FnOnce(&mut JsonObject) -> Result<()>,
     {
+        if self.status == DocStatus::Removed {
+            return Err(YorkieError::DocumentRemoved(self.key.clone()));
+        }
+
         let mut next_root = self.root.clone();
         let recorder = Rc::new(RefCell::new(DocumentEditRecorder::new(
             self.change_id.clone(),
@@ -120,6 +171,9 @@ impl Document {
         }
 
         self.checkpoint = self.checkpoint.forward(pack.checkpoint());
+        if pack.is_removed() {
+            self.apply_status(DocStatus::Removed);
+        }
         Ok(())
     }
 
@@ -748,21 +802,51 @@ fn crdt_tree_node_to_json_value(node: &TreeNode) -> Result<JsonValue> {
 
 #[cfg(test)]
 mod tests {
-    use super::{crdt_element_to_json_value, Document};
+    use super::{crdt_element_to_json_value, DocStatus, Document};
     use crate::change::ChangePack;
     use crate::crdt::counter::{CounterType, CounterValue, CrdtCounter};
     use crate::crdt::element::CrdtElement;
     use crate::crdt::rht::Rht;
     use crate::crdt::text::CrdtText;
     use crate::crdt::tree::{CrdtTree, TreeNode, TreeNodeId};
-    use crate::{Checkpoint, JsonArray, JsonObject, JsonValue, Result, VersionVector, YorkieError};
+    use crate::wire::WireChangePack;
+    use crate::{
+        Checkpoint, JsonArray, JsonObject, JsonValue, Result, VersionVector, YorkieError,
+        INITIAL_ACTOR_ID,
+    };
 
     #[test]
     fn creates_document_with_the_given_key() {
         let doc = Document::new("doc-key");
         assert_eq!("doc-key", doc.key());
         assert_eq!(Checkpoint::initial(), doc.checkpoint());
+        assert_eq!(DocStatus::Detached, doc.status());
+        assert!(!doc.is_attached());
+        assert_eq!(INITIAL_ACTOR_ID, doc.actor_id().as_str());
         assert!(!doc.has_local_changes());
+    }
+
+    #[test]
+    fn applies_status_and_actor_assignment_to_pending_changes() -> Result<()> {
+        let mut doc = Document::new("doc-key");
+
+        doc.update(|root| root.set("title", "hello").map(|_| ()))?;
+        doc.set_actor("000000000000000000000001");
+        doc.apply_status(DocStatus::Attached);
+
+        let pack = WireChangePack::try_from(&doc.create_change_pack())?;
+        assert_eq!(DocStatus::Attached, doc.status());
+        assert!(doc.is_attached());
+        assert_eq!("000000000000000000000001", doc.actor_id().as_str());
+        assert_eq!("000000000000000000000001", pack.changes[0].id.actor_id);
+
+        doc.apply_status(DocStatus::Detached);
+
+        assert_eq!(DocStatus::Detached, doc.status());
+        assert!(!doc.is_attached());
+        assert_eq!(INITIAL_ACTOR_ID, doc.actor_id().as_str());
+
+        Ok(())
     }
 
     #[test]
@@ -1617,6 +1701,31 @@ mod tests {
 
         assert_eq!(Checkpoint::new(4, 2), doc.checkpoint());
         assert!(!doc.has_local_changes());
+        Ok(())
+    }
+
+    #[test]
+    fn applies_removed_status_from_change_pack() -> Result<()> {
+        let mut doc = Document::new("doc-key");
+        doc.update(|root| root.set("title", "hello").map(|_| ()))?;
+
+        let pack = ChangePack::create(
+            "doc-key",
+            Checkpoint::new(1, 1),
+            true,
+            Vec::new(),
+            Some(VersionVector::new()),
+            None,
+        );
+        doc.apply_change_pack(&pack)?;
+
+        assert_eq!(DocStatus::Removed, doc.status());
+        assert_eq!(Checkpoint::new(1, 1), doc.checkpoint());
+        assert_eq!(
+            YorkieError::DocumentRemoved("doc-key".to_owned()),
+            doc.update(|root| root.set("next", "value").map(|_| ()))
+                .unwrap_err()
+        );
         Ok(())
     }
 

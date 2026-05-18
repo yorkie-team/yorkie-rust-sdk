@@ -46,6 +46,9 @@ Current Rust behavior:
 - `Document::update` clones the public `JsonObject`, attaches an edit recorder
   to that clone, lets the callback mutate it, then executes the recorded
   operations against `CrdtRoot` after the callback succeeds.
+- `Document` tracks `Detached`, `Attached`, and `Removed` status, exposes the
+  current actor ID, applies actor assignment to pending local changes, and
+  rejects edits after removal.
 - Public `JsonObject::set` and `JsonObject::remove` record `SetOperation` and
   `RemoveOperation` at the mutation site when called inside `Document::update`.
 - Public `JsonArray::push`, `insert`, `insert_after`, `insert_before`,
@@ -609,7 +612,8 @@ Current Rust behavior:
   removal flag, and optional snapshot bytes.
 - `Document::apply_change_pack` applies changes or decoded snapshot roots,
   removes acked local changes, reapplies remaining local changes after
-  snapshots, and advances checkpoints.
+  snapshots, advances checkpoints, and applies removed status when the pack is
+  marked as removed.
 
 JS/Go behavior:
 
@@ -623,8 +627,6 @@ Gap:
 - Rust change context now mediates the first public object/array mutation
   methods, but it does not yet own full live JSON/CRDT wrappers.
 - Presence changes are not implemented.
-- `ChangePack::is_removed` is stored but document removal behavior is not
-  applied.
 - Change packs can be projected to generated protobuf payloads and
   reconstructed back into core `ChangePack` values for the current operation
   set. Binary round-trip tests cover nested object/array/counter replay, and
@@ -632,14 +634,15 @@ Gap:
   `Document::apply_change_pack`.
 - Raw snapshot bytes that have not been decoded by the protocol converter are
   still rejected by core to keep protobuf parsing out of `yorkie-core`.
-- Sync/status transitions are not implemented.
+- Full sync status transitions are not implemented.
 
 Expected direction:
 
 - Add live change context before expanding public document mutation APIs.
 - Extend snapshot handling with presence, GC, and cross-language binary
   fixtures before real client sync.
-- Add document removal behavior when `ChangePack::is_removed` is applied.
+- Extend status handling with presence, events, and client-driven lifecycle
+  transitions.
 
 ## Undo and Redo
 
@@ -750,9 +753,12 @@ Current Rust behavior:
   interval. Defaults match the JS/Go values where both implementations already
   agree.
 - `SyncMode`, `DeactivateOptions`, `AttachOptions`, `AttachChannelOptions`, and
-  `DetachOptions` are defined as public client-surface types, but no client
-  method consumes them yet.
-- `Client` stores a key, deactivated status, and sync/watch condition flags.
+  `DetachOptions` are defined as public client-surface types.
+- `Client` stores a key, optional actor ID, deactivated status, sync/watch
+  condition flags, and document attachment metadata.
+- `Client::has`, `attach`, `detach`, and `change_sync_mode` cover local
+  lifecycle bookkeeping and precondition errors for documents. These methods do
+  not perform RPC yet.
 - Document local change packs can be created and applied in-memory.
 
 JS/Go behavior:
@@ -763,20 +769,23 @@ JS/Go behavior:
 Gap:
 
 - No real client lifecycle.
-- No activate/deactivate RPC; the status is only initialized.
+- No public activate/deactivate RPC. Client activation is still a transport
+  integration point, so attached success paths are currently exercised through
+  internal tests.
 - No RPC transport.
 - No watch stream.
 - No presence.
-- No document status model.
-- Sync modes are represented as types but not executed by a sync loop.
+- Sync modes are represented in attachment metadata but not executed by a sync
+  loop.
 - Auth token refresh, gRPC-web/connect transport choice, Go TLS options, and
   Go receive-size/logger options are not modeled yet.
 
 Expected direction:
 
-- Keep CRDT and document behavior stable before implementing network sync.
-- Start client work only after protocol conversion and change pack behavior are
-  closer to JS/Go.
+- Add a transport boundary for activate, attach, detach, remove, and
+  push-pull sync.
+- Keep Client state transitions aligned with document status and attachment
+  metadata as the network layer lands.
 
 ## Error Behavior
 

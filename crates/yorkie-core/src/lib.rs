@@ -18,7 +18,7 @@ pub use change::{
     MAX_CHECKPOINT, MAX_CLIENT_SEQ, MAX_SERVER_SEQ,
 };
 pub use crdt::counter::{CounterType, CounterValue};
-pub use document::Document;
+pub use document::{DocStatus, Document};
 pub use error::{Result, YorkieError};
 pub use json::{JsonArray, JsonArrayElement, JsonCounter, JsonObject, JsonValue};
 pub use time::{

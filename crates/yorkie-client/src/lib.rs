@@ -2,9 +2,13 @@
 //! Network client layer for Yorkie.
 
 use std::collections::BTreeMap;
+use std::error::Error;
+use std::fmt::{self, Display, Formatter};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-pub use yorkie_core::{Document, JsonArray, JsonObject, JsonValue, Result, YorkieError};
+pub use yorkie_core::{
+    ActorId, DocStatus, Document, JsonArray, JsonObject, JsonValue, Result, YorkieError,
+};
 
 pub const DEFAULT_RPC_ADDR: &str = "https://api.yorkie.dev";
 pub const DEFAULT_SYNC_LOOP_DURATION_MS: u64 = 50;
@@ -78,6 +82,38 @@ pub struct AttachChannelOptions {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DetachOptions;
 
+/// Errors from the client lifecycle layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientError {
+    ClientNotActivated(String),
+    NotAttached(String),
+    NotDetached(String),
+    InvalidArgument(String),
+    Core(YorkieError),
+}
+
+pub type ClientResult<T> = std::result::Result<T, ClientError>;
+
+impl Display for ClientError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ClientNotActivated(key) => write!(f, "client {key:?} is not active"),
+            Self::NotAttached(key) => write!(f, "resource {key:?} is not attached"),
+            Self::NotDetached(key) => write!(f, "resource {key:?} is not detached"),
+            Self::InvalidArgument(message) => write!(f, "invalid client argument: {message}"),
+            Self::Core(err) => Display::fmt(err, f),
+        }
+    }
+}
+
+impl Error for ClientError {}
+
+impl From<YorkieError> for ClientError {
+    fn from(value: YorkieError) -> Self {
+        Self::Core(value)
+    }
+}
+
 impl Default for ClientOptions {
     fn default() -> Self {
         Self {
@@ -100,9 +136,28 @@ impl Default for ClientOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Client {
     key: String,
+    id: Option<ActorId>,
     status: ClientStatus,
     conditions: BTreeMap<ClientCondition, bool>,
+    attachments: BTreeMap<String, Attachment>,
     options: ClientOptions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Attachment {
+    sync_mode: SyncMode,
+    poll_interval: Duration,
+    poll_interval_pinned: bool,
+}
+
+impl Attachment {
+    fn new(sync_mode: SyncMode, poll_interval: Duration, poll_interval_pinned: bool) -> Self {
+        Self {
+            sync_mode,
+            poll_interval,
+            poll_interval_pinned,
+        }
+    }
 }
 
 impl Client {
@@ -115,10 +170,16 @@ impl Client {
 
         Self {
             key,
+            id: None,
             status: ClientStatus::Deactivated,
             conditions,
+            attachments: BTreeMap::new(),
             options,
         }
+    }
+
+    pub fn id(&self) -> Option<&ActorId> {
+        self.id.as_ref()
     }
 
     pub fn key(&self) -> &str {
@@ -140,6 +201,89 @@ impl Client {
     pub fn options(&self) -> &ClientOptions {
         &self.options
     }
+
+    pub fn has(&self, key: &str) -> bool {
+        self.attachments.contains_key(key)
+    }
+
+    pub fn attach(&mut self, doc: &mut Document, options: AttachOptions) -> ClientResult<()> {
+        let actor_id = self.require_active()?.clone();
+        if doc.status() != DocStatus::Detached {
+            return Err(ClientError::NotDetached(doc.key().to_owned()));
+        }
+
+        let sync_mode = options.sync_mode.unwrap_or(SyncMode::Realtime);
+        let (poll_interval, poll_interval_pinned) =
+            resolve_document_poll_interval(sync_mode, options.document_poll_interval)?;
+
+        doc.set_actor(actor_id);
+        doc.apply_status(DocStatus::Attached);
+        self.attachments.insert(
+            doc.key().to_owned(),
+            Attachment::new(sync_mode, poll_interval, poll_interval_pinned),
+        );
+
+        if let Some(initial_root) = options.initial_root {
+            let entries = initial_root
+                .iter()
+                .map(|(key, value)| (key.to_owned(), value.clone()))
+                .collect::<Vec<_>>();
+            doc.update(|root| {
+                for (key, value) in entries {
+                    if root.get(&key).is_none() {
+                        root.set(key, value)?;
+                    }
+                }
+                Ok(())
+            })?;
+        }
+
+        Ok(())
+    }
+
+    pub fn detach(&mut self, doc: &mut Document, _options: DetachOptions) -> ClientResult<()> {
+        self.require_active()?;
+        if self.attachments.remove(doc.key()).is_none() {
+            return Err(ClientError::NotAttached(doc.key().to_owned()));
+        }
+        if doc.status() != DocStatus::Removed {
+            doc.apply_status(DocStatus::Detached);
+        }
+        Ok(())
+    }
+
+    pub fn change_sync_mode(&mut self, doc: &Document, sync_mode: SyncMode) -> ClientResult<()> {
+        self.require_active()?;
+        let Some(attachment) = self.attachments.get_mut(doc.key()) else {
+            return Err(ClientError::NotAttached(doc.key().to_owned()));
+        };
+
+        if attachment.sync_mode == sync_mode {
+            return Ok(());
+        }
+
+        attachment.sync_mode = sync_mode;
+        if !attachment.poll_interval_pinned {
+            attachment.poll_interval = default_document_poll_interval(sync_mode);
+        }
+        Ok(())
+    }
+
+    fn require_active(&self) -> ClientResult<&ActorId> {
+        if !self.is_active() {
+            return Err(ClientError::ClientNotActivated(self.key.clone()));
+        }
+
+        self.id
+            .as_ref()
+            .ok_or_else(|| ClientError::ClientNotActivated(self.key.clone()))
+    }
+
+    #[cfg(test)]
+    fn apply_activation(&mut self, actor_id: impl Into<ActorId>) {
+        self.id = Some(actor_id.into());
+        self.status = ClientStatus::Activated;
+    }
 }
 
 impl Default for Client {
@@ -160,13 +304,38 @@ fn generate_client_key() -> String {
     format!("rust-{timestamp:x}-{counter:x}")
 }
 
+fn resolve_document_poll_interval(
+    sync_mode: SyncMode,
+    document_poll_interval: Option<Duration>,
+) -> ClientResult<(Duration, bool)> {
+    if let Some(interval) = document_poll_interval {
+        if interval.is_zero() {
+            return Err(ClientError::InvalidArgument(
+                "document_poll_interval must be greater than 0".to_owned(),
+            ));
+        }
+        return Ok((interval, true));
+    }
+
+    Ok((default_document_poll_interval(sync_mode), false))
+}
+
+fn default_document_poll_interval(sync_mode: SyncMode) -> Duration {
+    if sync_mode == SyncMode::Polling {
+        Duration::from_millis(DEFAULT_POLLING_INTERVAL_MS)
+    } else {
+        Duration::ZERO
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        AttachChannelOptions, AttachOptions, Client, ClientCondition, ClientOptions, ClientStatus,
-        DeactivateOptions, DetachOptions, SyncMode, DEFAULT_CHANNEL_HEARTBEAT_INTERVAL_MS,
-        DEFAULT_POLLING_INTERVAL_MS, DEFAULT_RECONNECT_STREAM_DELAY_MS,
-        DEFAULT_RETRY_SYNC_LOOP_DELAY_MS, DEFAULT_RPC_ADDR, DEFAULT_SYNC_LOOP_DURATION_MS,
+        AttachChannelOptions, AttachOptions, Client, ClientCondition, ClientError, ClientOptions,
+        ClientStatus, DeactivateOptions, DetachOptions, DocStatus, Document, JsonObject, SyncMode,
+        DEFAULT_CHANNEL_HEARTBEAT_INTERVAL_MS, DEFAULT_POLLING_INTERVAL_MS,
+        DEFAULT_RECONNECT_STREAM_DELAY_MS, DEFAULT_RETRY_SYNC_LOOP_DELAY_MS, DEFAULT_RPC_ADDR,
+        DEFAULT_SYNC_LOOP_DURATION_MS,
     };
     use std::collections::BTreeMap;
     use std::time::Duration;
@@ -271,5 +440,132 @@ mod tests {
             Some("local"),
             client.options().metadata.get("region").map(String::as_str)
         );
+    }
+
+    #[test]
+    fn rejects_attach_when_client_is_not_active() {
+        let mut client = Client::new(ClientOptions {
+            key: Some("client-key".to_owned()),
+            ..ClientOptions::default()
+        });
+        let mut doc = Document::new("doc-key");
+
+        let err = client
+            .attach(&mut doc, AttachOptions::default())
+            .unwrap_err();
+
+        assert_eq!(
+            ClientError::ClientNotActivated("client-key".to_owned()),
+            err
+        );
+        assert_eq!(DocStatus::Detached, doc.status());
+        assert!(!client.has("doc-key"));
+    }
+
+    #[test]
+    fn attaches_and_detaches_document_with_local_lifecycle_state() -> super::ClientResult<()> {
+        let mut client = Client::new(ClientOptions {
+            key: Some("client-key".to_owned()),
+            ..ClientOptions::default()
+        });
+        let mut doc = Document::new("doc-key");
+        let mut initial_root = JsonObject::new();
+        initial_root.set("title", "hello")?;
+
+        client.apply_activation("000000000000000000000001");
+        client.attach(
+            &mut doc,
+            AttachOptions {
+                initial_root: Some(initial_root),
+                sync_mode: Some(SyncMode::Polling),
+                ..AttachOptions::default()
+            },
+        )?;
+
+        assert_eq!(
+            Some("000000000000000000000001"),
+            client.id().map(|id| id.as_str())
+        );
+        assert!(client.has("doc-key"));
+        assert_eq!(DocStatus::Attached, doc.status());
+        assert!(doc.is_attached());
+        assert_eq!("000000000000000000000001", doc.actor_id().as_str());
+        assert_eq!(r#"{"title":"hello"}"#, doc.to_sorted_json());
+        let attachment = client.attachments.get("doc-key").unwrap();
+        assert_eq!(SyncMode::Polling, attachment.sync_mode);
+        assert_eq!(
+            Duration::from_millis(DEFAULT_POLLING_INTERVAL_MS),
+            attachment.poll_interval
+        );
+        assert!(!attachment.poll_interval_pinned);
+
+        client.detach(&mut doc, DetachOptions)?;
+
+        assert!(!client.has("doc-key"));
+        assert_eq!(DocStatus::Detached, doc.status());
+        assert_eq!("000000000000000000000000", doc.actor_id().as_str());
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_attach_when_document_is_not_detached() {
+        let mut client = Client::new(ClientOptions {
+            key: Some("client-key".to_owned()),
+            ..ClientOptions::default()
+        });
+        let mut doc = Document::new("doc-key");
+
+        client.apply_activation("000000000000000000000001");
+        doc.apply_status(DocStatus::Attached);
+
+        let err = client
+            .attach(&mut doc, AttachOptions::default())
+            .unwrap_err();
+
+        assert_eq!(ClientError::NotDetached("doc-key".to_owned()), err);
+    }
+
+    #[test]
+    fn changes_document_sync_mode_and_validates_poll_interval() -> super::ClientResult<()> {
+        let mut client = Client::new(ClientOptions {
+            key: Some("client-key".to_owned()),
+            ..ClientOptions::default()
+        });
+        let mut doc = Document::new("doc-key");
+
+        client.apply_activation("000000000000000000000001");
+        client.attach(
+            &mut doc,
+            AttachOptions {
+                sync_mode: Some(SyncMode::Realtime),
+                ..AttachOptions::default()
+            },
+        )?;
+        client.change_sync_mode(&doc, SyncMode::Polling)?;
+
+        let attachment = client.attachments.get("doc-key").unwrap();
+        assert_eq!(SyncMode::Polling, attachment.sync_mode);
+        assert_eq!(
+            Duration::from_millis(DEFAULT_POLLING_INTERVAL_MS),
+            attachment.poll_interval
+        );
+
+        let mut other_doc = Document::new("other-doc");
+        let err = client
+            .attach(
+                &mut other_doc,
+                AttachOptions {
+                    document_poll_interval: Some(Duration::ZERO),
+                    ..AttachOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            ClientError::InvalidArgument(
+                "document_poll_interval must be greater than 0".to_owned()
+            ),
+            err
+        );
+        Ok(())
     }
 }

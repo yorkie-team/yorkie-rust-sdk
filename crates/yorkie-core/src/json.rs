@@ -405,7 +405,7 @@ impl JsonObject {
         Some(removed)
     }
 
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, &JsonValue)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &JsonValue)> {
         self.members
             .iter()
             .map(|(key, value)| (key.as_str(), value))

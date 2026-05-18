@@ -1,7 +1,8 @@
 use yorkie::{
     ActorId, AttachChannelOptions, AttachOptions, ChangePack, Checkpoint, Client, ClientCondition,
-    ClientStatus, CounterType, CounterValue, DeactivateOptions, DetachOptions, Document,
-    JsonCounter, Result, SyncMode, TimeTicket, TimeTicketStruct, VersionVector,
+    ClientError, ClientStatus, CounterType, CounterValue, DeactivateOptions, DetachOptions,
+    DocStatus, Document, JsonCounter, Result, SyncMode, TimeTicket, TimeTicketStruct,
+    VersionVector,
 };
 
 #[test]
@@ -15,6 +16,7 @@ fn facade_exports_document_api() -> Result<()> {
 
     assert_eq!(r#"{"title":"hello"}"#, doc.to_sorted_json());
     assert_eq!(Checkpoint::initial(), doc.checkpoint());
+    assert_eq!(DocStatus::Detached, doc.status());
 
     let pack: ChangePack = doc.create_change_pack();
     assert_eq!("test-doc", pack.document_key());
@@ -52,7 +54,8 @@ fn facade_exports_time_api() {
 
 #[test]
 fn facade_exports_client_api() {
-    let client = Client::default();
+    let mut client = Client::default();
+    let mut doc = Document::new("doc-key");
     let attach_options = AttachOptions {
         sync_mode: Some(SyncMode::Polling),
         ..AttachOptions::default()
@@ -67,6 +70,11 @@ fn facade_exports_client_api() {
     assert!(!client.condition(ClientCondition::SyncLoop));
     assert_eq!(Some(SyncMode::Polling), attach_options.sync_mode);
     assert_eq!(Some(SyncMode::Realtime), channel_options.sync_mode);
+    assert_eq!(
+        ClientError::ClientNotActivated(client.key().to_owned()),
+        client.attach(&mut doc, attach_options).unwrap_err()
+    );
+    assert!(!client.has("doc-key"));
     assert_eq!(
         DeactivateOptions::default(),
         DeactivateOptions {

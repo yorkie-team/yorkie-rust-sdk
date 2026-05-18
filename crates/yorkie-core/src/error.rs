@@ -47,6 +47,9 @@ pub enum YorkieError {
     /// A counter operation is invalid for the current counter mode.
     InvalidCounterOperation(String),
 
+    /// The document has been removed and can no longer be edited.
+    DocumentRemoved(String),
+
     /// Snapshot bytes were provided without a decoded root object.
     UnsupportedSnapshot,
 
@@ -90,6 +93,7 @@ impl Display for YorkieError {
             Self::InvalidCounterOperation(message) => {
                 write!(f, "invalid counter operation: {message}")
             }
+            Self::DocumentRemoved(key) => write!(f, "document {key:?} is removed"),
             Self::UnsupportedSnapshot => write!(f, "snapshot application requires a decoded root"),
             Self::UnsupportedProtocolConversion(value) => {
                 write!(f, "unsupported protocol conversion for {value}")
