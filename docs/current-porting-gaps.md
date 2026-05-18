@@ -748,8 +748,8 @@ Current Rust behavior:
 
 - Client crates and facade are scaffolded.
 - `yorkie-client` is split into `client`, `options`, `attachment`,
-  `transport`, and `error` modules, with `lib.rs` kept as a re-exporting crate
-  entrypoint.
+  `transport`, `protocol`, and `error` modules, with `lib.rs` kept as a
+  re-exporting crate entrypoint.
 - `ClientOptions` carries the JS/Go-shaped base options that do not require a
   network runtime yet: RPC address, client key, API key, metadata, user agent,
   sync-loop duration, retry delay, reconnect delay, and channel heartbeat
@@ -784,6 +784,10 @@ Current Rust behavior:
   transport boundary, apply the returned change pack, and remove attachment
   metadata when the document is removed. The push-only response guard follows
   the client-side JS behavior.
+- `yorkie-client::protocol` converts activate/deactivate, attach/detach/remove,
+  and push-pull transport DTOs to and from generated protobuf request/response
+  messages. Shard keys remain on transport DTOs because JS/Go send them as
+  request metadata rather than protobuf fields.
 - `Client::has` and `change_sync_mode` cover local lifecycle bookkeeping and
   precondition errors for documents.
 - Document local change packs can be created and applied in-memory.
@@ -801,7 +805,8 @@ Gap:
 
 - No concrete RPC transport.
 - Activate/deactivate/attach/detach/remove/push-pull sync use a transport
-  trait, but there is no Connect/gRPC-web implementation yet.
+  trait and have protobuf conversion helpers, but there is no Connect/gRPC-web
+  implementation yet.
 - No watch stream.
 - No presence.
 - Schema rules and max-size limits are stored after attach but are not enforced
@@ -815,7 +820,8 @@ Gap:
 
 Expected direction:
 
-- Add a concrete protocol transport for the existing client lifecycle boundary.
+- Add a concrete protocol transport that uses the existing client protocol
+  conversion helpers.
 - Keep Client state transitions aligned with document status and attachment
   metadata as the network layer lands.
 

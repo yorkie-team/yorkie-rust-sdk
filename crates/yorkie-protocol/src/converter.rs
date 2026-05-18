@@ -18,6 +18,7 @@ pub enum ProtocolError {
     Decode(String),
     InvalidActorId(String),
     InvalidBase64(String),
+    InvalidInteger { field: &'static str, value: i32 },
     InvalidOffset { field: &'static str, value: i32 },
     MissingField(&'static str),
     UnsupportedValueType(i32),
@@ -32,6 +33,9 @@ impl Display for ProtocolError {
             Self::Decode(err) => write!(f, "protobuf decode failed: {err}"),
             Self::InvalidActorId(actor_id) => write!(f, "invalid actor id {actor_id:?}"),
             Self::InvalidBase64(value) => write!(f, "invalid base64 value {value:?}"),
+            Self::InvalidInteger { field, value } => {
+                write!(f, "invalid integer for {field}: {value}")
+            }
             Self::InvalidOffset { field, value } => {
                 write!(f, "invalid negative offset for {field}: {value}")
             }

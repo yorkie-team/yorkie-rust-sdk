@@ -6,23 +6,24 @@ a design smell even when the compiler can technically build them.
 
 ## Desired Crate Direction
 
-The intended dependency direction is:
+The intended dependency graph is:
 
 ```text
-yorkie
-  -> yorkie-client
+yorkie-core
+  -> standard library and small pure-Rust utilities only
+
+yorkie-protocol
   -> yorkie-core
-  -> yorkie-protocol
+  -> generated protocol types and protocol-only helpers
 
 yorkie-client
   -> yorkie-core
   -> yorkie-protocol
 
-yorkie-core
-  -> standard library and small pure-Rust utilities only
-
-yorkie-protocol
-  -> generated protocol types and protocol-only helpers
+yorkie
+  -> yorkie-core
+  -> yorkie-protocol
+  -> yorkie-client
 ```
 
 The `yorkie` crate is a facade. It should re-export user-facing APIs and avoid
@@ -102,6 +103,7 @@ Current `yorkie-client` module layout follows the same split:
 | `options.rs` | Client, attach, detach, channel, and sync mode option types. |
 | `attachment.rs` | Per-resource attachment metadata and sync interval helpers. |
 | `transport.rs` | Request/response DTOs and transport traits for RPC boundaries. |
+| `protocol.rs` | Conversion between client transport DTOs and generated protobuf request/response types. |
 | `error.rs` | Client-layer error and result types. |
 | `lib.rs` | Crate entrypoint and public re-exports only. |
 

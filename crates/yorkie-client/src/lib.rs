@@ -5,6 +5,7 @@ mod attachment;
 mod client;
 mod error;
 mod options;
+pub mod protocol;
 mod transport;
 
 pub use client::{Client, ClientCondition, ClientStatus};
