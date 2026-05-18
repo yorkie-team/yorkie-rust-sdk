@@ -2,7 +2,12 @@
 //! Protocol types and converters for Yorkie.
 
 pub mod converter;
-pub mod resources;
+
+pub mod yorkie {
+    pub mod v1 {
+        include!(concat!(env!("OUT_DIR"), "/yorkie.v1.rs"));
+    }
+}
 
 /// The protobuf package used by Yorkie SDK RPCs.
 pub const YORKIE_PROTO_PACKAGE: &str = "yorkie.v1";

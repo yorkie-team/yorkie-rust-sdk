@@ -1,4 +1,4 @@
-use crate::resources;
+use crate::yorkie::v1 as api;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -33,39 +33,39 @@ impl From<YorkieError> for ProtocolError {
     }
 }
 
-pub fn to_change_pack(pack: &CoreChangePack) -> Result<resources::ChangePack> {
+pub fn to_change_pack(pack: &CoreChangePack) -> Result<api::ChangePack> {
     let pack = WireChangePack::try_from(pack)?;
     wire_change_pack_to_proto(&pack)
 }
 
-pub fn to_checkpoint(checkpoint: CoreCheckpoint) -> resources::Checkpoint {
-    resources::Checkpoint {
+pub fn to_checkpoint(checkpoint: CoreCheckpoint) -> api::Checkpoint {
+    api::Checkpoint {
         server_seq: checkpoint.server_seq(),
         client_seq: checkpoint.client_seq(),
     }
 }
 
-pub fn to_time_ticket(ticket: &CoreTimeTicket) -> Result<resources::TimeTicket> {
-    Ok(resources::TimeTicket {
+pub fn to_time_ticket(ticket: &CoreTimeTicket) -> Result<api::TimeTicket> {
+    Ok(api::TimeTicket {
         lamport: ticket.lamport(),
         delimiter: ticket.delimiter(),
         actor_id: actor_id_to_bytes(ticket.actor_id())?,
     })
 }
 
-pub fn to_version_vector(vector: &CoreVersionVector) -> Result<resources::VersionVector> {
+pub fn to_version_vector(vector: &CoreVersionVector) -> Result<api::VersionVector> {
     let mut proto_vector = BTreeMap::new();
     for (actor_id, lamport) in vector.iter() {
         proto_vector.insert(base64_encode(&actor_id_to_bytes(actor_id)?), lamport);
     }
 
-    Ok(resources::VersionVector {
+    Ok(api::VersionVector {
         vector: proto_vector,
     })
 }
 
-fn wire_change_pack_to_proto(pack: &WireChangePack) -> Result<resources::ChangePack> {
-    Ok(resources::ChangePack {
+fn wire_change_pack_to_proto(pack: &WireChangePack) -> Result<api::ChangePack> {
+    Ok(api::ChangePack {
         document_key: pack.document_key.clone(),
         checkpoint: Some(to_checkpoint(pack.checkpoint)),
         snapshot: pack.snapshot.clone().unwrap_or_default(),
@@ -74,6 +74,7 @@ fn wire_change_pack_to_proto(pack: &WireChangePack) -> Result<resources::ChangeP
             .iter()
             .map(wire_change_to_proto)
             .collect::<Result<Vec<_>>>()?,
+        min_synced_ticket: None,
         is_removed: pack.is_removed,
         version_vector: pack
             .version_vector
@@ -83,8 +84,8 @@ fn wire_change_pack_to_proto(pack: &WireChangePack) -> Result<resources::ChangeP
     })
 }
 
-fn wire_change_to_proto(change: &WireChange) -> Result<resources::Change> {
-    Ok(resources::Change {
+fn wire_change_to_proto(change: &WireChange) -> Result<api::Change> {
+    Ok(api::Change {
         id: Some(wire_change_id_to_proto(&change.id)?),
         message: change.message.clone().unwrap_or_default(),
         operations: change
@@ -92,11 +93,12 @@ fn wire_change_to_proto(change: &WireChange) -> Result<resources::Change> {
             .iter()
             .map(wire_operation_to_proto)
             .collect::<Result<Vec<_>>>()?,
+        presence_change: None,
     })
 }
 
-fn wire_change_id_to_proto(id: &WireChangeId) -> Result<resources::ChangeId> {
-    Ok(resources::ChangeId {
+fn wire_change_id_to_proto(id: &WireChangeId) -> Result<api::ChangeId> {
+    Ok(api::ChangeId {
         client_seq: id.client_seq,
         server_seq: id.server_seq,
         lamport: id.lamport,
@@ -105,14 +107,14 @@ fn wire_change_id_to_proto(id: &WireChangeId) -> Result<resources::ChangeId> {
     })
 }
 
-fn wire_operation_to_proto(operation: &WireOperation) -> Result<resources::Operation> {
+fn wire_operation_to_proto(operation: &WireOperation) -> Result<api::Operation> {
     let body = match operation {
         WireOperation::Set {
             parent_created_at,
             key,
             value,
             executed_at,
-        } => resources::OperationBody::Set(resources::OperationSet {
+        } => api::operation::Body::Set(api::operation::Set {
             parent_created_at: Some(to_time_ticket(parent_created_at)?),
             key: key.clone(),
             value: Some(wire_json_element_simple_to_proto(value)?),
@@ -123,7 +125,7 @@ fn wire_operation_to_proto(operation: &WireOperation) -> Result<resources::Opera
             prev_created_at,
             value,
             executed_at,
-        } => resources::OperationBody::Add(resources::OperationAdd {
+        } => api::operation::Body::Add(api::operation::Add {
             parent_created_at: Some(to_time_ticket(parent_created_at)?),
             prev_created_at: Some(to_time_ticket(prev_created_at)?),
             value: Some(wire_json_element_simple_to_proto(value)?),
@@ -134,7 +136,7 @@ fn wire_operation_to_proto(operation: &WireOperation) -> Result<resources::Opera
             prev_created_at,
             created_at,
             executed_at,
-        } => resources::OperationBody::Move(resources::OperationMove {
+        } => api::operation::Body::Move(api::operation::Move {
             parent_created_at: Some(to_time_ticket(parent_created_at)?),
             prev_created_at: Some(to_time_ticket(prev_created_at)?),
             created_at: Some(to_time_ticket(created_at)?),
@@ -144,7 +146,7 @@ fn wire_operation_to_proto(operation: &WireOperation) -> Result<resources::Opera
             parent_created_at,
             created_at,
             executed_at,
-        } => resources::OperationBody::Remove(resources::OperationRemove {
+        } => api::operation::Body::Remove(api::operation::Remove {
             parent_created_at: Some(to_time_ticket(parent_created_at)?),
             created_at: Some(to_time_ticket(created_at)?),
             executed_at: Some(to_time_ticket(executed_at)?),
@@ -154,7 +156,7 @@ fn wire_operation_to_proto(operation: &WireOperation) -> Result<resources::Opera
             value,
             executed_at,
             actor,
-        } => resources::OperationBody::Increase(resources::OperationIncrease {
+        } => api::operation::Body::Increase(api::operation::Increase {
             parent_created_at: Some(to_time_ticket(parent_created_at)?),
             value: Some(wire_json_element_simple_to_proto(value)?),
             executed_at: Some(to_time_ticket(executed_at)?),
@@ -165,7 +167,7 @@ fn wire_operation_to_proto(operation: &WireOperation) -> Result<resources::Opera
             created_at,
             value,
             executed_at,
-        } => resources::OperationBody::ArraySet(resources::OperationArraySet {
+        } => api::operation::Body::ArraySet(api::operation::ArraySet {
             parent_created_at: Some(to_time_ticket(parent_created_at)?),
             created_at: Some(to_time_ticket(created_at)?),
             value: Some(wire_json_element_simple_to_proto(value)?),
@@ -173,38 +175,38 @@ fn wire_operation_to_proto(operation: &WireOperation) -> Result<resources::Opera
         }),
     };
 
-    Ok(resources::Operation { body })
+    Ok(api::Operation { body: Some(body) })
 }
 
 fn wire_json_element_simple_to_proto(
     value: &WireJsonElementSimple,
-) -> Result<resources::JsonElementSimple> {
-    Ok(resources::JsonElementSimple {
+) -> Result<api::JsonElementSimple> {
+    Ok(api::JsonElementSimple {
         created_at: Some(to_time_ticket(&value.created_at)?),
         moved_at: value.moved_at.as_ref().map(to_time_ticket).transpose()?,
         removed_at: value.removed_at.as_ref().map(to_time_ticket).transpose()?,
-        value_type: wire_value_type_to_proto(value.value_type),
+        r#type: wire_value_type_to_proto(value.value_type) as i32,
         value: value.value.clone(),
     })
 }
 
-fn wire_value_type_to_proto(value_type: WireValueType) -> resources::ValueType {
+fn wire_value_type_to_proto(value_type: WireValueType) -> api::ValueType {
     match value_type {
-        WireValueType::Null => resources::ValueType::Null,
-        WireValueType::Boolean => resources::ValueType::Boolean,
-        WireValueType::Integer => resources::ValueType::Integer,
-        WireValueType::Long => resources::ValueType::Long,
-        WireValueType::Double => resources::ValueType::Double,
-        WireValueType::String => resources::ValueType::String,
-        WireValueType::Bytes => resources::ValueType::Bytes,
-        WireValueType::Date => resources::ValueType::Date,
-        WireValueType::JsonObject => resources::ValueType::JsonObject,
-        WireValueType::JsonArray => resources::ValueType::JsonArray,
-        WireValueType::Text => resources::ValueType::Text,
-        WireValueType::IntegerCnt => resources::ValueType::IntegerCnt,
-        WireValueType::LongCnt => resources::ValueType::LongCnt,
-        WireValueType::IntegerDedupCnt => resources::ValueType::IntegerDedupCnt,
-        WireValueType::Tree => resources::ValueType::Tree,
+        WireValueType::Null => api::ValueType::Null,
+        WireValueType::Boolean => api::ValueType::Boolean,
+        WireValueType::Integer => api::ValueType::Integer,
+        WireValueType::Long => api::ValueType::Long,
+        WireValueType::Double => api::ValueType::Double,
+        WireValueType::String => api::ValueType::String,
+        WireValueType::Bytes => api::ValueType::Bytes,
+        WireValueType::Date => api::ValueType::Date,
+        WireValueType::JsonObject => api::ValueType::JsonObject,
+        WireValueType::JsonArray => api::ValueType::JsonArray,
+        WireValueType::Text => api::ValueType::Text,
+        WireValueType::IntegerCnt => api::ValueType::IntegerCnt,
+        WireValueType::LongCnt => api::ValueType::LongCnt,
+        WireValueType::IntegerDedupCnt => api::ValueType::IntegerDedupCnt,
+        WireValueType::Tree => api::ValueType::Tree,
     }
 }
 
@@ -252,7 +254,7 @@ fn base64_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{to_change_pack, to_time_ticket, to_version_vector};
-    use crate::resources::{OperationBody, ValueType};
+    use crate::yorkie::v1::{operation::Body, ValueType};
     use std::error::Error;
     use yorkie_core::{Document, TimeTicket};
 
@@ -293,20 +295,20 @@ mod tests {
         assert_eq!(1, proto.changes.len());
         assert_eq!(2, proto.changes[0].operations.len());
 
-        let OperationBody::Set(set) = &proto.changes[0].operations[0].body else {
+        let Some(Body::Set(set)) = &proto.changes[0].operations[0].body else {
             panic!("expected set operation");
         };
         assert_eq!("count", set.key);
         let value = set.value.as_ref().expect("set value");
-        assert_eq!(ValueType::IntegerCnt, value.value_type);
+        assert_eq!(ValueType::IntegerCnt as i32, value.r#type);
         assert_eq!(1i32.to_le_bytes().to_vec(), value.value);
 
-        let OperationBody::Increase(increase) = &proto.changes[0].operations[1].body else {
+        let Some(Body::Increase(increase)) = &proto.changes[0].operations[1].body else {
             panic!("expected increase operation");
         };
         assert_eq!("", increase.actor);
         let value = increase.value.as_ref().expect("increase value");
-        assert_eq!(ValueType::Integer, value.value_type);
+        assert_eq!(ValueType::Integer as i32, value.r#type);
         assert_eq!(2i32.to_le_bytes().to_vec(), value.value);
         Ok(())
     }
@@ -322,20 +324,20 @@ mod tests {
 
         let proto = to_change_pack(&doc.create_change_pack())?;
 
-        let OperationBody::Set(set) = &proto.changes[0].operations[0].body else {
+        let Some(Body::Set(set)) = &proto.changes[0].operations[0].body else {
             panic!("expected set operation");
         };
         assert_eq!(
-            ValueType::IntegerDedupCnt,
-            set.value.as_ref().expect("set value").value_type
+            ValueType::IntegerDedupCnt as i32,
+            set.value.as_ref().expect("set value").r#type
         );
 
-        let OperationBody::Increase(increase) = &proto.changes[0].operations[1].body else {
+        let Some(Body::Increase(increase)) = &proto.changes[0].operations[1].body else {
             panic!("expected increase operation");
         };
         assert_eq!("user-1", increase.actor);
         let value = increase.value.as_ref().expect("increase value");
-        assert_eq!(ValueType::Integer, value.value_type);
+        assert_eq!(ValueType::Integer as i32, value.r#type);
         assert_eq!(1i32.to_le_bytes().to_vec(), value.value);
         Ok(())
     }

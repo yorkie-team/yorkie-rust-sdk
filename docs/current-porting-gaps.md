@@ -323,10 +323,11 @@ Gap:
 - Rust uses explicit constructors and object/array helper methods instead of
   JavaScript's `new Counter(...)` syntax or Go's dynamic `any` value
   inference. The semantics are aligned, but the public shape is Rust-specific.
-- Counter creation and increase operations now convert to proto-shaped Rust
+- Counter creation and increase operations now convert to generated protobuf
   payloads through `yorkie_core::wire` and `yorkie_protocol::converter`.
-  From-protocol conversion and full snapshot `JSONElement.Counter`
-  conversion with HLL register payloads are still missing.
+  From-protocol conversion, protobuf binary round-trip tests, and full
+  snapshot `JSONElement.Counter` conversion with HLL register payloads are
+  still missing.
 - Change-level concurrent counter tests are still missing because the public
   editing path does not yet include client sync/history.
 
@@ -613,9 +614,9 @@ Gap:
 - Snapshot application is explicitly unsupported.
 - `ChangePack::is_removed` is stored but document removal behavior is not
   applied.
-- Change packs can be projected to proto-shaped Rust payloads for supported
-  set/add/move/remove/increase/array-set operations. Actual protobuf binary
-  encoding and from-protocol reconstruction are not implemented.
+- Change packs can be projected to generated protobuf payloads for supported
+  set/add/move/remove/increase/array-set operations. From-protocol
+  reconstruction and binary compatibility tests are not implemented.
 - Sync/status transitions are not implemented.
 
 Expected direction:
@@ -656,11 +657,10 @@ Current Rust behavior:
 - `yorkie_core::wire` exposes a narrow projection of internal changes and
   operations without making the internal CRDT and operation structs part of the
   public SDK facade.
-- `yorkie_protocol::resources` mirrors the proto field shape for checkpoint,
-  time ticket, version vector, change pack, change, JSON element simple values,
-  and the currently supported operation bodies.
+- `yorkie_protocol::yorkie::v1` is generated from vendored Yorkie protobuf
+  files at build time.
 - `yorkie_protocol::converter::to_change_pack` converts a core `ChangePack`
-  into proto-shaped Rust payloads for set/add/move/remove/increase/array-set
+  into generated protobuf payloads for set/add/move/remove/increase/array-set
   operations when their element payloads are primitive, counter, text, or tree
   simple values.
 - Protocol conversion tests cover actor bytes, version-vector base64 actor
@@ -673,7 +673,6 @@ JS/Go behavior:
 
 Gap:
 
-- No generated protobuf structs or binary encoding are wired in yet.
 - No protobuf-to-operation conversion.
 - Object/array simple element payload bytes, full `JSONElement` payloads,
   text/tree operation bodies, snapshots, and presence changes are not converted
@@ -683,11 +682,11 @@ Gap:
 
 Expected direction:
 
-- Extend the proto-shaped converter in the same order as the in-memory
+- Extend the generated protobuf converter in the same order as the in-memory
   operation set: object/array bytes, full JSON element snapshots, text/tree
   operations, then from-protocol reconstruction.
-- Add real protobuf generation/encoding once the field-level conversion is
-  stable.
+- Add protobuf binary compatibility tests once the field-level conversion is
+  broader.
 - Use JS converter files and Yorkie proto definitions as the main reference,
   with Go as a server/client cross-check.
 
