@@ -94,33 +94,34 @@ pub struct PushPullChangesResponse {
 }
 
 /// Transport boundary used by the client lifecycle and document attachment.
+#[allow(async_fn_in_trait)]
 pub trait ClientTransport {
-    fn activate_client(
+    async fn activate_client(
         &mut self,
         request: ActivateClientRequest,
     ) -> ClientResult<ActivateClientResponse>;
 
-    fn deactivate_client(
+    async fn deactivate_client(
         &mut self,
         request: DeactivateClientRequest,
     ) -> ClientResult<DeactivateClientResponse>;
 
-    fn attach_document(
+    async fn attach_document(
         &mut self,
         request: AttachDocumentRequest,
     ) -> ClientResult<AttachDocumentResponse>;
 
-    fn detach_document(
+    async fn detach_document(
         &mut self,
         request: DetachDocumentRequest,
     ) -> ClientResult<DetachDocumentResponse>;
 
-    fn remove_document(
+    async fn remove_document(
         &mut self,
         request: RemoveDocumentRequest,
     ) -> ClientResult<RemoveDocumentResponse>;
 
-    fn push_pull_changes(
+    async fn push_pull_changes(
         &mut self,
         request: PushPullChangesRequest,
     ) -> ClientResult<PushPullChangesResponse>;
