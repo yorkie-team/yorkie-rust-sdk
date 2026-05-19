@@ -760,8 +760,9 @@ Current Rust behavior:
   types.
 - `Client` stores a key, optional actor ID, deactivated status, sync/watch
   condition flags, and document attachment metadata.
-- `ClientTransport` is a testable transport boundary for activate/deactivate,
-  document attach/detach/remove, and client-side push-pull sync.
+- `ClientTransport` is an async, testable transport boundary for
+  activate/deactivate, document attach/detach/remove, and client-side push-pull
+  sync.
   `Client::activate` sends client key, metadata, and shard key through this
   boundary; `Client::deactivate` sends client ID and synchronous flag, clears
   local attachment metadata, and marks sync/watch conditions inactive.
@@ -804,9 +805,9 @@ JS/Go behavior:
 Gap:
 
 - No concrete RPC transport.
-- Activate/deactivate/attach/detach/remove/push-pull sync use a transport
-  trait and have protobuf conversion helpers, but there is no Connect/gRPC-web
-  implementation yet.
+- Activate/deactivate/attach/detach/remove/push-pull sync use an async
+  transport trait and have protobuf conversion helpers, but there is no
+  Connect/gRPC-web implementation yet.
 - No watch stream.
 - No presence.
 - Schema rules and max-size limits are stored after attach but are not enforced

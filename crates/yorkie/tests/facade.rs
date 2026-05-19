@@ -1,3 +1,5 @@
+use std::future::Future;
+use std::task::{Context, Poll, Waker};
 use yorkie::{
     ActivateClientRequest, ActivateClientResponse, ActorId, AttachChannelOptions,
     AttachDocumentRequest, AttachDocumentResponse, AttachOptions, ChangePack, Checkpoint, Client,
@@ -19,7 +21,7 @@ struct FacadeTransport {
 }
 
 impl ClientTransport for FacadeTransport {
-    fn activate_client(
+    async fn activate_client(
         &mut self,
         _request: ActivateClientRequest,
     ) -> yorkie::ClientResult<ActivateClientResponse> {
@@ -29,14 +31,14 @@ impl ClientTransport for FacadeTransport {
         })
     }
 
-    fn deactivate_client(
+    async fn deactivate_client(
         &mut self,
         _request: DeactivateClientRequest,
     ) -> yorkie::ClientResult<DeactivateClientResponse> {
         Ok(DeactivateClientResponse)
     }
 
-    fn attach_document(
+    async fn attach_document(
         &mut self,
         request: AttachDocumentRequest,
     ) -> yorkie::ClientResult<AttachDocumentResponse> {
@@ -53,7 +55,7 @@ impl ClientTransport for FacadeTransport {
         })
     }
 
-    fn detach_document(
+    async fn detach_document(
         &mut self,
         request: DetachDocumentRequest,
     ) -> yorkie::ClientResult<DetachDocumentResponse> {
@@ -63,7 +65,7 @@ impl ClientTransport for FacadeTransport {
         })
     }
 
-    fn remove_document(
+    async fn remove_document(
         &mut self,
         request: RemoveDocumentRequest,
     ) -> yorkie::ClientResult<RemoveDocumentResponse> {
@@ -73,7 +75,7 @@ impl ClientTransport for FacadeTransport {
         })
     }
 
-    fn push_pull_changes(
+    async fn push_pull_changes(
         &mut self,
         request: PushPullChangesRequest,
     ) -> yorkie::ClientResult<PushPullChangesResponse> {
@@ -81,6 +83,22 @@ impl ClientTransport for FacadeTransport {
         Ok(PushPullChangesResponse {
             change_pack: request.change_pack,
         })
+    }
+}
+
+fn block_on<F>(future: F) -> F::Output
+where
+    F: Future,
+{
+    let waker = Waker::noop();
+    let mut context = Context::from_waker(waker);
+    let mut future = std::pin::pin!(future);
+
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => return output,
+            Poll::Pending => std::thread::yield_now(),
+        }
     }
 }
 
@@ -150,29 +168,25 @@ fn facade_exports_client_api() {
     assert!(!client.condition(ClientCondition::SyncLoop));
     assert_eq!(
         ClientError::ClientNotActivated(client.key().to_owned()),
-        client
-            .attach(&mut transport, &mut doc, attach_options.clone())
-            .unwrap_err()
+        block_on(client.attach(&mut transport, &mut doc, attach_options.clone())).unwrap_err()
     );
-    client.activate(&mut transport).unwrap();
+    block_on(client.activate(&mut transport)).unwrap();
     assert_eq!(ClientStatus::Activated, client.status());
     assert_eq!(1, transport.activate_requests);
     assert_eq!(Some(SyncMode::Polling), attach_options.sync_mode);
     assert_eq!(Some(SyncMode::Realtime), channel_options.sync_mode);
-    client
-        .attach(&mut transport, &mut doc, attach_options)
-        .unwrap();
+    block_on(client.attach(&mut transport, &mut doc, attach_options)).unwrap();
     assert!(client.has("doc-key"));
     assert_eq!(1024, doc.max_size_per_document());
     assert_eq!(1, doc.schema_rules().len());
     assert_eq!(1, transport.attach_requests);
     doc.update(|root| root.set("title", "hello").map(|_| ()))
         .unwrap();
-    client.sync(&mut transport, &mut doc).unwrap();
+    block_on(client.sync(&mut transport, &mut doc)).unwrap();
     assert!(!doc.has_local_changes());
     assert_eq!(1, transport.push_pull_requests);
     assert_eq!(SyncOptions::default(), SyncOptions { sync_mode: None });
-    client.remove(&mut transport, &mut doc).unwrap();
+    block_on(client.remove(&mut transport, &mut doc)).unwrap();
     assert!(!client.has("doc-key"));
     assert_eq!(DocStatus::Removed, doc.status());
     assert_eq!(1, transport.remove_requests);
