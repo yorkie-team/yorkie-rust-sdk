@@ -1,3 +1,5 @@
+// The module mirrors the JS `change/change.ts` layout.
+#[allow(clippy::module_inception)]
 mod change;
 mod checkpoint;
 mod context;

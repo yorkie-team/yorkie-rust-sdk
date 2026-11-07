@@ -316,7 +316,7 @@ impl RgaTreeList {
             .element_map_by_created_at
             .get(&created_id)
             .copied()
-            .ok_or_else(|| YorkieError::MissingCrdtElement(created_id))?;
+            .ok_or(YorkieError::MissingCrdtElement(created_id))?;
         self.remove_at_position_index(position_index);
         self.rebuild_indexes();
         Ok(())

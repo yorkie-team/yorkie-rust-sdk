@@ -882,10 +882,8 @@ impl JsonArray {
             }
         }
 
-        let mut insert_at = from;
-        for item in items {
+        for (insert_at, item) in (from..).zip(items) {
             self.insert(insert_at, item)?;
-            insert_at += 1;
         }
 
         Ok(removed_values)

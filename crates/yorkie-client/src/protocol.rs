@@ -320,11 +320,13 @@ mod tests {
 
     #[test]
     fn rejects_negative_attach_response_max_size() {
-        let mut response = api::AttachDocumentResponse::default();
-        response.change_pack = Some(
-            converter::to_change_pack(&Document::new("doc-key").create_change_pack()).unwrap(),
-        );
-        response.max_size_per_document = -1;
+        let response = api::AttachDocumentResponse {
+            change_pack: Some(
+                converter::to_change_pack(&Document::new("doc-key").create_change_pack()).unwrap(),
+            ),
+            max_size_per_document: -1,
+            ..Default::default()
+        };
 
         assert_eq!(
             ProtocolError::InvalidInteger {

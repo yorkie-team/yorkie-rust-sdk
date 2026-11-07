@@ -163,6 +163,29 @@ pub(crate) struct TextStyleChange {
     pub(crate) attributes_to_remove: Vec<String>,
 }
 
+type TextStyleResult = (
+    Vec<RhtNode>,
+    DataSize,
+    Vec<TextStyleChange>,
+    BTreeMap<String, String>,
+    Vec<String>,
+);
+type TextRemoveStyleResult = (
+    Vec<RhtNode>,
+    DataSize,
+    Vec<TextStyleChange>,
+    BTreeMap<String, String>,
+);
+
+impl std::fmt::Display for CrdtText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for node in self.rga_tree_split.iter().filter(|node| !node.is_removed()) {
+            f.write_str(node.value().content())?;
+        }
+        Ok(())
+    }
+}
+
 impl CrdtText {
     pub(crate) fn new(created_at: TimeTicket, rga_tree_split: RgaTreeSplit<TextValue>) -> Self {
         Self {
@@ -324,13 +347,7 @@ impl CrdtText {
         attributes: BTreeMap<String, String>,
         edited_at: TimeTicket,
         version_vector: Option<&VersionVector>,
-    ) -> Result<(
-        Vec<RhtNode>,
-        DataSize,
-        Vec<TextStyleChange>,
-        BTreeMap<String, String>,
-        Vec<String>,
-    )> {
+    ) -> Result<TextStyleResult> {
         let mut diff = DataSize::default();
         let (_, diff_to, to_right) = self
             .rga_tree_split
@@ -478,12 +495,7 @@ impl CrdtText {
         attributes_to_remove: &[String],
         edited_at: TimeTicket,
         version_vector: Option<&VersionVector>,
-    ) -> Result<(
-        Vec<RhtNode>,
-        DataSize,
-        Vec<TextStyleChange>,
-        BTreeMap<String, String>,
-    )> {
+    ) -> Result<TextRemoveStyleResult> {
         let mut diff = DataSize::default();
         let (_, diff_to, to_right) = self
             .rga_tree_split
@@ -617,15 +629,6 @@ impl CrdtText {
 
     pub(crate) fn to_sorted_json(&self) -> String {
         self.to_json()
-    }
-
-    pub(crate) fn to_string(&self) -> String {
-        self.rga_tree_split
-            .iter()
-            .filter(|node| !node.is_removed())
-            .map(|node| node.value().content())
-            .collect::<Vec<_>>()
-            .join("")
     }
 
     pub(crate) fn to_test_string(&self) -> String {

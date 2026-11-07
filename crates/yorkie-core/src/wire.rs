@@ -406,7 +406,7 @@ impl TryFrom<&Operation> for WireOperation {
             }),
             Operation::Edit(operation) => Ok(Self::Edit {
                 parent_created_at: operation.parent_created_at().clone(),
-                from: WireTextNodePos::from(operation.from_pos()),
+                from: WireTextNodePos::from(operation.range_from()),
                 to: WireTextNodePos::from(operation.to_pos()),
                 content: operation.content().to_owned(),
                 attributes: operation.attributes().clone(),
@@ -414,7 +414,7 @@ impl TryFrom<&Operation> for WireOperation {
             }),
             Operation::Style(operation) => Ok(Self::Style {
                 parent_created_at: operation.parent_created_at().clone(),
-                from: WireTextNodePos::from(operation.from_pos()),
+                from: WireTextNodePos::from(operation.range_from()),
                 to: WireTextNodePos::from(operation.to_pos()),
                 attributes: operation.attributes().clone(),
                 attributes_to_remove: operation.attributes_to_remove().to_vec(),
@@ -428,7 +428,7 @@ impl TryFrom<&Operation> for WireOperation {
             }),
             Operation::TreeEdit(operation) => Ok(Self::TreeEdit {
                 parent_created_at: operation.parent_created_at().clone(),
-                from: WireTreePos::from(operation.from_pos()),
+                from: WireTreePos::from(operation.range_from()),
                 to: WireTreePos::from(operation.to_pos()),
                 contents: operation
                     .contents()
@@ -438,7 +438,7 @@ impl TryFrom<&Operation> for WireOperation {
             }),
             Operation::TreeStyle(operation) => Ok(Self::TreeStyle {
                 parent_created_at: operation.parent_created_at().clone(),
-                from: WireTreePos::from(operation.from_pos()),
+                from: WireTreePos::from(operation.range_from()),
                 to: WireTreePos::from(operation.to_pos()),
                 attributes: operation.attributes().clone(),
                 attributes_to_remove: operation.attributes_to_remove().to_vec(),

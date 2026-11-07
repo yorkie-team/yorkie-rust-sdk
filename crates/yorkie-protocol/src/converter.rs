@@ -399,7 +399,7 @@ fn wire_operation_to_proto(operation: &WireOperation) -> Result<api::Operation> 
                 .map(|groups| {
                     groups
                         .iter()
-                        .map(wire_tree_nodes_to_proto)
+                        .map(|nodes| wire_tree_nodes_to_proto(nodes))
                         .collect::<Result<Vec<_>>>()
                 })
                 .transpose()?
@@ -903,7 +903,7 @@ fn proto_text_node_to_wire(node: &api::TextNode) -> Result<WireTextNode> {
     })
 }
 
-fn wire_tree_nodes_to_proto(nodes: &Vec<WireTreeNode>) -> Result<api::TreeNodes> {
+fn wire_tree_nodes_to_proto(nodes: &[WireTreeNode]) -> Result<api::TreeNodes> {
     Ok(api::TreeNodes {
         content: nodes
             .iter()
@@ -1194,7 +1194,7 @@ fn base64_encode(bytes: &[u8]) -> String {
 }
 
 fn base64_decode(value: &str) -> Result<Vec<u8>> {
-    if value.len() % 4 != 0 {
+    if !value.len().is_multiple_of(4) {
         return Err(ProtocolError::InvalidBase64(value.to_owned()));
     }
 

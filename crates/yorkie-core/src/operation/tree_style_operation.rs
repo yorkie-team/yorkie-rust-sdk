@@ -141,7 +141,7 @@ impl TreeStyleOperation {
         self.meta.executed_at()
     }
 
-    pub(crate) fn from_pos(&self) -> &TreePos {
+    pub(crate) fn range_from(&self) -> &TreePos {
         &self.from_pos
     }
 

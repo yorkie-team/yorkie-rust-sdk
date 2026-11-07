@@ -107,6 +107,9 @@ impl CrdtElementMeta {
     }
 }
 
+// Boxing the primitive/counter variants would touch every constructor and
+// match; the size difference is accepted.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum CrdtElement {
     Primitive(CrdtPrimitive),

@@ -687,6 +687,20 @@ pub(crate) struct TreeEditResult {
     pub(crate) inserted_size: usize,
 }
 
+type TreeStyleResult = (
+    Vec<RhtNode>,
+    DataSize,
+    Vec<TreeStyleChange>,
+    BTreeMap<String, String>,
+    Vec<String>,
+);
+type TreeRemoveStyleResult = (
+    Vec<RhtNode>,
+    DataSize,
+    Vec<TreeStyleChange>,
+    BTreeMap<String, String>,
+);
+
 impl CrdtTree {
     pub(crate) fn new(root: TreeNode, created_at: TimeTicket) -> Self {
         let mut tree = Self {
@@ -801,13 +815,7 @@ impl CrdtTree {
         attributes: BTreeMap<String, String>,
         edited_at: TimeTicket,
         version_vector: Option<&crate::VersionVector>,
-    ) -> Result<(
-        Vec<RhtNode>,
-        DataSize,
-        Vec<TreeStyleChange>,
-        BTreeMap<String, String>,
-        Vec<String>,
-    )> {
+    ) -> Result<TreeStyleResult> {
         let mut diff = self.split_text_range(&range)?;
         let from_idx = self.pos_to_index(&range.0)?;
         let to_idx = self.pos_to_index(&range.1)?;
@@ -912,12 +920,7 @@ impl CrdtTree {
         attributes_to_remove: &[String],
         edited_at: TimeTicket,
         version_vector: Option<&crate::VersionVector>,
-    ) -> Result<(
-        Vec<RhtNode>,
-        DataSize,
-        Vec<TreeStyleChange>,
-        BTreeMap<String, String>,
-    )> {
+    ) -> Result<TreeRemoveStyleResult> {
         let mut diff = self.split_text_range(&range)?;
         let from_idx = self.pos_to_index(&range.0)?;
         let to_idx = self.pos_to_index(&range.1)?;
@@ -1124,13 +1127,11 @@ impl CrdtTree {
         if let Some(contents) = contents {
             let (parent_path, offset) = self.position_to_parent_offset(&range.0)?;
             let parent = node_at_visible_path_mut(&mut self.root, &parent_path)?;
-            let mut insert_offset = offset;
-            for mut content in contents {
+            for (insert_offset, mut content) in (offset..).zip(contents) {
                 content.clear_removed_recursively();
                 inserted_size += content.padded_size(false);
                 add_data_size(&mut diff, subtree_data_size(&content));
                 parent.insert_visible_at(insert_offset, content)?;
-                insert_offset += 1;
             }
         }
 
@@ -1288,27 +1289,24 @@ impl CrdtTree {
                 })
                 .unwrap_or(false);
 
-            if node_can_delete(node, edited_at, version_vector) || parent_removed {
-                if matches!(token.kind, TreeTokenKind::Text | TreeTokenKind::Start)
-                    && removed.insert(token.path.clone())
-                {
-                    targets.remove_paths.push(token.path.clone());
+            if (node_can_delete(node, edited_at, version_vector) || parent_removed)
+                && matches!(token.kind, TreeTokenKind::Text | TreeTokenKind::Start)
+                && removed.insert(token.path.clone())
+            {
+                targets.remove_paths.push(token.path.clone());
 
-                    if !node.is_text()
-                        && node.ins_next_id().is_some()
-                        && !merged.contains(&token.path)
+                if !node.is_text() && node.ins_next_id().is_some() && !merged.contains(&token.path)
+                {
+                    for split_path in self
+                        .unknown_split_sibling_paths(&token.path, version_vector)
+                        .unwrap_or_default()
                     {
-                        for split_path in self
-                            .unknown_split_sibling_paths(&token.path, version_vector)
-                            .unwrap_or_default()
-                        {
-                            if removed.insert(split_path.clone()) {
-                                targets.remove_paths.push(split_path.clone());
-                            }
-                            for descendant_path in descendant_paths(&self.root, &split_path) {
-                                if removed.insert(descendant_path.clone()) {
-                                    targets.remove_paths.push(descendant_path);
-                                }
+                        if removed.insert(split_path.clone()) {
+                            targets.remove_paths.push(split_path.clone());
+                        }
+                        for descendant_path in descendant_paths(&self.root, &split_path) {
+                            if removed.insert(descendant_path.clone()) {
+                                targets.remove_paths.push(descendant_path);
                             }
                         }
                     }

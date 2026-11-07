@@ -118,6 +118,10 @@ impl RgaTreeSplitPos {
 
 pub(crate) type RgaTreeSplitPosRange = (RgaTreeSplitPos, RgaTreeSplitPos);
 
+/// Result of `RgaTreeSplit::edit`: the caret position, the removed nodes, the
+/// data size diff and the removed values.
+type SplitEditResult<V> = (RgaTreeSplitPos, Vec<RgaTreeSplitNode<V>>, DataSize, Vec<V>);
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RgaTreeSplitNode<V>
 where
@@ -396,7 +400,7 @@ where
         edited_at: TimeTicket,
         value: Option<V>,
         version_vector: Option<&VersionVector>,
-    ) -> Result<(RgaTreeSplitPos, Vec<RgaTreeSplitNode<V>>, DataSize, Vec<V>)> {
+    ) -> Result<SplitEditResult<V>> {
         let mut diff = DataSize::default();
 
         let (to_left, diff_to, to_right) = self.find_node_with_split(&range.1, &edited_at)?;
