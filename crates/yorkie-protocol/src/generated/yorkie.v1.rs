@@ -24,13 +24,31 @@ pub struct ChangePack {
     pub snapshot: ::prost::alloc::vec::Vec<u8>,
     #[prost(message, repeated, tag = "4")]
     pub changes: ::prost::alloc::vec::Vec<Change>,
-    /// deprecated
+    /// min_synced_ticket is superseded by version_vector and is written by no
+    /// SDK and read by no server. It stays declared rather than `reserved`
+    /// because the repository gates proto changes on buf's FILE category, whose
+    /// FIELD_NO_DELETE fires on a removed number even when it is reserved.
+    #[deprecated]
     #[prost(message, optional, tag = "5")]
     pub min_synced_ticket: ::core::option::Option<TimeTicket>,
     #[prost(bool, tag = "6")]
     pub is_removed: bool,
     #[prost(message, optional, tag = "7")]
     pub version_vector: ::core::option::Option<VersionVector>,
+    #[prost(int64, tag = "8")]
+    pub epoch: i64,
+    /// capabilities is the negotiation channel for wire features a peer may not
+    /// understand. A server sets it on the pack it returns to advertise what it
+    /// supports; a client must treat absence as "unsupported" rather than as
+    /// "unknown", because a server that predates a feature cannot say so.
+    ///
+    /// It exists because a server does not store the bytes a client sent: it
+    /// re-encodes from its own domain model, so a field it does not know is
+    /// dropped from the stored change log and the push still succeeds. Without a
+    /// handshake a client cannot tell that its restore was silently downgraded to
+    /// an ordinary insert. Measured against a pinned v0.7.20 server.
+    #[prost(string, repeated, tag = "9")]
+    pub capabilities: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Change {
@@ -81,6 +99,8 @@ pub mod operation {
         pub value: ::core::option::Option<super::JsonElementSimple>,
         #[prost(message, optional, tag = "4")]
         pub executed_at: ::core::option::Option<super::TimeTicket>,
+        #[prost(enumeration = "super::RestoreMode", tag = "5")]
+        pub restore_mode: i32,
     }
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
     pub struct Add {
@@ -92,6 +112,8 @@ pub mod operation {
         pub value: ::core::option::Option<super::JsonElementSimple>,
         #[prost(message, optional, tag = "4")]
         pub executed_at: ::core::option::Option<super::TimeTicket>,
+        #[prost(enumeration = "super::RestoreMode", tag = "5")]
+        pub restore_mode: i32,
     }
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
     pub struct Move {
@@ -121,7 +143,9 @@ pub mod operation {
         pub from: ::core::option::Option<super::TextNodePos>,
         #[prost(message, optional, tag = "3")]
         pub to: ::core::option::Option<super::TextNodePos>,
-        /// deprecated
+        /// created_at_map_by_actor is superseded by the change's version vector and
+        /// is written by no SDK. See ChangePack.min_synced_ticket for why it is
+        /// deprecated rather than reserved.
         #[prost(btree_map = "string, message", tag = "4")]
         pub created_at_map_by_actor: ::prost::alloc::collections::BTreeMap<
             ::prost::alloc::string::String,
@@ -136,6 +160,18 @@ pub mod operation {
             ::prost::alloc::string::String,
             ::prost::alloc::string::String,
         >,
+        /// identity-preserving undo/redo
+        #[prost(message, repeated, tag = "8")]
+        pub restore_spans: ::prost::alloc::vec::Vec<super::RestoreSpan>,
+        #[prost(enumeration = "super::RestoreMode", tag = "9")]
+        pub restore_mode: i32,
+        /// retombstone_spans is the companion span set for an identity-preserving
+        /// reverse op: restore_spans is content the reversed edit removed (to
+        /// revive), retombstone_spans is content it inserted (to re-remove). Both
+        /// are addressed by original identity so a revived neighbour keeps its
+        /// relative order across chained undo/redo. restore_mode selects direction.
+        #[prost(message, repeated, tag = "10")]
+        pub retombstone_spans: ::prost::alloc::vec::Vec<super::RestoreSpan>,
     }
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct Style {
@@ -152,7 +188,7 @@ pub mod operation {
         >,
         #[prost(message, optional, tag = "5")]
         pub executed_at: ::core::option::Option<super::TimeTicket>,
-        /// deprecated
+        /// Deprecated for the same reason as Edit.created_at_map_by_actor.
         #[prost(btree_map = "string, message", tag = "6")]
         pub created_at_map_by_actor: ::prost::alloc::collections::BTreeMap<
             ::prost::alloc::string::String,
@@ -182,7 +218,7 @@ pub mod operation {
         pub from: ::core::option::Option<super::TreePos>,
         #[prost(message, optional, tag = "3")]
         pub to: ::core::option::Option<super::TreePos>,
-        /// deprecated
+        /// Deprecated for the same reason as Edit.created_at_map_by_actor.
         #[prost(btree_map = "string, message", tag = "4")]
         pub created_at_map_by_actor: ::prost::alloc::collections::BTreeMap<
             ::prost::alloc::string::String,
@@ -194,6 +230,19 @@ pub mod operation {
         pub split_level: i32,
         #[prost(message, optional, tag = "6")]
         pub executed_at: ::core::option::Option<super::TimeTicket>,
+        /// identity-preserving undo/redo
+        #[prost(message, repeated, tag = "8")]
+        pub restore_spans: ::prost::alloc::vec::Vec<super::TreeRestoreSpan>,
+        #[prost(enumeration = "super::RestoreMode", tag = "9")]
+        pub restore_mode: i32,
+        #[prost(message, repeated, tag = "10")]
+        pub retombstone_spans: ::prost::alloc::vec::Vec<super::TreeRestoreSpan>,
+        /// split_tickets carries the tickets the originating replica issued for the
+        /// nodes an element split creates, in issue order. Empty for a change
+        /// written before this field existed, which replays through the simulation
+        /// that reconstructed them from executed_at and the content count.
+        #[prost(message, repeated, tag = "11")]
+        pub split_tickets: ::prost::alloc::vec::Vec<super::TimeTicket>,
     }
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct TreeStyle {
@@ -214,7 +263,7 @@ pub mod operation {
         pub attributes_to_remove: ::prost::alloc::vec::Vec<
             ::prost::alloc::string::String,
         >,
-        /// deprecated
+        /// Deprecated for the same reason as Edit.created_at_map_by_actor.
         #[prost(btree_map = "string, message", tag = "7")]
         pub created_at_map_by_actor: ::prost::alloc::collections::BTreeMap<
             ::prost::alloc::string::String,
@@ -231,6 +280,8 @@ pub mod operation {
         pub value: ::core::option::Option<super::JsonElementSimple>,
         #[prost(message, optional, tag = "4")]
         pub executed_at: ::core::option::Option<super::TimeTicket>,
+        #[prost(enumeration = "super::RestoreMode", tag = "5")]
+        pub restore_mode: i32,
     }
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Body {
@@ -256,12 +307,21 @@ pub mod operation {
         ArraySet(ArraySet),
     }
 }
+/// JSONElementSimple is the value an operation carries: the element's identity
+/// plus its encoded contents. Its moved_at and removed_at carry no lifecycle
+/// state -- nothing ever wrote them, because an element reaching a replica
+/// inside an operation has neither moved nor been removed yet. The snapshot
+/// form, JSONElement, is where both are actually populated.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct JsonElementSimple {
     #[prost(message, optional, tag = "1")]
     pub created_at: ::core::option::Option<TimeTicket>,
+    /// Never written. See the message comment; deprecated rather than reserved
+    /// for the reason given on ChangePack.min_synced_ticket.
+    #[deprecated]
     #[prost(message, optional, tag = "2")]
     pub moved_at: ::core::option::Option<TimeTicket>,
+    #[deprecated]
     #[prost(message, optional, tag = "3")]
     pub removed_at: ::core::option::Option<TimeTicket>,
     #[prost(enumeration = "ValueType", tag = "4")]
@@ -286,6 +346,10 @@ pub mod json_element {
         pub moved_at: ::core::option::Option<super::TimeTicket>,
         #[prost(message, optional, tag = "4")]
         pub removed_at: ::core::option::Option<super::TimeTicket>,
+        /// revived_at is the revive half of the liveness register. See the comment
+        /// on RestoreMode for why an element needs one.
+        #[prost(message, optional, tag = "5")]
+        pub revived_at: ::core::option::Option<super::TimeTicket>,
     }
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct JsonArray {
@@ -297,6 +361,8 @@ pub mod json_element {
         pub moved_at: ::core::option::Option<super::TimeTicket>,
         #[prost(message, optional, tag = "4")]
         pub removed_at: ::core::option::Option<super::TimeTicket>,
+        #[prost(message, optional, tag = "5")]
+        pub revived_at: ::core::option::Option<super::TimeTicket>,
     }
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
     pub struct Primitive {
@@ -310,6 +376,8 @@ pub mod json_element {
         pub moved_at: ::core::option::Option<super::TimeTicket>,
         #[prost(message, optional, tag = "5")]
         pub removed_at: ::core::option::Option<super::TimeTicket>,
+        #[prost(message, optional, tag = "6")]
+        pub revived_at: ::core::option::Option<super::TimeTicket>,
     }
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct Text {
@@ -321,6 +389,8 @@ pub mod json_element {
         pub moved_at: ::core::option::Option<super::TimeTicket>,
         #[prost(message, optional, tag = "4")]
         pub removed_at: ::core::option::Option<super::TimeTicket>,
+        #[prost(message, optional, tag = "5")]
+        pub revived_at: ::core::option::Option<super::TimeTicket>,
     }
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
     pub struct Counter {
@@ -336,6 +406,8 @@ pub mod json_element {
         pub removed_at: ::core::option::Option<super::TimeTicket>,
         #[prost(bytes = "vec", tag = "7")]
         pub hll_registers: ::prost::alloc::vec::Vec<u8>,
+        #[prost(message, optional, tag = "8")]
+        pub revived_at: ::core::option::Option<super::TimeTicket>,
     }
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct Tree {
@@ -347,6 +419,8 @@ pub mod json_element {
         pub moved_at: ::core::option::Option<super::TimeTicket>,
         #[prost(message, optional, tag = "4")]
         pub removed_at: ::core::option::Option<super::TimeTicket>,
+        #[prost(message, optional, tag = "5")]
+        pub revived_at: ::core::option::Option<super::TimeTicket>,
     }
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Body {
@@ -371,8 +445,17 @@ pub struct RhtNode {
     #[prost(message, optional, tag = "2")]
     pub element: ::core::option::Option<JsonElement>,
 }
+/// RGANode is one position slot of an array, serialized as a flat repeated
+/// field by its container rather than as a linked list. The recursive `next`
+/// is a leftover of the linked-list form: nothing writes it, and because it
+/// stays declared, a server unmarshalling element bytes is still obliged to be
+/// ready to parse a chain as deep as the array is long.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RgaNode {
+    /// Never written; the container's flat `nodes` carries the order instead.
+    /// Deprecated rather than reserved for the reason given on
+    /// ChangePack.min_synced_ticket.
+    #[deprecated]
     #[prost(message, optional, boxed, tag = "1")]
     pub next: ::core::option::Option<::prost::alloc::boxed::Box<RgaNode>>,
     #[prost(message, optional, tag = "2")]
@@ -408,6 +491,16 @@ pub struct TextNode {
         ::prost::alloc::string::String,
         NodeAttr,
     >,
+    /// removal_events is the removal ledger beyond removed_at: every removal of
+    /// this node and every undo that cancelled one, except removed_at itself.
+    /// An actor's events alternate in ticket order, a removal then the undo
+    /// cancelling it, so each is told apart by its place. Empty when removed_at
+    /// says it all. A piece recreated after GC records a stand-in removal by the
+    /// undoing actor at lamport 0, then its cancel. The pairing relies on an
+    /// undo cancelling only its own actor's removal; a change to that rule needs
+    /// a new field, not a new reading of this one.
+    #[prost(message, repeated, tag = "6")]
+    pub removal_events: ::prost::alloc::vec::Vec<TimeTicket>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TextNodeId {
@@ -544,6 +637,8 @@ pub struct Project {
     pub remove_on_detach: bool,
     #[prost(bool, tag = "27")]
     pub auto_revision_enabled: bool,
+    #[prost(string, tag = "28")]
+    pub channel_session_ttl: ::prost::alloc::string::String,
     #[prost(string, repeated, tag = "14")]
     pub allowed_origins: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(message, optional, tag = "12")]
@@ -620,6 +715,8 @@ pub struct UpdatableProjectFields {
     pub remove_on_detach: ::core::option::Option<bool>,
     #[prost(message, optional, tag = "22")]
     pub auto_revision_enabled: ::core::option::Option<bool>,
+    #[prost(message, optional, tag = "23")]
+    pub channel_session_ttl: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(message, optional, tag = "9")]
     pub allowed_origins: ::core::option::Option<
         updatable_project_fields::AllowedOrigins,
@@ -675,6 +772,10 @@ pub struct PresenceChange {
     pub r#type: i32,
     #[prost(message, optional, tag = "2")]
     pub presence: ::core::option::Option<Presence>,
+    /// removed_keys lists the top-level keys a CHANGE_TYPE_PATCH deletes. Unused
+    /// by the other change types.
+    #[prost(string, repeated, tag = "3")]
+    pub removed_keys: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// Nested message and enum types in `PresenceChange`.
 pub mod presence_change {
@@ -695,6 +796,13 @@ pub mod presence_change {
         Put = 1,
         Delete = 2,
         Clear = 3,
+        /// CHANGE_TYPE_PATCH carries only the top-level keys that changed since
+        /// the sender's previous presence: set entries in presence, deleted keys
+        /// in removed_keys. Clients send it only to a server that advertises the
+        /// "presence-patch" capability on ChangePack. The server folds it into
+        /// a CHANGE_TYPE_PUT of the full presence before storing, so it never
+        /// appears in a pulled change.
+        Patch = 4,
     }
     impl ChangeType {
         /// String value of the enum field names used in the ProtoBuf definition.
@@ -707,6 +815,7 @@ pub mod presence_change {
                 Self::Put => "CHANGE_TYPE_PUT",
                 Self::Delete => "CHANGE_TYPE_DELETE",
                 Self::Clear => "CHANGE_TYPE_CLEAR",
+                Self::Patch => "CHANGE_TYPE_PATCH",
             }
         }
         /// Creates an enum from field names used in the ProtoBuf definition.
@@ -716,6 +825,7 @@ pub mod presence_change {
                 "CHANGE_TYPE_PUT" => Some(Self::Put),
                 "CHANGE_TYPE_DELETE" => Some(Self::Delete),
                 "CHANGE_TYPE_CLEAR" => Some(Self::Clear),
+                "CHANGE_TYPE_PATCH" => Some(Self::Patch),
                 _ => None,
             }
         }
@@ -751,6 +861,59 @@ pub struct TextNodePos {
     pub offset: i32,
     #[prost(int32, tag = "3")]
     pub relative_offset: i32,
+}
+/// RestoreSpan carries a run of characters from a single original text
+/// insertion, addressed by split-invariant absolute offsets [start, end),
+/// for identity-preserving undo/redo. content and attributes are a deep
+/// copy of the removed value so restore is independent of GC state.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RestoreSpan {
+    #[prost(message, optional, tag = "1")]
+    pub created_at: ::core::option::Option<TimeTicket>,
+    #[prost(int32, tag = "2")]
+    pub start: i32,
+    #[prost(int32, tag = "3")]
+    pub end: i32,
+    #[prost(string, tag = "4")]
+    pub content: ::prost::alloc::string::String,
+    #[prost(btree_map = "string, string", tag = "5")]
+    pub attributes: ::prost::alloc::collections::BTreeMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
+}
+/// TreeRestoreSpan carries a tree node run from a single deletion, addressed
+/// by TreeNodeID identity, for identity-preserving Tree undo/redo. Unlike the
+/// text RestoreSpan (flat offsets), a tree span records the node's structure
+/// (type/attrs) and its position anchors, because in a tree id-order is not
+/// sibling-order: left_sibling_id and right_sibling_id are redundant external
+/// boundary anchors of the deleted run, so restore can reconstruct the run's
+/// internal order from the op's own spans and needs only one surviving
+/// boundary to place it. value/attributes are a deep copy so a GC-purged node
+/// can be recreated.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TreeRestoreSpan {
+    #[prost(message, optional, tag = "1")]
+    pub id: ::core::option::Option<TreeNodeId>,
+    #[prost(string, tag = "2")]
+    pub node_type: ::prost::alloc::string::String,
+    #[prost(bool, tag = "3")]
+    pub is_text: bool,
+    #[prost(int32, tag = "4")]
+    pub length: i32,
+    #[prost(string, tag = "5")]
+    pub value: ::prost::alloc::string::String,
+    #[prost(btree_map = "string, message", tag = "6")]
+    pub attributes: ::prost::alloc::collections::BTreeMap<
+        ::prost::alloc::string::String,
+        NodeAttr,
+    >,
+    #[prost(message, optional, tag = "7")]
+    pub parent_id: ::core::option::Option<TreeNodeId>,
+    #[prost(message, optional, tag = "8")]
+    pub left_sibling_id: ::core::option::Option<TreeNodeId>,
+    #[prost(message, optional, tag = "9")]
+    pub right_sibling_id: ::core::option::Option<TreeNodeId>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TimeTicket {
@@ -896,6 +1059,52 @@ pub struct RevisionSummary {
     #[prost(message, optional, tag = "5")]
     pub created_at: ::core::option::Option<::prost_types::Timestamp>,
 }
+/// RestoreMode selects the identity-preserving path. RESTORE_MODE_UNSPECIFIED
+/// means an ordinary edit (no restore semantics), keeping forward edits
+/// unchanged on the wire.
+///
+/// For elements it selects between reviving the element already in the tree and
+/// inserting a copy of it. The copy is what undo does today, and because a
+/// deep copy keeps every descendant's created_at, it puts a second live element
+/// under ids the document is indexed by. Reviving needs a replicated liveness
+/// register -- removed_at paired with revived_at on each element -- so that
+/// every replica resolves a remove/revive race the same way, with a tie going
+/// to the removal as the shipped remove register already does.
+///
+/// The branch cannot be chosen from local state. A replica that collected
+/// between the removal and the undo has purged the tombstone, and one that
+/// joined from a later snapshot never had it, so "revive if a tombstone is
+/// present" is a function of local collection timing and the same change log
+/// would produce different documents. That is why the branch is on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum RestoreMode {
+    Unspecified = 0,
+    Restore = 1,
+    Retombstone = 2,
+}
+impl RestoreMode {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "RESTORE_MODE_UNSPECIFIED",
+            Self::Restore => "RESTORE_MODE_RESTORE",
+            Self::Retombstone => "RESTORE_MODE_RETOMBSTONE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "RESTORE_MODE_UNSPECIFIED" => Some(Self::Unspecified),
+            "RESTORE_MODE_RESTORE" => Some(Self::Restore),
+            "RESTORE_MODE_RETOMBSTONE" => Some(Self::Retombstone),
+            _ => None,
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ValueType {
@@ -1007,6 +1216,11 @@ pub struct ActivateClientRequest {
 pub struct ActivateClientResponse {
     #[prost(string, tag = "1")]
     pub client_id: ::prost::alloc::string::String,
+    /// actor_id is the stable actor derived from the project and client key.
+    /// Opted-in SDKs stamp it into changes; old SDKs ignore it and keep using
+    /// client_id as their actor.
+    #[prost(string, tag = "2")]
+    pub actor_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeactivateClientRequest {
@@ -1025,6 +1239,18 @@ pub struct AttachDocumentRequest {
     pub change_pack: ::core::option::Option<ChangePack>,
     #[prost(string, tag = "3")]
     pub schema_key: ::prost::alloc::string::String,
+    /// disable_gc declares that this attachment will not produce or consume
+    /// tombstones. The server skips minVV tracking and omits the response
+    /// VersionVector for this client. Use only with Counter / primitive
+    /// workloads; misuse leads to undefined GC behavior on this client.
+    #[prost(bool, tag = "4")]
+    pub disable_gc: bool,
+    /// disable_presence declares that this document does not produce, consume,
+    /// or store presence. Honored on first attach only; subsequent attaches
+    /// observe the value persisted in the server-side document metadata. See
+    /// docs/tasks/active/20260616-presenceless-document-option-todo.md.
+    #[prost(bool, tag = "5")]
+    pub disable_presence: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AttachDocumentResponse {
@@ -1036,6 +1262,13 @@ pub struct AttachDocumentResponse {
     pub max_size_per_document: i32,
     #[prost(message, repeated, tag = "4")]
     pub schema_rules: ::prost::alloc::vec::Vec<Rule>,
+    /// disable_presence carries the server-fixated value of the document's
+    /// presence option (see AttachDocumentRequest.disable_presence). Clients
+    /// align their local gating state to this value rather than the requested
+    /// value, so an attach to an already-fixated document observes the
+    /// persisted decision.
+    #[prost(bool, tag = "5")]
+    pub disable_presence: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DetachDocumentRequest {
@@ -1057,8 +1290,28 @@ pub struct DetachDocumentResponse {
 pub struct WatchRequest {
     #[prost(string, tag = "1")]
     pub client_id: ::prost::alloc::string::String,
+    /// resources lists what the stream delivers. It must hold between 1 and 100
+    /// descriptors, and the server must recognize every one of them: a request
+    /// naming a resource the server cannot subscribe to is rejected whole rather
+    /// than served in part, so a client never watches fewer resources than it
+    /// asked for without being told.
     #[prost(message, repeated, tag = "2")]
     pub resources: ::prost::alloc::vec::Vec<ResourceDescriptor>,
+    /// actor_id is the stable actor the client stamps into its changes. When set,
+    /// the server subscribes the client under it so watch peer ids and
+    /// watched/unwatched events match the presence CRDT keying. Old SDKs omit it
+    /// and the server falls back to client_id (the session id).
+    #[prost(string, tag = "3")]
+    pub actor_id: ::prost::alloc::string::String,
+    /// heartbeat_interval_ms is the interval, in milliseconds, at which this
+    /// stream asks the server to send a WatchHeartbeat while it is idle. 0, which
+    /// is also what an SDK older than the heartbeat leaves here, asks for none:
+    /// such a stream gets no WatchHeartbeat bodies at all, so the heartbeat can
+    /// never reach a client that would not recognize it. The server clamps the
+    /// request to its own bounds and reports the value it settled on in
+    /// WatchInitialization.heartbeat_interval_ms.
+    #[prost(int64, tag = "4")]
+    pub heartbeat_interval_ms: i64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ResourceDescriptor {
@@ -1087,7 +1340,7 @@ pub struct ChannelDescriptor {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct WatchResponse {
-    #[prost(oneof = "watch_response::Body", tags = "1, 2")]
+    #[prost(oneof = "watch_response::Body", tags = "1, 2, 3")]
     pub body: ::core::option::Option<watch_response::Body>,
 }
 /// Nested message and enum types in `WatchResponse`.
@@ -1098,13 +1351,25 @@ pub mod watch_response {
         Initialization(super::WatchInitialization),
         #[prost(message, tag = "2")]
         Event(super::WatchEvent),
+        #[prost(message, tag = "3")]
+        Heartbeat(super::WatchHeartbeat),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct WatchInitialization {
     #[prost(message, repeated, tag = "1")]
     pub resource_inits: ::prost::alloc::vec::Vec<ResourceInit>,
+    /// heartbeat_interval_ms is the interval, in milliseconds, at which the
+    /// server sends a WatchHeartbeat on this stream while it is idle. 0 means
+    /// the server sends none, so the client must not apply an idle timeout.
+    #[prost(int64, tag = "2")]
+    pub heartbeat_interval_ms: i64,
 }
+/// WatchHeartbeat is sent on an idle Watch stream so a client can tell a live
+/// stream from a half-open one. It carries no payload: its arrival is the
+/// signal.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WatchHeartbeat {}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ResourceInit {
     #[prost(oneof = "resource_init::Init", tags = "1, 2")]
@@ -1250,6 +1515,13 @@ pub struct PushPullChangesRequest {
     pub change_pack: ::core::option::Option<ChangePack>,
     #[prost(bool, tag = "4")]
     pub push_only: bool,
+    /// disable_gc declares that this PushPull will not produce or consume
+    /// tombstones. The server skips minVV tracking and omits the response
+    /// VersionVector. Clients that attached with disable_gc=true must keep
+    /// setting this on every subsequent PushPullChanges. See
+    /// docs/design/disable-gc-on-attach.md.
+    #[prost(bool, tag = "5")]
+    pub disable_gc: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PushPullChangesResponse {
@@ -1343,7 +1615,7 @@ pub struct DetachChannelResponse {
     #[prost(int64, tag = "1")]
     pub session_count: i64,
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RefreshChannelRequest {
     #[prost(string, tag = "1")]
     pub client_id: ::prost::alloc::string::String,
@@ -1351,9 +1623,41 @@ pub struct RefreshChannelRequest {
     pub channel_key: ::prost::alloc::string::String,
     #[prost(string, tag = "3")]
     pub session_id: ::prost::alloc::string::String,
+    /// client_key and metadata are used only on the first call (when session_id
+    /// is empty). The server activates the client and attaches it to the channel
+    /// before refreshing, collapsing ActivateClient + AttachChannel + RefreshChannel
+    /// into a single round trip.
+    #[prost(string, tag = "4")]
+    pub client_key: ::prost::alloc::string::String,
+    #[prost(btree_map = "string, string", tag = "5")]
+    pub metadata: ::prost::alloc::collections::BTreeMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RefreshChannelResponse {
+    #[prost(int64, tag = "1")]
+    pub session_count: i64,
+    /// client_id and session_id are populated only when the request was a
+    /// first-call (i.e. session_id was empty). Subsequent heartbeats leave
+    /// these empty.
+    #[prost(string, tag = "2")]
+    pub client_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub session_id: ::prost::alloc::string::String,
+}
+/// PeekChannel reads the current session_count of a channel without creating
+/// a session on the server. Use this when a client only needs to display the
+/// count (e.g. "N people writing") without contributing to it and without
+/// receiving broadcasts. Caller polls on its own cadence.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PeekChannelRequest {
+    #[prost(string, tag = "1")]
+    pub channel_key: ::prost::alloc::string::String,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct RefreshChannelResponse {
+pub struct PeekChannelResponse {
     #[prost(int64, tag = "1")]
     pub session_count: i64,
 }

@@ -47,6 +47,7 @@ service YorkieService {
   rpc AttachChannel (AttachChannelRequest) returns (AttachChannelResponse) {}
   rpc DetachChannel (DetachChannelRequest) returns (DetachChannelResponse) {}
   rpc RefreshChannel (RefreshChannelRequest) returns (RefreshChannelResponse) {}
+  rpc PeekChannel (PeekChannelRequest) returns (PeekChannelResponse) {}
   rpc Broadcast (BroadcastRequest) returns (BroadcastResponse) {}
 }
 
@@ -57,6 +58,10 @@ message ActivateClientRequest {
 
 message ActivateClientResponse {
   string client_id = 1;
+  // actor_id is the stable actor derived from the project and client key.
+  // Opted-in SDKs stamp it into changes; old SDKs ignore it and keep using
+  // client_id as their actor.
+  string actor_id = 2;
 }
 
 message DeactivateClientRequest {
@@ -71,6 +76,16 @@ message AttachDocumentRequest {
   string client_id = 1;
   ChangePack change_pack = 2;
   string schema_key = 3;
+  // disable_gc declares that this attachment will not produce or consume
+  // tombstones. The server skips minVV tracking and omits the response
+  // VersionVector for this client. Use only with Counter / primitive
+  // workloads; misuse leads to undefined GC behavior on this client.
+  bool disable_gc = 4;
+  // disable_presence declares that this document does not produce, consume,
+  // or store presence. Honored on first attach only; subsequent attaches
+  // observe the value persisted in the server-side document metadata. See
+  // docs/tasks/active/20260616-presenceless-document-option-todo.md.
+  bool disable_presence = 5;
 }
 
 message AttachDocumentResponse {
@@ -78,6 +93,12 @@ message AttachDocumentResponse {
   ChangePack change_pack = 2;
   int32 max_size_per_document = 3;
   repeated Rule schema_rules = 4;
+  // disable_presence carries the server-fixated value of the document's
+  // presence option (see AttachDocumentRequest.disable_presence). Clients
+  // align their local gating state to this value rather than the requested
+  // value, so an attach to an already-fixated document observes the
+  // persisted decision.
+  bool disable_presence = 5;
 }
 
 message DetachDocumentRequest {
@@ -93,7 +114,25 @@ message DetachDocumentResponse {
 
 message WatchRequest {
   string client_id = 1;
+  // resources lists what the stream delivers. It must hold between 1 and 100
+  // descriptors, and the server must recognize every one of them: a request
+  // naming a resource the server cannot subscribe to is rejected whole rather
+  // than served in part, so a client never watches fewer resources than it
+  // asked for without being told.
   repeated ResourceDescriptor resources = 2;
+  // actor_id is the stable actor the client stamps into its changes. When set,
+  // the server subscribes the client under it so watch peer ids and
+  // watched/unwatched events match the presence CRDT keying. Old SDKs omit it
+  // and the server falls back to client_id (the session id).
+  string actor_id = 3;
+  // heartbeat_interval_ms is the interval, in milliseconds, at which this
+  // stream asks the server to send a WatchHeartbeat while it is idle. 0, which
+  // is also what an SDK older than the heartbeat leaves here, asks for none:
+  // such a stream gets no WatchHeartbeat bodies at all, so the heartbeat can
+  // never reach a client that would not recognize it. The server clamps the
+  // request to its own bounds and reports the value it settled on in
+  // WatchInitialization.heartbeat_interval_ms.
+  int64 heartbeat_interval_ms = 4;
 }
 
 message ResourceDescriptor {
@@ -115,12 +154,23 @@ message WatchResponse {
   oneof body {
     WatchInitialization initialization = 1;
     WatchEvent event = 2;
+    WatchHeartbeat heartbeat = 3;
   }
 }
 
 message WatchInitialization {
   repeated ResourceInit resource_inits = 1;
+
+  // heartbeat_interval_ms is the interval, in milliseconds, at which the
+  // server sends a WatchHeartbeat on this stream while it is idle. 0 means
+  // the server sends none, so the client must not apply an idle timeout.
+  int64 heartbeat_interval_ms = 2;
 }
+
+// WatchHeartbeat is sent on an idle Watch stream so a client can tell a live
+// stream from a half-open one. It carries no payload: its arrival is the
+// signal.
+message WatchHeartbeat {}
 
 message ResourceInit {
   oneof init {
@@ -210,6 +260,12 @@ message PushPullChangesRequest {
   string document_id = 2;
   ChangePack change_pack = 3;
   bool push_only = 4;
+  // disable_gc declares that this PushPull will not produce or consume
+  // tombstones. The server skips minVV tracking and omits the response
+  // VersionVector. Clients that attached with disable_gc=true must keep
+  // setting this on every subsequent PushPullChanges. See
+  // docs/design/disable-gc-on-attach.md.
+  bool disable_gc = 5;
 }
 
 message PushPullChangesResponse {
@@ -282,9 +338,32 @@ message RefreshChannelRequest {
   string client_id = 1;
   string channel_key = 2;
   string session_id = 3;
+  // client_key and metadata are used only on the first call (when session_id
+  // is empty). The server activates the client and attaches it to the channel
+  // before refreshing, collapsing ActivateClient + AttachChannel + RefreshChannel
+  // into a single round trip.
+  string client_key = 4;
+  map<string, string> metadata = 5;
 }
 
 message RefreshChannelResponse {
+  int64 session_count = 1;
+  // client_id and session_id are populated only when the request was a
+  // first-call (i.e. session_id was empty). Subsequent heartbeats leave
+  // these empty.
+  string client_id = 2;
+  string session_id = 3;
+}
+
+// PeekChannel reads the current session_count of a channel without creating
+// a session on the server. Use this when a client only needs to display the
+// count (e.g. "N people writing") without contributing to it and without
+// receiving broadcasts. Caller polls on its own cadence.
+message PeekChannelRequest {
+  string channel_key = 1;
+}
+
+message PeekChannelResponse {
   int64 session_count = 1;
 }
 

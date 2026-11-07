@@ -1,3 +1,7 @@
+// The server proto marks some legacy fields deprecated; the wire format still
+// carries them, so the converter sets them explicitly.
+#![allow(deprecated)]
+
 use crate::yorkie::v1 as api;
 use prost::Message;
 use std::collections::BTreeMap;
@@ -195,6 +199,7 @@ fn wire_change_pack_to_proto(pack: &WireChangePack) -> Result<api::ChangePack> {
             .as_ref()
             .map(to_version_vector)
             .transpose()?,
+        ..Default::default()
     })
 }
 
@@ -299,6 +304,7 @@ fn wire_operation_to_proto(operation: &WireOperation) -> Result<api::Operation> 
             key: key.clone(),
             value: Some(wire_json_element_simple_to_proto(value)?),
             executed_at: Some(to_time_ticket(executed_at)?),
+            ..Default::default()
         }),
         WireOperation::Add {
             parent_created_at,
@@ -310,6 +316,7 @@ fn wire_operation_to_proto(operation: &WireOperation) -> Result<api::Operation> 
             prev_created_at: Some(to_time_ticket(prev_created_at)?),
             value: Some(wire_json_element_simple_to_proto(value)?),
             executed_at: Some(to_time_ticket(executed_at)?),
+            ..Default::default()
         }),
         WireOperation::Move {
             parent_created_at,
@@ -346,6 +353,7 @@ fn wire_operation_to_proto(operation: &WireOperation) -> Result<api::Operation> 
             content: content.clone(),
             executed_at: Some(to_time_ticket(executed_at)?),
             attributes: attributes.clone(),
+            ..Default::default()
         }),
         WireOperation::Style {
             parent_created_at,
@@ -398,6 +406,7 @@ fn wire_operation_to_proto(operation: &WireOperation) -> Result<api::Operation> 
                 .unwrap_or_default(),
             split_level: i32_from_usize(*split_level, "tree_edit.split_level")?,
             executed_at: Some(to_time_ticket(executed_at)?),
+            ..Default::default()
         }),
         WireOperation::TreeStyle {
             parent_created_at,
@@ -429,6 +438,7 @@ fn wire_operation_to_proto(operation: &WireOperation) -> Result<api::Operation> 
             created_at: Some(to_time_ticket(created_at)?),
             value: Some(wire_json_element_simple_to_proto(value)?),
             executed_at: Some(to_time_ticket(executed_at)?),
+            ..Default::default()
         }),
     };
 
@@ -668,6 +678,7 @@ fn wire_json_element_to_proto(element: &WireJsonElement) -> Result<api::JsonElem
             created_at: Some(to_time_ticket(created_at)?),
             moved_at: moved_at.as_ref().map(to_time_ticket).transpose()?,
             removed_at: removed_at.as_ref().map(to_time_ticket).transpose()?,
+            ..Default::default()
         }),
         WireJsonElement::Array {
             nodes,
@@ -682,6 +693,7 @@ fn wire_json_element_to_proto(element: &WireJsonElement) -> Result<api::JsonElem
             created_at: Some(to_time_ticket(created_at)?),
             moved_at: moved_at.as_ref().map(to_time_ticket).transpose()?,
             removed_at: removed_at.as_ref().map(to_time_ticket).transpose()?,
+            ..Default::default()
         }),
         WireJsonElement::Primitive {
             value_type,
@@ -695,6 +707,7 @@ fn wire_json_element_to_proto(element: &WireJsonElement) -> Result<api::JsonElem
             created_at: Some(to_time_ticket(created_at)?),
             moved_at: moved_at.as_ref().map(to_time_ticket).transpose()?,
             removed_at: removed_at.as_ref().map(to_time_ticket).transpose()?,
+            ..Default::default()
         }),
         WireJsonElement::Text {
             nodes,
@@ -709,6 +722,7 @@ fn wire_json_element_to_proto(element: &WireJsonElement) -> Result<api::JsonElem
             created_at: Some(to_time_ticket(created_at)?),
             moved_at: moved_at.as_ref().map(to_time_ticket).transpose()?,
             removed_at: removed_at.as_ref().map(to_time_ticket).transpose()?,
+            ..Default::default()
         }),
         WireJsonElement::Counter {
             value_type,
@@ -724,6 +738,7 @@ fn wire_json_element_to_proto(element: &WireJsonElement) -> Result<api::JsonElem
             moved_at: moved_at.as_ref().map(to_time_ticket).transpose()?,
             removed_at: removed_at.as_ref().map(to_time_ticket).transpose()?,
             hll_registers: hll_registers.clone(),
+            ..Default::default()
         }),
         WireJsonElement::Tree {
             nodes,
@@ -738,6 +753,7 @@ fn wire_json_element_to_proto(element: &WireJsonElement) -> Result<api::JsonElem
             created_at: Some(to_time_ticket(created_at)?),
             moved_at: moved_at.as_ref().map(to_time_ticket).transpose()?,
             removed_at: removed_at.as_ref().map(to_time_ticket).transpose()?,
+            ..Default::default()
         }),
     };
 
@@ -869,6 +885,7 @@ fn wire_text_node_to_proto(node: &WireTextNode) -> Result<api::TextNode> {
             .map(wire_text_node_id_to_proto)
             .transpose()?,
         attributes: wire_attrs_to_proto(&node.attributes)?,
+        ..Default::default()
     })
 }
 
@@ -1756,12 +1773,14 @@ mod tests {
                                 created_at: Some(to_time_ticket(&TimeTicket::new(1, 1, actor_id))?),
                                 moved_at: None,
                                 removed_at: None,
+                                ..Default::default()
                             })),
                         }),
                     }],
                     created_at: Some(to_time_ticket(&TimeTicket::initial())?),
                     moved_at: None,
                     removed_at: None,
+                    ..Default::default()
                 })),
             }),
             presences: BTreeMap::new(),
@@ -1779,6 +1798,7 @@ mod tests {
             min_synced_ticket: None,
             is_removed: false,
             version_vector: Some(to_version_vector(&version_vector)?),
+            ..Default::default()
         };
 
         let pack = from_change_pack(&proto)?;

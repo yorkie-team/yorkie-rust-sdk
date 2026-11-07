@@ -49,6 +49,7 @@ pub fn to_attach_document_request(
         client_id: request.client_id.to_string(),
         change_pack: Some(converter::to_change_pack(&request.change_pack)?),
         schema_key: request.schema_key.clone().unwrap_or_default(),
+        ..Default::default()
     })
 }
 
@@ -120,6 +121,7 @@ pub fn to_push_pull_changes_request(
         document_id: request.document_id.clone(),
         change_pack: Some(converter::to_change_pack(&request.change_pack)?),
         push_only: request.push_only,
+        ..Default::default()
     })
 }
 
@@ -169,6 +171,7 @@ mod tests {
 
         let response = from_activate_client_response(&api::ActivateClientResponse {
             client_id: "000000000000000000000001".to_owned(),
+            ..Default::default()
         });
         assert_eq!("000000000000000000000001", response.client_id.as_str());
     }
@@ -217,6 +220,7 @@ mod tests {
                 "object",
                 vec![TreeNodeRule::new("paragraph", "text*", "bold", "block")],
             )]),
+            ..Default::default()
         };
         let response = from_attach_document_response(&proto_response)?;
         assert_eq!("document-id", response.document_id);
