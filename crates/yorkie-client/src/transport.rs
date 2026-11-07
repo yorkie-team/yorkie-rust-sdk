@@ -1,4 +1,5 @@
 use crate::error::ClientResult;
+use async_trait::async_trait;
 use std::collections::BTreeMap;
 use yorkie_core::{ActorId, ChangePack, SchemaRule};
 
@@ -94,35 +95,35 @@ pub struct PushPullChangesResponse {
 }
 
 /// Transport boundary used by the client lifecycle and document attachment.
-#[allow(async_fn_in_trait)]
-pub trait ClientTransport {
+#[async_trait]
+pub trait ClientTransport: Send + Sync {
     async fn activate_client(
-        &mut self,
+        &self,
         request: ActivateClientRequest,
     ) -> ClientResult<ActivateClientResponse>;
 
     async fn deactivate_client(
-        &mut self,
+        &self,
         request: DeactivateClientRequest,
     ) -> ClientResult<DeactivateClientResponse>;
 
     async fn attach_document(
-        &mut self,
+        &self,
         request: AttachDocumentRequest,
     ) -> ClientResult<AttachDocumentResponse>;
 
     async fn detach_document(
-        &mut self,
+        &self,
         request: DetachDocumentRequest,
     ) -> ClientResult<DetachDocumentResponse>;
 
     async fn remove_document(
-        &mut self,
+        &self,
         request: RemoveDocumentRequest,
     ) -> ClientResult<RemoveDocumentResponse>;
 
     async fn push_pull_changes(
-        &mut self,
+        &self,
         request: PushPullChangesRequest,
     ) -> ClientResult<PushPullChangesResponse>;
 }

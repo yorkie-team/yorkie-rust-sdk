@@ -1,4 +1,6 @@
+use async_trait::async_trait;
 use std::future::Future;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 use yorkie::{
     ActivateClientRequest, ActivateClientResponse, ActorId, AttachChannelOptions,
@@ -13,36 +15,37 @@ use yorkie::{
 
 #[derive(Debug, Default)]
 struct FacadeTransport {
-    activate_requests: usize,
-    attach_requests: usize,
-    detach_requests: usize,
-    remove_requests: usize,
-    push_pull_requests: usize,
+    activate_requests: AtomicUsize,
+    attach_requests: AtomicUsize,
+    detach_requests: AtomicUsize,
+    remove_requests: AtomicUsize,
+    push_pull_requests: AtomicUsize,
 }
 
+#[async_trait]
 impl ClientTransport for FacadeTransport {
     async fn activate_client(
-        &mut self,
+        &self,
         _request: ActivateClientRequest,
     ) -> yorkie::ClientResult<ActivateClientResponse> {
-        self.activate_requests += 1;
+        self.activate_requests.fetch_add(1, Ordering::SeqCst);
         Ok(ActivateClientResponse {
             client_id: ActorId::new("000000000000000000000001"),
         })
     }
 
     async fn deactivate_client(
-        &mut self,
+        &self,
         _request: DeactivateClientRequest,
     ) -> yorkie::ClientResult<DeactivateClientResponse> {
         Ok(DeactivateClientResponse)
     }
 
     async fn attach_document(
-        &mut self,
+        &self,
         request: AttachDocumentRequest,
     ) -> yorkie::ClientResult<AttachDocumentResponse> {
-        self.attach_requests += 1;
+        self.attach_requests.fetch_add(1, Ordering::SeqCst);
         Ok(AttachDocumentResponse {
             document_id: "document-id".to_owned(),
             change_pack: request.change_pack,
@@ -56,30 +59,30 @@ impl ClientTransport for FacadeTransport {
     }
 
     async fn detach_document(
-        &mut self,
+        &self,
         request: DetachDocumentRequest,
     ) -> yorkie::ClientResult<DetachDocumentResponse> {
-        self.detach_requests += 1;
+        self.detach_requests.fetch_add(1, Ordering::SeqCst);
         Ok(DetachDocumentResponse {
             change_pack: request.change_pack,
         })
     }
 
     async fn remove_document(
-        &mut self,
+        &self,
         request: RemoveDocumentRequest,
     ) -> yorkie::ClientResult<RemoveDocumentResponse> {
-        self.remove_requests += 1;
+        self.remove_requests.fetch_add(1, Ordering::SeqCst);
         Ok(RemoveDocumentResponse {
             change_pack: request.change_pack,
         })
     }
 
     async fn push_pull_changes(
-        &mut self,
+        &self,
         request: PushPullChangesRequest,
     ) -> yorkie::ClientResult<PushPullChangesResponse> {
-        self.push_pull_requests += 1;
+        self.push_pull_requests.fetch_add(1, Ordering::SeqCst);
         Ok(PushPullChangesResponse {
             change_pack: request.change_pack,
         })
@@ -152,7 +155,7 @@ fn facade_exports_time_api() {
 #[test]
 fn facade_exports_client_api() {
     let mut client = Client::default();
-    let mut transport = FacadeTransport::default();
+    let transport = FacadeTransport::default();
     let mut doc = Document::new("doc-key");
     let attach_options = AttachOptions {
         sync_mode: Some(SyncMode::Polling),
@@ -168,28 +171,28 @@ fn facade_exports_client_api() {
     assert!(!client.condition(ClientCondition::SyncLoop));
     assert_eq!(
         ClientError::ClientNotActivated(client.key().to_owned()),
-        block_on(client.attach(&mut transport, &mut doc, attach_options.clone())).unwrap_err()
+        block_on(client.attach(&transport, &mut doc, attach_options.clone())).unwrap_err()
     );
-    block_on(client.activate(&mut transport)).unwrap();
+    block_on(client.activate(&transport)).unwrap();
     assert_eq!(ClientStatus::Activated, client.status());
-    assert_eq!(1, transport.activate_requests);
+    assert_eq!(1, transport.activate_requests.load(Ordering::SeqCst));
     assert_eq!(Some(SyncMode::Polling), attach_options.sync_mode);
     assert_eq!(Some(SyncMode::Realtime), channel_options.sync_mode);
-    block_on(client.attach(&mut transport, &mut doc, attach_options)).unwrap();
+    block_on(client.attach(&transport, &mut doc, attach_options)).unwrap();
     assert!(client.has("doc-key"));
     assert_eq!(1024, doc.max_size_per_document());
     assert_eq!(1, doc.schema_rules().len());
-    assert_eq!(1, transport.attach_requests);
+    assert_eq!(1, transport.attach_requests.load(Ordering::SeqCst));
     doc.update(|root| root.set("title", "hello").map(|_| ()))
         .unwrap();
-    block_on(client.sync(&mut transport, &mut doc)).unwrap();
+    block_on(client.sync(&transport, &mut doc)).unwrap();
     assert!(!doc.has_local_changes());
-    assert_eq!(1, transport.push_pull_requests);
+    assert_eq!(1, transport.push_pull_requests.load(Ordering::SeqCst));
     assert_eq!(SyncOptions::default(), SyncOptions { sync_mode: None });
-    block_on(client.remove(&mut transport, &mut doc)).unwrap();
+    block_on(client.remove(&transport, &mut doc)).unwrap();
     assert!(!client.has("doc-key"));
     assert_eq!(DocStatus::Removed, doc.status());
-    assert_eq!(1, transport.remove_requests);
+    assert_eq!(1, transport.remove_requests.load(Ordering::SeqCst));
     assert_eq!(
         DeactivateOptions::default(),
         DeactivateOptions {
@@ -198,5 +201,5 @@ fn facade_exports_client_api() {
         }
     );
     assert_eq!(DetachOptions, DetachOptions);
-    assert_eq!(0, transport.detach_requests);
+    assert_eq!(0, transport.detach_requests.load(Ordering::SeqCst));
 }

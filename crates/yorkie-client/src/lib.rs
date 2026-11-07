@@ -3,12 +3,14 @@
 
 mod attachment;
 mod client;
+mod connect;
 mod error;
 mod options;
 pub mod protocol;
 mod transport;
 
 pub use client::{Client, ClientCondition, ClientStatus};
+pub use connect::ConnectTransport;
 pub use error::{ClientError, ClientResult};
 pub use options::{
     AttachChannelOptions, AttachOptions, ClientOptions, DeactivateOptions, DetachOptions, SyncMode,

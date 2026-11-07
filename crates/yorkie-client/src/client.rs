@@ -85,7 +85,7 @@ impl Client {
         self.attachments.contains_key(key)
     }
 
-    pub async fn activate<T>(&mut self, transport: &mut T) -> ClientResult<()>
+    pub async fn activate<T>(&mut self, transport: &T) -> ClientResult<()>
     where
         T: ClientTransport,
     {
@@ -109,7 +109,7 @@ impl Client {
 
     pub async fn deactivate<T>(
         &mut self,
-        transport: &mut T,
+        transport: &T,
         options: DeactivateOptions,
     ) -> ClientResult<()>
     where
@@ -137,7 +137,7 @@ impl Client {
 
     pub async fn attach<T>(
         &mut self,
-        transport: &mut T,
+        transport: &T,
         doc: &mut Document,
         options: AttachOptions,
     ) -> ClientResult<()>
@@ -206,7 +206,7 @@ impl Client {
 
     pub async fn detach<T>(
         &mut self,
-        transport: &mut T,
+        transport: &T,
         doc: &mut Document,
         _options: DetachOptions,
     ) -> ClientResult<()>
@@ -238,7 +238,7 @@ impl Client {
         Ok(())
     }
 
-    pub async fn sync<T>(&mut self, transport: &mut T, doc: &mut Document) -> ClientResult<()>
+    pub async fn sync<T>(&mut self, transport: &T, doc: &mut Document) -> ClientResult<()>
     where
         T: ClientTransport,
     {
@@ -248,7 +248,7 @@ impl Client {
 
     pub async fn sync_with_options<T>(
         &mut self,
-        transport: &mut T,
+        transport: &T,
         doc: &mut Document,
         options: SyncOptions,
     ) -> ClientResult<()>
@@ -291,7 +291,7 @@ impl Client {
         Ok(())
     }
 
-    pub async fn remove<T>(&mut self, transport: &mut T, doc: &mut Document) -> ClientResult<()>
+    pub async fn remove<T>(&mut self, transport: &T, doc: &mut Document) -> ClientResult<()>
     where
         T: ClientTransport,
     {
@@ -406,23 +406,25 @@ mod tests {
         DetachDocumentRequest, DetachDocumentResponse, PushPullChangesRequest,
         PushPullChangesResponse, RemoveDocumentRequest, RemoveDocumentResponse,
     };
+    use async_trait::async_trait;
     use std::collections::BTreeMap;
     use std::future::Future;
+    use std::sync::Mutex;
     use std::task::{Context, Poll, Waker};
     use std::time::Duration;
     use yorkie_core::{
         ActorId, DocStatus, Document, JsonObject, SchemaRule, TreeNodeRule, YorkieError,
     };
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug)]
     struct FakeTransport {
         client_id: ActorId,
-        activate_requests: Vec<ActivateClientRequest>,
-        deactivate_requests: Vec<DeactivateClientRequest>,
-        attach_requests: Vec<AttachDocumentRequest>,
-        detach_requests: Vec<DetachDocumentRequest>,
-        remove_requests: Vec<RemoveDocumentRequest>,
-        push_pull_requests: Vec<PushPullChangesRequest>,
+        activate_requests: Mutex<Vec<ActivateClientRequest>>,
+        deactivate_requests: Mutex<Vec<DeactivateClientRequest>>,
+        attach_requests: Mutex<Vec<AttachDocumentRequest>>,
+        detach_requests: Mutex<Vec<DetachDocumentRequest>>,
+        remove_requests: Mutex<Vec<RemoveDocumentRequest>>,
+        push_pull_requests: Mutex<Vec<PushPullChangesRequest>>,
         attach_max_size_per_document: usize,
         attach_schema_rules: Vec<SchemaRule>,
     }
@@ -431,43 +433,44 @@ mod tests {
         fn default() -> Self {
             Self {
                 client_id: ActorId::new("000000000000000000000001"),
-                activate_requests: Vec::new(),
-                deactivate_requests: Vec::new(),
-                attach_requests: Vec::new(),
-                detach_requests: Vec::new(),
-                remove_requests: Vec::new(),
-                push_pull_requests: Vec::new(),
+                activate_requests: Mutex::new(Vec::new()),
+                deactivate_requests: Mutex::new(Vec::new()),
+                attach_requests: Mutex::new(Vec::new()),
+                detach_requests: Mutex::new(Vec::new()),
+                remove_requests: Mutex::new(Vec::new()),
+                push_pull_requests: Mutex::new(Vec::new()),
                 attach_max_size_per_document: 0,
                 attach_schema_rules: Vec::new(),
             }
         }
     }
 
+    #[async_trait]
     impl ClientTransport for FakeTransport {
         async fn activate_client(
-            &mut self,
+            &self,
             request: ActivateClientRequest,
         ) -> ClientResult<ActivateClientResponse> {
-            self.activate_requests.push(request);
+            self.activate_requests.lock().unwrap().push(request);
             Ok(ActivateClientResponse {
                 client_id: self.client_id.clone(),
             })
         }
 
         async fn deactivate_client(
-            &mut self,
+            &self,
             request: DeactivateClientRequest,
         ) -> ClientResult<DeactivateClientResponse> {
-            self.deactivate_requests.push(request);
+            self.deactivate_requests.lock().unwrap().push(request);
             Ok(DeactivateClientResponse)
         }
 
         async fn attach_document(
-            &mut self,
+            &self,
             request: AttachDocumentRequest,
         ) -> ClientResult<AttachDocumentResponse> {
             let change_pack = request.change_pack.clone();
-            self.attach_requests.push(request);
+            self.attach_requests.lock().unwrap().push(request);
             Ok(AttachDocumentResponse {
                 document_id: "document-id".to_owned(),
                 change_pack,
@@ -477,29 +480,29 @@ mod tests {
         }
 
         async fn detach_document(
-            &mut self,
+            &self,
             request: DetachDocumentRequest,
         ) -> ClientResult<DetachDocumentResponse> {
             let change_pack = request.change_pack.clone();
-            self.detach_requests.push(request);
+            self.detach_requests.lock().unwrap().push(request);
             Ok(DetachDocumentResponse { change_pack })
         }
 
         async fn remove_document(
-            &mut self,
+            &self,
             request: RemoveDocumentRequest,
         ) -> ClientResult<RemoveDocumentResponse> {
             let change_pack = request.change_pack.clone();
-            self.remove_requests.push(request);
+            self.remove_requests.lock().unwrap().push(request);
             Ok(RemoveDocumentResponse { change_pack })
         }
 
         async fn push_pull_changes(
-            &mut self,
+            &self,
             request: PushPullChangesRequest,
         ) -> ClientResult<PushPullChangesResponse> {
             let change_pack = request.change_pack.clone();
-            self.push_pull_requests.push(request);
+            self.push_pull_requests.lock().unwrap().push(request);
             Ok(PushPullChangesResponse { change_pack })
         }
     }
@@ -632,10 +635,10 @@ mod tests {
             metadata: BTreeMap::from([("region".to_owned(), "local".to_owned())]),
             ..ClientOptions::default()
         });
-        let mut transport = FakeTransport::default();
+        let transport = FakeTransport::default();
 
-        block_on(client.activate(&mut transport))?;
-        block_on(client.activate(&mut transport))?;
+        block_on(client.activate(&transport))?;
+        block_on(client.activate(&transport))?;
 
         assert_eq!(ClientStatus::Activated, client.status());
         assert!(client.is_active());
@@ -644,15 +647,18 @@ mod tests {
             client.id().map(|id| id.as_str())
         );
         assert!(client.condition(ClientCondition::SyncLoop));
-        assert_eq!(1, transport.activate_requests.len());
-        assert_eq!("client-key", transport.activate_requests[0].client_key);
+        assert_eq!(1, transport.activate_requests.lock().unwrap().len());
+        assert_eq!(
+            "client-key",
+            transport.activate_requests.lock().unwrap()[0].client_key
+        );
         assert_eq!(
             "api-key/client-key",
-            transport.activate_requests[0].shard_key
+            transport.activate_requests.lock().unwrap()[0].shard_key
         );
         assert_eq!(
             Some("local"),
-            transport.activate_requests[0]
+            transport.activate_requests.lock().unwrap()[0]
                 .metadata
                 .get("region")
                 .map(String::as_str)
@@ -667,19 +673,19 @@ mod tests {
             api_key: "api-key".to_owned(),
             ..ClientOptions::default()
         });
-        let mut transport = FakeTransport::default();
+        let transport = FakeTransport::default();
         let mut doc = Document::new("doc-key");
 
-        block_on(client.activate(&mut transport))?;
-        block_on(client.attach(&mut transport, &mut doc, AttachOptions::default()))?;
+        block_on(client.activate(&transport))?;
+        block_on(client.attach(&transport, &mut doc, AttachOptions::default()))?;
         block_on(client.deactivate(
-            &mut transport,
+            &transport,
             DeactivateOptions {
                 keepalive: true,
                 synchronous: true,
             },
         ))?;
-        block_on(client.deactivate(&mut transport, DeactivateOptions::default()))?;
+        block_on(client.deactivate(&transport, DeactivateOptions::default()))?;
 
         assert_eq!(ClientStatus::Deactivated, client.status());
         assert!(!client.is_active());
@@ -690,15 +696,17 @@ mod tests {
         assert!(!client.condition(ClientCondition::SyncLoop));
         assert!(!client.condition(ClientCondition::WatchLoop));
         assert!(!client.has("doc-key"));
-        assert_eq!(1, transport.deactivate_requests.len());
+        assert_eq!(1, transport.deactivate_requests.lock().unwrap().len());
         assert_eq!(
             "000000000000000000000001",
-            transport.deactivate_requests[0].client_id.as_str()
+            transport.deactivate_requests.lock().unwrap()[0]
+                .client_id
+                .as_str()
         );
-        assert!(transport.deactivate_requests[0].synchronous);
+        assert!(transport.deactivate_requests.lock().unwrap()[0].synchronous);
         assert_eq!(
             "api-key/client-key",
-            transport.deactivate_requests[0].shard_key
+            transport.deactivate_requests.lock().unwrap()[0].shard_key
         );
         Ok(())
     }
@@ -709,11 +717,11 @@ mod tests {
             key: Some("client-key".to_owned()),
             ..ClientOptions::default()
         });
-        let mut transport = FakeTransport::default();
+        let transport = FakeTransport::default();
         let mut doc = Document::new("doc-key");
 
-        let err = block_on(client.attach(&mut transport, &mut doc, AttachOptions::default()))
-            .unwrap_err();
+        let err =
+            block_on(client.attach(&transport, &mut doc, AttachOptions::default())).unwrap_err();
 
         assert_eq!(
             ClientError::ClientNotActivated("client-key".to_owned()),
@@ -721,7 +729,7 @@ mod tests {
         );
         assert_eq!(DocStatus::Detached, doc.status());
         assert!(!client.has("doc-key"));
-        assert!(transport.attach_requests.is_empty());
+        assert!(transport.attach_requests.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -731,14 +739,14 @@ mod tests {
             api_key: "api-key".to_owned(),
             ..ClientOptions::default()
         });
-        let mut transport = FakeTransport::default();
+        let transport = FakeTransport::default();
         let mut doc = Document::new("doc-key");
         let mut initial_root = JsonObject::new();
         initial_root.set("title", "hello")?;
 
         client.apply_activation("000000000000000000000001");
         block_on(client.attach(
-            &mut transport,
+            &transport,
             &mut doc,
             AttachOptions {
                 initial_root: Some(initial_root),
@@ -768,38 +776,57 @@ mod tests {
         );
         assert!(!attachment.poll_interval_pinned);
         assert!(!client.condition(ClientCondition::WatchLoop));
-        assert_eq!(1, transport.attach_requests.len());
+        assert_eq!(1, transport.attach_requests.lock().unwrap().len());
         assert_eq!(
             "000000000000000000000001",
-            transport.attach_requests[0].client_id.as_str()
+            transport.attach_requests.lock().unwrap()[0]
+                .client_id
+                .as_str()
         );
-        assert_eq!("api-key/doc-key", transport.attach_requests[0].shard_key);
+        assert_eq!(
+            "api-key/doc-key",
+            transport.attach_requests.lock().unwrap()[0].shard_key
+        );
         assert_eq!(
             Some("schema"),
-            transport.attach_requests[0].schema_key.as_deref()
+            transport.attach_requests.lock().unwrap()[0]
+                .schema_key
+                .as_deref()
         );
         assert_eq!(
             "doc-key",
-            transport.attach_requests[0].change_pack.document_key()
+            transport.attach_requests.lock().unwrap()[0]
+                .change_pack
+                .document_key()
         );
 
-        block_on(client.detach(&mut transport, &mut doc, DetachOptions))?;
+        block_on(client.detach(&transport, &mut doc, DetachOptions))?;
 
         assert!(!client.has("doc-key"));
         assert_eq!(DocStatus::Detached, doc.status());
         assert_eq!("000000000000000000000000", doc.actor_id().as_str());
-        assert_eq!(1, transport.detach_requests.len());
+        assert_eq!(1, transport.detach_requests.lock().unwrap().len());
         assert_eq!(
             "000000000000000000000001",
-            transport.detach_requests[0].client_id.as_str()
+            transport.detach_requests.lock().unwrap()[0]
+                .client_id
+                .as_str()
         );
-        assert_eq!("document-id", transport.detach_requests[0].document_id);
+        assert_eq!(
+            "document-id",
+            transport.detach_requests.lock().unwrap()[0].document_id
+        );
         assert_eq!(
             "doc-key",
-            transport.detach_requests[0].change_pack.document_key()
+            transport.detach_requests.lock().unwrap()[0]
+                .change_pack
+                .document_key()
         );
-        assert!(!transport.detach_requests[0].remove_if_not_attached);
-        assert_eq!("api-key/doc-key", transport.detach_requests[0].shard_key);
+        assert!(!transport.detach_requests.lock().unwrap()[0].remove_if_not_attached);
+        assert_eq!(
+            "api-key/doc-key",
+            transport.detach_requests.lock().unwrap()[0].shard_key
+        );
         Ok(())
     }
 
@@ -810,12 +837,12 @@ mod tests {
             api_key: "api-key".to_owned(),
             ..ClientOptions::default()
         });
-        let mut transport = FakeTransport::default();
+        let transport = FakeTransport::default();
         let mut doc = Document::new("doc-key");
 
         client.apply_activation("000000000000000000000001");
         block_on(client.attach(
-            &mut transport,
+            &transport,
             &mut doc,
             AttachOptions {
                 sync_mode: Some(SyncMode::Realtime),
@@ -824,25 +851,39 @@ mod tests {
         ))?;
         doc.update(|root| root.set("title", "hello").map(|_| ()))?;
 
-        block_on(client.remove(&mut transport, &mut doc))?;
+        block_on(client.remove(&transport, &mut doc))?;
 
         assert_eq!(DocStatus::Removed, doc.status());
         assert!(!client.has("doc-key"));
         assert!(!client.condition(ClientCondition::WatchLoop));
         assert!(!doc.has_local_changes());
-        assert_eq!(1, transport.remove_requests.len());
+        assert_eq!(1, transport.remove_requests.lock().unwrap().len());
         assert_eq!(
             "000000000000000000000001",
-            transport.remove_requests[0].client_id.as_str()
+            transport.remove_requests.lock().unwrap()[0]
+                .client_id
+                .as_str()
         );
-        assert_eq!("document-id", transport.remove_requests[0].document_id);
+        assert_eq!(
+            "document-id",
+            transport.remove_requests.lock().unwrap()[0].document_id
+        );
         assert_eq!(
             "doc-key",
-            transport.remove_requests[0].change_pack.document_key()
+            transport.remove_requests.lock().unwrap()[0]
+                .change_pack
+                .document_key()
         );
-        assert!(transport.remove_requests[0].change_pack.is_removed());
-        assert!(transport.remove_requests[0].change_pack.has_changes());
-        assert_eq!("api-key/doc-key", transport.remove_requests[0].shard_key);
+        assert!(transport.remove_requests.lock().unwrap()[0]
+            .change_pack
+            .is_removed());
+        assert!(transport.remove_requests.lock().unwrap()[0]
+            .change_pack
+            .has_changes());
+        assert_eq!(
+            "api-key/doc-key",
+            transport.remove_requests.lock().unwrap()[0].shard_key
+        );
         assert_eq!(
             YorkieError::DocumentRemoved("doc-key".to_owned()),
             doc.update(|root| root.set("next", "value").map(|_| ()))
@@ -850,8 +891,7 @@ mod tests {
         );
         assert_eq!(
             ClientError::NotDetached("doc-key".to_owned()),
-            block_on(client.attach(&mut transport, &mut doc, AttachOptions::default()))
-                .unwrap_err()
+            block_on(client.attach(&transport, &mut doc, AttachOptions::default())).unwrap_err()
         );
         Ok(())
     }
@@ -862,19 +902,19 @@ mod tests {
             key: Some("client-key".to_owned()),
             ..ClientOptions::default()
         });
-        let mut transport = FakeTransport::default();
+        let transport = FakeTransport::default();
         let mut doc = Document::new("doc-key");
 
-        let err = block_on(client.remove(&mut transport, &mut doc)).unwrap_err();
+        let err = block_on(client.remove(&transport, &mut doc)).unwrap_err();
         assert_eq!(
             ClientError::ClientNotActivated("client-key".to_owned()),
             err
         );
 
         client.apply_activation("000000000000000000000001");
-        let err = block_on(client.remove(&mut transport, &mut doc)).unwrap_err();
+        let err = block_on(client.remove(&transport, &mut doc)).unwrap_err();
         assert_eq!(ClientError::NotAttached("doc-key".to_owned()), err);
-        assert!(transport.remove_requests.is_empty());
+        assert!(transport.remove_requests.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -884,31 +924,43 @@ mod tests {
             api_key: "api-key".to_owned(),
             ..ClientOptions::default()
         });
-        let mut transport = FakeTransport::default();
+        let transport = FakeTransport::default();
         let mut doc = Document::new("doc-key");
 
         client.apply_activation("000000000000000000000001");
-        block_on(client.attach(&mut transport, &mut doc, AttachOptions::default()))?;
+        block_on(client.attach(&transport, &mut doc, AttachOptions::default()))?;
         doc.update(|root| root.set("title", "hello").map(|_| ()))?;
         assert!(doc.has_local_changes());
 
-        block_on(client.sync(&mut transport, &mut doc))?;
+        block_on(client.sync(&transport, &mut doc))?;
 
         assert!(!doc.has_local_changes());
         assert_eq!(DocStatus::Attached, doc.status());
-        assert_eq!(1, transport.push_pull_requests.len());
+        assert_eq!(1, transport.push_pull_requests.lock().unwrap().len());
         assert_eq!(
             "000000000000000000000001",
-            transport.push_pull_requests[0].client_id.as_str()
+            transport.push_pull_requests.lock().unwrap()[0]
+                .client_id
+                .as_str()
         );
-        assert_eq!("document-id", transport.push_pull_requests[0].document_id);
+        assert_eq!(
+            "document-id",
+            transport.push_pull_requests.lock().unwrap()[0].document_id
+        );
         assert_eq!(
             "doc-key",
-            transport.push_pull_requests[0].change_pack.document_key()
+            transport.push_pull_requests.lock().unwrap()[0]
+                .change_pack
+                .document_key()
         );
-        assert!(transport.push_pull_requests[0].change_pack.has_changes());
-        assert!(!transport.push_pull_requests[0].push_only);
-        assert_eq!("api-key/doc-key", transport.push_pull_requests[0].shard_key);
+        assert!(transport.push_pull_requests.lock().unwrap()[0]
+            .change_pack
+            .has_changes());
+        assert!(!transport.push_pull_requests.lock().unwrap()[0].push_only);
+        assert_eq!(
+            "api-key/doc-key",
+            transport.push_pull_requests.lock().unwrap()[0].shard_key
+        );
         Ok(())
     }
 
@@ -918,19 +970,19 @@ mod tests {
             key: Some("client-key".to_owned()),
             ..ClientOptions::default()
         });
-        let mut transport = FakeTransport::default();
+        let transport = FakeTransport::default();
         let mut doc = Document::new("doc-key");
 
-        let err = block_on(client.sync(&mut transport, &mut doc)).unwrap_err();
+        let err = block_on(client.sync(&transport, &mut doc)).unwrap_err();
         assert_eq!(
             ClientError::ClientNotActivated("client-key".to_owned()),
             err
         );
 
         client.apply_activation("000000000000000000000001");
-        let err = block_on(client.sync(&mut transport, &mut doc)).unwrap_err();
+        let err = block_on(client.sync(&transport, &mut doc)).unwrap_err();
         assert_eq!(ClientError::NotAttached("doc-key".to_owned()), err);
-        assert!(transport.push_pull_requests.is_empty());
+        assert!(transport.push_pull_requests.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -940,12 +992,12 @@ mod tests {
             api_key: "api-key".to_owned(),
             ..ClientOptions::default()
         });
-        let mut transport = FakeTransport::default();
+        let transport = FakeTransport::default();
         let mut doc = Document::new("doc-key");
 
         client.apply_activation("000000000000000000000001");
         block_on(client.attach(
-            &mut transport,
+            &transport,
             &mut doc,
             AttachOptions {
                 sync_mode: Some(SyncMode::RealtimePushOnly),
@@ -955,7 +1007,7 @@ mod tests {
         doc.update(|root| root.set("title", "hello").map(|_| ()))?;
 
         block_on(client.sync_with_options(
-            &mut transport,
+            &transport,
             &mut doc,
             SyncOptions {
                 sync_mode: Some(SyncMode::RealtimePushOnly),
@@ -963,8 +1015,8 @@ mod tests {
         ))?;
 
         assert!(doc.has_local_changes());
-        assert_eq!(1, transport.push_pull_requests.len());
-        assert!(transport.push_pull_requests[0].push_only);
+        assert_eq!(1, transport.push_pull_requests.lock().unwrap().len());
+        assert!(transport.push_pull_requests.lock().unwrap()[0].push_only);
         Ok(())
     }
 
@@ -974,17 +1026,17 @@ mod tests {
             key: Some("client-key".to_owned()),
             ..ClientOptions::default()
         });
-        let mut transport = FakeTransport::default();
+        let transport = FakeTransport::default();
         let mut doc = Document::new("doc-key");
 
         client.apply_activation("000000000000000000000001");
         doc.apply_status(DocStatus::Attached);
 
-        let err = block_on(client.attach(&mut transport, &mut doc, AttachOptions::default()))
-            .unwrap_err();
+        let err =
+            block_on(client.attach(&transport, &mut doc, AttachOptions::default())).unwrap_err();
 
         assert_eq!(ClientError::NotDetached("doc-key".to_owned()), err);
-        assert!(transport.attach_requests.is_empty());
+        assert!(transport.attach_requests.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -993,7 +1045,7 @@ mod tests {
             key: Some("client-key".to_owned()),
             ..ClientOptions::default()
         });
-        let mut transport = FakeTransport {
+        let transport = FakeTransport {
             attach_max_size_per_document: 4096,
             attach_schema_rules: vec![SchemaRule::new(
                 "$.profile",
@@ -1006,7 +1058,7 @@ mod tests {
 
         client.apply_activation("000000000000000000000001");
         block_on(client.attach(
-            &mut transport,
+            &transport,
             &mut doc,
             AttachOptions {
                 sync_mode: Some(SyncMode::Realtime),
@@ -1039,7 +1091,7 @@ mod tests {
 
         let mut other_doc = Document::new("other-doc");
         let err = block_on(client.attach(
-            &mut transport,
+            &transport,
             &mut other_doc,
             AttachOptions {
                 document_poll_interval: Some(Duration::ZERO),

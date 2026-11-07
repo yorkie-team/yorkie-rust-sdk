@@ -804,10 +804,10 @@ JS/Go behavior:
 
 Gap:
 
-- No concrete RPC transport.
-- Activate/deactivate/attach/detach/remove/push-pull sync use an async
-  transport trait and have protobuf conversion helpers, but there is no
-  Connect/gRPC-web implementation yet.
+- `ConnectTransport` implements the unary RPCs over the Connect protocol
+  (reqwest, binary protobuf). Server-streaming (watch) is not implemented yet.
+- The `ClientTransport` trait is `async_trait` with `&self` methods so it can
+  later be held as `Arc<dyn ClientTransport>`.
 - No watch stream.
 - No presence.
 - Schema rules and max-size limits are stored after attach but are not enforced

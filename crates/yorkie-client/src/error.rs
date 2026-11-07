@@ -10,6 +10,11 @@ pub enum ClientError {
     NotDetached(String),
     InvalidArgument(String),
     Transport(String),
+    /// Error reply from the server, with its Connect error code.
+    Rpc {
+        code: String,
+        message: String,
+    },
     Core(YorkieError),
 }
 
@@ -23,6 +28,7 @@ impl Display for ClientError {
             Self::NotDetached(key) => write!(f, "resource {key:?} is not detached"),
             Self::InvalidArgument(message) => write!(f, "invalid client argument: {message}"),
             Self::Transport(message) => write!(f, "client transport error: {message}"),
+            Self::Rpc { code, message } => write!(f, "rpc error {code}: {message}"),
             Self::Core(err) => Display::fmt(err, f),
         }
     }
