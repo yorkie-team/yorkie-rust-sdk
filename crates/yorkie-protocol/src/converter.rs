@@ -9,8 +9,8 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use yorkie_core::wire::{
     WireChange, WireChangeId, WireChangePack, WireJsonElement, WireJsonElementSimple, WireNodeAttr,
-    WireOperation, WireRgaNode, WireRhtNode, WireTextNode, WireTextNodeId, WireTextNodePos,
-    WireTreeNode, WireTreeNodeId, WireTreePos, WireValueType,
+    WireOperation, WirePresence, WirePresenceChange, WireRgaNode, WireRhtNode, WireTextNode,
+    WireTextNodeId, WireTextNodePos, WireTreeNode, WireTreeNodeId, WireTreePos, WireValueType,
 };
 use yorkie_core::{ChangePack as CoreChangePack, Checkpoint as CoreCheckpoint};
 use yorkie_core::{SchemaRule as CoreSchemaRule, TreeNodeRule as CoreTreeNodeRule};
@@ -25,6 +25,7 @@ pub enum ProtocolError {
     InvalidInteger { field: &'static str, value: i32 },
     InvalidOffset { field: &'static str, value: i32 },
     MissingField(&'static str),
+    UnsupportedPresenceChange(i32),
     UnsupportedValueType(i32),
 }
 
@@ -44,6 +45,9 @@ impl Display for ProtocolError {
                 write!(f, "invalid negative offset for {field}: {value}")
             }
             Self::MissingField(field) => write!(f, "missing protobuf field {field}"),
+            Self::UnsupportedPresenceChange(change_type) => {
+                write!(f, "unsupported presence change type {change_type}")
+            }
             Self::UnsupportedValueType(value_type) => {
                 write!(f, "unsupported protobuf value type {value_type}")
             }
@@ -178,7 +182,7 @@ fn wire_change_pack_to_proto(pack: &WireChangePack) -> Result<api::ChangePack> {
     let snapshot = if let Some(snapshot) = &pack.snapshot {
         snapshot.clone()
     } else if let Some(snapshot_root) = &pack.snapshot_root {
-        snapshot_root_to_bytes(snapshot_root)?
+        snapshot_root_to_bytes(snapshot_root, &pack.snapshot_presences)?
     } else {
         Vec::new()
     };
@@ -204,10 +208,11 @@ fn wire_change_pack_to_proto(pack: &WireChangePack) -> Result<api::ChangePack> {
 }
 
 fn proto_change_pack_to_wire(pack: &api::ChangePack) -> Result<WireChangePack> {
-    let snapshot_root = if pack.snapshot.is_empty() {
-        None
+    let (snapshot_root, snapshot_presences) = if pack.snapshot.is_empty() {
+        (None, BTreeMap::new())
     } else {
-        Some(snapshot_root_from_bytes(&pack.snapshot)?)
+        let (root, presences) = snapshot_from_bytes(&pack.snapshot)?;
+        (Some(root), presences)
     };
 
     Ok(WireChangePack {
@@ -221,6 +226,7 @@ fn proto_change_pack_to_wire(pack: &api::ChangePack) -> Result<WireChangePack> {
             .collect::<Result<Vec<_>>>()?,
         snapshot: (!pack.snapshot.is_empty()).then(|| pack.snapshot.clone()),
         snapshot_root,
+        snapshot_presences,
         version_vector: pack
             .version_vector
             .as_ref()
@@ -229,17 +235,70 @@ fn proto_change_pack_to_wire(pack: &api::ChangePack) -> Result<WireChangePack> {
     })
 }
 
-fn snapshot_root_to_bytes(snapshot_root: &WireJsonElement) -> Result<Vec<u8>> {
+fn snapshot_root_to_bytes(
+    snapshot_root: &WireJsonElement,
+    presences: &BTreeMap<String, WirePresence>,
+) -> Result<Vec<u8>> {
     Ok(api::Snapshot {
         root: Some(wire_json_element_to_proto(snapshot_root)?),
-        presences: BTreeMap::new(),
+        presences: presences
+            .iter()
+            .map(|(actor_id, presence)| (actor_id.clone(), wire_presence_to_proto(presence)))
+            .collect(),
     }
     .encode_to_vec())
 }
 
-fn snapshot_root_from_bytes(snapshot: &[u8]) -> Result<WireJsonElement> {
+#[allow(clippy::type_complexity)]
+fn snapshot_from_bytes(
+    snapshot: &[u8],
+) -> Result<(WireJsonElement, BTreeMap<String, WirePresence>)> {
     let snapshot = api::Snapshot::decode(snapshot)?;
-    proto_json_element_to_wire(required(&snapshot.root, "snapshot.root")?)
+    let root = proto_json_element_to_wire(required(&snapshot.root, "snapshot.root")?)?;
+    let presences = snapshot
+        .presences
+        .iter()
+        .map(|(actor_id, presence)| (actor_id.clone(), proto_presence_to_wire(presence)))
+        .collect();
+    Ok((root, presences))
+}
+
+fn wire_presence_to_proto(presence: &WirePresence) -> api::Presence {
+    api::Presence {
+        data: presence.clone(),
+    }
+}
+
+fn proto_presence_to_wire(presence: &api::Presence) -> WirePresence {
+    presence.data.clone()
+}
+
+fn wire_presence_change_to_proto(change: &WirePresenceChange) -> api::PresenceChange {
+    use api::presence_change::ChangeType;
+    match change {
+        WirePresenceChange::Put(presence) => api::PresenceChange {
+            r#type: ChangeType::Put as i32,
+            presence: Some(wire_presence_to_proto(presence)),
+            removed_keys: Vec::new(),
+        },
+        WirePresenceChange::Clear => api::PresenceChange {
+            r#type: ChangeType::Clear as i32,
+            presence: None,
+            removed_keys: Vec::new(),
+        },
+    }
+}
+
+fn proto_presence_change_to_wire(change: &api::PresenceChange) -> Result<WirePresenceChange> {
+    use api::presence_change::ChangeType;
+    match ChangeType::try_from(change.r#type) {
+        Ok(ChangeType::Put) => Ok(WirePresenceChange::Put(proto_presence_to_wire(required(
+            &change.presence,
+            "presence_change.presence",
+        )?))),
+        Ok(ChangeType::Clear) => Ok(WirePresenceChange::Clear),
+        _ => Err(ProtocolError::UnsupportedPresenceChange(change.r#type)),
+    }
 }
 
 fn wire_change_to_proto(change: &WireChange) -> Result<api::Change> {
@@ -251,7 +310,10 @@ fn wire_change_to_proto(change: &WireChange) -> Result<api::Change> {
             .iter()
             .map(wire_operation_to_proto)
             .collect::<Result<Vec<_>>>()?,
-        presence_change: None,
+        presence_change: change
+            .presence_change
+            .as_ref()
+            .map(wire_presence_change_to_proto),
     })
 }
 
@@ -264,6 +326,11 @@ fn proto_change_to_wire(change: &api::Change) -> Result<WireChange> {
             .iter()
             .map(proto_operation_to_wire)
             .collect::<Result<Vec<_>>>()?,
+        presence_change: change
+            .presence_change
+            .as_ref()
+            .map(proto_presence_change_to_wire)
+            .transpose()?,
     })
 }
 
@@ -1527,6 +1594,7 @@ mod tests {
             changes: Vec::new(),
             snapshot: None,
             snapshot_root: Some(root.clone()),
+            snapshot_presences: BTreeMap::new(),
             version_vector: Some(version_vector.clone()),
         };
 
@@ -1567,6 +1635,7 @@ mod tests {
             changes: vec![WireChange {
                 id: wire_change_id(1, 30),
                 message: None,
+                presence_change: None,
                 operations: vec![
                     WireOperation::Set {
                         parent_created_at: TimeTicket::initial(),
@@ -1664,6 +1733,7 @@ mod tests {
             }],
             snapshot: None,
             snapshot_root: None,
+            snapshot_presences: BTreeMap::new(),
             version_vector: Some(version_vector_with_lamport(30)),
         };
 
@@ -2113,5 +2183,91 @@ mod tests {
 
     fn ticket(lamport: i64) -> TimeTicket {
         TimeTicket::new(lamport, 0, "000000000000000000000001")
+    }
+
+    // JS `converter.toPresenceChange/fromPresence`: each presence value is its
+    // JSON encoding on the wire.
+    #[test]
+    fn presence_change_roundtrips_through_change_pack() -> Result<(), Box<dyn Error>> {
+        let mut doc = Document::new("doc-key");
+        doc.set_actor("000000000000000000000001");
+        doc.update_with_presence(|_, presence| {
+            let mut data = yorkie_core::Presence::new();
+            data.insert("name".to_owned(), serde_json::json!("a"));
+            data.insert(
+                "pos".to_owned(),
+                serde_json::json!({"x": 1, "y": [2, null]}),
+            );
+            presence.set(data);
+            Ok(())
+        })?;
+        doc.update_with_presence(|_, presence| {
+            presence.clear();
+            Ok(())
+        })?;
+        let pack = doc.create_change_pack();
+
+        let proto = to_change_pack(&pack)?;
+        let put = proto.changes[0].presence_change.as_ref().unwrap();
+        assert_eq!(api::presence_change::ChangeType::Put as i32, put.r#type);
+        let data = &put.presence.as_ref().unwrap().data;
+        assert_eq!(r#""a""#, data["name"]);
+        assert_eq!(r#"{"x":1,"y":[2,null]}"#, data["pos"]);
+        let clear = proto.changes[1].presence_change.as_ref().unwrap();
+        assert_eq!(api::presence_change::ChangeType::Clear as i32, clear.r#type);
+
+        let decoded = decode_change_pack(&encode_change_pack(&pack)?)?;
+        assert_eq!(pack, decoded);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_unsupported_presence_change_types() {
+        let change = api::PresenceChange {
+            r#type: api::presence_change::ChangeType::Patch as i32,
+            ..Default::default()
+        };
+        assert_eq!(
+            Err(ProtocolError::UnsupportedPresenceChange(4)),
+            super::proto_presence_change_to_wire(&change)
+        );
+    }
+
+    #[test]
+    fn snapshot_restores_presences() -> Result<(), Box<dyn Error>> {
+        let actor_a = "000000000000000000000002";
+        let mut version_vector = VersionVector::new();
+        version_vector.set(actor_a, 3);
+        let mut presences = BTreeMap::new();
+        presences.insert(
+            actor_a.to_owned(),
+            BTreeMap::from([("name".to_owned(), r#""b""#.to_owned())]),
+        );
+        let wire = WireChangePack {
+            document_key: "doc-key".to_owned(),
+            checkpoint: Checkpoint::new(7, 0),
+            is_removed: false,
+            changes: Vec::new(),
+            snapshot: None,
+            snapshot_root: Some(sample_snapshot_root()),
+            snapshot_presences: presences.clone(),
+            version_vector: Some(version_vector),
+        };
+
+        let proto = wire_change_pack_to_proto(&wire)?;
+        assert_eq!(
+            presences,
+            proto_change_pack_to_wire(&proto)?.snapshot_presences
+        );
+
+        let mut doc = Document::new("doc-key");
+        doc.apply_change_pack(&from_change_pack(&proto)?)?;
+        let actor = yorkie_core::ActorId::from(actor_a);
+        assert!(doc.has_presence(&actor));
+        doc.add_online_client(actor.clone());
+        let mut expected = yorkie_core::Presence::new();
+        expected.insert("name".to_owned(), serde_json::json!("b"));
+        assert_eq!(Some(expected), doc.presence(&actor));
+        Ok(())
     }
 }

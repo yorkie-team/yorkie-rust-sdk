@@ -92,6 +92,7 @@ it has:
 | `Checkpoint` | `packages/sdk/src/document/change/checkpoint.ts` | Tracks sent and received client/server sequences for sync. |
 | `ChangeContext` | `packages/sdk/src/document/change/context.ts` | Records operations during a local edit and issues time tickets from the next change ID. |
 | `Change` | `packages/sdk/src/document/change/change.ts` | Unit of document modification that executes operations and collects operation info and reverse operations. |
+| `Presence`, `PresenceChange`, `PresenceProxy` | `packages/sdk/src/document/presence/{presence,change}.ts` | `Presence` is a JSON object map; `PresenceChange` is `Put`/`Clear` (JS `Patch` is not ported); `PresenceProxy` is the `presence` handle of `Document::update_with_presence` (`set` merges, `get`, `clear`). `Document::{my_presence, presence, others_presences, presences}` mirror `getMyPresence/getPresence/getOthersPresences/getPresences`. |
 | `ChangePack` | `packages/sdk/src/document/change/change_pack.ts` | Bundle of document key, checkpoint, changes, version vector, removal flag, and optional snapshot for sync. |
 | `yorkie_core::wire` | `packages/sdk/src/api/converter.ts`, `../yorkie/api/converter/*` | Protocol-facing projection for changes, operations, simple elements, full JSON elements, RGA/RHT nodes, text nodes, tree nodes, and positions without exposing CRDT internals through the top-level SDK facade. |
 | `CrdtElementMeta` | `packages/sdk/src/document/crdt/element.ts` | Rust metadata holder for CRDT element timestamps. |

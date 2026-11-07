@@ -16,7 +16,8 @@ use crate::operation::{
     AddOperation, ArraySetOperation, EditOperation, IncreaseOperation, MoveOperation, Operation,
     RemoveOperation, SetOperation, StyleOperation, TreeEditOperation, TreeStyleOperation,
 };
-use crate::{Result, TimeTicket, VersionVector, YorkieError};
+use crate::presence::{Presence, PresenceChange};
+use crate::{ActorId, Result, TimeTicket, VersionVector, YorkieError};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,11 +240,22 @@ pub struct WireChangeId {
     pub version_vector: VersionVector,
 }
 
+/// Wire projection of a presence: each value is its JSON encoding, as JS
+/// `JSON.stringify` writes it into proto `Presence.data`.
+pub type WirePresence = BTreeMap<String, String>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WirePresenceChange {
+    Put(WirePresence),
+    Clear,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireChange {
     pub id: WireChangeId,
     pub message: Option<String>,
     pub operations: Vec<WireOperation>,
+    pub presence_change: Option<WirePresenceChange>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,6 +266,8 @@ pub struct WireChangePack {
     pub changes: Vec<WireChange>,
     pub snapshot: Option<Vec<u8>>,
     pub snapshot_root: Option<WireJsonElement>,
+    /// Snapshot presences keyed by the actor ID string.
+    pub snapshot_presences: BTreeMap<String, WirePresence>,
     pub version_vector: Option<VersionVector>,
 }
 
@@ -277,6 +291,11 @@ impl TryFrom<&ChangePack> for WireChangePack {
                 .snapshot_root()
                 .map(|object| WireJsonElement::try_from(&CrdtElement::object(object.clone())))
                 .transpose()?,
+            snapshot_presences: pack
+                .snapshot_presences()
+                .iter()
+                .map(|(actor_id, presence)| Ok((actor_id.to_string(), presence_to_wire(presence)?)))
+                .collect::<Result<_>>()?,
             version_vector: pack.version_vector().cloned(),
         })
     }
@@ -304,6 +323,17 @@ impl TryFrom<WireChangePack> for ChangePack {
             })
             .transpose()?;
 
+        let snapshot_presences = pack
+            .snapshot_presences
+            .iter()
+            .map(|(actor_id, presence)| {
+                Ok((
+                    ActorId::from(actor_id.as_str()),
+                    presence_from_wire(presence)?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+
         Ok(Self::create_with_snapshot_root(
             pack.document_key,
             pack.checkpoint,
@@ -312,7 +342,8 @@ impl TryFrom<WireChangePack> for ChangePack {
             pack.version_vector,
             pack.snapshot,
             snapshot_root,
-        ))
+        )
+        .with_snapshot_presences(snapshot_presences))
     }
 }
 
@@ -330,6 +361,10 @@ impl TryFrom<&Change> for WireChange {
             id: WireChangeId::from(change.id()),
             message: change.message().map(ToOwned::to_owned),
             operations,
+            presence_change: change
+                .presence_change()
+                .map(WirePresenceChange::try_from)
+                .transpose()?,
         })
     }
 }
@@ -344,12 +379,63 @@ impl TryFrom<WireChange> for Change {
             .map(Operation::try_from)
             .collect::<Result<Vec<_>>>()?;
 
-        Ok(Self::create(
-            ChangeId::from(change.id),
-            operations,
-            change.message,
-        ))
+        let presence_change = change
+            .presence_change
+            .as_ref()
+            .map(PresenceChange::try_from)
+            .transpose()?;
+
+        Ok(
+            Self::create(ChangeId::from(change.id), operations, change.message)
+                .with_presence_change(presence_change),
+        )
     }
+}
+
+impl TryFrom<&PresenceChange> for WirePresenceChange {
+    type Error = YorkieError;
+
+    fn try_from(change: &PresenceChange) -> Result<Self> {
+        Ok(match change {
+            PresenceChange::Put(presence) => Self::Put(presence_to_wire(presence)?),
+            PresenceChange::Clear => Self::Clear,
+        })
+    }
+}
+
+impl TryFrom<&WirePresenceChange> for PresenceChange {
+    type Error = YorkieError;
+
+    fn try_from(change: &WirePresenceChange) -> Result<Self> {
+        Ok(match change {
+            WirePresenceChange::Put(presence) => Self::Put(presence_from_wire(presence)?),
+            WirePresenceChange::Clear => Self::Clear,
+        })
+    }
+}
+
+fn presence_to_wire(presence: &Presence) -> Result<WirePresence> {
+    presence
+        .iter()
+        .map(|(key, value)| {
+            serde_json::to_string(value)
+                .map(|json| (key.clone(), json))
+                .map_err(|_| YorkieError::UnsupportedProtocolConversion("presence value"))
+        })
+        .collect()
+}
+
+fn presence_from_wire(presence: &WirePresence) -> Result<Presence> {
+    presence
+        .iter()
+        .map(|(key, json)| {
+            serde_json::from_str(json)
+                .map(|value| (key.clone(), value))
+                .map_err(|_| {
+                    YorkieError::UnsupportedProtocolConversion("presence value is not JSON")
+                })
+        })
+        .collect()
 }
 
 impl From<&ChangeId> for WireChangeId {

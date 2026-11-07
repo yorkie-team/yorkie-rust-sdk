@@ -626,7 +626,10 @@ Gap:
 
 - Rust change context now mediates the first public object/array mutation
   methods, but it does not yet own full live JSON/CRDT wrappers.
-- Presence changes are not implemented.
+- Presence is implemented for `Put`/`Clear`: `Document::update_with_presence`,
+  presence-only changes, remote presence application, snapshot presences, and
+  online-client tracking. JS `Patch` changes, `disablePresence`, and presence
+  undo/redo are not ported. Presence events are not emitted yet.
 - Change packs can be projected to generated protobuf payloads and
   reconstructed back into core `ChangePack` values for the current operation
   set. Binary round-trip tests cover nested object/array/counter replay, and
@@ -712,14 +715,16 @@ JS/Go behavior:
 
 Gap:
 
-- Presence changes are not converted yet.
+- Presence `Put`/`Clear` changes and snapshot presences are converted; each
+  value travels as its JSON encoding. `Patch`/`Delete` presence changes are
+  rejected with `UnsupportedPresenceChange`.
 - Go has a nil-pack converter error case. Rust takes `&api::ChangePack`, so
   that exact nil case is excluded by the function signature; the missing
   checkpoint case is covered.
 - Snapshot bytes are carried in `ChangePack`, and the protocol converter
   decodes `Snapshot.root` into a core snapshot root for
-  `Document::apply_change_pack`. Snapshot presences are currently ignored
-  because presence is not implemented.
+  `Document::apply_change_pack`. Snapshot presences replace the document's
+  presences.
 - No cross-language binary compatibility tests. This is intentionally not the
   immediate focus while JS/Go in-repo converter scenarios are still being
   ported.

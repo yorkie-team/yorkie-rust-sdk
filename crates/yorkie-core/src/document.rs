@@ -11,11 +11,13 @@ use crate::operation::{
     AddOperation, ArraySetOperation, IncreaseOperation, MoveOperation, OpSource, Operation,
     RemoveOperation, SetOperation,
 };
+use crate::presence::{Presence, PresenceProxy};
 use crate::{
     ActorId, JsonArray, JsonObject, JsonValue, Result, SchemaRule, TimeTicket, YorkieError,
     INITIAL_ACTOR_ID,
 };
 use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 /// A local Yorkie document.
@@ -30,6 +32,8 @@ pub struct Document {
     local_changes: Vec<Change>,
     max_size_per_document: usize,
     schema_rules: Vec<SchemaRule>,
+    presences: BTreeMap<ActorId, Presence>,
+    online_clients: BTreeSet<ActorId>,
 }
 
 /// Document attachment state.
@@ -53,6 +57,8 @@ impl Document {
             local_changes: Vec::new(),
             max_size_per_document: 0,
             schema_rules: Vec::new(),
+            presences: BTreeMap::new(),
+            online_clients: BTreeSet::new(),
         }
     }
 
@@ -80,6 +86,19 @@ impl Document {
     pub fn set_actor(&mut self, actor_id: impl Into<ActorId>) {
         let actor_id = actor_id.into();
 
+        // The self presence and the online entry follow the actor, so they
+        // stay reachable under the new ID (JS reaches the same result through
+        // `reissueActor`, which rebuilds both).
+        let prev = self.change_id.actor_id().clone();
+        if prev != actor_id {
+            if let Some(presence) = self.presences.remove(&prev) {
+                self.presences.insert(actor_id.clone(), presence);
+            }
+            if self.online_clients.remove(&prev) {
+                self.online_clients.insert(actor_id.clone());
+            }
+        }
+
         for change in &mut self.local_changes {
             change.set_actor(actor_id.clone());
         }
@@ -92,6 +111,9 @@ impl Document {
         self.status = status;
 
         if status == DocStatus::Detached {
+            // A detached document no longer owns a presence; drop it so a
+            // later attach starts from an empty one.
+            self.presences.remove(self.change_id.actor_id());
             self.set_actor(INITIAL_ACTOR_ID);
         }
     }
@@ -100,6 +122,15 @@ impl Document {
     pub fn update<F>(&mut self, update_fn: F) -> Result<()>
     where
         F: FnOnce(&mut JsonObject) -> Result<()>,
+    {
+        self.update_with_presence(|root, _| update_fn(root))
+    }
+
+    /// Updates the document root and the local presence in one change
+    /// (JS `doc.update((root, presence) => ...)`).
+    pub fn update_with_presence<F>(&mut self, update_fn: F) -> Result<()>
+    where
+        F: FnOnce(&mut JsonObject, &mut PresenceProxy) -> Result<()>,
     {
         if self.status == DocStatus::Removed {
             return Err(YorkieError::DocumentRemoved(self.key.clone()));
@@ -112,10 +143,17 @@ impl Document {
         let recorder_ref: JsonEditRecorderRef = recorder.clone();
         next_root.attach_recorder(recorder_ref);
 
-        update_fn(&mut next_root)?;
+        let mut proxy = PresenceProxy::new(
+            self.presences
+                .get(self.change_id.actor_id())
+                .cloned()
+                .unwrap_or_default(),
+        );
+        update_fn(&mut next_root, &mut proxy)?;
 
         let mut context = recorder.borrow().context.clone();
-        if !context.has_change() {
+        context.set_presence_change(proxy.into_change());
+        if context.operations().is_empty() {
             collect_object_changes(
                 &mut context,
                 &self.crdt_root,
@@ -128,6 +166,7 @@ impl Document {
         if context.has_change() {
             let change = context.to_change();
             change.execute(&mut self.crdt_root, OpSource::Local)?;
+            change.apply_presence_change(&mut self.presences);
             self.local_changes.push(change);
             self.change_id = context.next_id();
             self.root = crdt_object_to_json_object(self.crdt_root.object())?;
@@ -202,6 +241,78 @@ impl Document {
         Ok(())
     }
 
+    /// Returns the presence of the current client. Empty unless attached,
+    /// as in JS `getMyPresence`.
+    pub fn my_presence(&self) -> Presence {
+        if self.status != DocStatus::Attached {
+            return Presence::new();
+        }
+        self.presences
+            .get(self.change_id.actor_id())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Returns the presence of the given client: self, or an online client
+    /// that has a presence (JS `getPresence`).
+    pub fn presence(&self, actor_id: &ActorId) -> Option<Presence> {
+        if actor_id == self.change_id.actor_id() {
+            return Some(self.my_presence());
+        }
+        if !self.online_clients.contains(actor_id) {
+            return None;
+        }
+        self.presences.get(actor_id).cloned()
+    }
+
+    /// Returns the presences of online clients other than this one, ordered
+    /// by actor ID (JS `getOthersPresences`).
+    pub fn others_presences(&self) -> Vec<(ActorId, Presence)> {
+        let me = self.change_id.actor_id();
+        self.online_clients
+            .iter()
+            .filter(|actor_id| *actor_id != me)
+            .filter_map(|actor_id| {
+                self.presences
+                    .get(actor_id)
+                    .map(|presence| (actor_id.clone(), presence.clone()))
+            })
+            .collect()
+    }
+
+    /// Returns this client and the online clients that have a presence,
+    /// ordered by actor ID (JS `getPresences`).
+    pub fn presences(&self) -> Vec<(ActorId, Presence)> {
+        let mut all = self.others_presences();
+        all.push((self.change_id.actor_id().clone(), self.my_presence()));
+        all.sort_by(|a, b| a.0.cmp(&b.0));
+        all
+    }
+
+    /// Replaces the set of online clients.
+    #[doc(hidden)]
+    pub fn set_online_clients(&mut self, actor_ids: impl IntoIterator<Item = ActorId>) {
+        self.online_clients = actor_ids.into_iter().collect();
+    }
+
+    /// Marks a client as online.
+    #[doc(hidden)]
+    pub fn add_online_client(&mut self, actor_id: ActorId) {
+        self.online_clients.insert(actor_id);
+    }
+
+    /// Marks a client as offline.
+    #[doc(hidden)]
+    pub fn remove_online_client(&mut self, actor_id: &ActorId) {
+        self.online_clients.remove(actor_id);
+    }
+
+    /// Returns whether a presence is stored for the given client.
+    #[doc(hidden)]
+    pub fn has_presence(&self, actor_id: &ActorId) -> bool {
+        self.presences.contains_key(actor_id)
+    }
+
     /// Serializes the document root with object keys sorted lexicographically.
     pub fn to_sorted_json(&self) -> String {
         self.root.to_sorted_json()
@@ -210,6 +321,7 @@ impl Document {
     fn apply_changes(&mut self, changes: &[Change], source: OpSource) -> Result<()> {
         for change in changes {
             change.execute(&mut self.crdt_root, source)?;
+            change.apply_presence_change(&mut self.presences);
             self.change_id = self.change_id.sync_clocks(change.id());
         }
 
@@ -224,6 +336,7 @@ impl Document {
             .clone();
 
         self.crdt_root = CrdtRoot::new(snapshot_root);
+        self.presences = pack.snapshot_presences().clone();
         self.root = crdt_object_to_json_object(self.crdt_root.object())?;
 
         if let Some(version_vector) = pack.version_vector() {
@@ -1972,5 +2085,178 @@ mod tests {
 
         assert_eq!(YorkieError::UnsupportedSnapshot, err);
         assert_eq!(Checkpoint::initial(), doc.checkpoint());
+    }
+
+    // Presence cases follow JS `test/unit/document/presence_test.ts` and
+    // `Document.getMyPresence/getPresences/getOthersPresences`.
+
+    fn presence_of(value: serde_json::Value) -> crate::Presence {
+        value.as_object().unwrap().clone()
+    }
+
+    fn actor(n: u8) -> crate::ActorId {
+        crate::ActorId::from(format!("{n:024x}"))
+    }
+
+    fn attached_doc(n: u8) -> Document {
+        let mut doc = Document::new("doc-key");
+        doc.set_actor(actor(n));
+        doc.apply_status(DocStatus::Attached);
+        doc
+    }
+
+    #[test]
+    fn presence_set_in_update_is_reflected_in_my_presence() -> Result<()> {
+        let mut doc = attached_doc(1);
+        doc.update(|root| {
+            root.set("k", 1i32)?;
+            Ok(())
+        })?;
+        let before = doc.to_sorted_json();
+
+        doc.update_with_presence(|_, presence| {
+            presence.set(presence_of(serde_json::json!({"name": "a", "n": 1})));
+            presence.set(presence_of(serde_json::json!({"n": 2})));
+            assert_eq!(Some(&serde_json::json!(2)), presence.get("n"));
+            Ok(())
+        })?;
+
+        assert_eq!(
+            presence_of(serde_json::json!({"name": "a", "n": 2})),
+            doc.my_presence()
+        );
+        assert_eq!(before, doc.to_sorted_json());
+        // A presence-only change is still a change and is pushed.
+        let pack = doc.create_change_pack();
+        assert_eq!(2, pack.change_size());
+        assert_eq!(0, pack.changes()[1].operations().len());
+        assert!(pack.changes()[1].presence_change().is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn update_can_change_root_and_presence_together() -> Result<()> {
+        let mut doc = attached_doc(1);
+        doc.update_with_presence(|root, presence| {
+            root.set("k", "v")?;
+            presence.set(presence_of(serde_json::json!({"a": true})));
+            Ok(())
+        })?;
+
+        assert_eq!(r#"{"k":"v"}"#, doc.to_sorted_json());
+        assert_eq!(
+            presence_of(serde_json::json!({"a": true})),
+            doc.my_presence()
+        );
+        assert_eq!(1, doc.create_change_pack().change_size());
+        Ok(())
+    }
+
+    #[test]
+    fn failed_update_does_not_change_presence() {
+        let mut doc = attached_doc(1);
+        let result = doc.update_with_presence(|_, presence| {
+            presence.set(presence_of(serde_json::json!({"a": 1})));
+            Err(YorkieError::DocumentRemoved("x".to_owned()))
+        });
+        assert!(result.is_err());
+        assert!(doc.my_presence().is_empty());
+        assert!(!doc.has_local_changes());
+    }
+
+    #[test]
+    fn my_presence_is_empty_unless_attached() -> Result<()> {
+        let mut doc = Document::new("doc-key");
+        doc.update_with_presence(|_, presence| {
+            presence.set(presence_of(serde_json::json!({"a": 1})));
+            Ok(())
+        })?;
+        assert!(doc.my_presence().is_empty());
+        doc.apply_status(DocStatus::Attached);
+        assert_eq!(presence_of(serde_json::json!({"a": 1})), doc.my_presence());
+        Ok(())
+    }
+
+    #[test]
+    fn set_actor_moves_self_presence() -> Result<()> {
+        let mut doc = Document::new("doc-key");
+        doc.update_with_presence(|_, presence| {
+            presence.set(presence_of(serde_json::json!({"a": 1})));
+            Ok(())
+        })?;
+        doc.set_actor(actor(7));
+        doc.apply_status(DocStatus::Attached);
+
+        assert_eq!(presence_of(serde_json::json!({"a": 1})), doc.my_presence());
+        assert!(doc.has_presence(&actor(7)));
+        assert!(!doc.has_presence(&crate::ActorId::from(INITIAL_ACTOR_ID)));
+        Ok(())
+    }
+
+    #[test]
+    fn applies_remote_put_and_clear_and_lists_online_presences() -> Result<()> {
+        let mut source = attached_doc(2);
+        source.update_with_presence(|_, presence| {
+            presence.set(presence_of(serde_json::json!({"name": "b"})));
+            Ok(())
+        })?;
+        let mut target = attached_doc(1);
+        target.update_with_presence(|_, presence| {
+            presence.set(presence_of(serde_json::json!({"name": "a"})));
+            Ok(())
+        })?;
+
+        let put_pack = |changes: Vec<_>| {
+            ChangePack::create("doc-key", Checkpoint::new(1, 0), false, changes, None, None)
+        };
+        target.apply_change_pack(&put_pack(source.create_change_pack().changes().to_vec()))?;
+
+        // Stored, but not listed until the actor is online.
+        assert!(target.has_presence(&actor(2)));
+        assert_eq!(None, target.presence(&actor(2)));
+        assert!(target.others_presences().is_empty());
+
+        target.add_online_client(actor(2));
+        assert_eq!(
+            Some(presence_of(serde_json::json!({"name": "b"}))),
+            target.presence(&actor(2))
+        );
+        assert_eq!(
+            vec![
+                (actor(1), presence_of(serde_json::json!({"name": "a"}))),
+                (actor(2), presence_of(serde_json::json!({"name": "b"}))),
+            ],
+            target.presences()
+        );
+        assert_eq!(1, target.others_presences().len());
+
+        source.update_with_presence(|_, presence| {
+            presence.clear();
+            Ok(())
+        })?;
+        let clear = source.create_change_pack().changes()[1..].to_vec();
+        target.apply_change_pack(&put_pack(clear))?;
+        assert!(!target.has_presence(&actor(2)));
+        assert_eq!(1, target.presences().len());
+
+        target.remove_online_client(&actor(2));
+        target.set_online_clients([actor(3)]);
+        assert!(target.others_presences().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn detach_status_drops_self_presence() -> Result<()> {
+        let mut doc = attached_doc(1);
+        doc.update_with_presence(|_, presence| {
+            presence.set(presence_of(serde_json::json!({"a": 1})));
+            Ok(())
+        })?;
+        doc.apply_status(DocStatus::Detached);
+        assert!(!doc.has_presence(&actor(1)));
+        doc.set_actor(actor(2));
+        doc.apply_status(DocStatus::Attached);
+        assert!(doc.my_presence().is_empty());
+        Ok(())
     }
 }

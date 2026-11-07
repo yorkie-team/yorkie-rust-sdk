@@ -6,4 +6,5 @@ repository.workspace = true
 version.workspace = true
 
 [dependencies]
+serde_json = "1"
 

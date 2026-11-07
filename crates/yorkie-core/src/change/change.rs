@@ -1,14 +1,17 @@
 use super::ChangeId;
 use crate::crdt::root::CrdtRoot;
 use crate::operation::{OpInfo, OpSource, Operation};
+use crate::presence::{Presence, PresenceChange};
 use crate::time::ActorId;
 use crate::Result;
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Change {
     id: ChangeId,
     operations: Vec<Operation>,
     message: Option<String>,
+    presence_change: Option<PresenceChange>,
 }
 
 impl Change {
@@ -17,6 +20,30 @@ impl Change {
             id,
             operations,
             message,
+            presence_change: None,
+        }
+    }
+
+    pub(crate) fn with_presence_change(mut self, presence_change: Option<PresenceChange>) -> Self {
+        self.presence_change = presence_change;
+        self
+    }
+
+    pub(crate) fn presence_change(&self) -> Option<&PresenceChange> {
+        self.presence_change.as_ref()
+    }
+
+    /// Applies this change's presence change to the actor's entry (JS
+    /// `Change.execute`, presence part).
+    pub(crate) fn apply_presence_change(&self, presences: &mut BTreeMap<ActorId, Presence>) {
+        match &self.presence_change {
+            Some(PresenceChange::Put(presence)) => {
+                presences.insert(self.id.actor_id().clone(), presence.clone());
+            }
+            Some(PresenceChange::Clear) => {
+                presences.remove(self.id.actor_id());
+            }
+            None => {}
         }
     }
 
