@@ -247,6 +247,8 @@ pub type WirePresence = BTreeMap<String, String>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WirePresenceChange {
     Put(WirePresence),
+    /// Receive-only; see `PresenceChange::Patch`.
+    Patch(WirePresence),
     Clear,
 }
 
@@ -398,6 +400,7 @@ impl TryFrom<&PresenceChange> for WirePresenceChange {
     fn try_from(change: &PresenceChange) -> Result<Self> {
         Ok(match change {
             PresenceChange::Put(presence) => Self::Put(presence_to_wire(presence)?),
+            PresenceChange::Patch(presence) => Self::Patch(presence_to_wire(presence)?),
             PresenceChange::Clear => Self::Clear,
         })
     }
@@ -409,6 +412,7 @@ impl TryFrom<&WirePresenceChange> for PresenceChange {
     fn try_from(change: &WirePresenceChange) -> Result<Self> {
         Ok(match change {
             WirePresenceChange::Put(presence) => Self::Put(presence_from_wire(presence)?),
+            WirePresenceChange::Patch(presence) => Self::Patch(presence_from_wire(presence)?),
             WirePresenceChange::Clear => Self::Clear,
         })
     }

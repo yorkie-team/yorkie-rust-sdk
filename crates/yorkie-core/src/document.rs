@@ -86,9 +86,9 @@ impl Document {
     pub fn set_actor(&mut self, actor_id: impl Into<ActorId>) {
         let actor_id = actor_id.into();
 
-        // The self presence and the online entry follow the actor, so they
-        // stay reachable under the new ID (JS reaches the same result through
-        // `reissueActor`, which rebuilds both).
+        // The self presence and the online entry follow the actor. This
+        // matches JS `reissueActor` (a presence set before attach, rebuilt
+        // under the new actor); plain JS `setActor` does not move presences.
         let prev = self.change_id.actor_id().clone();
         if prev != actor_id {
             if let Some(presence) = self.presences.remove(&prev) {
@@ -282,6 +282,9 @@ impl Document {
 
     /// Returns this client and the online clients that have a presence,
     /// ordered by actor ID (JS `getPresences`).
+    ///
+    /// Deliberate divergence: JS lists self first, then online clients in
+    /// insertion order. Rust sorts everything by actor ID and lists self once.
     pub fn presences(&self) -> Vec<(ActorId, Presence)> {
         let mut all = self.others_presences();
         all.push((self.change_id.actor_id().clone(), self.my_presence()));
@@ -2258,5 +2261,36 @@ mod tests {
         doc.apply_status(DocStatus::Attached);
         assert!(doc.my_presence().is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn fallback_diff_root_edit_and_presence_change_share_one_update() -> Result<()> {
+        let mut doc = attached_doc(1);
+        doc.update(|root| {
+            root.set("title", "old")?;
+            Ok(())
+        })?;
+
+        // Replacing the value in place bypasses the recorder, so the root
+        // edit is found by the fallback diff.
+        doc.update_with_presence(|root, presence| {
+            *root.get_mut("title").unwrap() = JsonValue::from("new");
+            presence.set(presence_of(serde_json::json!({"a": 1})));
+            Ok(())
+        })?;
+
+        assert_eq!(r#"{"title":"new"}"#, doc.to_sorted_json());
+        assert_eq!(crdt_root_json(&doc), doc.to_sorted_json());
+        assert_eq!(presence_of(serde_json::json!({"a": 1})), doc.my_presence());
+        let pack = doc.create_change_pack();
+        assert_eq!(2, pack.change_size());
+        let last = &pack.changes()[1];
+        assert!(!last.operations().is_empty());
+        assert!(last.presence_change().is_some());
+        Ok(())
+    }
+
+    fn crdt_root_json(doc: &Document) -> String {
+        doc.crdt_root.to_sorted_json()
     }
 }

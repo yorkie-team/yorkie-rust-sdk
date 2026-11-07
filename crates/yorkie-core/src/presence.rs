@@ -9,15 +9,21 @@ pub type Presence = serde_json::Map<String, Value>;
 ///
 /// `Put` carries the whole presence as of the change. `Clear` removes the
 /// actor's presence. JS also has `Patch`; it is an upload-side optimisation
-/// the server folds into `Put`, and is not ported.
+/// the server folds into `Put`.
+///
+/// `Patch` is receive-only: Rust never produces one. It is decoded so a pack
+/// carrying one (a server without the presence-patch capability stores a patch
+/// as-is) does not wedge sync. On apply, its keys merge onto the actor's
+/// existing presence, as in JS `Change.execute`. It encodes back to PATCH.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PresenceChange {
     Put(Presence),
+    Patch(Presence),
     Clear,
 }
 
 /// The presence handle passed to `Document::update_with_presence`
-/// (JS `Channel`/`presence` proxy in `presence.ts`).
+/// (JS `Presence` class in `presence/presence.ts`).
 #[derive(Debug, Clone)]
 pub struct PresenceProxy {
     presence: Presence,

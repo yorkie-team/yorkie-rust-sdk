@@ -25,7 +25,6 @@ pub enum ProtocolError {
     InvalidInteger { field: &'static str, value: i32 },
     InvalidOffset { field: &'static str, value: i32 },
     MissingField(&'static str),
-    UnsupportedPresenceChange(i32),
     UnsupportedValueType(i32),
 }
 
@@ -45,9 +44,6 @@ impl Display for ProtocolError {
                 write!(f, "invalid negative offset for {field}: {value}")
             }
             Self::MissingField(field) => write!(f, "missing protobuf field {field}"),
-            Self::UnsupportedPresenceChange(change_type) => {
-                write!(f, "unsupported presence change type {change_type}")
-            }
             Self::UnsupportedValueType(value_type) => {
                 write!(f, "unsupported protobuf value type {value_type}")
             }
@@ -281,6 +277,11 @@ fn wire_presence_change_to_proto(change: &WirePresenceChange) -> api::PresenceCh
             presence: Some(wire_presence_to_proto(presence)),
             removed_keys: Vec::new(),
         },
+        WirePresenceChange::Patch(presence) => api::PresenceChange {
+            r#type: ChangeType::Patch as i32,
+            presence: Some(wire_presence_to_proto(presence)),
+            removed_keys: Vec::new(),
+        },
         WirePresenceChange::Clear => api::PresenceChange {
             r#type: ChangeType::Clear as i32,
             presence: None,
@@ -289,6 +290,10 @@ fn wire_presence_change_to_proto(change: &WirePresenceChange) -> api::PresenceCh
     }
 }
 
+// Mirrors JS `fromPresenceChange`: every type decodes, so a stored change the
+// server redelivers on each pull can never wedge the pack. UNSPECIFIED (what a
+// server without the presence-patch capability stores for a patch) and DELETE
+// decode as an empty Put; PATCH keeps its keys and tolerates an absent presence.
 fn proto_presence_change_to_wire(change: &api::PresenceChange) -> Result<WirePresenceChange> {
     use api::presence_change::ChangeType;
     match ChangeType::try_from(change.r#type) {
@@ -297,7 +302,16 @@ fn proto_presence_change_to_wire(change: &api::PresenceChange) -> Result<WirePre
             "presence_change.presence",
         )?))),
         Ok(ChangeType::Clear) => Ok(WirePresenceChange::Clear),
-        _ => Err(ProtocolError::UnsupportedPresenceChange(change.r#type)),
+        Ok(ChangeType::Patch) => Ok(WirePresenceChange::Patch(
+            change
+                .presence
+                .as_ref()
+                .map(proto_presence_to_wire)
+                .unwrap_or_default(),
+        )),
+        Ok(ChangeType::Unspecified | ChangeType::Delete) | Err(_) => {
+            Ok(WirePresenceChange::Put(WirePresence::new()))
+        }
     }
 }
 
@@ -1318,8 +1332,8 @@ mod tests {
     use std::error::Error;
     use yorkie_core::wire::{
         WireChange, WireChangeId, WireChangePack, WireJsonElement, WireJsonElementSimple,
-        WireNodeAttr, WireOperation, WireRgaNode, WireRhtNode, WireTextNode, WireTextNodeId,
-        WireTextNodePos, WireTreeNode, WireTreeNodeId, WireValueType,
+        WireNodeAttr, WireOperation, WirePresence, WirePresenceChange, WireRgaNode, WireRhtNode,
+        WireTextNode, WireTextNodeId, WireTextNodePos, WireTreeNode, WireTreeNodeId, WireValueType,
     };
     use yorkie_core::{Checkpoint, Document, SchemaRule, TimeTicket, TreeNodeRule, VersionVector};
 
@@ -2221,16 +2235,126 @@ mod tests {
         Ok(())
     }
 
+    fn presence_pack_with(
+        change_type: api::presence_change::ChangeType,
+        data: &[(&str, &str)],
+        with_presence: bool,
+    ) -> api::ChangePack {
+        let mut pack = to_change_pack(&Document::new("doc-key").create_change_pack()).unwrap();
+        let mut change = to_change_pack(&{
+            let mut doc = Document::new("doc-key");
+            doc.update(|root| {
+                root.set("k", 1i32)?;
+                Ok(())
+            })
+            .unwrap();
+            doc.create_change_pack()
+        })
+        .unwrap()
+        .changes
+        .remove(0);
+        change.operations.clear();
+        change.presence_change = Some(api::PresenceChange {
+            r#type: change_type as i32,
+            presence: with_presence.then(|| api::Presence {
+                data: data
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            }),
+            removed_keys: Vec::new(),
+        });
+        pack.changes.push(change);
+        pack.checkpoint = Some(api::Checkpoint {
+            server_seq: 1,
+            client_seq: 0,
+        });
+        pack
+    }
+
+    fn remote_presence_of(
+        pack: &api::ChangePack,
+        existing: Option<&str>,
+    ) -> Option<yorkie_core::Presence> {
+        let mut doc = Document::new("doc-key");
+        let actor = yorkie_core::ActorId::from("000000000000000000000000");
+        doc.set_actor(actor.clone());
+        doc.apply_status(yorkie_core::DocStatus::Attached);
+        if let Some(name) = existing {
+            doc.update_with_presence(|_, presence| {
+                let mut data = yorkie_core::Presence::new();
+                data.insert("name".to_owned(), serde_json::json!(name));
+                data.insert("x".to_owned(), serde_json::json!(1));
+                presence.set(data);
+                Ok(())
+            })
+            .unwrap();
+        }
+        // The change in the pack carries the document's own actor.
+        doc.apply_change_pack(&from_change_pack(pack).unwrap())
+            .unwrap();
+        doc.presence(&actor)
+    }
+
+    // JS `fromPresenceChange`: UNSPECIFIED, DELETE and PATCH must decode, not
+    // fail the pack (a failing stored change would wedge sync forever).
     #[test]
-    fn rejects_unsupported_presence_change_types() {
-        let change = api::PresenceChange {
-            r#type: api::presence_change::ChangeType::Patch as i32,
-            ..Default::default()
-        };
+    fn decodes_unspecified_and_delete_presence_changes_as_empty_put() {
+        use api::presence_change::ChangeType;
+        for change_type in [ChangeType::Unspecified, ChangeType::Delete] {
+            let proto = presence_pack_with(change_type, &[("a", "1")], true);
+            let wire = proto_change_pack_to_wire(&proto).unwrap();
+            assert_eq!(
+                Some(WirePresenceChange::Put(WirePresence::new())),
+                wire.changes[0].presence_change
+            );
+            let got = remote_presence_of(&proto, Some("n")).unwrap();
+            assert!(
+                got.is_empty(),
+                "{change_type:?} should store an empty presence"
+            );
+        }
+    }
+
+    #[test]
+    fn decodes_patch_presence_change_and_merges_onto_existing_presence() {
+        use api::presence_change::ChangeType;
+        let proto = presence_pack_with(ChangeType::Patch, &[("x", "2"), ("y", "\"z\"")], true);
+        let wire = proto_change_pack_to_wire(&proto).unwrap();
+        assert!(matches!(
+            wire.changes[0].presence_change,
+            Some(WirePresenceChange::Patch(_))
+        ));
+        // Encoding back keeps PATCH, so the round trip is lossless.
         assert_eq!(
-            Err(ProtocolError::UnsupportedPresenceChange(4)),
-            super::proto_presence_change_to_wire(&change)
+            proto.changes[0].presence_change,
+            to_change_pack(&from_change_pack(&proto).unwrap())
+                .unwrap()
+                .changes[0]
+                .presence_change
         );
+
+        let got = remote_presence_of(&proto, Some("n")).unwrap();
+        assert_eq!(serde_json::json!("n"), got["name"]);
+        assert_eq!(serde_json::json!(2), got["x"]);
+        assert_eq!(serde_json::json!("z"), got["y"]);
+
+        // No base presence: the patch becomes the presence.
+        let got = remote_presence_of(&proto, None).unwrap();
+        assert_eq!(2, got.len());
+    }
+
+    #[test]
+    fn decodes_patch_without_presence_as_empty_patch() {
+        use api::presence_change::ChangeType;
+        let proto = presence_pack_with(ChangeType::Patch, &[], false);
+        let wire = proto_change_pack_to_wire(&proto).unwrap();
+        assert_eq!(
+            Some(WirePresenceChange::Patch(WirePresence::new())),
+            wire.changes[0].presence_change
+        );
+        let got = remote_presence_of(&proto, Some("n")).unwrap();
+        assert_eq!(2, got.len());
     }
 
     #[test]

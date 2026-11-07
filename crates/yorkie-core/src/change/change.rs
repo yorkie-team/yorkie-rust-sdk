@@ -40,6 +40,12 @@ impl Change {
             Some(PresenceChange::Put(presence)) => {
                 presences.insert(self.id.actor_id().clone(), presence.clone());
             }
+            Some(PresenceChange::Patch(patch)) => {
+                let entry = presences.entry(self.id.actor_id().clone()).or_default();
+                for (key, value) in patch {
+                    entry.insert(key.clone(), value.clone());
+                }
+            }
             Some(PresenceChange::Clear) => {
                 presences.remove(self.id.actor_id());
             }

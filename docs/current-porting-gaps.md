@@ -628,8 +628,8 @@ Gap:
   methods, but it does not yet own full live JSON/CRDT wrappers.
 - Presence is implemented for `Put`/`Clear`: `Document::update_with_presence`,
   presence-only changes, remote presence application, snapshot presences, and
-  online-client tracking. JS `Patch` changes, `disablePresence`, and presence
-  undo/redo are not ported. Presence events are not emitted yet.
+  online-client tracking. Rust never emits JS `Patch` changes (it decodes them);
+  `disablePresence` and presence undo/redo are not ported. Presence events are not emitted yet.
 - Change packs can be projected to generated protobuf payloads and
   reconstructed back into core `ChangePack` values for the current operation
   set. Binary round-trip tests cover nested object/array/counter replay, and
@@ -716,8 +716,11 @@ JS/Go behavior:
 Gap:
 
 - Presence `Put`/`Clear` changes and snapshot presences are converted; each
-  value travels as its JSON encoding. `Patch`/`Delete` presence changes are
-  rejected with `UnsupportedPresenceChange`.
+  value travels as its JSON encoding. As in JS `fromPresenceChange`, every
+  type decodes so a stored change cannot wedge sync: UNSPECIFIED and DELETE
+  decode as an empty `Put`, and PATCH decodes as the receive-only
+  `PresenceChange::Patch` (absent presence becomes `{}`), which merges onto the
+  actor's presence on apply and encodes back to PATCH.
 - Go has a nil-pack converter error case. Rust takes `&api::ChangePack`, so
   that exact nil case is excluded by the function signature; the missing
   checkpoint case is covered.
