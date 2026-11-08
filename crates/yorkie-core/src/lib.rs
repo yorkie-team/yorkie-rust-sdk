@@ -7,6 +7,7 @@ mod change;
 mod crdt;
 mod document;
 mod error;
+mod event;
 mod json;
 #[allow(dead_code)]
 mod operation;
@@ -22,6 +23,10 @@ pub use change::{
 pub use crdt::counter::{CounterType, CounterValue};
 pub use document::{DocStatus, Document};
 pub use error::{Result, YorkieError};
+pub use event::{
+    ChangeInfo, DocEvent, DocSyncStatus, EditOpValue, OperationInfo, StreamConnectionStatus,
+    StyleOpValue, SubscriptionId, TreeStyleOpValue,
+};
 pub use json::{JsonArray, JsonArrayElement, JsonCounter, JsonObject, JsonValue};
 pub use presence::{Presence, PresenceChange, PresenceProxy};
 pub use schema::{SchemaRule, TreeNodeRule};

@@ -275,9 +275,9 @@ Gap:
   protobuf-shaped object/array/tree payload bytes and from-wire operation
   construction. Broader replay tests for text/tree operation payloads are still
   needed before treating this as full sync parity.
-- Rust `OpInfo` currently uses a separate `ArrayRemove` enum variant for
-  clarity, while JS represents array removal as a `remove` op info carrying an
-  index. This internal Rust shape may need to converge before exposing events.
+- Rust `OpInfo` keeps a separate internal `ArrayRemove` variant; the public
+  `OperationInfo` delivered to subscribers folds it into `Remove { index }`,
+  as JS does.
 
 Expected direction:
 
@@ -285,7 +285,6 @@ Expected direction:
   remaining clone/diff fallback surface.
 - Add version-vector parameters to operation execution when sync/replay
   behavior is ported.
-- Align event/op-info shape before exposing watch or local event APIs.
 
 ## Counter and Increase Operation
 
@@ -472,8 +471,9 @@ Gap:
 - `StyleOperation` emits per-block style operation info from the text helper,
   but `EditOperation` still emits a single requested range instead of the full
   value-change list produced by JS `RGATreeSplit.edit`.
-- Text operation info is still internal and shaped for Rust tests; it has not
-  yet been aligned with the external watch/event payload shape.
+- Text operation info is converted to the public `OperationInfo::{Edit,
+  Style}` shape, but `EditOperation` still reports one range per edit (see
+  above), so edit events are not yet the JS value-change list.
 - Version-vector-aware edit/style conflict behavior is modeled at the internal
   helper level and is passed through `Change`, but it still needs broader
   multi-change replay coverage at the operation layer.
@@ -484,8 +484,8 @@ Gap:
 Expected direction:
 
 - Connect public Text methods through `ChangeContext`.
-- Align edit operation info with the JS value-change list before exposing text
-  watch/event APIs.
+- Align edit operation info with the JS value-change list (Task 8 public
+  Text facade).
 - Continue porting JS history and multi-client text scenarios at the operation
   layer.
 - Replace rebuild-on-mutation indexing with stable node handles to align the
@@ -629,7 +629,16 @@ Gap:
 - Presence is implemented for `Put`/`Clear`: `Document::update_with_presence`,
   presence-only changes, remote presence application, snapshot presences, and
   online-client tracking. Rust never emits JS `Patch` changes (it decodes them);
-  `disablePresence` and presence undo/redo are not ported. Presence events are not emitted yet.
+  `disablePresence` and presence undo/redo are not ported.
+- Document events follow JS `reconcilePresence`: local presence updates,
+  remote presence changes, and status transitions publish
+  `PresenceChanged`/`Watched`/`Unwatched`. A remote `Clear` takes the actor
+  offline. `Initialized`, watch-driven `Watched`/`Unwatched`,
+  `ConnectionChanged`, `SyncStatusChanged`, and `Broadcast` are defined but
+  published by the client, which does not do so yet. JS `AuthError`,
+  `EpochMismatch`, `WriteRejected`, `LocalChangesDropped`, and
+  `PersistDisabled` events are not ported. `ChangeInfo` omits JS
+  `clientSeq`/`serverSeq`/`rawChange`.
 - Change packs can be projected to generated protobuf payloads and
   reconstructed back into core `ChangePack` values for the current operation
   set. Binary round-trip tests cover nested object/array/counter replay, and
@@ -891,7 +900,7 @@ Expected direction:
 
 - Treat current array CRDT behavior as semantically covered for the ported
   internal matrix, but not as a finished performance implementation.
-- Do not expose current operation event shapes as stable public API.
+- `OperationInfo` is public; keep new op infos in the JS `OpInfo` shape.
 - Route CRDT mutations through `CrdtRoot` to keep the copied root index fresh.
 - Prefer adding missing public JSON behavior before expanding network/client
   behavior.

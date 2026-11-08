@@ -6,12 +6,13 @@ use crate::crdt::object::CrdtObject;
 use crate::crdt::primitive::{CrdtPrimitive, PrimitiveValue};
 use crate::crdt::root::CrdtRoot;
 use crate::crdt::tree::{attribute_value_to_json_value, TreeNode};
+use crate::event::{ChangeInfo, DocEvent, OperationInfo, Subscribers, SubscriptionId};
 use crate::json::{counter_operand, JsonEditRecorder, JsonEditRecorderRef, RecordedJsonValue};
 use crate::operation::{
     AddOperation, ArraySetOperation, IncreaseOperation, MoveOperation, OpSource, Operation,
     RemoveOperation, SetOperation,
 };
-use crate::presence::{Presence, PresenceProxy};
+use crate::presence::{Presence, PresenceChange, PresenceProxy};
 use crate::{
     ActorId, JsonArray, JsonObject, JsonValue, Result, SchemaRule, TimeTicket, YorkieError,
     INITIAL_ACTOR_ID,
@@ -34,6 +35,7 @@ pub struct Document {
     schema_rules: Vec<SchemaRule>,
     presences: BTreeMap<ActorId, Presence>,
     online_clients: BTreeSet<ActorId>,
+    subscribers: Subscribers,
 }
 
 /// Document attachment state.
@@ -59,6 +61,7 @@ impl Document {
             schema_rules: Vec::new(),
             presences: BTreeMap::new(),
             online_clients: BTreeSet::new(),
+            subscribers: Subscribers::default(),
         }
     }
 
@@ -108,6 +111,8 @@ impl Document {
 
     /// Applies a document status transition.
     pub fn apply_status(&mut self, status: DocStatus) {
+        let actor_id = self.change_id.actor_id().clone();
+        let prev = self.presence_state(&actor_id, self.status == DocStatus::Attached);
         self.status = status;
 
         if status == DocStatus::Detached {
@@ -116,6 +121,11 @@ impl Document {
             self.presences.remove(self.change_id.actor_id());
             self.set_actor(INITIAL_ACTOR_ID);
         }
+
+        if let Some(event) = self.reconcile_presence(&actor_id, prev) {
+            self.publish(event);
+        }
+        self.publish(DocEvent::StatusChanged(status));
     }
 
     /// Updates the document root.
@@ -165,11 +175,25 @@ impl Document {
 
         if context.has_change() {
             let change = context.to_change();
-            change.execute(&mut self.crdt_root, OpSource::Local)?;
+            let actor_id = self.change_id.actor_id().clone();
+            let prev = self.presence_state(&actor_id, self.status == DocStatus::Attached);
+            let executed = change.execute(&mut self.crdt_root, OpSource::Local)?;
             change.apply_presence_change(&mut self.presences);
+
+            // As in JS, the change event is gated on the operations that ran,
+            // not on the op infos they produced.
+            let change_event = (!executed.operations.is_empty())
+                .then(|| DocEvent::LocalChange(change_info(&change, executed.op_infos)));
+            let presence_event = change
+                .presence_change()
+                .and_then(|_| self.reconcile_presence(&actor_id, prev));
+
             self.local_changes.push(change);
             self.change_id = context.next_id();
             self.root = crdt_object_to_json_object(self.crdt_root.object())?;
+            for event in change_event.into_iter().chain(presence_event) {
+                self.publish(event);
+            }
             return Ok(());
         }
 
@@ -321,11 +345,108 @@ impl Document {
         self.root.to_sorted_json()
     }
 
+    /// Registers a callback for every event of this document and returns its
+    /// subscription ID (JS `subscribe('all', cb)`; the JS default
+    /// `subscribe(cb)` delivers only snapshot and change events, which callers
+    /// select here by matching on the event).
+    ///
+    /// Callbacks run synchronously, inside the call that produced the event,
+    /// while the caller holds `&mut Document`. When the document is shared
+    /// behind a mutex, the lock is held during the callback: locking the same
+    /// document again from inside it deadlocks.
+    pub fn subscribe(
+        &mut self,
+        callback: impl FnMut(&DocEvent) + Send + 'static,
+    ) -> SubscriptionId {
+        self.subscribers.add(None, Box::new(callback))
+    }
+
+    /// Registers a callback for the local and remote changes that touch
+    /// `path` or an element under it (JS `subscribe(targetPath, cb)`). Each
+    /// delivered event carries only those operations; a change without any is
+    /// not delivered. Paths match on whole segments, so `$.todos` covers
+    /// `$.todos.0` but not `$.todos2`. Callbacks run as in `subscribe`.
+    pub fn subscribe_path(
+        &mut self,
+        path: &str,
+        callback: impl FnMut(&DocEvent) + Send + 'static,
+    ) -> SubscriptionId {
+        self.subscribers
+            .add(Some(path.to_owned()), Box::new(callback))
+    }
+
+    /// Removes a subscription. Unknown IDs are ignored.
+    pub fn unsubscribe(&mut self, id: SubscriptionId) {
+        self.subscribers.remove(id);
+    }
+
+    /// Delivers an event to this document's subscribers (JS `publish`).
+    #[doc(hidden)]
+    pub fn publish(&mut self, event: DocEvent) {
+        self.subscribers.publish(&event);
+    }
+
+    fn presence_state(&self, actor_id: &ActorId, was_online: bool) -> PresenceState {
+        PresenceState {
+            presence: self.presences.get(actor_id).cloned(),
+            was_online,
+        }
+    }
+
+    /// Compares a client's presence and online state with `prev` and returns
+    /// the event for the transition (JS `reconcilePresence`). Self is online
+    /// while attached; others while in the online set.
+    fn reconcile_presence(&self, actor_id: &ActorId, prev: PresenceState) -> Option<DocEvent> {
+        let is_self = actor_id == self.change_id.actor_id();
+        let is_online = if is_self {
+            self.status == DocStatus::Attached
+        } else {
+            self.online_clients.contains(actor_id)
+        };
+        let was_ready = prev.was_online && prev.presence.is_some();
+
+        let Some(presence) = self.presences.get(actor_id).filter(|_| is_online) else {
+            return match prev.presence {
+                Some(presence) if was_ready && !is_self => {
+                    Some(DocEvent::Unwatched(actor_id.clone(), presence))
+                }
+                _ => None,
+            };
+        };
+
+        let presence = presence.clone();
+        if !was_ready && !is_self {
+            return Some(DocEvent::Watched(actor_id.clone(), presence));
+        }
+        Some(DocEvent::PresenceChanged(actor_id.clone(), presence))
+    }
+
     fn apply_changes(&mut self, changes: &[Change], source: OpSource) -> Result<()> {
         for change in changes {
-            change.execute(&mut self.crdt_root, source)?;
+            let actor_id = change.id().actor_id().clone();
+            let prev = change
+                .presence_change()
+                .map(|_| self.presence_state(&actor_id, self.online_clients.contains(&actor_id)));
+            let executed = change.execute(&mut self.crdt_root, source)?;
             change.apply_presence_change(&mut self.presences);
             self.change_id = self.change_id.sync_clocks(change.id());
+
+            if !executed.operations.is_empty() {
+                let info = change_info(change, executed.op_infos);
+                self.publish(if source == OpSource::Remote {
+                    DocEvent::RemoteChange(info)
+                } else {
+                    DocEvent::LocalChange(info)
+                });
+            }
+            if let Some(prev) = prev {
+                if matches!(change.presence_change(), Some(PresenceChange::Clear)) {
+                    self.online_clients.remove(&actor_id);
+                }
+                if let Some(event) = self.reconcile_presence(&actor_id, prev) {
+                    self.publish(event);
+                }
+            }
         }
 
         self.root = crdt_object_to_json_object(self.crdt_root.object())?;
@@ -351,6 +472,7 @@ impl Document {
         self.remove_pushed_local_changes(pack.checkpoint().client_seq());
         let local_changes = self.local_changes.clone();
         self.apply_changes(&local_changes, OpSource::Local)?;
+        self.publish(DocEvent::Snapshot);
         Ok(())
     }
 
@@ -363,6 +485,21 @@ impl Document {
         {
             self.local_changes.remove(0);
         }
+    }
+}
+
+/// A client's presence and online state before a change, for
+/// `Document::reconcile_presence`.
+struct PresenceState {
+    presence: Option<Presence>,
+    was_online: bool,
+}
+
+fn change_info(change: &Change, op_infos: Vec<crate::operation::OpInfo>) -> ChangeInfo {
+    ChangeInfo {
+        actor: change.id().actor_id().clone(),
+        message: change.message().map(str::to_owned),
+        operations: op_infos.into_iter().map(OperationInfo::from).collect(),
     }
 }
 
@@ -950,6 +1087,7 @@ mod tests {
     use crate::crdt::rht::Rht;
     use crate::crdt::text::CrdtText;
     use crate::crdt::tree::{CrdtTree, TreeNode, TreeNodeId};
+    use crate::event::DocEvent;
     use crate::wire::WireChangePack;
     use crate::{
         Checkpoint, JsonArray, JsonObject, JsonValue, Result, SchemaRule, TreeNodeRule,
@@ -2069,6 +2207,37 @@ mod tests {
             r#"{"draft":"local","title":"remote"}"#,
             target.to_sorted_json()
         );
+        Ok(())
+    }
+
+    // JS `applySnapshot`: replayed local changes publish local-change events,
+    // then one snapshot event follows.
+    #[test]
+    fn snapshot_pack_publishes_replayed_changes_then_snapshot() -> Result<()> {
+        let mut source = Document::new("source-doc");
+        source.update(|root| root.set("title", "remote").map(|_| ()))?;
+        let mut target = Document::new("target-doc");
+        target.update(|root| root.set("draft", "local").map(|_| ()))?;
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = events.clone();
+        target.subscribe(move |event| sink.lock().unwrap().push(event.clone()));
+
+        let source_pack = source.create_change_pack();
+        let snapshot_pack = ChangePack::create_with_snapshot_root(
+            "target-doc",
+            Checkpoint::new(7, 0),
+            false,
+            Vec::new(),
+            source_pack.version_vector().cloned(),
+            Some(vec![1]),
+            Some(source.crdt_root.object().clone()),
+        );
+        target.apply_change_pack(&snapshot_pack)?;
+
+        let events = events.lock().unwrap();
+        assert_eq!(2, events.len());
+        assert!(matches!(&events[0], DocEvent::LocalChange(info) if info.operations.len() == 1));
+        assert_eq!(DocEvent::Snapshot, events[1]);
         Ok(())
     }
 
