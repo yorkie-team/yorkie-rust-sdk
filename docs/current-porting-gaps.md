@@ -253,6 +253,11 @@ Gap:
   a root that grows to 500 members take about six minutes in a debug build.
   The two JS snapshot integration cases that build such a root are ignored
   for this (`integration_snapshot.rs`); both pass in a release build.
+- Collection is slow in the same way. For each GC pair it walks the whole
+  document twice, once to find the pair's barrier and container
+  (`locate_gc_pair`) and once to purge it, so a pass costs time in GC pairs
+  times nodes. Each purge also refreshes the copied pairs of the container
+  and its ancestors.
 
 Expected direction:
 
@@ -296,12 +301,20 @@ Gap:
   being unregistered; JS `collect` drops such a pair.
 - The running `doc_size` disagrees with a root rebuilt from the same content:
   removing a text node does not move its size from `live` to `gc`, and a
-  moved element's ticket is not charged the way a rebuild charges it. This holds with or without
-  collection. The JS barrier tests check the running size against a rebuild;
-  the Rust ports check the garbage count only.
+  moved element's ticket is not charged the way a rebuild charges it. This
+  holds with or without collection. The JS barrier tests check the running
+  size against a rebuild; the Rust ports check the garbage count only.
 - JS keeps a clone root and collects it too (`getGarbageLenFromClone`).
   Rust has no clone to collect: a local change runs on a copy that replaces
   the root.
+- The JS case "gc targeting nodes made by deactivated client"
+  (`gc_test.ts:1397`) deactivates with `synchronous: true`, which the
+  memory-backed server fails ("change not found"), as the JS NOTE says. It
+  needs a Mongo-backed server. CI runs the memory backend, so the Rust port
+  (`integration_gc.rs`) is ignored and never runs there.
+- With collection on, JS object case `object_test.ts:923` fails: the undo
+  names an object that has been purged. JS runs it with `disableGC`, which
+  is not ported, so the Rust port stays ignored.
 
 ## CRDT Array and RGA List
 
@@ -1289,8 +1302,8 @@ Current Rust behavior:
   primitives, objects, arrays (including the concurrency table), counters,
   text, tree (including split and merge matrices), history, schema and size
   limits, channels with broadcast, documents, snapshots, and garbage
-  collection (including push-only and containment cases). CI runs them against a pinned server
-  image (`.github/workflows/ci.yml`).
+  collection (including push-only and containment cases). CI runs them
+  against a pinned server image (`.github/workflows/ci.yml`).
 
 JS/Go behavior:
 
