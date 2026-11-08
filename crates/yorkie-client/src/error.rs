@@ -12,6 +12,7 @@ pub(crate) const UNRETRYABLE_WRITE_CODES: [ErrorCode; 2] = [
 
 /// Errors from the client lifecycle layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ClientError {
     ClientNotActivated(String),
     NotAttached(String),

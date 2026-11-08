@@ -28,6 +28,7 @@ pub enum DocSyncStatus {
 
 /// An event that occurs in a `Document` (JS `DocEvent`).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum DocEvent {
     /// The document status changed (JS `status-changed`).
     StatusChanged(DocStatus),
@@ -72,6 +73,7 @@ pub struct ChangeInfo {
 /// What an executed operation did (JS `OpInfo`). `path` is the JSON path of
 /// the target element, such as `$.todos.0`.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum OperationInfo {
     /// JS `SetOpInfo`.
     Set { path: String, key: String },

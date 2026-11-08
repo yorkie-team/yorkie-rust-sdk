@@ -111,6 +111,7 @@ impl FromStr for ErrorCode {
 
 /// The common error type used by Yorkie core.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum YorkieError {
     /// An object member key is not allowed by Yorkie's document model.
     InvalidObjectKey(String),
