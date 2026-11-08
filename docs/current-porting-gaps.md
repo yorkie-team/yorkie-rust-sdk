@@ -160,11 +160,11 @@ Gap:
   position-range conversions (`indexRangeToPosRange`, `posRangeToIndexRange`,
   `pathRangeToPosRange`, `posRangeToPathRange`), or the test helpers. There is
   no `JsonArray::push_tree` or `JsonArray::get_tree_mut` either.
-- JS ignores `TreeNodeInput` details a Rust enum cannot express the same way:
-  an element whose type is `"text"` and a text root are rejected with
-  `YorkieError::InvalidArgument`, since in JS the type alone makes a node a
-  text node. As in JS and Go, the attributes of the root given to
-  `JsonTree::new` are dropped.
+- Rust rejects two inputs with `YorkieError::InvalidArgument` that JS has no
+  check for: an element whose type is `"text"` and a text root. In JS the type
+  alone makes a node a text node, so such input would crash JS when it reads
+  the missing value or children. As in JS and Go, the attributes of the root
+  given to `JsonTree::new` are dropped.
 - Setting a `JsonTree` read from a document into another key copies its
   current nodes. JS builds an empty tree in that case, because such a `Tree`
   has no initial root.
