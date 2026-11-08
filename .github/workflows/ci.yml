@@ -17,8 +17,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Version pinned to rust-toolchain.toml; keep the two in step.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.99.1
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
@@ -38,7 +40,9 @@ jobs:
       YORKIE_IMAGE: yorkieteam/yorkie:0.7.24
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
       - uses: Swatinem/rust-cache@v2
       # The image's entrypoint is `yorkie` with no default command, and a
       # `services:` container cannot pass arguments, so start it with
@@ -48,12 +52,20 @@ jobs:
           docker run -d --name yorkie -p 8080:8080 -p 8081:8081 "$YORKIE_IMAGE" \
             server --rpc-port 8080 --profiling-port 8081
           for _ in $(seq 1 30); do
+            if [ "$(docker inspect -f '{{.State.Running}}' yorkie)" != "true" ]; then
+              docker logs yorkie
+              exit 1
+            fi
             if curl -s -o /dev/null "$YORKIE_TEST_RPC_ADDR"; then exit 0; fi
             sleep 1
           done
           docker logs yorkie
           exit 1
       - run: cargo test -p yorkie
+      - name: Smoke-run the quickstart example
+        run: cargo run -p yorkie --example quickstart
+        env:
+          YORKIE_RPC_ADDR: ${{ env.YORKIE_TEST_RPC_ADDR }}
       - name: Server logs
         if: failure()
         run: docker logs yorkie
