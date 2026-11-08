@@ -13,4 +13,4 @@ yorkie-protocol = { path = "../yorkie-protocol" }
 [dev-dependencies]
 async-trait = "0.1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

@@ -1,14 +1,26 @@
-//! Client lifecycle: activation, document attachment, and manual sync.
+//! Client lifecycle: activation, document attachment, manual sync, and the
+//! background loops that keep realtime documents in sync.
 //!
 //! JS reference: `packages/sdk/src/client/client.ts` (`activate`,
-//! `deactivate`, `attach`, `detach`, `sync`, `remove`, `changeSyncMode`).
+//! `deactivate`, `attach`, `detach`, `sync`, `remove`, `changeSyncMode`,
+//! `enqueueTask`, `syncInternal`, `detachInternal`).
 //!
 //! Locking: the client keeps its own state behind one mutex, and each attached
 //! document sits behind its own [`SharedDocument`] mutex. Neither lock is held
-//! across an `.await`, and the client never holds both at once.
+//! across an `.await`, and the client never holds both at once. Client calls
+//! and sync-loop rounds additionally take the async task queue, which is held
+//! across `.await`s so that only one of them talks to the server at a time,
+//! as in JS `enqueueTask`. Watch streams do not take it.
+//!
+//! Background loops (the sync loop in [`crate::sync_loop`] and one watch loop
+//! per realtime attachment in [`crate::watch`]) are tokio tasks. They hold a
+//! `Weak<ClientInner>`, so dropping every `Client` handle drops the client,
+//! and their [`TaskHandle`]s live in the client state: dropping a handle
+//! stops its loop. A `Client` must therefore be used inside a tokio runtime.
 
 use crate::attachment::{
-    default_document_poll_interval, resolve_document_poll_interval, Attachment, SharedDocument,
+    default_document_poll_interval, resolve_document_poll_interval, uses_watch_stream, Attachment,
+    SharedDocument,
 };
 use crate::connect::ConnectTransport;
 use crate::error::{ClientError, ClientResult};
@@ -17,12 +29,14 @@ use crate::transport::{
     ActivateClientRequest, AttachDocumentRequest, ClientTransport, DeactivateClientRequest,
     DetachDocumentRequest, PushPullChangesRequest, RemoveDocumentRequest,
 };
+use crate::{sync_loop, watch};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Debug, Formatter};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
-use yorkie_core::{ActorId, DocStatus, Document};
+use std::future::Future;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use yorkie_core::{ActorId, DocEvent, DocStatus, DocSyncStatus, Document};
 
 /// Client activation state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,47 +55,83 @@ pub enum ClientCondition {
 /// A Yorkie client (JS `Client`).
 ///
 /// It owns its transport and the documents attached to it. Clones share the
-/// same client, so it can be handed to background tasks.
+/// same client. Activating it starts a sync loop, and attaching a document in
+/// a realtime mode starts a watch stream; both run as tokio tasks, so the
+/// client must be used inside a tokio runtime.
 #[derive(Clone)]
 pub struct Client {
-    inner: Arc<ClientInner>,
+    pub(crate) inner: Arc<ClientInner>,
 }
 
-struct ClientInner {
+pub(crate) struct ClientInner {
     key: String,
     options: ClientOptions,
-    transport: Arc<dyn ClientTransport>,
+    pub(crate) transport: Arc<dyn ClientTransport>,
     state: Mutex<ClientState>,
+    /// Serializes client calls and sync-loop rounds (JS `enqueueTask`).
+    task_queue: tokio::sync::Mutex<()>,
+    /// Background loops currently alive, counted by the loops themselves.
+    running_tasks: Arc<AtomicUsize>,
 }
 
 /// Mutable client state. Locked only for synchronous steps.
-struct ClientState {
+pub(crate) struct ClientState {
     /// Per-session ID the server routes requests by (JS `id`).
     id: Option<ActorId>,
     /// Actor stamped into document changes (JS `actorID`).
     actor_id: Option<ActorId>,
     status: ClientStatus,
     conditions: BTreeMap<ClientCondition, bool>,
-    attachments: BTreeMap<String, Attachment>,
+    pub(crate) attachments: BTreeMap<String, Attachment>,
     /// Keys with an attach in flight (JS `attachingDocs`).
     attaching: BTreeSet<String>,
+    /// The sync loop task while the client is active.
+    sync_loop: Option<TaskHandle>,
 }
 
 /// The IDs an active client sends in requests and stamps into changes.
-struct Session {
-    client_id: ActorId,
-    actor_id: ActorId,
+pub(crate) struct Session {
+    pub(crate) client_id: ActorId,
+    pub(crate) actor_id: ActorId,
 }
 
 /// A document to push and pull, captured from its attachment.
-struct SyncTarget {
-    key: String,
-    doc: SharedDocument,
+pub(crate) struct SyncTarget {
+    pub(crate) key: String,
+    pub(crate) doc: SharedDocument,
     document_id: String,
     /// Mode the request is sent in; `RealtimePushOnly` sends push-only.
     request_mode: SyncMode,
     /// Mode of the attachment when the sync started.
     attachment_mode: SyncMode,
+}
+
+/// A running background loop. Dropping the handle stops the loop at its next
+/// `.await`.
+#[derive(Debug)]
+pub(crate) struct TaskHandle(tokio::task::AbortHandle);
+
+impl Drop for TaskHandle {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Counts a background loop as running until its future is dropped, which
+/// happens when it returns or is aborted.
+struct RunningTask(Arc<AtomicUsize>);
+
+impl RunningTask {
+    fn start(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter.clone())
+    }
+}
+
+impl Drop for RunningTask {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Client {
@@ -104,6 +154,7 @@ impl Client {
             ]),
             attachments: BTreeMap::new(),
             attaching: BTreeSet::new(),
+            sync_loop: None,
         };
 
         Self {
@@ -112,8 +163,16 @@ impl Client {
                 options,
                 transport,
                 state: Mutex::new(state),
+                task_queue: tokio::sync::Mutex::new(()),
+                running_tasks: Arc::new(AtomicUsize::new(0)),
             }),
         }
+    }
+
+    /// Returns the client a background loop works for, if a handle to it is
+    /// still alive.
+    pub(crate) fn upgrade(inner: &Weak<ClientInner>) -> Option<Self> {
+        inner.upgrade().map(|inner| Self { inner })
     }
 
     /// Returns the per-session client ID used to route requests (JS `getID`).
@@ -155,8 +214,17 @@ impl Client {
         self.state().attachments.contains_key(key)
     }
 
-    /// Registers this client with the server (JS `activate`).
+    /// Returns how many background loops (the sync loop and watch loops) are
+    /// running. For tests that check the loops stop.
+    #[doc(hidden)]
+    pub fn running_task_count(&self) -> usize {
+        self.inner.running_tasks.load(Ordering::SeqCst)
+    }
+
+    /// Registers this client with the server and starts the sync loop (JS
+    /// `activate`).
     pub async fn activate(&self) -> ClientResult<()> {
+        let _queue = self.lock_task_queue().await;
         if self.is_active() {
             return Ok(());
         }
@@ -180,12 +248,16 @@ impl Client {
         state.id = Some(response.client_id);
         state.status = ClientStatus::Activated;
         state.conditions.insert(ClientCondition::SyncLoop, true);
+        // Spawned after the status is set, so the loop's first round sees an
+        // active client.
+        state.sync_loop = Some(sync_loop::spawn(&self.inner));
         Ok(())
     }
 
-    /// Deactivates this client and detaches every attached document locally
-    /// (JS `deactivate` and `deactivateInternal`).
+    /// Deactivates this client, stops its loops, and detaches every attached
+    /// document locally (JS `deactivate` and `deactivateInternal`).
     pub async fn deactivate(&self, options: DeactivateOptions) -> ClientResult<()> {
+        let _queue = self.lock_task_queue().await;
         let client_id = {
             let state = self.state();
             if state.status == ClientStatus::Deactivated {
@@ -203,15 +275,20 @@ impl Client {
             })
             .await?;
 
-        let attachments = {
+        let (attachments, sync_loop) = {
             let mut state = self.state();
             state.status = ClientStatus::Deactivated;
             state.conditions.insert(ClientCondition::SyncLoop, false);
             state.conditions.insert(ClientCondition::WatchLoop, false);
-            std::mem::take(&mut state.attachments)
+            (
+                std::mem::take(&mut state.attachments),
+                state.sync_loop.take(),
+            )
         };
+        drop(sync_loop);
         for attachment in attachments.into_values() {
-            lock_document(&attachment.doc).apply_status(DocStatus::Detached);
+            let doc = release_attachment(attachment);
+            lock_document(&doc).apply_status(DocStatus::Detached);
         }
         Ok(())
     }
@@ -219,7 +296,9 @@ impl Client {
     /// Attaches the document and returns it (JS `attach`).
     ///
     /// As in JS, the document is stamped with this client's actor and its
-    /// initial presence is set before the attach request is sent.
+    /// initial presence is set before the attach request is sent. In a
+    /// realtime mode it then opens the watch stream and waits until the
+    /// stream is initialized or its first attempt fails.
     pub async fn attach(
         &self,
         doc: SharedDocument,
@@ -233,6 +312,7 @@ impl Client {
             schema,
         } = options;
 
+        let _queue = self.lock_task_queue().await;
         let session = self.session()?;
         let key = {
             let doc = lock_document(&doc);
@@ -247,7 +327,7 @@ impl Client {
 
         let change_pack = {
             let mut doc = lock_document(&doc);
-            doc.set_actor(session.actor_id);
+            doc.set_actor(session.actor_id.clone());
             doc.update_with_presence(|_, presence| {
                 presence.set(initial_presence);
                 Ok(())
@@ -259,7 +339,7 @@ impl Client {
             .inner
             .transport
             .attach_document(AttachDocumentRequest {
-                client_id: session.client_id,
+                client_id: session.client_id.clone(),
                 change_pack,
                 schema_key: schema,
                 shard_key: self.shard_key(&key),
@@ -285,19 +365,37 @@ impl Client {
             return Ok(doc);
         }
 
-        {
+        // The client may have been deactivated, or activated again as another
+        // session, while the request was in flight.
+        let watch_ready = {
             let mut state = self.state();
-            state.attachments.insert(
-                key,
-                Attachment::new(
+            if state.is_current(&session) {
+                let mut attachment = Attachment::new(
                     doc.clone(),
                     response.document_id,
                     sync_mode,
                     poll_interval,
                     poll_interval_pinned,
-                ),
-            );
-            state.refresh_watch_loop_condition();
+                );
+                let watch_ready = uses_watch_stream(sync_mode).then(|| {
+                    let (task, ready) = watch::spawn(&self.inner, key.clone(), doc.clone());
+                    attachment.watch_task = Some(task);
+                    ready
+                });
+                state.attachments.insert(key.clone(), attachment);
+                state.refresh_watch_loop_condition();
+                Some(watch_ready)
+            } else {
+                None
+            }
+        };
+        let Some(watch_ready) = watch_ready else {
+            lock_document(&doc).apply_status(DocStatus::Detached);
+            return Err(ClientError::ClientNotActivated(self.inner.key.clone()));
+        };
+        if let Some(ready) = watch_ready {
+            // An error only means the watch task ended first.
+            let _ = ready.await;
         }
 
         if let Some(initial_root) = initial_root {
@@ -323,9 +421,10 @@ impl Client {
     /// As in JS, the presence is cleared first so peers drop this client's
     /// presence when the detach change reaches them.
     pub async fn detach(&self, doc: &SharedDocument, _options: DetachOptions) -> ClientResult<()> {
+        let _queue = self.lock_task_queue().await;
         let session = self.session()?;
         let key = document_key(doc);
-        let document_id = self.attached_document_id(&key)?;
+        let document_id = self.attached_document_id(&key, doc)?;
 
         let change_pack = {
             let mut doc = lock_document(doc);
@@ -355,7 +454,7 @@ impl Client {
                 doc.apply_status(DocStatus::Detached);
             }
         }
-        self.remove_attachment(&key);
+        self.remove_attachment(&key, doc);
         Ok(())
     }
 
@@ -364,6 +463,7 @@ impl Client {
     /// With a document, it syncs that document in push-pull mode. With
     /// `None`, it syncs every attached document in its attachment's mode.
     pub async fn sync(&self, doc: Option<&SharedDocument>) -> ClientResult<()> {
+        let _queue = self.lock_task_queue().await;
         let session = self.session()?;
         let targets = match doc {
             Some(doc) => {
@@ -372,6 +472,7 @@ impl Client {
                 let attachment = state
                     .attachments
                     .get(&key)
+                    .filter(|attachment| attachment.holds(doc))
                     .ok_or_else(|| ClientError::NotAttached(key.clone()))?;
                 vec![SyncTarget::new(key, attachment, SyncMode::Realtime)]
             }
@@ -393,9 +494,10 @@ impl Client {
 
     /// Removes the document on the server (JS `remove`).
     pub async fn remove(&self, doc: &SharedDocument) -> ClientResult<()> {
+        let _queue = self.lock_task_queue().await;
         let session = self.session()?;
         let key = document_key(doc);
-        let document_id = self.attached_document_id(&key)?;
+        let document_id = self.attached_document_id(&key, doc)?;
 
         let change_pack = {
             let mut doc = lock_document(doc);
@@ -417,43 +519,108 @@ impl Client {
             .await?;
 
         lock_document(doc).apply_change_pack(&response.change_pack)?;
-        self.remove_attachment(&key);
+        self.remove_attachment(&key, doc);
         Ok(())
     }
 
     /// Changes the sync mode of an attached document (JS `changeSyncMode`).
+    ///
+    /// Leaving the realtime modes for `Manual` or `Polling` closes the watch
+    /// stream; coming back opens it again and waits for it as `attach` does.
+    /// Switching to `Realtime` pulls at the next sync-loop tick.
     pub async fn change_sync_mode(
         &self,
         doc: &SharedDocument,
         sync_mode: SyncMode,
     ) -> ClientResult<()> {
+        let _queue = self.lock_task_queue().await;
         let key = document_key(doc);
-        let mut state = self.state();
-        state.session(&self.inner.key)?;
-        let Some(attachment) = state.attachments.get_mut(&key) else {
-            return Err(ClientError::NotAttached(key));
+        let (stopped_watch, watch_ready) = {
+            let mut state = self.state();
+            state.session(&self.inner.key)?;
+            let Some(attachment) = state
+                .attachments
+                .get_mut(&key)
+                .filter(|attachment| attachment.holds(doc))
+            else {
+                return Err(ClientError::NotAttached(key));
+            };
+
+            let prev_sync_mode = attachment.sync_mode;
+            if prev_sync_mode == sync_mode {
+                return Ok(());
+            }
+
+            let stopped_watch = if uses_watch_stream(sync_mode) {
+                None
+            } else {
+                attachment.watch_task.take()
+            };
+            attachment.sync_mode = sync_mode;
+            // JS: the server sends no change events while the stream is
+            // closed or ignored, so pull once on resuming realtime sync.
+            if sync_mode == SyncMode::Realtime {
+                attachment.change_event_received = true;
+            }
+            if !attachment.poll_interval_pinned {
+                attachment.poll_interval = default_document_poll_interval(sync_mode);
+            }
+            let watch_ready = (!uses_watch_stream(prev_sync_mode) && uses_watch_stream(sync_mode))
+                .then(|| {
+                    let (task, ready) = watch::spawn(&self.inner, key.clone(), doc.clone());
+                    attachment.watch_task = Some(task);
+                    ready
+                });
+            state.refresh_watch_loop_condition();
+            (stopped_watch, watch_ready)
         };
 
-        if attachment.sync_mode == sync_mode {
-            return Ok(());
+        if let Some(task) = stopped_watch {
+            drop(task);
+            watch::publish_disconnected(&mut lock_document(doc));
         }
-
-        attachment.sync_mode = sync_mode;
-        if !attachment.poll_interval_pinned {
-            attachment.poll_interval = default_document_poll_interval(sync_mode);
+        if let Some(ready) = watch_ready {
+            // An error only means the watch task ended first.
+            let _ = ready.await;
         }
-        state.refresh_watch_loop_condition();
         Ok(())
     }
 
-    async fn sync_document(&self, client_id: &ActorId, target: SyncTarget) -> ClientResult<()> {
+    /// Pushes and pulls one document and publishes the sync status (JS
+    /// `syncInternal`).
+    pub(crate) async fn sync_document(
+        &self,
+        client_id: &ActorId,
+        target: SyncTarget,
+    ) -> ClientResult<()> {
+        let result = self.push_pull(client_id, &target).await;
+        let status = match result {
+            Ok(_) => DocSyncStatus::Synced,
+            Err(_) => DocSyncStatus::SyncFailed,
+        };
+        lock_document(&target.doc).publish(DocEvent::SyncStatusChanged(status));
+
+        let removed = result?;
+        if removed {
+            self.remove_attachment(&target.key, &target.doc);
+        } else {
+            self.with_attachment(&target.key, &target.doc, |attachment| {
+                attachment.last_synced_at = Some(Instant::now());
+            });
+        }
+        Ok(())
+    }
+
+    /// Sends one push-pull request and applies the response. Returns whether
+    /// the response removed the document.
+    async fn push_pull(&self, client_id: &ActorId, target: &SyncTarget) -> ClientResult<bool> {
         let change_pack = lock_document(&target.doc).create_change_pack();
         let response = self
             .inner
             .transport
             .push_pull_changes(PushPullChangesRequest {
                 client_id: client_id.clone(),
-                document_id: target.document_id,
+                document_id: target.document_id.clone(),
                 change_pack,
                 push_only: target.request_mode == SyncMode::RealtimePushOnly,
                 shard_key: self.shard_key(&target.key),
@@ -466,44 +633,75 @@ impl Client {
                 SyncMode::RealtimePushOnly | SyncMode::RealtimeSyncOff
             )
         {
-            return Ok(());
+            return Ok(false);
         }
 
-        let removed = {
-            let mut doc = lock_document(&target.doc);
-            doc.apply_change_pack(&response.change_pack)?;
-            doc.status() == DocStatus::Removed
-        };
-        if removed {
-            self.remove_attachment(&target.key);
-        }
-        Ok(())
+        let mut doc = lock_document(&target.doc);
+        doc.apply_change_pack(&response.change_pack)?;
+        Ok(doc.status() == DocStatus::Removed)
     }
 
-    fn state(&self) -> MutexGuard<'_, ClientState> {
+    /// Waits for the task queue, which serializes client calls and sync-loop
+    /// rounds (JS `enqueueTask`).
+    pub(crate) async fn lock_task_queue(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.inner.task_queue.lock().await
+    }
+
+    pub(crate) fn state(&self) -> MutexGuard<'_, ClientState> {
         self.inner.state()
     }
 
-    fn session(&self) -> ClientResult<Session> {
+    pub(crate) fn session(&self) -> ClientResult<Session> {
         self.state().session(&self.inner.key)
     }
 
-    fn attached_document_id(&self, key: &str) -> ClientResult<String> {
+    pub(crate) fn set_condition(&self, condition: ClientCondition, value: bool) {
+        self.state().conditions.insert(condition, value);
+    }
+
+    /// Runs `f` on the attachment of `key` if it still holds `doc`.
+    pub(crate) fn with_attachment<R>(
+        &self,
+        key: &str,
+        doc: &SharedDocument,
+        f: impl FnOnce(&mut Attachment) -> R,
+    ) -> Option<R> {
         self.state()
             .attachments
-            .get(key)
-            .map(|attachment| attachment.resource_id.clone())
+            .get_mut(key)
+            .filter(|attachment| attachment.holds(doc))
+            .map(f)
+    }
+
+    pub(crate) fn shard_key(&self, resource_key: &str) -> String {
+        format!("{}/{}", self.inner.options.api_key, resource_key)
+    }
+
+    fn attached_document_id(&self, key: &str, doc: &SharedDocument) -> ClientResult<String> {
+        self.with_attachment(key, doc, |attachment| attachment.resource_id.clone())
             .ok_or_else(|| ClientError::NotAttached(key.to_owned()))
     }
 
-    fn remove_attachment(&self, key: &str) {
-        let mut state = self.state();
-        state.attachments.remove(key);
-        state.refresh_watch_loop_condition();
-    }
-
-    fn shard_key(&self, resource_key: &str) -> String {
-        format!("{}/{}", self.inner.options.api_key, resource_key)
+    /// Drops the attachment of `key` if it still holds `doc`, which stops its
+    /// watch stream (JS `detachInternal`). The only place attachments are
+    /// removed one at a time.
+    fn remove_attachment(&self, key: &str, doc: &SharedDocument) {
+        let attachment = {
+            let mut state = self.state();
+            if !state
+                .attachments
+                .get(key)
+                .is_some_and(|attachment| attachment.holds(doc))
+            {
+                return;
+            }
+            let attachment = state.attachments.remove(key);
+            state.refresh_watch_loop_condition();
+            attachment
+        };
+        if let Some(attachment) = attachment {
+            release_attachment(attachment);
+        }
     }
 
     #[cfg(test)]
@@ -532,10 +730,21 @@ impl ClientInner {
     fn state(&self) -> MutexGuard<'_, ClientState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    /// Spawns a background loop that counts as running until it ends or its
+    /// handle is dropped.
+    pub(crate) fn spawn_task(&self, task: impl Future<Output = ()> + Send + 'static) -> TaskHandle {
+        let running = RunningTask::start(&self.running_tasks);
+        let handle = tokio::spawn(async move {
+            let _running = running;
+            task.await;
+        });
+        TaskHandle(handle.abort_handle())
+    }
 }
 
 impl ClientState {
-    fn session(&self, client_key: &str) -> ClientResult<Session> {
+    pub(crate) fn session(&self, client_key: &str) -> ClientResult<Session> {
         match (&self.status, &self.id, &self.actor_id) {
             (ClientStatus::Activated, Some(client_id), Some(actor_id)) => Ok(Session {
                 client_id: client_id.clone(),
@@ -545,18 +754,23 @@ impl ClientState {
         }
     }
 
+    /// Whether the client is still active in the given session.
+    fn is_current(&self, session: &Session) -> bool {
+        self.status == ClientStatus::Activated && self.id.as_ref() == Some(&session.client_id)
+    }
+
     fn refresh_watch_loop_condition(&mut self) {
         let has_watch_attachment = self
             .attachments
             .values()
-            .any(|attachment| should_start_watch_loop(attachment.sync_mode));
+            .any(|attachment| uses_watch_stream(attachment.sync_mode));
         self.conditions
             .insert(ClientCondition::WatchLoop, has_watch_attachment);
     }
 }
 
 impl SyncTarget {
-    fn new(key: String, attachment: &Attachment, request_mode: SyncMode) -> Self {
+    pub(crate) fn new(key: String, attachment: &Attachment, request_mode: SyncMode) -> Self {
         Self {
             key,
             doc: attachment.doc.clone(),
@@ -593,7 +807,28 @@ impl Drop for AttachingGuard<'_> {
     }
 }
 
-fn lock_document(doc: &SharedDocument) -> MutexGuard<'_, Document> {
+/// Drops a removed attachment, stopping its watch stream, and clears the
+/// document's online clients (JS `detachInternal`). A document that was
+/// watched also gets the events JS publishes when its stream closes. Must be
+/// called without the client state lock.
+fn release_attachment(attachment: Attachment) -> SharedDocument {
+    let Attachment {
+        doc, watch_task, ..
+    } = attachment;
+    let watched = watch_task.is_some();
+    drop(watch_task);
+    {
+        let mut doc = lock_document(&doc);
+        if watched {
+            watch::publish_disconnected(&mut doc);
+        } else {
+            doc.reset_online_clients();
+        }
+    }
+    doc
+}
+
+pub(crate) fn lock_document(doc: &SharedDocument) -> MutexGuard<'_, Document> {
     doc.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -613,10 +848,6 @@ fn generate_client_key() -> String {
     format!("rust-{timestamp:x}-{counter:x}")
 }
 
-fn should_start_watch_loop(sync_mode: SyncMode) -> bool {
-    sync_mode != SyncMode::Manual && sync_mode != SyncMode::Polling
-}
-
 #[cfg(test)]
 mod tests {
     use super::{Client, ClientCondition, ClientStatus};
@@ -633,18 +864,18 @@ mod tests {
         AttachDocumentResponse, ClientTransport, DeactivateClientRequest, DeactivateClientResponse,
         DetachDocumentRequest, DetachDocumentResponse, PushPullChangesRequest,
         PushPullChangesResponse, RemoveDocumentRequest, RemoveDocumentResponse,
-        WatchDocumentRequest, WatchStream,
+        WatchDocumentRequest, WatchDocumentResponse, WatchStream,
     };
     use async_trait::async_trait;
-    use futures_util::stream;
+    use futures_util::stream::{self, StreamExt};
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::future::Future;
     use std::sync::{Arc, Mutex};
-    use std::task::{Context, Poll, Waker};
     use std::time::Duration;
     use yorkie_core::{
-        ActorId, DocStatus, Document, JsonObject, Presence, SchemaRule, TreeNodeRule, YorkieError,
+        ActorId, DocEvent, DocStatus, DocSyncStatus, Document, JsonObject, Presence, SchemaRule,
+        StreamConnectionStatus, TreeNodeRule, YorkieError,
     };
     use yorkie_protocol::converter;
     use yorkie_protocol::yorkie::v1::presence_change::ChangeType;
@@ -659,6 +890,11 @@ mod tests {
         detach_requests: Mutex<Vec<DetachDocumentRequest>>,
         remove_requests: Mutex<Vec<RemoveDocumentRequest>>,
         push_pull_requests: Mutex<Vec<PushPullChangesRequest>>,
+        watch_requests: Mutex<Vec<WatchDocumentRequest>>,
+        /// Messages for the next watch streams, one list per stream. A stream
+        /// stays open after its messages; once these run out, streams report
+        /// no other watchers.
+        watch_scripts: Mutex<Vec<Vec<ClientResult<WatchDocumentResponse>>>>,
         attach_max_size_per_document: usize,
         attach_schema_rules: Vec<SchemaRule>,
     }
@@ -674,6 +910,8 @@ mod tests {
                 detach_requests: Mutex::new(Vec::new()),
                 remove_requests: Mutex::new(Vec::new()),
                 push_pull_requests: Mutex::new(Vec::new()),
+                watch_requests: Mutex::new(Vec::new()),
+                watch_scripts: Mutex::new(Vec::new()),
                 attach_max_size_per_document: 0,
                 attach_schema_rules: Vec::new(),
             }
@@ -742,28 +980,33 @@ mod tests {
             Ok(PushPullChangesResponse { change_pack })
         }
 
-        async fn watch_document(
-            &self,
-            _request: WatchDocumentRequest,
-        ) -> ClientResult<WatchStream> {
-            Ok(Box::pin(stream::pending()))
+        async fn watch_document(&self, request: WatchDocumentRequest) -> ClientResult<WatchStream> {
+            self.watch_requests.lock().unwrap().push(request);
+            let mut scripts = self.watch_scripts.lock().unwrap();
+            let messages = if scripts.is_empty() {
+                vec![Ok(WatchDocumentResponse::Initialization {
+                    client_ids: Vec::new(),
+                    heartbeat_interval_ms: 0,
+                })]
+            } else {
+                scripts.remove(0)
+            };
+            Ok(Box::pin(stream::iter(messages).chain(stream::pending())))
         }
     }
 
+    /// Runs one client call on a fresh single-threaded runtime. Background
+    /// loops it spawns run only while the call waits, and stop when the
+    /// runtime is dropped at the end, so request counts stay exact.
     fn block_on<F>(future: F) -> F::Output
     where
         F: Future,
     {
-        let waker = Waker::noop();
-        let mut context = Context::from_waker(waker);
-        let mut future = std::pin::pin!(future);
-
-        loop {
-            match future.as_mut().poll(&mut context) {
-                Poll::Ready(output) => return output,
-                Poll::Pending => std::thread::yield_now(),
-            }
-        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future)
     }
 
     fn mock_client(options: ClientOptions, transport: &Arc<MockTransport>) -> Client {
@@ -884,6 +1127,7 @@ mod tests {
             retry_sync_loop_delay: Duration::from_millis(200),
             reconnect_stream_delay: Duration::from_millis(300),
             channel_heartbeat_interval: Duration::from_secs(10),
+            watch_heartbeat_interval: Duration::from_secs(5),
             user_agent: Some("test-agent".to_owned()),
         };
 
@@ -1449,6 +1693,350 @@ mod tests {
             err
         );
         assert!(client.state().attaching.is_empty());
+        Ok(())
+    }
+
+    fn fast_loop_options() -> ClientOptions {
+        ClientOptions {
+            sync_loop_duration: Duration::from_millis(5),
+            retry_sync_loop_delay: Duration::from_millis(5),
+            reconnect_stream_delay: Duration::from_millis(5),
+            ..keyed_options()
+        }
+    }
+
+    /// Polls `condition` every few milliseconds for up to five seconds.
+    async fn eventually(mut condition: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !condition() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "condition not met within 5s"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    fn set_title(doc: &SharedDocument) {
+        doc.lock()
+            .unwrap()
+            .update(|root| root.set("title", "hello").map(|_| ()))
+            .unwrap();
+    }
+
+    fn pushed_keys(transport: &MockTransport) -> Vec<String> {
+        transport
+            .push_pull_requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.change_pack.document_key().to_owned())
+            .collect()
+    }
+
+    fn collect_events(doc: &SharedDocument) -> Arc<Mutex<Vec<DocEvent>>> {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        doc.lock()
+            .unwrap()
+            .subscribe(move |event| sink.lock().unwrap().push(event.clone()));
+        events
+    }
+
+    /// JS `runSyncLoop` with `needRealtimeSync`: realtime documents with
+    /// local changes are pushed in the background, manual ones are not.
+    #[tokio::test]
+    async fn sync_loop_pushes_realtime_documents_only() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        let client = mock_client(fast_loop_options(), &transport);
+        let realtime = shared("realtime");
+        let manual = shared("manual");
+
+        client.activate().await?;
+        client
+            .attach(realtime.clone(), AttachOptions::default())
+            .await?;
+        client
+            .attach(
+                manual.clone(),
+                AttachOptions {
+                    sync_mode: SyncMode::Manual,
+                    ..AttachOptions::default()
+                },
+            )
+            .await?;
+        let events = collect_events(&realtime);
+        set_title(&realtime);
+        set_title(&manual);
+
+        eventually(|| !realtime.lock().unwrap().has_local_changes()).await;
+        assert!(events
+            .lock()
+            .unwrap()
+            .contains(&DocEvent::SyncStatusChanged(DocSyncStatus::Synced)));
+        // Give the loop a few more rounds to (wrongly) pick up the manual one.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(manual.lock().unwrap().has_local_changes());
+        assert!(!pushed_keys(&transport).contains(&"manual".to_owned()));
+        {
+            let requests = transport.watch_requests.lock().unwrap();
+            assert_eq!(1, requests.len());
+            assert_eq!("document-id", requests[0].document_id);
+            assert_eq!("000000000000000000000001", requests[0].actor_id.as_str());
+            assert_eq!(20000, requests[0].heartbeat_interval_ms);
+            assert_eq!("api-key/realtime", requests[0].shard_key);
+        }
+
+        client.deactivate(DeactivateOptions::default()).await?;
+        Ok(())
+    }
+
+    /// JS `runWatchStream`: an error ends the stream with `Disconnected`, and
+    /// the loop opens a new one after `reconnectStreamDelay`.
+    #[tokio::test]
+    async fn watch_loop_reconnects_after_a_retryable_error() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        *transport.watch_scripts.lock().unwrap() = vec![vec![
+            Ok(WatchDocumentResponse::Initialization {
+                client_ids: Vec::new(),
+                heartbeat_interval_ms: 0,
+            }),
+            Err(ClientError::Transport("connection reset".to_owned())),
+        ]];
+        let client = mock_client(fast_loop_options(), &transport);
+        let doc = shared("doc-key");
+        let events = collect_events(&doc);
+
+        client.activate().await?;
+        client.attach(doc.clone(), AttachOptions::default()).await?;
+        eventually(|| transport.watch_requests.lock().unwrap().len() >= 2).await;
+        eventually(|| {
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event, DocEvent::Initialized(_)))
+                .count()
+                >= 3
+        })
+        .await;
+
+        let connection = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                DocEvent::ConnectionChanged(status) => Some(*status),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            vec![
+                StreamConnectionStatus::Connected,
+                StreamConnectionStatus::Disconnected,
+                StreamConnectionStatus::Connected,
+            ],
+            connection
+        );
+        assert!(client.condition(ClientCondition::WatchLoop));
+        client.deactivate(DeactivateOptions::default()).await?;
+        Ok(())
+    }
+
+    /// JS `handleConnectError` returning false: the watch loop stops.
+    #[tokio::test]
+    async fn watch_loop_stops_after_a_non_retryable_error() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        *transport.watch_scripts.lock().unwrap() = vec![vec![Err(ClientError::Rpc {
+            code: "permission_denied".to_owned(),
+            message: "denied".to_owned(),
+        })]];
+        let client = mock_client(fast_loop_options(), &transport);
+        let doc = shared("doc-key");
+
+        client.activate().await?;
+        client.attach(doc.clone(), AttachOptions::default()).await?;
+        eventually(|| client.running_task_count() == 1).await;
+
+        assert!(!client.condition(ClientCondition::WatchLoop));
+        assert!(client.has("doc-key"));
+        assert_eq!(1, transport.watch_requests.lock().unwrap().len());
+        client.deactivate(DeactivateOptions::default()).await?;
+        Ok(())
+    }
+
+    /// JS `changeSyncMode`: Manual closes the stream, Realtime reopens it.
+    #[tokio::test]
+    async fn change_sync_mode_stops_and_restarts_the_watch_stream() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        let client = mock_client(fast_loop_options(), &transport);
+        let doc = shared("doc-key");
+
+        client.activate().await?;
+        client.attach(doc.clone(), AttachOptions::default()).await?;
+        assert_eq!(2, client.running_task_count());
+
+        client.change_sync_mode(&doc, SyncMode::Manual).await?;
+        eventually(|| client.running_task_count() == 1).await;
+        set_title(&doc);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(doc.lock().unwrap().has_local_changes());
+
+        // Requests from the realtime period, before the switch.
+        let pushed_before = transport.push_pull_requests.lock().unwrap().len();
+        client
+            .change_sync_mode(&doc, SyncMode::RealtimePushOnly)
+            .await?;
+        assert_eq!(2, client.running_task_count());
+        assert_eq!(2, transport.watch_requests.lock().unwrap().len());
+        eventually(|| transport.push_pull_requests.lock().unwrap().len() > pushed_before).await;
+        assert!(
+            transport.push_pull_requests.lock().unwrap()[pushed_before..]
+                .iter()
+                .all(|request| request.push_only)
+        );
+
+        client.deactivate(DeactivateOptions::default()).await?;
+        Ok(())
+    }
+
+    /// Loops hold the client weakly: deactivating stops them, and dropping
+    /// the last handle drops the client and stops them too.
+    #[tokio::test]
+    async fn background_loops_stop_on_deactivate_and_on_drop() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        let client = mock_client(fast_loop_options(), &transport);
+        client.activate().await?;
+        client
+            .attach(shared("doc-key"), AttachOptions::default())
+            .await?;
+        assert_eq!(2, client.running_task_count());
+        client.deactivate(DeactivateOptions::default()).await?;
+        eventually(|| client.running_task_count() == 0).await;
+
+        let client = mock_client(fast_loop_options(), &transport);
+        client.activate().await?;
+        client
+            .attach(shared("doc-key"), AttachOptions::default())
+            .await?;
+        let running = client.inner.running_tasks.clone();
+        let inner = Arc::downgrade(&client.inner);
+        assert_eq!(2, running.load(std::sync::atomic::Ordering::SeqCst));
+        drop(client);
+        eventually(|| inner.upgrade().is_none()).await;
+        eventually(|| running.load(std::sync::atomic::Ordering::SeqCst) == 0).await;
+        Ok(())
+    }
+
+    /// Review rule: an attach that finishes after the client left the session
+    /// it started in must not register the document.
+    #[test]
+    fn attach_finishing_after_deactivation_is_rejected() {
+        struct DeactivatingTransport {
+            mock: MockTransport,
+            client: Mutex<Option<Client>>,
+        }
+
+        #[async_trait]
+        impl ClientTransport for DeactivatingTransport {
+            async fn activate_client(
+                &self,
+                request: ActivateClientRequest,
+            ) -> ClientResult<ActivateClientResponse> {
+                self.mock.activate_client(request).await
+            }
+
+            async fn deactivate_client(
+                &self,
+                request: DeactivateClientRequest,
+            ) -> ClientResult<DeactivateClientResponse> {
+                self.mock.deactivate_client(request).await
+            }
+
+            /// Deactivates the client while the attach is "in flight".
+            async fn attach_document(
+                &self,
+                request: AttachDocumentRequest,
+            ) -> ClientResult<AttachDocumentResponse> {
+                if let Some(client) = self.client.lock().unwrap().take() {
+                    client.state().status = ClientStatus::Deactivated;
+                }
+                self.mock.attach_document(request).await
+            }
+
+            async fn detach_document(
+                &self,
+                request: DetachDocumentRequest,
+            ) -> ClientResult<DetachDocumentResponse> {
+                self.mock.detach_document(request).await
+            }
+
+            async fn remove_document(
+                &self,
+                request: RemoveDocumentRequest,
+            ) -> ClientResult<RemoveDocumentResponse> {
+                self.mock.remove_document(request).await
+            }
+
+            async fn push_pull_changes(
+                &self,
+                request: PushPullChangesRequest,
+            ) -> ClientResult<PushPullChangesResponse> {
+                self.mock.push_pull_changes(request).await
+            }
+
+            async fn watch_document(
+                &self,
+                request: WatchDocumentRequest,
+            ) -> ClientResult<WatchStream> {
+                self.mock.watch_document(request).await
+            }
+        }
+
+        let transport = Arc::new(DeactivatingTransport {
+            mock: MockTransport::default(),
+            client: Mutex::new(None),
+        });
+        let client = Client::with_transport(keyed_options(), transport.clone());
+        *transport.client.lock().unwrap() = Some(client.clone());
+        let doc = shared("doc-key");
+
+        client.apply_activation("000000000000000000000001");
+        let err = block_on(client.attach(doc.clone(), AttachOptions::default())).unwrap_err();
+
+        assert_eq!(
+            ClientError::ClientNotActivated("client-key".to_owned()),
+            err
+        );
+        assert!(!client.has("doc-key"));
+        assert_eq!(DocStatus::Detached, doc.lock().unwrap().status());
+        assert_eq!(0, client.running_task_count());
+    }
+
+    /// Review rule: work that resumes after an `.await` only removes the
+    /// attachment it started with, never a newer one with the same key.
+    #[test]
+    fn remove_attachment_keeps_a_newer_document_with_the_same_key() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        let client = mock_client(keyed_options(), &transport);
+        let doc = shared("doc-key");
+        let stale = shared("doc-key");
+
+        client.apply_activation("000000000000000000000001");
+        block_on(client.attach(doc.clone(), AttachOptions::default()))?;
+        client.remove_attachment("doc-key", &stale);
+        assert!(client.has("doc-key"));
+
+        assert_eq!(
+            ClientError::NotAttached("doc-key".to_owned()),
+            block_on(client.sync(Some(&stale))).unwrap_err()
+        );
+        assert_eq!(
+            ClientError::NotAttached("doc-key".to_owned()),
+            block_on(client.detach(&stale, DetachOptions)).unwrap_err()
+        );
+        client.remove_attachment("doc-key", &doc);
+        assert!(!client.has("doc-key"));
         Ok(())
     }
 }

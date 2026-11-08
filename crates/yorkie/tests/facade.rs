@@ -3,7 +3,6 @@ use futures_util::stream;
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
 use yorkie::{
     ActivateClientRequest, ActivateClientResponse, ActorId, AttachChannelOptions,
     AttachDocumentRequest, AttachDocumentResponse, AttachOptions, ChangePack, Checkpoint, Client,
@@ -99,20 +98,17 @@ impl ClientTransport for FacadeTransport {
     }
 }
 
+/// Runs one client call on a fresh runtime; the loops it starts stop when
+/// the runtime is dropped.
 fn block_on<F>(future: F) -> F::Output
 where
     F: Future,
 {
-    let waker = Waker::noop();
-    let mut context = Context::from_waker(waker);
-    let mut future = std::pin::pin!(future);
-
-    loop {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(output) => return output,
-            Poll::Pending => std::thread::yield_now(),
-        }
-    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(future)
 }
 
 #[test]

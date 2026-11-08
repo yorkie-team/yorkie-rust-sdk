@@ -6,7 +6,7 @@
 
 mod integration_support;
 
-use integration_support::{rpc_addr, unique_key};
+use integration_support::{eventually, rpc_addr, unique_key};
 use std::sync::{Arc, Mutex};
 use yorkie::{
     AttachOptions, Client, ClientError, ClientOptions, DeactivateOptions, DetachOptions, DocStatus,
@@ -167,7 +167,8 @@ async fn attach_with_initial_presence() {
 }
 
 /// Review Focus 5. JS `deactivateInternal` detaches every attachment and
-/// sets each document to `Detached`. No background tasks exist yet.
+/// sets each document to `Detached`; JS `deactivate` stops the sync loop and
+/// `detachInternal` cancels each watch stream.
 #[tokio::test]
 async fn deactivate_detaches_documents_and_stops_tasks() {
     let Some(addr) = rpc_addr() else { return };
@@ -176,10 +177,18 @@ async fn deactivate_detaches_documents_and_stops_tasks() {
         unique_key("deactivate-detaches-1"),
         unique_key("deactivate-detaches-2"),
     ];
-    let mut docs = Vec::new();
-    for key in &keys {
-        docs.push(client.attach(shared(key), manual_attach()).await.unwrap());
-    }
+    let docs = vec![
+        client
+            .attach(shared(&keys[0]), manual_attach())
+            .await
+            .unwrap(),
+        client
+            .attach(shared(&keys[1]), AttachOptions::default())
+            .await
+            .unwrap(),
+    ];
+    // The sync loop and the realtime document's watch loop.
+    assert_eq!(2, client.running_task_count());
 
     client
         .deactivate(DeactivateOptions::default())
@@ -191,4 +200,8 @@ async fn deactivate_detaches_documents_and_stops_tasks() {
         assert_eq!(DocStatus::Detached, doc.lock().unwrap().status());
         assert!(!client.has(key));
     }
+    eventually("background loops to stop", || {
+        client.running_task_count() == 0
+    })
+    .await;
 }

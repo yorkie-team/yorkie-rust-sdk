@@ -633,9 +633,9 @@ Gap:
 - Document events follow JS `reconcilePresence`: local presence updates,
   remote presence changes, and status transitions publish
   `PresenceChanged`/`Watched`/`Unwatched`. A remote `Clear` takes the actor
-  offline. `Initialized`, watch-driven `Watched`/`Unwatched`,
-  `ConnectionChanged`, `SyncStatusChanged`, and `Broadcast` are defined but
-  published by the client, which does not do so yet. JS `AuthError`,
+  offline. The client publishes `Initialized`, watch-driven
+  `Watched`/`Unwatched`, `ConnectionChanged`, and `SyncStatusChanged`;
+  `Broadcast` is defined but not published yet. JS `AuthError`,
   `EpochMismatch`, `WriteRejected`, `LocalChangesDropped`, and
   `PersistDisabled` events are not ported. `ChangeInfo` omits JS
   `clientSeq`/`serverSeq`/`rawChange`.
@@ -764,55 +764,106 @@ Expected direction:
 Current Rust behavior:
 
 - `yorkie-client` is split into `client`, `options`, `attachment`,
-  `transport`, `connect`, `protocol`, and `error` modules, with `lib.rs` kept
-  as a re-exporting crate entrypoint.
+  `transport`, `connect`, `protocol`, `sync_loop`, `watch`, and `error`
+  modules, with `lib.rs` kept as a re-exporting crate entrypoint.
 - `ClientOptions` carries the JS/Go-shaped base options: RPC address, client
   key, API key, metadata, user agent, sync-loop duration, retry delay,
-  reconnect delay, and channel heartbeat interval. Defaults match the JS/Go
-  values where both implementations already agree.
+  reconnect delay, channel heartbeat interval, and watch heartbeat interval
+  (JS `watchHeartbeatInterval`, default 20s). Defaults match the JS/Go values
+  where both implementations already agree.
 - `SyncMode`, `DeactivateOptions`, `AttachOptions`, `AttachChannelOptions`,
   and `DetachOptions` are public client-surface types. `AttachOptions` has
   `initial_root`, `initial_presence` (default empty), `sync_mode` (default
   `Realtime`), `document_poll_interval`, and `schema`, as in JS.
 - `Client` is a cloneable handle over `Arc<ClientInner>`. It owns an
   `Arc<dyn ClientTransport>`: `Client::new` builds a `ConnectTransport`, and
-  `Client::with_transport` takes any transport (tests use a mock). Its methods
-  take `&self`.
+  `Client::with_transport` takes any transport (tests use a mock or wrap
+  `ConnectTransport`). Its methods take `&self`. Because it spawns tokio
+  tasks, it must be used inside a tokio runtime.
+- Client calls (`activate`, `deactivate`, `attach`, `detach`, `sync`,
+  `remove`, `change_sync_mode`) and each sync-loop round run one at a time on
+  an async task queue (JS `enqueueTask`). Watch streams do not use it.
 - Documents are shared as `SharedDocument` (`Arc<std::sync::Mutex<Document>>`).
   The client locks a document only for synchronous steps (build a pack, apply
-  a response) and never across an `.await`, and it never holds a document
-  lock together with its own state lock. Event callbacks run under the
-  document lock, so a callback must not lock the same document again.
-- `Client::activate` sends client key, metadata, and shard key. The actor
-  stamped into changes is the response `actor_id`, or `client_id` when it is
-  empty (JS `res.actorId || res.clientId`); requests keep sending `client_id`.
+  a response, publish an event) and never across an `.await`, and it never
+  holds a document lock together with its own state lock. Event callbacks run
+  under the document lock, so a callback must not lock the same document
+  again.
+- `Client::activate` sends client key, metadata, and shard key and starts the
+  sync loop. The actor stamped into changes is the response `actor_id`, or
+  `client_id` when it is empty (JS `res.actorId || res.clientId`); requests
+  keep sending `client_id`.
 - `Client::deactivate` sends client ID and synchronous flag, marks sync/watch
-  conditions inactive, drops every attachment, and sets each attached
-  document to `Detached` (JS `deactivateInternal`).
+  conditions inactive, stops the sync loop and every watch loop, drops every
+  attachment, and sets each attached document to `Detached` (JS
+  `deactivateInternal`).
 - `Client::attach` rejects an inactive client, a document that is not
   `Detached`, and a key that is already attached or attaching
   (`ClientError::AlreadyAttached`, JS `ErrAlreadyAttached`). It stamps the
   actor, sets `initial_presence` in a local change, sends the attach request,
-  stores returned max-size/schema-rule metadata, applies the returned pack,
-  records the attachment, applies `initial_root` for missing keys, and returns
-  the same `SharedDocument`.
+  stores returned max-size/schema-rule metadata, and applies the returned
+  pack. It then re-checks that the client is still active in the same session
+  (otherwise the document goes back to `Detached` and the call fails with
+  `ClientNotActivated`), records the attachment, and in a realtime mode opens
+  the watch stream and waits until it is initialized or its first attempt
+  ends, as JS awaits `runWatchLoop`. Finally it applies `initial_root` for
+  missing keys and returns the same `SharedDocument`.
 - `Client::detach` clears the presence first (JS `p.clear()` before detach),
   sends client ID, document ID, local `ChangePack`, `remove_if_not_attached`,
   and shard key, applies the returned pack, updates document status, and
-  removes the attachment.
+  removes the attachment, which stops its watch loop (JS `detachInternal`).
 - `Client::remove` stamps the actor, sends a `ChangePack` marked as removed,
   applies the returned pack, and removes the attachment.
 - `Client::sync(Some(doc))` pushes and pulls that document; `sync(None)` syncs
   every attachment in its own sync mode, one after another (JS runs them in
   parallel). The push-only response guard follows the client-side JS
-  behavior. A pulled removal drops the attachment.
-- `Client::change_sync_mode` updates attachment bookkeeping and the watch loop
-  condition flag.
+  behavior. A pulled removal drops the attachment. Every sync publishes
+  `SyncStatusChanged(Synced | SyncFailed)`.
+- `detach`, `sync`, `remove`, and `change_sync_mode` find the attachment by
+  key and require it to hold the same `SharedDocument`. Work that resumes
+  after an `.await` (a sync, a watch message) touches or removes an
+  attachment only if it still holds the document it started with, so a newer
+  attachment of the same key is never dropped.
+- The sync loop (`sync_loop.rs`, JS `runSyncLoop`) is one tokio task per
+  active client. Every `sync_loop_duration` it syncs, in parallel, each
+  attachment that needs it (JS `needRealtimeSync`): `Realtime` with local
+  changes or a pending remote-change notice, `RealtimePushOnly` with local
+  changes (push-only request), `Polling` once per poll interval, never
+  `RealtimeSyncOff` or `Manual`. The notice is cleared before the request and
+  restored if the sync fails. After a retryable error (network failures and
+  the Connect codes JS retries) it waits `retry_sync_loop_delay`; any other
+  error stops the loop.
+- The watch loop (`watch.rs`, JS `runWatchLoop`/`runWatchStream`) is one
+  tokio task per attachment in `Realtime`, `RealtimePushOnly`, or
+  `RealtimeSyncOff`. It opens the unified `Watch` RPC with a document
+  descriptor, `actor_id`, and `heartbeat_interval_ms`, publishes
+  `ConnectionChanged(Connected)`, and marks a pull as needed. Initialization
+  sets the online clients and publishes `Initialized`
+  (`Document::apply_watch_init`); `DOCUMENT_CHANGED` marks a pull as needed;
+  `DOCUMENT_WATCHED`/`UNWATCHED` update the online set and publish
+  `Watched`/`Unwatched` (`Document::apply_watched`/`apply_unwatched`);
+  heartbeats are ignored. When the stream fails or ends it clears the online
+  clients, publishes `Initialized` and `ConnectionChanged(Disconnected)`, and
+  reconnects after `reconnect_stream_delay`; a non-retryable error stops it.
+  Once the server reports a nonzero heartbeat interval, a stream silent for
+  three times that interval (1s to 24h) is treated as half-open and
+  reconnected (JS `watchIdleTimeout`).
+- `Client::change_sync_mode` follows JS `changeDocumentSyncMode`: switching to
+  `Manual` or `Polling` closes the watch stream (publishing the same
+  disconnect events), switching from those to a realtime mode opens it and
+  waits for it, and switching to `Realtime` marks a pull as needed.
+- Loops hold `Weak<ClientInner>`, and their handles live in the client state
+  and abort the loop when dropped, so dropping every `Client` handle stops
+  them as well. `Client::running_task_count` (hidden) lets tests check that.
 - `yorkie-client::protocol` converts activate/deactivate, attach/detach/remove,
-  and push-pull transport DTOs to and from generated protobuf messages. Shard
-  keys remain on transport DTOs because JS/Go send them as request metadata.
-- `ConnectTransport` implements the unary RPCs over the Connect protocol
-  (reqwest, binary protobuf).
+  push-pull, and watch transport DTOs to and from generated protobuf messages.
+  Shard keys remain on transport DTOs because JS/Go send them as request
+  metadata. Unknown watch bodies (channel events, unknown event types) are
+  skipped.
+- `ConnectTransport` implements the unary RPCs and the server-streaming
+  `Watch` RPC over the Connect protocol (reqwest, binary protobuf,
+  `application/connect+proto` envelopes, end-stream errors decoded into
+  `ClientError::Rpc`).
 - `Document` stores max-size and schema-rule metadata received during attach,
   but update-time max-size/schema validation is not implemented yet.
 
@@ -820,15 +871,24 @@ JS/Go behavior:
 
 - Clients support activate/deactivate, attach/detach, sync, watch, presence,
   stream handling, retry/error behavior, and document status transitions.
-- JS serializes client calls through a task queue and runs a sync loop and a
-  watch stream per realtime attachment.
+- JS `handleConnectError` refreshes auth tokens on `Unauthenticated`, parks
+  documents whose writes the server rejects for size, retries
+  `ErrTooManySubscribers`, and deactivates the client on
+  `ErrClientNotActivated`/`ErrClientNotFound`.
 
 Gap:
 
-- No sync loop and no watch stream: sync modes are recorded but only manual
-  `sync` moves changes, and online clients are not tracked from the server.
-- Client calls are not serialized by a task queue; concurrent duplicate
-  attaches of one key are rejected, but other calls may interleave.
+- Retry decisions use only the Connect code: Yorkie error codes carried in
+  error metadata (`ErrTooManySubscribers`, size rejections,
+  `ErrClientNotActivated`) are not decoded, so write-rejected parking, the
+  auth-token refresh and its backoff, and deactivation on a lost client are
+  not ported. `AuthError`/`EpochMismatch`/`WriteRejected` events are not
+  published.
+- `DOCUMENT_BROADCAST` watch events are ignored until broadcast lands.
+- Detach does not mark the attachment as detaching (JS `markDetaching`); the
+  task queue keeps the sync loop from running during a detach instead.
+- A push-only or sync-off reply that carries changes is skipped whole; JS
+  still takes the push acknowledgement (`acknowledgePushedChanges`).
 - Schema rules and max-size limits are stored after attach but are not enforced
   during `Document::update` yet.
 - `DeactivateOptions::keepalive`, `disableGC`, auth token refresh,
@@ -837,8 +897,9 @@ Gap:
 
 Expected direction:
 
-- Add the watch stream and the realtime sync loop as tokio tasks spawned from
-  `Client`, with a task registry and cancellation on detach/deactivate.
+- Decode Yorkie error metadata so retry, parking, and auth handling can
+  follow `handleConnectError`.
+- Deliver document broadcasts over the watch stream.
 
 ## Error Behavior
 

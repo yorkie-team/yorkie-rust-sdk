@@ -22,3 +22,15 @@ pub fn unique_key(prefix: &str) -> String {
         .unwrap_or_default();
     format!("{prefix}-{millis}")
 }
+
+/// Polls `condition` every 10ms until it holds, failing after five seconds.
+pub async fn eventually(what: &str, mut condition: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !condition() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}

@@ -8,6 +8,9 @@ pub const DEFAULT_RETRY_SYNC_LOOP_DELAY_MS: u64 = 1000;
 pub const DEFAULT_RECONNECT_STREAM_DELAY_MS: u64 = 1000;
 pub const DEFAULT_CHANNEL_HEARTBEAT_INTERVAL_MS: u64 = 30000;
 pub const DEFAULT_POLLING_INTERVAL_MS: u64 = 3000;
+/// Heartbeat interval a client asks the server for on its watch streams
+/// (JS `DefaultWatchHeartbeatMs`).
+pub const DEFAULT_WATCH_HEARTBEAT_INTERVAL_MS: u64 = 20000;
 
 /// Synchronization mode used by document and channel attachments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +33,11 @@ pub struct ClientOptions {
     pub retry_sync_loop_delay: Duration,
     pub reconnect_stream_delay: Duration,
     pub channel_heartbeat_interval: Duration,
+    /// How often the server should send a heartbeat on an idle watch stream
+    /// (JS `watchHeartbeatInterval`). The server clamps it and reports what it
+    /// uses; a stream silent for three times that long is reconnected. Zero
+    /// asks for no heartbeats and disables the idle timeout.
+    pub watch_heartbeat_interval: Duration,
     pub user_agent: Option<String>,
 }
 
@@ -77,6 +85,7 @@ impl Default for ClientOptions {
             channel_heartbeat_interval: Duration::from_millis(
                 DEFAULT_CHANNEL_HEARTBEAT_INTERVAL_MS,
             ),
+            watch_heartbeat_interval: Duration::from_millis(DEFAULT_WATCH_HEARTBEAT_INTERVAL_MS),
             user_agent: None,
         }
     }
