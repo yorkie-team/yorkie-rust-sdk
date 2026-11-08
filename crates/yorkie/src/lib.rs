@@ -7,7 +7,8 @@ pub use yorkie_client::{
     ClientResult, ClientStatus, ClientTransport, ConnectTransport, DeactivateClientRequest,
     DeactivateClientResponse, DeactivateOptions, DetachDocumentRequest, DetachDocumentResponse,
     DetachOptions, PushPullChangesRequest, PushPullChangesResponse, RemoveDocumentRequest,
-    RemoveDocumentResponse, SharedDocument, SyncMode,
+    RemoveDocumentResponse, SharedDocument, SyncMode, WatchDocEvent, WatchDocEventType,
+    WatchDocumentRequest, WatchDocumentResponse, WatchStream,
 };
 pub use yorkie_core::{
     ActorId, ChangePack, Checkpoint, CounterType, CounterValue, DocEvent, DocStatus, Document,

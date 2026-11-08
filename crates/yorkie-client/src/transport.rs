@@ -1,6 +1,8 @@
 use crate::error::ClientResult;
 use async_trait::async_trait;
+use futures_util::Stream;
 use std::collections::BTreeMap;
+use std::pin::Pin;
 use yorkie_core::{ActorId, ChangePack, SchemaRule};
 
 /// Request data for activating a client.
@@ -99,6 +101,57 @@ pub struct PushPullChangesResponse {
     pub change_pack: ChangePack,
 }
 
+/// Request data for watching a document (JS `watch` with a document
+/// resource descriptor).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchDocumentRequest {
+    pub client_id: ActorId,
+    /// The stable actor the client stamps into changes, so the server keys
+    /// watched/unwatched events by the same ID as presences.
+    pub actor_id: ActorId,
+    pub document_id: String,
+    /// How often the server should send a heartbeat on an idle stream; 0
+    /// asks for none.
+    pub heartbeat_interval_ms: u64,
+    pub shard_key: String,
+}
+
+/// One message of a document watch stream (JS `WatchResponse` with a
+/// document body).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchDocumentResponse {
+    /// The clients watching the document when the stream opened, and the
+    /// heartbeat interval the server settled on (0 when it sends none).
+    Initialization {
+        client_ids: Vec<ActorId>,
+        heartbeat_interval_ms: u64,
+    },
+    /// Something happened to the document on the server.
+    Event(WatchDocEvent),
+    /// Keeps an idle stream alive; carries nothing.
+    Heartbeat,
+}
+
+/// A document event from the watch stream (JS `DocEvent` in the API).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchDocEvent {
+    pub event_type: WatchDocEventType,
+    pub publisher: ActorId,
+}
+
+/// The kind of a watch stream document event (JS `PbDocEventType`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchDocEventType {
+    DocumentChanged,
+    DocumentWatched,
+    DocumentUnwatched,
+    DocumentBroadcast,
+}
+
+/// A stream of watch messages. It ends with `None` when the server closes the
+/// stream normally, and yields an error when it fails.
+pub type WatchStream = Pin<Box<dyn Stream<Item = ClientResult<WatchDocumentResponse>> + Send>>;
+
 /// Transport boundary used by the client lifecycle and document attachment.
 #[async_trait]
 pub trait ClientTransport: Send + Sync {
@@ -131,4 +184,7 @@ pub trait ClientTransport: Send + Sync {
         &self,
         request: PushPullChangesRequest,
     ) -> ClientResult<PushPullChangesResponse>;
+
+    /// Opens a server stream of events for one document (JS `watch`).
+    async fn watch_document(&self, request: WatchDocumentRequest) -> ClientResult<WatchStream>;
 }

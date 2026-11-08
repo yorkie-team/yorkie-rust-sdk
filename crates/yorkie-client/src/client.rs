@@ -633,8 +633,10 @@ mod tests {
         AttachDocumentResponse, ClientTransport, DeactivateClientRequest, DeactivateClientResponse,
         DetachDocumentRequest, DetachDocumentResponse, PushPullChangesRequest,
         PushPullChangesResponse, RemoveDocumentRequest, RemoveDocumentResponse,
+        WatchDocumentRequest, WatchStream,
     };
     use async_trait::async_trait;
+    use futures_util::stream;
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::future::Future;
@@ -738,6 +740,13 @@ mod tests {
             let change_pack = request.change_pack.clone();
             self.push_pull_requests.lock().unwrap().push(request);
             Ok(PushPullChangesResponse { change_pack })
+        }
+
+        async fn watch_document(
+            &self,
+            _request: WatchDocumentRequest,
+        ) -> ClientResult<WatchStream> {
+            Ok(Box::pin(stream::pending()))
         }
     }
 

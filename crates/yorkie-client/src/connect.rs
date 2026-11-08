@@ -1,7 +1,11 @@
-//! Connect protocol transport for unary Yorkie RPCs.
+//! Connect protocol transport for Yorkie RPCs: unary calls and the
+//! server-streaming `Watch` call.
 //!
 //! JS reference: `packages/sdk/src/client/client.ts` (Connect client setup,
-//! `x-api-key`, `x-shard-key` and `x-yorkie-user-agent` headers).
+//! `x-api-key`, `x-shard-key` and `x-yorkie-user-agent` headers). Streaming
+//! follows the Connect protocol's enveloped messages: a flag byte, a 4-byte
+//! big-endian length, and the payload; flag `0x02` marks the end-stream
+//! message, a JSON object with an optional `error`.
 
 use crate::error::{ClientError, ClientResult};
 use crate::options::ClientOptions;
@@ -10,13 +14,21 @@ use crate::transport::{
     ActivateClientRequest, ActivateClientResponse, AttachDocumentRequest, AttachDocumentResponse,
     ClientTransport, DeactivateClientRequest, DeactivateClientResponse, DetachDocumentRequest,
     DetachDocumentResponse, PushPullChangesRequest, PushPullChangesResponse, RemoveDocumentRequest,
-    RemoveDocumentResponse,
+    RemoveDocumentResponse, WatchDocumentRequest, WatchStream,
 };
 use async_trait::async_trait;
+use futures_util::{stream, Stream, StreamExt};
 use prost::Message;
 use yorkie_protocol::yorkie::v1 as api;
 
 const SERVICE_PATH: &str = "yorkie.v1.YorkieService";
+
+/// Envelope flag of a compressed message. This client never asks for
+/// compression, so a compressed envelope is a protocol error.
+const FLAG_COMPRESSED: u8 = 0x01;
+/// Envelope flag of the end-stream message.
+const FLAG_END_STREAM: u8 = 0x02;
+const ENVELOPE_HEADER_LEN: usize = 5;
 
 /// Unary RPC transport speaking the Connect protocol over HTTP.
 #[derive(Debug, Clone)]
@@ -45,6 +57,21 @@ impl ConnectTransport {
         })
     }
 
+    fn post(&self, method: &str, shard_key: &str, content_type: &str) -> reqwest::RequestBuilder {
+        let builder = self
+            .http
+            .post(format!("{}/{SERVICE_PATH}/{method}", self.base_url))
+            .header("content-type", content_type)
+            .header("connect-protocol-version", "1")
+            .header("x-shard-key", shard_key)
+            .header("x-yorkie-user-agent", &self.user_agent);
+        if self.api_key.is_empty() {
+            builder
+        } else {
+            builder.header("x-api-key", &self.api_key)
+        }
+    }
+
     async fn unary<Req, Res>(
         &self,
         method: &str,
@@ -55,18 +82,8 @@ impl ConnectTransport {
         Req: Message,
         Res: Message + Default,
     {
-        let mut builder = self
-            .http
-            .post(format!("{}/{SERVICE_PATH}/{method}", self.base_url))
-            .header("content-type", "application/proto")
-            .header("connect-protocol-version", "1")
-            .header("x-shard-key", shard_key)
-            .header("x-yorkie-user-agent", &self.user_agent);
-        if !self.api_key.is_empty() {
-            builder = builder.header("x-api-key", &self.api_key);
-        }
-
-        let response = builder
+        let response = self
+            .post(method, shard_key, "application/proto")
             .body(request.encode_to_vec())
             .send()
             .await
@@ -81,6 +98,143 @@ impl ConnectTransport {
         }
         Res::decode(body.as_ref()).map_err(|err| ClientError::Transport(err.to_string()))
     }
+
+    /// Calls a server-streaming RPC. The request is sent as one enveloped
+    /// message; the returned stream yields each response message and ends
+    /// at the end-stream message, or yields its error.
+    async fn server_stream<Req, Res>(
+        &self,
+        method: &str,
+        shard_key: &str,
+        request: &Req,
+    ) -> ClientResult<impl Stream<Item = ClientResult<Res>> + Send + 'static>
+    where
+        Req: Message,
+        Res: Message + Default + 'static,
+    {
+        let response = self
+            .post(method, shard_key, "application/connect+proto")
+            .body(encode_envelope(0, &request.encode_to_vec()))
+            .send()
+            .await
+            .map_err(|err| ClientError::Transport(err.to_string()))?;
+        let status = response.status().as_u16();
+        if status != 200 {
+            let body = response
+                .bytes()
+                .await
+                .map_err(|err| ClientError::Transport(err.to_string()))?;
+            return Err(decode_connect_error(status, &body));
+        }
+
+        let body = response.bytes_stream();
+        Ok(stream::unfold(
+            Some((body, EnvelopeDecoder::default())),
+            |state| async move {
+                let (mut body, mut decoder) = state?;
+                loop {
+                    match decoder.next_envelope() {
+                        Ok(Some(Envelope::Message(payload))) => {
+                            let message = Res::decode(payload.as_slice())
+                                .map_err(|err| ClientError::Transport(err.to_string()));
+                            return Some((message, Some((body, decoder))));
+                        }
+                        Ok(Some(Envelope::EndStream(payload))) => {
+                            return decode_end_stream(&payload)
+                                .err()
+                                .map(|err| (Err(err), None));
+                        }
+                        Ok(None) => {}
+                        Err(err) => return Some((Err(err), None)),
+                    }
+                    match body.next().await {
+                        Some(Ok(chunk)) => decoder.push(&chunk),
+                        Some(Err(err)) => {
+                            return Some((Err(ClientError::Transport(err.to_string())), None));
+                        }
+                        None => {
+                            let err = ClientError::Transport(
+                                "stream ended without an end-stream message".to_owned(),
+                            );
+                            return Some((Err(err), None));
+                        }
+                    }
+                }
+            },
+        ))
+    }
+}
+
+/// Wraps a message in a Connect envelope.
+pub(crate) fn encode_envelope(flags: u8, payload: &[u8]) -> Vec<u8> {
+    let len = u32::try_from(payload.len()).expect("Connect messages are below 4 GiB");
+    let mut envelope = Vec::with_capacity(ENVELOPE_HEADER_LEN + payload.len());
+    envelope.push(flags);
+    envelope.extend_from_slice(&len.to_be_bytes());
+    envelope.extend_from_slice(payload);
+    envelope
+}
+
+/// A decoded Connect envelope.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Envelope {
+    Message(Vec<u8>),
+    EndStream(Vec<u8>),
+}
+
+/// Splits a byte stream into Connect envelopes, buffering partial frames.
+#[derive(Debug, Default)]
+pub(crate) struct EnvelopeDecoder {
+    buffer: Vec<u8>,
+}
+
+impl EnvelopeDecoder {
+    pub(crate) fn push(&mut self, bytes: &[u8]) {
+        self.buffer.extend_from_slice(bytes);
+    }
+
+    /// Returns the next complete envelope, or `None` until more bytes arrive.
+    pub(crate) fn next_envelope(&mut self) -> ClientResult<Option<Envelope>> {
+        let Some(header) = self.buffer.get(..ENVELOPE_HEADER_LEN) else {
+            return Ok(None);
+        };
+        let flags = header[0];
+        let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        if self.buffer.len() < ENVELOPE_HEADER_LEN + len {
+            return Ok(None);
+        }
+        if flags & FLAG_COMPRESSED != 0 {
+            return Err(ClientError::Transport(
+                "received a compressed Connect message without asking for one".to_owned(),
+            ));
+        }
+
+        let payload = self.buffer[ENVELOPE_HEADER_LEN..ENVELOPE_HEADER_LEN + len].to_vec();
+        self.buffer.drain(..ENVELOPE_HEADER_LEN + len);
+        Ok(Some(if flags & FLAG_END_STREAM != 0 {
+            Envelope::EndStream(payload)
+        } else {
+            Envelope::Message(payload)
+        }))
+    }
+}
+
+/// Decodes the JSON end-stream message: `Ok` when it carries no error, else
+/// its error as [`ClientError::Rpc`].
+pub(crate) fn decode_end_stream(payload: &[u8]) -> ClientResult<()> {
+    if payload.is_empty() {
+        return Ok(());
+    }
+    let value = serde_json::from_slice::<serde_json::Value>(payload)
+        .map_err(|err| ClientError::Transport(format!("invalid end-stream message: {err}")))?;
+    let Some(error) = value.get("error").filter(|error| !error.is_null()) else {
+        return Ok(());
+    };
+    let text = |field: &str| error.get(field).and_then(|value| value.as_str());
+    Err(ClientError::Rpc {
+        code: text("code").unwrap_or("unknown").to_owned(),
+        message: text("message").unwrap_or_default().to_owned(),
+    })
 }
 
 fn protocol_error(err: impl ToString) -> ClientError {
@@ -207,6 +361,22 @@ impl ClientTransport for ConnectTransport {
             .await?;
         conv::from_push_pull_changes_response(&response).map_err(protocol_error)
     }
+
+    async fn watch_document(&self, request: WatchDocumentRequest) -> ClientResult<WatchStream> {
+        let responses = self
+            .server_stream::<_, api::WatchResponse>(
+                "Watch",
+                &request.shard_key,
+                &conv::to_watch_document_request(&request),
+            )
+            .await?;
+        Ok(Box::pin(responses.filter_map(|response| async move {
+            match response {
+                Ok(response) => conv::from_watch_response(&response).map(Ok),
+                Err(err) => Some(Err(err)),
+            }
+        })))
+    }
 }
 
 #[cfg(test)]
@@ -240,6 +410,71 @@ mod tests {
         assert!(matches!(
             decode_connect_error(404, b"<html>"),
             ClientError::Rpc { code, .. } if code == "unimplemented"
+        ));
+    }
+
+    /// Connect envelopes: messages split across chunks are buffered, and an
+    /// end-stream error becomes `ClientError::Rpc`.
+    #[test]
+    fn connect_envelope_roundtrip() {
+        let first = api::WatchResponse {
+            body: Some(api::watch_response::Body::Heartbeat(api::WatchHeartbeat {})),
+        };
+        let mut bytes = encode_envelope(0, &first.encode_to_vec());
+        assert_eq!(0, bytes[0]);
+        assert_eq!(
+            (bytes.len() - ENVELOPE_HEADER_LEN) as u32,
+            u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]])
+        );
+        bytes.extend(encode_envelope(
+            FLAG_END_STREAM,
+            br#"{"error":{"code":"unavailable","message":"server stopped"},"metadata":{}}"#,
+        ));
+
+        let mut decoder = EnvelopeDecoder::default();
+        let mut envelopes = Vec::new();
+        for chunk in bytes.chunks(3) {
+            decoder.push(chunk);
+            while let Some(envelope) = decoder.next_envelope().unwrap() {
+                envelopes.push(envelope);
+            }
+        }
+
+        assert_eq!(2, envelopes.len());
+        let Envelope::Message(payload) = &envelopes[0] else {
+            panic!("expected a message, got {:?}", envelopes[0]);
+        };
+        assert_eq!(
+            first,
+            api::WatchResponse::decode(payload.as_slice()).unwrap()
+        );
+        let Envelope::EndStream(payload) = &envelopes[1] else {
+            panic!("expected an end-stream message, got {:?}", envelopes[1]);
+        };
+        assert_eq!(
+            Err(ClientError::Rpc {
+                code: "unavailable".to_owned(),
+                message: "server stopped".to_owned(),
+            }),
+            decode_end_stream(payload)
+        );
+    }
+
+    #[test]
+    fn end_stream_without_error_ends_cleanly() {
+        assert_eq!(Ok(()), decode_end_stream(b""));
+        assert_eq!(Ok(()), decode_end_stream(br#"{"metadata":{"k":["v"]}}"#));
+        assert_eq!(Ok(()), decode_end_stream(br#"{"error":null}"#));
+        assert!(matches!(
+            decode_end_stream(b"not json"),
+            Err(ClientError::Transport(_))
+        ));
+
+        let mut decoder = EnvelopeDecoder::default();
+        decoder.push(&encode_envelope(FLAG_COMPRESSED, b"x"));
+        assert!(matches!(
+            decoder.next_envelope(),
+            Err(ClientError::Transport(_))
         ));
     }
 }

@@ -4,7 +4,8 @@ use crate::transport::{
     ActivateClientRequest, ActivateClientResponse, AttachDocumentRequest, AttachDocumentResponse,
     DeactivateClientRequest, DeactivateClientResponse, DetachDocumentRequest,
     DetachDocumentResponse, PushPullChangesRequest, PushPullChangesResponse, RemoveDocumentRequest,
-    RemoveDocumentResponse,
+    RemoveDocumentResponse, WatchDocEvent, WatchDocEventType, WatchDocumentRequest,
+    WatchDocumentResponse,
 };
 use yorkie_core::ActorId;
 use yorkie_protocol::converter::{self, ProtocolError};
@@ -135,6 +136,63 @@ pub fn from_push_pull_changes_response(
             "push_pull_changes_response.change_pack",
         )?)?,
     })
+}
+
+/// Builds the unified `Watch` request for one document, as JS
+/// `createDocumentWatchStream` does.
+pub fn to_watch_document_request(request: &WatchDocumentRequest) -> api::WatchRequest {
+    api::WatchRequest {
+        client_id: request.client_id.to_string(),
+        resources: vec![api::ResourceDescriptor {
+            resource: Some(api::resource_descriptor::Resource::Document(
+                api::DocumentDescriptor {
+                    document_id: request.document_id.clone(),
+                },
+            )),
+        }],
+        actor_id: request.actor_id.to_string(),
+        heartbeat_interval_ms: i64::try_from(request.heartbeat_interval_ms).unwrap_or(i64::MAX),
+    }
+}
+
+/// Converts a `Watch` response for a document stream. Bodies this client does
+/// not know (an empty body, a channel event, an unknown event type) return
+/// `None` and are skipped, so a newer server does not break the stream.
+pub fn from_watch_response(response: &api::WatchResponse) -> Option<WatchDocumentResponse> {
+    use api::watch_response::Body;
+
+    match response.body.as_ref()? {
+        Body::Initialization(init) => Some(WatchDocumentResponse::Initialization {
+            client_ids: init
+                .resource_inits
+                .iter()
+                .filter_map(|resource_init| match &resource_init.init {
+                    Some(api::resource_init::Init::DocumentInit(init)) => Some(&init.client_ids),
+                    _ => None,
+                })
+                .flatten()
+                .map(|client_id| ActorId::new(client_id.clone()))
+                .collect(),
+            heartbeat_interval_ms: u64::try_from(init.heartbeat_interval_ms).unwrap_or(0),
+        }),
+        Body::Event(event) => {
+            let Some(api::watch_event::Event::DocEvent(doc_event)) = &event.event else {
+                return None;
+            };
+            let event = doc_event.event.as_ref()?;
+            let event_type = match api::DocEventType::try_from(event.r#type).ok()? {
+                api::DocEventType::DocumentChanged => WatchDocEventType::DocumentChanged,
+                api::DocEventType::DocumentWatched => WatchDocEventType::DocumentWatched,
+                api::DocEventType::DocumentUnwatched => WatchDocEventType::DocumentUnwatched,
+                api::DocEventType::DocumentBroadcast => WatchDocEventType::DocumentBroadcast,
+            };
+            Some(WatchDocumentResponse::Event(WatchDocEvent {
+                event_type,
+                publisher: ActorId::new(event.publisher.clone()),
+            }))
+        }
+        Body::Heartbeat(_) => Some(WatchDocumentResponse::Heartbeat),
+    }
 }
 
 fn required<'a, T>(value: &'a Option<T>, field: &'static str) -> Result<&'a T> {
@@ -347,5 +405,81 @@ mod tests {
             },
             from_attach_document_response(&response).unwrap_err()
         );
+    }
+
+    /// JS `createDocumentWatchStream` and `handleWatchDocumentResponse`.
+    #[test]
+    fn converts_watch_messages() {
+        let request = to_watch_document_request(&WatchDocumentRequest {
+            client_id: ActorId::new("000000000000000000000001"),
+            actor_id: ActorId::new("000000000000000000000002"),
+            document_id: "document-id".to_owned(),
+            heartbeat_interval_ms: 20000,
+            shard_key: "api-key/doc-key".to_owned(),
+        });
+        assert_eq!("000000000000000000000001", request.client_id);
+        assert_eq!("000000000000000000000002", request.actor_id);
+        assert_eq!(20000, request.heartbeat_interval_ms);
+        assert_eq!(
+            vec![api::ResourceDescriptor {
+                resource: Some(api::resource_descriptor::Resource::Document(
+                    api::DocumentDescriptor {
+                        document_id: "document-id".to_owned(),
+                    }
+                )),
+            }],
+            request.resources
+        );
+
+        let init = api::WatchResponse {
+            body: Some(api::watch_response::Body::Initialization(
+                api::WatchInitialization {
+                    resource_inits: vec![api::ResourceInit {
+                        init: Some(api::resource_init::Init::DocumentInit(api::DocumentInit {
+                            document_id: "document-id".to_owned(),
+                            client_ids: vec!["000000000000000000000003".to_owned()],
+                        })),
+                    }],
+                    heartbeat_interval_ms: 15000,
+                },
+            )),
+        };
+        assert_eq!(
+            Some(WatchDocumentResponse::Initialization {
+                client_ids: vec![ActorId::new("000000000000000000000003")],
+                heartbeat_interval_ms: 15000,
+            }),
+            from_watch_response(&init)
+        );
+
+        let event = |r#type: i32| api::WatchResponse {
+            body: Some(api::watch_response::Body::Event(api::WatchEvent {
+                event: Some(api::watch_event::Event::DocEvent(api::DocWatchEvent {
+                    document_id: "document-id".to_owned(),
+                    event: Some(api::DocEvent {
+                        r#type,
+                        publisher: "000000000000000000000003".to_owned(),
+                        body: None,
+                    }),
+                })),
+            })),
+        };
+        assert_eq!(
+            Some(WatchDocumentResponse::Event(WatchDocEvent {
+                event_type: WatchDocEventType::DocumentWatched,
+                publisher: ActorId::new("000000000000000000000003"),
+            })),
+            from_watch_response(&event(api::DocEventType::DocumentWatched as i32))
+        );
+        assert_eq!(None, from_watch_response(&event(99)));
+
+        let heartbeat = api::WatchResponse {
+            body: Some(api::watch_response::Body::Heartbeat(api::WatchHeartbeat {})),
+        };
+        assert_eq!(
+            Some(WatchDocumentResponse::Heartbeat),
+            from_watch_response(&heartbeat)
+        );
+        assert_eq!(None, from_watch_response(&api::WatchResponse::default()));
     }
 }

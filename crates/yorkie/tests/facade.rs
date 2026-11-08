@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use futures_util::stream;
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -11,7 +12,7 @@ use yorkie::{
     DetachDocumentResponse, DetachOptions, DocStatus, Document, JsonCounter, Presence,
     PushPullChangesRequest, PushPullChangesResponse, RemoveDocumentRequest, RemoveDocumentResponse,
     Result, SchemaRule, SharedDocument, SyncMode, TimeTicket, TimeTicketStruct, TreeNodeRule,
-    VersionVector,
+    VersionVector, WatchDocumentRequest, WatchStream,
 };
 
 #[derive(Debug, Default)]
@@ -88,6 +89,13 @@ impl ClientTransport for FacadeTransport {
         Ok(PushPullChangesResponse {
             change_pack: request.change_pack,
         })
+    }
+
+    async fn watch_document(
+        &self,
+        _request: WatchDocumentRequest,
+    ) -> yorkie::ClientResult<WatchStream> {
+        Ok(Box::pin(stream::pending()))
     }
 }
 
