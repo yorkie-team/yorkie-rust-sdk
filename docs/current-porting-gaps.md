@@ -1130,8 +1130,10 @@ Current Rust behavior:
   waits for it, and switching to `Realtime` marks a pull as needed. A switch
   to `RealtimePushOnly` or `RealtimeSyncOff` is counted on the attachment
   before it waits on the task queue (JS `pendingPullPauses`), so a sync
-  already in flight drops the remote state of its reply, unless the
-  document is `Manual`, and marks a pull as needed again.
+  already in flight drops the remote state of its reply and marks a pull as
+  needed again. This check reads the attachment's mode when the reply
+  arrives and skips a `Manual` document. The pull is marked in `Polling`
+  too, as in JS; `Polling` ignores the mark and pulls on its interval.
 - Loops hold `Weak<ClientInner>`, and their handles live in the client state
   and abort the loop when dropped, so dropping every `Client` handle stops
   them as well. `Client::running_task_count` (hidden) lets tests check that.
@@ -1192,9 +1194,11 @@ Gap:
 - Detach does not mark the attachment as detaching (JS `markDetaching`); the
   task queue keeps the sync loop from running during a detach instead.
 - A push-only or sync-off reply is taken as a push acknowledgement only, as
-  in JS, and so is a reply that arrives while a pause is pending. JS reads
-  the attachment's mode when the reply arrives; Rust takes the request's
-  mode and the attachment's mode when the sync started.
+  in JS, and so is a reply that arrives while a pause is pending. For the
+  push-only and sync-off part, Rust takes the request's mode and the
+  attachment's mode when the sync started, where JS reads the attachment's
+  mode when the reply arrives. The pending-pause part reads the mode when
+  the reply arrives, as JS does.
 - Integration tests set schema rules and the size limit with
   `Document::set_schema_rules` and `set_max_size_per_document` after
   attaching. JS creates them through the admin API (`CreateSchema`,
