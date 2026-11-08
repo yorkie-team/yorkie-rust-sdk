@@ -850,7 +850,9 @@ impl Client {
 
     /// Returns a channel's session count without joining it (JS
     /// `peekChannel`). It needs no activation, adds no session, and gets no
-    /// events; callers poll it themselves.
+    /// events; callers poll it themselves. As in JS, an error is returned as
+    /// is: it does not go through `handleConnectError`, so an
+    /// `ErrUnauthenticated` does not refresh the auth token.
     pub async fn peek_channel(&self, channel_key: &str) -> ClientResult<u64> {
         let _queue = self.lock_task_queue().await;
         let response = self
