@@ -747,13 +747,14 @@ impl Client {
             state.id.clone()
         };
         let local_broadcast = {
+            let sender = send_local_broadcasts(&self.inner, key.clone(), Arc::downgrade(&channel));
             let mut channel = lock_channel(&channel);
             // JS: a client that is already active gives the channel its ID
             // now; otherwise the first refresh does.
             if let Some(client_id) = client_id {
                 channel.set_actor(client_id);
             }
-            channel.subscribe(send_local_broadcasts(&self.inner, key.clone()))
+            channel.subscribe(sender)
         };
         self.with_channel_attachment(&key, &channel, |attachment| {
             attachment.local_broadcast = Some(local_broadcast);
@@ -886,6 +887,7 @@ impl Client {
         broadcast_with_retry(
             &Arc::downgrade(&self.inner),
             key,
+            None,
             topic,
             &payload,
             options.max_retries,
@@ -893,12 +895,30 @@ impl Client {
         .await
     }
 
-    /// Sends one broadcast (one try of JS `broadcast`'s `doLoop`).
-    async fn broadcast_once(&self, key: &str, topic: &str, payload: Vec<u8>) -> ClientResult<()> {
+    /// Sends one broadcast (one try of JS `broadcast`'s `doLoop`). With
+    /// `channel`, the broadcast is that channel's `LocalBroadcast`, and only
+    /// goes out while that channel, not just any channel of `key`, is
+    /// attached.
+    async fn broadcast_once(
+        &self,
+        key: &str,
+        channel: Option<&Weak<Mutex<Channel>>>,
+        topic: &str,
+        payload: Vec<u8>,
+    ) -> ClientResult<()> {
         let _queue = self.lock_task_queue().await;
         let client_id = {
             let state = self.state();
-            if !state.channels.contains_key(key) {
+            let attached = match channel {
+                None => state.channels.contains_key(key),
+                Some(channel) => channel.upgrade().is_some_and(|channel| {
+                    state
+                        .channels
+                        .get(key)
+                        .is_some_and(|attachment| attachment.holds(&channel))
+                }),
+            };
+            if !attached {
                 return Err(ClientError::NotAttached(key.to_owned()));
             }
             state
@@ -1452,10 +1472,12 @@ fn release_channel_attachment(attachment: ChannelAttachment) {
 /// Returns the channel subscriber that sends each `LocalBroadcast` in the
 /// background (the JS `local-broadcast` handler of `attachChannel`), passing
 /// a final failure to the broadcast's error handler. It holds the client
-/// weakly, so a channel the app keeps does not keep the client alive.
+/// weakly, so a channel the app keeps does not keep the client alive, and
+/// the channel weakly, since the channel holds it.
 fn send_local_broadcasts(
     inner: &Arc<ClientInner>,
     key: String,
+    channel: Weak<Mutex<Channel>>,
 ) -> impl FnMut(&ChannelEvent) + Send + 'static {
     let inner = Arc::downgrade(inner);
     let runtime = tokio::runtime::Handle::current();
@@ -1469,16 +1491,24 @@ fn send_local_broadcasts(
         else {
             return;
         };
-        let (inner, key, topic, payload, options) = (
+        let (inner, key, channel, topic, payload, options) = (
             inner.clone(),
             key.clone(),
+            channel.clone(),
             topic.clone(),
             payload.clone(),
             options.clone(),
         );
         runtime.spawn(async move {
-            let result =
-                broadcast_with_retry(&inner, &key, &topic, &payload, options.max_retries).await;
+            let result = broadcast_with_retry(
+                &inner,
+                &key,
+                Some(&channel),
+                &topic,
+                &payload,
+                options.max_retries,
+            )
+            .await;
             if let (Err(err), Some(handler)) = (result, &options.error) {
                 handler.call(&err);
             }
@@ -1487,10 +1517,11 @@ fn send_local_broadcasts(
 }
 
 /// Sends a broadcast, retrying after retryable failures (JS `broadcast`).
-/// See `Client::broadcast`.
+/// See `Client::broadcast`, and `Client::broadcast_once` for `channel`.
 async fn broadcast_with_retry(
     inner: &Weak<ClientInner>,
     key: &str,
+    channel: Option<&Weak<Mutex<Channel>>>,
     topic: &str,
     payload: &serde_json::Value,
     max_retries: Option<u32>,
@@ -1502,7 +1533,10 @@ async fn broadcast_with_retry(
         let Some(client) = Client::upgrade(inner) else {
             return Err(ClientError::NotAttached(key.to_owned()));
         };
-        let err = match client.broadcast_once(key, topic, payload.clone()).await {
+        let err = match client
+            .broadcast_once(key, channel, topic, payload.clone())
+            .await
+        {
             Ok(()) => return Ok(()),
             Err(err) => err,
         };
@@ -3466,6 +3500,56 @@ mod tests {
             broadcast.await.unwrap()
         );
         assert_eq!(1, transport.broadcast_requests.lock().unwrap().len());
+        Ok(())
+    }
+
+    /// Review rule: a channel's pending `LocalBroadcast` retries end when
+    /// that channel detaches, even if another channel is attached under the
+    /// same key before the retry is due. They must not go out on the new
+    /// channel's session.
+    #[tokio::test(start_paused = true)]
+    async fn local_broadcast_retries_do_not_move_to_a_new_channel_of_the_key() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        let client = mock_client(fast_loop_options(), &transport);
+        client.activate().await?;
+        let first = shared_channel("room");
+        client
+            .attach_channel(first.clone(), fast_channel(SyncMode::Polling))
+            .await?;
+        eventually(|| first.lock().unwrap().is_attached()).await;
+        transport
+            .broadcast_errors
+            .lock()
+            .unwrap()
+            .push(ClientError::Transport("connection reset".to_owned()));
+
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let options = BroadcastOptions {
+            max_retries: None,
+            error: Some(BroadcastErrorHandler::new({
+                let errors = errors.clone();
+                move |err| errors.lock().unwrap().push(err.clone())
+            })),
+        };
+        first
+            .lock()
+            .unwrap()
+            .broadcast("cursor", json!(1), options)?;
+        eventually(|| transport.broadcast_requests.lock().unwrap().len() == 1).await;
+        client.detach_channel(&first).await?;
+        let second = shared_channel("room");
+        client
+            .attach_channel(second.clone(), fast_channel(SyncMode::Polling))
+            .await?;
+        eventually(|| second.lock().unwrap().is_attached()).await;
+
+        // The first retry is due 1s after the failure.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(1, transport.broadcast_requests.lock().unwrap().len());
+        assert_eq!(
+            vec![ClientError::NotAttached("room".to_owned())],
+            errors.lock().unwrap().clone()
+        );
         Ok(())
     }
 
