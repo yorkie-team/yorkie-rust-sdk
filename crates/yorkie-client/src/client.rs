@@ -25,16 +25,18 @@ use crate::attachment::{
     default_document_poll_interval, resolve_document_poll_interval, uses_watch_stream,
     validate_channel_sync_mode, Attachment, ChannelAttachment, SharedDocument,
 };
-use crate::channel::{first_key_path, Channel, ChannelEvent, ChannelStatus, SharedChannel};
+use crate::channel::{
+    first_key_path, BroadcastOptions, Channel, ChannelEvent, ChannelStatus, SharedChannel,
+};
 use crate::connect::ConnectTransport;
 use crate::error::{ClientError, ClientResult};
 use crate::options::{
     AttachChannelOptions, AttachOptions, ClientOptions, DeactivateOptions, DetachOptions, SyncMode,
 };
 use crate::transport::{
-    ActivateClientRequest, AttachDocumentRequest, ClientTransport, DeactivateClientRequest,
-    DetachDocumentRequest, PeekChannelRequest, PushPullChangesRequest, RefreshChannelRequest,
-    RemoveDocumentRequest,
+    ActivateClientRequest, AttachDocumentRequest, BroadcastRequest, ClientTransport,
+    DeactivateClientRequest, DetachDocumentRequest, PeekChannelRequest, PushPullChangesRequest,
+    RefreshChannelRequest, RemoveDocumentRequest,
 };
 use crate::{sync_loop, watch};
 use std::collections::{BTreeMap, BTreeSet};
@@ -55,6 +57,13 @@ pub enum ClientStatus {
 /// The Yorkie error code of a refresh for a session the server no longer
 /// has (JS `Code.ErrSessionNotFound`).
 const ERR_SESSION_NOT_FOUND: &str = "ErrSessionNotFound";
+
+/// The wait before the first broadcast retry, doubled for each later one
+/// (JS `DefaultBroadcastOptions.initialRetryInterval`).
+const BROADCAST_INITIAL_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+/// The longest wait between broadcast retries (JS
+/// `DefaultBroadcastOptions.maxBackoff`).
+const BROADCAST_MAX_BACKOFF: Duration = Duration::from_secs(20);
 
 /// Client background loop condition keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -647,7 +656,7 @@ impl Client {
                 return Err(ClientError::AlreadyAttached(key));
             }
             state.channels.insert(
-                key,
+                key.clone(),
                 ChannelAttachment::new(
                     channel.clone(),
                     sync_mode,
@@ -661,11 +670,18 @@ impl Client {
             }
             state.id.clone()
         };
-        // JS: a client that is already active gives the channel its ID now;
-        // otherwise the first refresh does.
-        if let Some(client_id) = client_id {
-            lock_channel(&channel).set_actor(client_id);
-        }
+        let local_broadcast = {
+            let mut channel = lock_channel(&channel);
+            // JS: a client that is already active gives the channel its ID
+            // now; otherwise the first refresh does.
+            if let Some(client_id) = client_id {
+                channel.set_actor(client_id);
+            }
+            channel.subscribe(send_local_broadcasts(&self.inner, key.clone()))
+        };
+        self.with_channel_attachment(&key, &channel, |attachment| {
+            attachment.local_broadcast = Some(local_broadcast);
+        });
         Ok(channel)
     }
 
@@ -709,26 +725,45 @@ impl Client {
     ) -> ClientResult<()> {
         let _queue = self.lock_task_queue().await;
         let key = channel_key(channel);
-        let mut state = self.state();
-        let Some(attachment) = state
-            .channels
-            .get_mut(&key)
-            .filter(|attachment| attachment.holds(channel))
-        else {
-            return Err(ClientError::NotAttached(key));
-        };
-        if attachment.sync_mode == sync_mode {
-            return Ok(());
-        }
-        validate_channel_sync_mode(sync_mode)?;
-
-        attachment.sync_mode = sync_mode;
-        if !attachment.heartbeat_interval_pinned {
-            attachment.heartbeat_interval = if sync_mode == SyncMode::Manual {
-                Duration::ZERO
-            } else {
-                self.inner.options.channel_heartbeat_interval
+        let (stopped_watch, watch_ready) = {
+            let mut state = self.state();
+            let active = state.session(&self.inner.key).is_ok();
+            let Some(attachment) = state
+                .channels
+                .get_mut(&key)
+                .filter(|attachment| attachment.holds(channel))
+            else {
+                return Err(ClientError::NotAttached(key));
             };
+            if attachment.sync_mode == sync_mode {
+                return Ok(());
+            }
+            validate_channel_sync_mode(sync_mode)?;
+
+            let stopped_watch = attachment.watch_task.take();
+            attachment.sync_mode = sync_mode;
+            if !attachment.heartbeat_interval_pinned {
+                attachment.heartbeat_interval = if sync_mode == SyncMode::Manual {
+                    Duration::ZERO
+                } else {
+                    self.inner.options.channel_heartbeat_interval
+                };
+            }
+            // Only `Realtime` watches. A client that is not active yet opens
+            // the stream after its first refresh instead (JS rejects here,
+            // with the same outcome once that refresh lands).
+            let watch_ready = (sync_mode == SyncMode::Realtime && active).then(|| {
+                let (task, ready) = watch::spawn_channel(&self.inner, key.clone(), channel.clone());
+                attachment.watch_task = Some(task);
+                ready
+            });
+            state.refresh_watch_loop_condition();
+            (stopped_watch, watch_ready)
+        };
+        drop(stopped_watch);
+        if let Some(ready) = watch_ready {
+            // An error only means the watch task ended first.
+            let _ = ready.await;
         }
         Ok(())
     }
@@ -747,6 +782,60 @@ impl Client {
             })
             .await?;
         Ok(response.session_count)
+    }
+
+    /// Broadcasts `payload` under `topic` to the other clients watching the
+    /// channel attached under `key` (JS `client.broadcast`), sending its JSON
+    /// encoding (JS `JSON.stringify`).
+    ///
+    /// A failure that `ClientError::is_retryable` accepts is retried after
+    /// 1s, 2s, 4s, and so on up to 20s, at most `options.max_retries` times,
+    /// and the call returns when the broadcast is sent or fails for good.
+    /// Each try waits for the task queue; the waits between tries do not
+    /// hold it. Unlike JS, which checks the attachment once, every try
+    /// checks it, so detaching the channel ends the retries. `options.error`
+    /// is not called here: the error is returned.
+    pub async fn broadcast(
+        &self,
+        key: &str,
+        topic: &str,
+        payload: serde_json::Value,
+        options: BroadcastOptions,
+    ) -> ClientResult<()> {
+        broadcast_with_retry(
+            &Arc::downgrade(&self.inner),
+            key,
+            topic,
+            &payload,
+            options.max_retries,
+        )
+        .await
+    }
+
+    /// Sends one broadcast (one try of JS `broadcast`'s `doLoop`).
+    async fn broadcast_once(&self, key: &str, topic: &str, payload: Vec<u8>) -> ClientResult<()> {
+        let _queue = self.lock_task_queue().await;
+        let client_id = {
+            let state = self.state();
+            if !state.channels.contains_key(key) {
+                return Err(ClientError::NotAttached(key.to_owned()));
+            }
+            state
+                .id
+                .clone()
+                .ok_or_else(|| ClientError::ClientNotActivated(self.inner.key.clone()))?
+        };
+        self.inner
+            .transport
+            .broadcast(BroadcastRequest {
+                client_id,
+                channel_key: key.to_owned(),
+                topic: topic.to_owned(),
+                payload,
+                shard_key: self.shard_key(first_key_path(key)),
+            })
+            .await?;
+        Ok(())
     }
 
     /// Creates or refreshes the session of an attached channel and takes the
@@ -811,14 +900,13 @@ impl Client {
         // while the request was in flight.
         let actor_id = {
             let mut state = self.state();
-            let Some(attachment) = state
+            if !state
                 .channels
-                .get_mut(&key)
-                .filter(|attachment| attachment.holds(&channel))
-            else {
+                .get(&key)
+                .is_some_and(|attachment| attachment.holds(&channel))
+            {
                 return Ok(());
-            };
-            attachment.last_heartbeat_at = Some(Instant::now());
+            }
             if first_call && state.id.is_none() {
                 if let Some(client_id) = &response.client_id {
                     state.id = Some(client_id.clone());
@@ -827,7 +915,24 @@ impl Client {
                     state.status = ClientStatus::Activated;
                 }
             }
-            state.id.clone()
+            let active = state.session(&self.inner.key).is_ok();
+            let actor_id = state.id.clone();
+            if let Some(attachment) = state.channels.get_mut(&key) {
+                attachment.last_heartbeat_at = Some(Instant::now());
+                // JS: a realtime channel opens its stream once the first
+                // refresh has given the client an ID; it is not awaited.
+                if first_call
+                    && active
+                    && attachment.sync_mode == SyncMode::Realtime
+                    && attachment.watch_task.is_none()
+                {
+                    let (task, _ready) =
+                        watch::spawn_channel(&self.inner, key.clone(), channel.clone());
+                    attachment.watch_task = Some(task);
+                    state.conditions.insert(ClientCondition::WatchLoop, true);
+                }
+            }
+            actor_id
         };
 
         let mut channel = lock_channel(&channel);
@@ -1073,7 +1178,11 @@ impl ClientState {
         let has_watch_attachment = self
             .attachments
             .values()
-            .any(|attachment| uses_watch_stream(attachment.sync_mode));
+            .any(|attachment| uses_watch_stream(attachment.sync_mode))
+            || self
+                .channels
+                .values()
+                .any(|attachment| attachment.sync_mode == SyncMode::Realtime);
         self.conditions
             .insert(ClientCondition::WatchLoop, has_watch_attachment);
     }
@@ -1147,12 +1256,89 @@ fn release_channel_attachment(attachment: ChannelAttachment) {
     let ChannelAttachment {
         channel,
         watch_task,
+        local_broadcast,
         ..
     } = attachment;
     drop(watch_task);
     let mut channel = lock_channel(&channel);
+    if let Some(id) = local_broadcast {
+        channel.unsubscribe(id);
+    }
     channel.apply_status(ChannelStatus::Detached);
     channel.set_session_id(None);
+}
+
+/// Returns the channel subscriber that sends each `LocalBroadcast` in the
+/// background (the JS `local-broadcast` handler of `attachChannel`), passing
+/// a final failure to the broadcast's error handler. It holds the client
+/// weakly, so a channel the app keeps does not keep the client alive.
+fn send_local_broadcasts(
+    inner: &Arc<ClientInner>,
+    key: String,
+) -> impl FnMut(&ChannelEvent) + Send + 'static {
+    let inner = Arc::downgrade(inner);
+    let runtime = tokio::runtime::Handle::current();
+    move |event| {
+        let ChannelEvent::LocalBroadcast {
+            topic,
+            payload,
+            options,
+            ..
+        } = event
+        else {
+            return;
+        };
+        let (inner, key, topic, payload, options) = (
+            inner.clone(),
+            key.clone(),
+            topic.clone(),
+            payload.clone(),
+            options.clone(),
+        );
+        runtime.spawn(async move {
+            let result =
+                broadcast_with_retry(&inner, &key, &topic, &payload, options.max_retries).await;
+            if let (Err(err), Some(handler)) = (result, &options.error) {
+                handler.call(&err);
+            }
+        });
+    }
+}
+
+/// Sends a broadcast, retrying after retryable failures (JS `broadcast`).
+/// See `Client::broadcast`.
+async fn broadcast_with_retry(
+    inner: &Weak<ClientInner>,
+    key: &str,
+    topic: &str,
+    payload: &serde_json::Value,
+    max_retries: Option<u32>,
+) -> ClientResult<()> {
+    let payload =
+        serde_json::to_vec(payload).map_err(|err| ClientError::InvalidArgument(err.to_string()))?;
+    let mut retries = 0;
+    loop {
+        let Some(client) = Client::upgrade(inner) else {
+            return Err(ClientError::NotAttached(key.to_owned()));
+        };
+        let err = match client.broadcast_once(key, topic, payload.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(err) => err,
+        };
+        if !err.is_retryable() || max_retries.is_some_and(|max| retries >= max) {
+            return Err(err);
+        }
+        drop(client);
+        tokio::time::sleep(broadcast_retry_delay(retries)).await;
+        retries += 1;
+    }
+}
+
+/// The wait before broadcast retry `retries + 1` (JS `exponentialBackoff`).
+fn broadcast_retry_delay(retries: u32) -> Duration {
+    BROADCAST_INITIAL_RETRY_INTERVAL
+        .saturating_mul(2u32.saturating_pow(retries))
+        .min(BROADCAST_MAX_BACKOFF)
 }
 
 pub(crate) fn lock_document(doc: &SharedDocument) -> MutexGuard<'_, Document> {
@@ -1185,9 +1371,12 @@ fn generate_client_key() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Client, ClientCondition, ClientStatus};
+    use super::{broadcast_retry_delay, Client, ClientCondition, ClientStatus};
     use crate::attachment::SharedDocument;
-    use crate::channel::{Channel, ChannelEvent, ChannelStatus, SharedChannel};
+    use crate::channel::{
+        BroadcastErrorHandler, BroadcastOptions, Channel, ChannelEvent, ChannelStatus,
+        SharedChannel,
+    };
     use crate::error::{ClientError, ClientResult};
     use crate::options::{
         AttachChannelOptions, AttachOptions, ClientOptions, DeactivateOptions, DetachOptions,
@@ -1197,11 +1386,13 @@ mod tests {
     };
     use crate::transport::{
         ActivateClientRequest, ActivateClientResponse, AttachDocumentRequest,
-        AttachDocumentResponse, ClientTransport, DeactivateClientRequest, DeactivateClientResponse,
-        DetachDocumentRequest, DetachDocumentResponse, PeekChannelRequest, PeekChannelResponse,
-        PushPullChangesRequest, PushPullChangesResponse, RefreshChannelRequest,
-        RefreshChannelResponse, RemoveDocumentRequest, RemoveDocumentResponse,
-        WatchDocumentRequest, WatchDocumentResponse, WatchStream,
+        AttachDocumentResponse, BroadcastRequest, BroadcastResponse, ChannelWatchStream,
+        ClientTransport, DeactivateClientRequest, DeactivateClientResponse, DetachDocumentRequest,
+        DetachDocumentResponse, PeekChannelRequest, PeekChannelResponse, PushPullChangesRequest,
+        PushPullChangesResponse, RefreshChannelRequest, RefreshChannelResponse,
+        RemoveDocumentRequest, RemoveDocumentResponse, WatchChannelEvent, WatchChannelEventType,
+        WatchChannelRequest, WatchChannelResponse, WatchDocumentRequest, WatchDocumentResponse,
+        WatchStream,
     };
     use async_trait::async_trait;
     use futures_util::stream::{self, StreamExt};
@@ -1238,6 +1429,11 @@ mod tests {
         /// Errors for the next refreshes, in order; later refreshes succeed.
         refresh_errors: Mutex<Vec<ClientError>>,
         peek_requests: Mutex<Vec<PeekChannelRequest>>,
+        channel_watch_requests: Mutex<Vec<WatchChannelRequest>>,
+        /// Messages for the next channel watch streams, one list per stream;
+        /// once these run out, streams report one session.
+        channel_watch_scripts: Mutex<Vec<Vec<ClientResult<WatchChannelResponse>>>>,
+        broadcast_requests: Mutex<Vec<BroadcastRequest>>,
     }
 
     impl Default for MockTransport {
@@ -1258,6 +1454,9 @@ mod tests {
                 refresh_requests: Mutex::new(Vec::new()),
                 refresh_errors: Mutex::new(Vec::new()),
                 peek_requests: Mutex::new(Vec::new()),
+                channel_watch_requests: Mutex::new(Vec::new()),
+                channel_watch_scripts: Mutex::new(Vec::new()),
+                broadcast_requests: Mutex::new(Vec::new()),
             }
         }
     }
@@ -1369,6 +1568,29 @@ mod tests {
         ) -> ClientResult<PeekChannelResponse> {
             self.peek_requests.lock().unwrap().push(request);
             Ok(PeekChannelResponse { session_count: 2 })
+        }
+
+        async fn watch_channel(
+            &self,
+            request: WatchChannelRequest,
+        ) -> ClientResult<ChannelWatchStream> {
+            self.channel_watch_requests.lock().unwrap().push(request);
+            let mut scripts = self.channel_watch_scripts.lock().unwrap();
+            let messages = if scripts.is_empty() {
+                vec![Ok(WatchChannelResponse::Initialization {
+                    session_count: 1,
+                    seq: 1,
+                    heartbeat_interval_ms: 0,
+                })]
+            } else {
+                scripts.remove(0)
+            };
+            Ok(Box::pin(stream::iter(messages).chain(stream::pending())))
+        }
+
+        async fn broadcast(&self, request: BroadcastRequest) -> ClientResult<BroadcastResponse> {
+            self.broadcast_requests.lock().unwrap().push(request);
+            Ok(BroadcastResponse)
         }
     }
 
@@ -2383,6 +2605,20 @@ mod tests {
             ) -> ClientResult<PeekChannelResponse> {
                 self.mock.peek_channel(request).await
             }
+
+            async fn watch_channel(
+                &self,
+                request: WatchChannelRequest,
+            ) -> ClientResult<ChannelWatchStream> {
+                self.mock.watch_channel(request).await
+            }
+
+            async fn broadcast(
+                &self,
+                request: BroadcastRequest,
+            ) -> ClientResult<BroadcastResponse> {
+                self.mock.broadcast(request).await
+            }
         }
 
         let transport = Arc::new(DeactivatingTransport {
@@ -2747,6 +2983,170 @@ mod tests {
         assert_eq!("room.1", requests[0].channel_key);
         assert_eq!("api-key/room", requests[0].shard_key);
         assert!(!client.is_active());
+        Ok(())
+    }
+
+    /// JS `exponentialBackoff`: 1s doubling per retry, at most 20s.
+    #[test]
+    fn broadcast_retries_back_off_exponentially() {
+        let delays: Vec<u64> = (0..7)
+            .map(|retries| broadcast_retry_delay(retries).as_secs())
+            .collect();
+        assert_eq!(vec![1, 2, 4, 8, 16, 20, 20], delays);
+        assert_eq!(Duration::from_secs(20), broadcast_retry_delay(u32::MAX));
+    }
+
+    /// JS `createChannelWatchStream` and `handleWatchChannelResponse`: a
+    /// realtime channel watches once its first refresh activated the client;
+    /// stale counts and broadcasts whose payload is not JSON are dropped.
+    #[tokio::test]
+    async fn realtime_channel_watches_after_its_first_refresh() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        let publisher = ActorId::new("000000000000000000000002");
+        let event = |event_type, session_count, seq, payload: &[u8]| {
+            Ok(WatchChannelResponse::Event(WatchChannelEvent {
+                event_type,
+                publisher: publisher.clone(),
+                session_count,
+                seq,
+                topic: "chat".to_owned(),
+                payload: payload.to_vec(),
+            }))
+        };
+        *transport.channel_watch_scripts.lock().unwrap() = vec![vec![
+            Ok(WatchChannelResponse::Initialization {
+                session_count: 2,
+                seq: 1,
+                heartbeat_interval_ms: 0,
+            }),
+            event(WatchChannelEventType::Presence, 3, 3, b""),
+            event(WatchChannelEventType::Presence, 1, 2, b""),
+            event(WatchChannelEventType::Broadcast, 0, 0, b"not json"),
+            event(WatchChannelEventType::Broadcast, 0, 0, br#"{"a":1}"#),
+        ]];
+        let client = mock_client(fast_loop_options(), &transport);
+        let channel = shared_channel("room.1");
+        let events = collect_channel_events(&channel);
+
+        client
+            .attach_channel(channel.clone(), AttachChannelOptions::default())
+            .await?;
+        eventually(|| events.lock().unwrap().len() == 4).await;
+
+        assert_eq!(
+            vec![
+                ChannelEvent::PresenceChanged { count: 1 },
+                ChannelEvent::Initialized { count: 2 },
+                ChannelEvent::PresenceChanged { count: 3 },
+                ChannelEvent::Broadcast {
+                    client_id: publisher.clone(),
+                    topic: "chat".to_owned(),
+                    payload: json!({"a": 1}),
+                },
+            ],
+            *events.lock().unwrap()
+        );
+        let requests = transport.channel_watch_requests.lock().unwrap().clone();
+        assert_eq!(1, requests.len());
+        assert_eq!(client.id(), Some(requests[0].client_id.clone()));
+        assert_eq!("room.1", requests[0].channel_key);
+        assert_eq!("api-key/room", requests[0].shard_key);
+        assert!(client.condition(ClientCondition::WatchLoop));
+        assert_eq!(2, client.running_task_count());
+        Ok(())
+    }
+
+    /// JS "Polling mode does not open a watch stream" and
+    /// `changeChannelSyncMode`: entering `Realtime` opens the stream and waits
+    /// for it; leaving it closes the stream.
+    #[tokio::test]
+    async fn only_realtime_channels_watch() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        let client = mock_client(fast_loop_options(), &transport);
+        client.activate().await?;
+        let channel = shared_channel("room");
+        let events = collect_channel_events(&channel);
+        client
+            .attach_channel(channel.clone(), fast_channel(SyncMode::Polling))
+            .await?;
+        eventually(|| channel.lock().unwrap().is_attached()).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(transport.channel_watch_requests.lock().unwrap().is_empty());
+        assert_eq!(1, client.running_task_count());
+
+        client
+            .change_channel_sync_mode(&channel, SyncMode::Realtime)
+            .await?;
+        assert_eq!(1, transport.channel_watch_requests.lock().unwrap().len());
+        assert!(events
+            .lock()
+            .unwrap()
+            .contains(&ChannelEvent::Initialized { count: 1 }));
+        assert_eq!(2, client.running_task_count());
+
+        client
+            .change_channel_sync_mode(&channel, SyncMode::Polling)
+            .await?;
+        eventually(|| client.running_task_count() == 1).await;
+        assert!(!client.condition(ClientCondition::WatchLoop));
+        Ok(())
+    }
+
+    /// JS `client.broadcast` and the `local-broadcast` handler of
+    /// `attachChannel`: the payload goes out as JSON with the first key path
+    /// as shard key, and detaching removes the handler.
+    #[tokio::test]
+    async fn broadcasts_are_sent_as_json() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        let client = mock_client(fast_loop_options(), &transport);
+        client.activate().await?;
+        assert_eq!(
+            ClientError::NotAttached("room.1".to_owned()),
+            client
+                .broadcast("room.1", "chat", json!(1), BroadcastOptions::default())
+                .await
+                .unwrap_err()
+        );
+        let channel = shared_channel("room.1");
+        client
+            .attach_channel(channel.clone(), fast_channel(SyncMode::Polling))
+            .await?;
+        eventually(|| channel.lock().unwrap().is_attached()).await;
+
+        client
+            .broadcast(
+                "room.1",
+                "chat",
+                json!({"a": 1}),
+                BroadcastOptions::default(),
+            )
+            .await?;
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let options = BroadcastOptions {
+            max_retries: Some(0),
+            error: Some(BroadcastErrorHandler::new({
+                let errors = errors.clone();
+                move |err| errors.lock().unwrap().push(err.clone())
+            })),
+        };
+        channel
+            .lock()
+            .unwrap()
+            .broadcast("cursor", json!([1, 2]), options)?;
+        eventually(|| transport.broadcast_requests.lock().unwrap().len() == 2).await;
+
+        let requests = transport.broadcast_requests.lock().unwrap().clone();
+        assert_eq!(client.id(), Some(requests[0].client_id.clone()));
+        assert_eq!("room.1", requests[0].channel_key);
+        assert_eq!("chat", requests[0].topic);
+        assert_eq!(br#"{"a":1}"#.to_vec(), requests[0].payload);
+        assert_eq!("api-key/room", requests[0].shard_key);
+        assert_eq!("cursor", requests[1].topic);
+        assert_eq!(b"[1,2]".to_vec(), requests[1].payload);
+        assert!(errors.lock().unwrap().is_empty());
+
+        client.detach_channel(&channel).await?;
+        assert!(format!("{:?}", channel.lock().unwrap()).contains("subscribers: 0"));
         Ok(())
     }
 }

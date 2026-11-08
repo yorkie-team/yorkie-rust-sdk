@@ -17,12 +17,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use yorkie::{
     ActivateClientRequest, ActivateClientResponse, ActorId, AttachDocumentRequest,
-    AttachDocumentResponse, AttachOptions, Client, ClientError, ClientOptions, ClientResult,
-    ClientTransport, ConnectTransport, DeactivateClientRequest, DeactivateClientResponse,
-    DeactivateOptions, DetachDocumentRequest, DetachDocumentResponse, DetachOptions, DocEvent,
-    Document, PeekChannelRequest, PeekChannelResponse, Presence, PushPullChangesRequest,
-    PushPullChangesResponse, RefreshChannelRequest, RefreshChannelResponse, RemoveDocumentRequest,
-    RemoveDocumentResponse, SharedDocument, StreamConnectionStatus, SyncMode, WatchDocumentRequest,
+    AttachDocumentResponse, AttachOptions, BroadcastRequest, BroadcastResponse, ChannelWatchStream,
+    Client, ClientError, ClientOptions, ClientResult, ClientTransport, ConnectTransport,
+    DeactivateClientRequest, DeactivateClientResponse, DeactivateOptions, DetachDocumentRequest,
+    DetachDocumentResponse, DetachOptions, DocEvent, Document, PeekChannelRequest,
+    PeekChannelResponse, Presence, PushPullChangesRequest, PushPullChangesResponse,
+    RefreshChannelRequest, RefreshChannelResponse, RemoveDocumentRequest, RemoveDocumentResponse,
+    SharedDocument, StreamConnectionStatus, SyncMode, WatchChannelRequest, WatchDocumentRequest,
     WatchStream,
 };
 
@@ -265,6 +266,17 @@ impl ClientTransport for FlakyWatchTransport {
 
     async fn peek_channel(&self, request: PeekChannelRequest) -> ClientResult<PeekChannelResponse> {
         self.inner.peek_channel(request).await
+    }
+
+    async fn watch_channel(
+        &self,
+        request: WatchChannelRequest,
+    ) -> ClientResult<ChannelWatchStream> {
+        self.inner.watch_channel(request).await
+    }
+
+    async fn broadcast(&self, request: BroadcastRequest) -> ClientResult<BroadcastResponse> {
+        self.inner.broadcast(request).await
     }
 }
 

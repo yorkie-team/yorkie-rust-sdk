@@ -1,24 +1,31 @@
-//! The watch loop that keeps a realtime document's stream open.
+//! The watch loops that keep the streams of realtime documents and channels
+//! open.
 //!
 //! JS reference: `packages/sdk/src/client/client.ts` (`runWatchLoop`,
-//! `createDocumentWatchStream`, `handleWatchDocumentResponse`),
+//! `createDocumentWatchStream`, `handleWatchDocumentResponse`,
+//! `createChannelWatchStream`, `handleWatchChannelResponse`),
 //! `client/attachment.ts` (`runWatchLoop`), and `client/watch.ts`
 //! (`runWatchStream`, `watchIdleTimeout`).
 //!
-//! The loop opens the stream, applies what it reports to the document, and
-//! when the stream fails or ends publishes `ConnectionChanged(Disconnected)`
-//! and opens it again after `reconnect_stream_delay`. An error that is not
-//! retryable stops the loop. Once the server reports a heartbeat interval, a
-//! stream silent for three times that long is treated as half-open and
-//! reconnected.
+//! A loop opens the stream, applies what it reports to the document or
+//! channel, and when the stream fails or ends opens it again after
+//! `reconnect_stream_delay`; a document also publishes
+//! `ConnectionChanged(Disconnected)`. An error that is not retryable stops
+//! the loop. Once the server reports a heartbeat interval, a stream silent
+//! for three times that long is treated as half-open and reconnected.
 
 use crate::attachment::SharedDocument;
-use crate::client::{lock_document, Client, ClientCondition, ClientInner, TaskHandle};
-use crate::error::ClientError;
-use crate::transport::{
-    ClientTransport, WatchDocEvent, WatchDocEventType, WatchDocumentRequest, WatchDocumentResponse,
+use crate::channel::{first_key_path, Channel, ChannelEvent, SharedChannel};
+use crate::client::{
+    lock_channel, lock_document, Client, ClientCondition, ClientInner, TaskHandle,
 };
-use futures_util::StreamExt;
+use crate::error::{ClientError, ClientResult};
+use crate::transport::{
+    ClientTransport, WatchChannelEvent, WatchChannelEventType, WatchChannelRequest,
+    WatchChannelResponse, WatchDocEvent, WatchDocEventType, WatchDocumentRequest,
+    WatchDocumentResponse,
+};
+use futures_util::{Stream, StreamExt};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -158,17 +165,7 @@ async fn watch_stream(
 
     let mut idle_timeout = None;
     loop {
-        let next = match idle_timeout {
-            Some(timeout) => match tokio::time::timeout(timeout, stream.next()).await {
-                Ok(next) => next,
-                Err(_) => Some(Err(ClientError::Transport(format!(
-                    "watch stream is idle for {}ms",
-                    timeout.as_millis()
-                )))),
-            },
-            None => stream.next().await,
-        };
-        let response = match next {
+        let response = match next_message(&mut stream, idle_timeout).await {
             Some(Ok(response)) => response,
             Some(Err(err)) => return stream_failed(inner, key, doc, Some(&err)),
             None => return stream_failed(inner, key, doc, None),
@@ -189,6 +186,27 @@ async fn watch_stream(
             }
             Handled::Stop => return StreamEnd::Stop,
         }
+    }
+}
+
+/// Waits for the next stream message. A stream silent for `idle_timeout`
+/// yields an error, which reconnects it (JS `runWatchStream`).
+async fn next_message<S, T>(
+    stream: &mut S,
+    idle_timeout: Option<Duration>,
+) -> Option<ClientResult<T>>
+where
+    S: Stream<Item = ClientResult<T>> + Unpin,
+{
+    let Some(timeout) = idle_timeout else {
+        return stream.next().await;
+    };
+    match tokio::time::timeout(timeout, stream.next()).await {
+        Ok(next) => next,
+        Err(_) => Some(Err(ClientError::Transport(format!(
+            "watch stream is idle for {}ms",
+            timeout.as_millis()
+        )))),
     }
 }
 
@@ -260,6 +278,191 @@ fn handle_response(
             Handled::Continue
         }
         WatchDocumentResponse::Heartbeat => Handled::Continue,
+    }
+}
+
+/// Starts the watch loop of an attached channel (JS `runWatchLoop` with
+/// `createChannelWatchStream`). The receiver completes as `spawn`'s does.
+pub(crate) fn spawn_channel(
+    inner: &Arc<ClientInner>,
+    key: String,
+    channel: SharedChannel,
+) -> (TaskHandle, oneshot::Receiver<()>) {
+    let (ready, ready_rx) = oneshot::channel();
+    let task = inner.spawn_task(run_channel(Arc::downgrade(inner), key, channel, ready));
+    (task, ready_rx)
+}
+
+async fn run_channel(
+    inner: Weak<ClientInner>,
+    key: String,
+    channel: SharedChannel,
+    ready: oneshot::Sender<()>,
+) {
+    let mut ready = Some(ready);
+    loop {
+        let Some((transport, request, reconnect_delay)) =
+            open_channel_request(&inner, &key, &channel)
+        else {
+            return;
+        };
+        let end =
+            watch_channel_stream(&inner, &key, &channel, transport, request, &mut ready).await;
+        if let Some(ready) = ready.take() {
+            let _ = ready.send(());
+        }
+        match end {
+            StreamEnd::Stop => return,
+            StreamEnd::Reconnect => tokio::time::sleep(reconnect_delay).await,
+        }
+    }
+}
+
+/// Builds the request for the next channel stream, or returns `None` when
+/// the client is gone, inactive, or no longer holds the channel.
+fn open_channel_request(
+    inner: &Weak<ClientInner>,
+    key: &str,
+    channel: &SharedChannel,
+) -> Option<(Arc<dyn ClientTransport>, WatchChannelRequest, Duration)> {
+    let client = Client::upgrade(inner)?;
+    let Ok(session) = client.session() else {
+        client.set_condition(ClientCondition::WatchLoop, false);
+        return None;
+    };
+    client.with_channel_attachment(key, channel, |_| ())?;
+    let request = WatchChannelRequest {
+        client_id: session.client_id,
+        channel_key: key.to_owned(),
+        heartbeat_interval_ms: ceil_millis(client.options().watch_heartbeat_interval),
+        shard_key: client.shard_key(first_key_path(key)),
+    };
+    Some((
+        client.inner.transport.clone(),
+        request,
+        client.options().reconnect_stream_delay,
+    ))
+}
+
+/// Opens one channel stream and handles it until it ends.
+async fn watch_channel_stream(
+    inner: &Weak<ClientInner>,
+    key: &str,
+    channel: &SharedChannel,
+    transport: Arc<dyn ClientTransport>,
+    request: WatchChannelRequest,
+    ready: &mut Option<oneshot::Sender<()>>,
+) -> StreamEnd {
+    let mut stream = match transport.watch_channel(request).await {
+        Ok(stream) => stream,
+        Err(err) => return channel_stream_failed(inner, key, channel, Some(&err)),
+    };
+
+    let mut idle_timeout = None;
+    loop {
+        let response = match next_message(&mut stream, idle_timeout).await {
+            Some(Ok(response)) => response,
+            Some(Err(err)) => return channel_stream_failed(inner, key, channel, Some(&err)),
+            None => return channel_stream_failed(inner, key, channel, None),
+        };
+
+        let Some(client) = Client::upgrade(inner) else {
+            return StreamEnd::Stop;
+        };
+        if client
+            .with_channel_attachment(key, channel, |_| ())
+            .is_none()
+        {
+            return StreamEnd::Stop;
+        }
+        drop(client);
+        let initialized = match &response {
+            WatchChannelResponse::Initialization {
+                heartbeat_interval_ms,
+                ..
+            } => {
+                idle_timeout = watch_idle_timeout(*heartbeat_interval_ms);
+                true
+            }
+            _ => false,
+        };
+        handle_channel_response(&mut lock_channel(channel), response);
+        if initialized {
+            if let Some(ready) = ready.take() {
+                let _ = ready.send(());
+            }
+        }
+    }
+}
+
+/// Handles a channel stream that failed with `err`, or ended normally when
+/// `err` is `None`. Unlike a document, a channel publishes nothing.
+fn channel_stream_failed(
+    inner: &Weak<ClientInner>,
+    key: &str,
+    channel: &SharedChannel,
+    err: Option<&ClientError>,
+) -> StreamEnd {
+    let Some(client) = Client::upgrade(inner) else {
+        return StreamEnd::Stop;
+    };
+    if client
+        .with_channel_attachment(key, channel, |_| ())
+        .is_none()
+    {
+        return StreamEnd::Stop;
+    }
+    match err {
+        Some(err) if !err.is_retryable() => {
+            client.set_condition(ClientCondition::WatchLoop, false);
+            StreamEnd::Stop
+        }
+        _ => StreamEnd::Reconnect,
+    }
+}
+
+/// Applies one channel stream message (JS `handleWatchChannelResponse`).
+/// Counts older than the last one taken are dropped; a broadcast whose
+/// payload is not JSON is skipped.
+fn handle_channel_response(channel: &mut Channel, response: WatchChannelResponse) {
+    match response {
+        WatchChannelResponse::Initialization {
+            session_count, seq, ..
+        } => {
+            if channel.update_session_count(session_count, seq) {
+                channel.publish(ChannelEvent::Initialized {
+                    count: session_count,
+                });
+            }
+        }
+        WatchChannelResponse::Event(WatchChannelEvent {
+            event_type: WatchChannelEventType::Broadcast,
+            publisher,
+            topic,
+            payload,
+            ..
+        }) => {
+            if let Ok(payload) = serde_json::from_slice(&payload) {
+                channel.publish(ChannelEvent::Broadcast {
+                    client_id: publisher,
+                    topic,
+                    payload,
+                });
+            }
+        }
+        WatchChannelResponse::Event(WatchChannelEvent {
+            event_type: WatchChannelEventType::Presence,
+            session_count,
+            seq,
+            ..
+        }) => {
+            if channel.update_session_count(session_count, seq) {
+                channel.publish(ChannelEvent::PresenceChanged {
+                    count: session_count,
+                });
+            }
+        }
+        WatchChannelResponse::Heartbeat => {}
     }
 }
 

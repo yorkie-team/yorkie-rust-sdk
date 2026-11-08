@@ -1,5 +1,5 @@
 //! Connect protocol transport for Yorkie RPCs: unary calls and the
-//! server-streaming `Watch` call.
+//! server-streaming `Watch` call, for documents and channels.
 //!
 //! JS reference: `packages/sdk/src/client/client.ts` (Connect client setup,
 //! `x-api-key`, `x-shard-key` and `x-yorkie-user-agent` headers). Streaming
@@ -12,10 +12,11 @@ use crate::options::ClientOptions;
 use crate::protocol as conv;
 use crate::transport::{
     ActivateClientRequest, ActivateClientResponse, AttachDocumentRequest, AttachDocumentResponse,
-    ClientTransport, DeactivateClientRequest, DeactivateClientResponse, DetachDocumentRequest,
+    BroadcastRequest, BroadcastResponse, ChannelWatchStream, ClientTransport,
+    DeactivateClientRequest, DeactivateClientResponse, DetachDocumentRequest,
     DetachDocumentResponse, PeekChannelRequest, PeekChannelResponse, PushPullChangesRequest,
     PushPullChangesResponse, RefreshChannelRequest, RefreshChannelResponse, RemoveDocumentRequest,
-    RemoveDocumentResponse, WatchDocumentRequest, WatchStream,
+    RemoveDocumentResponse, WatchChannelRequest, WatchDocumentRequest, WatchStream,
 };
 use async_trait::async_trait;
 use futures_util::{stream, Stream, StreamExt};
@@ -443,6 +444,36 @@ impl ClientTransport for ConnectTransport {
             )
             .await?;
         Ok(conv::from_peek_channel_response(&response))
+    }
+
+    async fn watch_channel(
+        &self,
+        request: WatchChannelRequest,
+    ) -> ClientResult<ChannelWatchStream> {
+        let responses = self
+            .server_stream::<_, api::WatchResponse>(
+                "Watch",
+                &request.shard_key,
+                &conv::to_watch_channel_request(&request),
+            )
+            .await?;
+        Ok(Box::pin(responses.filter_map(|response| async move {
+            match response {
+                Ok(response) => conv::from_watch_channel_response(&response).map(Ok),
+                Err(err) => Some(Err(err)),
+            }
+        })))
+    }
+
+    async fn broadcast(&self, request: BroadcastRequest) -> ClientResult<BroadcastResponse> {
+        let response: api::BroadcastResponse = self
+            .unary(
+                "Broadcast",
+                &request.shard_key,
+                &conv::to_broadcast_request(&request),
+            )
+            .await?;
+        Ok(conv::from_broadcast_response(&response))
     }
 }
 

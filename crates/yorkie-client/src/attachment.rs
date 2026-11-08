@@ -1,4 +1,4 @@
-use crate::channel::SharedChannel;
+use crate::channel::{ChannelSubscriptionId, SharedChannel};
 use crate::client::TaskHandle;
 use crate::error::{ClientError, ClientResult};
 use crate::options::{SyncMode, DEFAULT_POLLING_INTERVAL_MS};
@@ -95,6 +95,9 @@ pub(crate) struct ChannelAttachment {
     pub(crate) last_heartbeat_at: Option<Instant>,
     /// The watch loop task, while the attachment watches the channel.
     pub(crate) watch_task: Option<TaskHandle>,
+    /// The subscription that sends the channel's `LocalBroadcast` events
+    /// (JS `unsubscribeLocalBroadcast`), removed when the channel detaches.
+    pub(crate) local_broadcast: Option<ChannelSubscriptionId>,
 }
 
 impl ChannelAttachment {
@@ -111,6 +114,7 @@ impl ChannelAttachment {
             heartbeat_interval_pinned,
             last_heartbeat_at: None,
             watch_task: None,
+            local_broadcast: None,
         }
     }
 

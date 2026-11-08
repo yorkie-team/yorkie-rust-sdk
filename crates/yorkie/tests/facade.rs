@@ -5,14 +5,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use yorkie::{
     ActivateClientRequest, ActivateClientResponse, ActorId, AttachChannelOptions,
-    AttachDocumentRequest, AttachDocumentResponse, AttachOptions, ChangePack, Checkpoint, Client,
-    ClientCondition, ClientError, ClientStatus, ClientTransport, CounterType, CounterValue,
-    DeactivateClientRequest, DeactivateClientResponse, DeactivateOptions, DetachDocumentRequest,
-    DetachDocumentResponse, DetachOptions, DocStatus, Document, JsonCounter, PeekChannelRequest,
-    PeekChannelResponse, Presence, PushPullChangesRequest, PushPullChangesResponse,
-    RefreshChannelRequest, RefreshChannelResponse, RemoveDocumentRequest, RemoveDocumentResponse,
-    Result, SchemaRule, SharedDocument, SyncMode, TimeTicket, TimeTicketStruct, TreeNodeRule,
-    VersionVector, WatchDocumentRequest, WatchStream,
+    AttachDocumentRequest, AttachDocumentResponse, AttachOptions, BroadcastRequest,
+    BroadcastResponse, ChangePack, ChannelWatchStream, Checkpoint, Client, ClientCondition,
+    ClientError, ClientStatus, ClientTransport, CounterType, CounterValue, DeactivateClientRequest,
+    DeactivateClientResponse, DeactivateOptions, DetachDocumentRequest, DetachDocumentResponse,
+    DetachOptions, DocStatus, Document, JsonCounter, PeekChannelRequest, PeekChannelResponse,
+    Presence, PushPullChangesRequest, PushPullChangesResponse, RefreshChannelRequest,
+    RefreshChannelResponse, RemoveDocumentRequest, RemoveDocumentResponse, Result, SchemaRule,
+    SharedDocument, SyncMode, TimeTicket, TimeTicketStruct, TreeNodeRule, VersionVector,
+    WatchChannelRequest, WatchDocumentRequest, WatchStream,
 };
 
 #[derive(Debug, Default)]
@@ -113,6 +114,24 @@ impl ClientTransport for FacadeTransport {
         &self,
         _request: PeekChannelRequest,
     ) -> yorkie::ClientResult<PeekChannelResponse> {
+        Err(ClientError::Transport(
+            "channels are not used here".to_owned(),
+        ))
+    }
+
+    async fn watch_channel(
+        &self,
+        _request: WatchChannelRequest,
+    ) -> yorkie::ClientResult<ChannelWatchStream> {
+        Err(ClientError::Transport(
+            "channels are not used here".to_owned(),
+        ))
+    }
+
+    async fn broadcast(
+        &self,
+        _request: BroadcastRequest,
+    ) -> yorkie::ClientResult<BroadcastResponse> {
         Err(ClientError::Transport(
             "channels are not used here".to_owned(),
         ))

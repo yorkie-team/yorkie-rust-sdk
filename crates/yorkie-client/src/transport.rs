@@ -143,6 +143,75 @@ pub struct PeekChannelResponse {
     pub session_count: u64,
 }
 
+/// Request data for broadcasting to a channel (JS `rpcClient.broadcast`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BroadcastRequest {
+    pub client_id: ActorId,
+    pub channel_key: String,
+    pub topic: String,
+    /// The JSON encoding of the payload (JS `JSON.stringify`).
+    pub payload: Vec<u8>,
+    pub shard_key: String,
+}
+
+/// Response data for broadcasting to a channel.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BroadcastResponse;
+
+/// Request data for watching a channel (JS `watch` with a channel resource
+/// descriptor, built in `createChannelWatchStream`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchChannelRequest {
+    pub client_id: ActorId,
+    pub channel_key: String,
+    /// How often the server should send a heartbeat on an idle stream; 0
+    /// asks for none.
+    pub heartbeat_interval_ms: u64,
+    pub shard_key: String,
+}
+
+/// One message of a channel watch stream (JS `WatchResponse` with a channel
+/// body).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchChannelResponse {
+    /// The session count when the stream opened, its sequence number, and the
+    /// heartbeat interval the server settled on (0 when it sends none).
+    Initialization {
+        session_count: u64,
+        seq: u64,
+        heartbeat_interval_ms: u64,
+    },
+    /// The session count changed, or a client broadcast a message.
+    Event(WatchChannelEvent),
+    /// Keeps an idle stream alive; carries nothing.
+    Heartbeat,
+}
+
+/// A channel event from the watch stream (JS `ChannelEvent` in the API).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchChannelEvent {
+    pub event_type: WatchChannelEventType,
+    pub publisher: ActorId,
+    pub session_count: u64,
+    pub seq: u64,
+    pub topic: String,
+    /// The JSON encoding of a broadcast payload.
+    pub payload: Vec<u8>,
+}
+
+/// The kind of a watch stream channel event (JS `PbChannelEventType`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchChannelEventType {
+    /// The session count changed. JS treats every type but `BROADCAST` this
+    /// way, and so does the conversion.
+    Presence,
+    Broadcast,
+}
+
+/// A stream of channel watch messages, which ends like a [`WatchStream`].
+pub type ChannelWatchStream =
+    Pin<Box<dyn Stream<Item = ClientResult<WatchChannelResponse>> + Send>>;
+
 /// Request data for watching a document (JS `watch` with a document
 /// resource descriptor).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,4 +307,11 @@ pub trait ClientTransport: Send + Sync {
 
     /// Reads a channel's session count (JS `peekChannel`).
     async fn peek_channel(&self, request: PeekChannelRequest) -> ClientResult<PeekChannelResponse>;
+
+    /// Opens a server stream of events for one channel (JS `watch`).
+    async fn watch_channel(&self, request: WatchChannelRequest)
+        -> ClientResult<ChannelWatchStream>;
+
+    /// Sends a message to the clients watching a channel (JS `broadcast`).
+    async fn broadcast(&self, request: BroadcastRequest) -> ClientResult<BroadcastResponse>;
 }

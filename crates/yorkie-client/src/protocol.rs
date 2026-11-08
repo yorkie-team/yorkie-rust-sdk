@@ -2,11 +2,12 @@
 
 use crate::transport::{
     ActivateClientRequest, ActivateClientResponse, AttachDocumentRequest, AttachDocumentResponse,
-    DeactivateClientRequest, DeactivateClientResponse, DetachDocumentRequest,
-    DetachDocumentResponse, PeekChannelRequest, PeekChannelResponse, PushPullChangesRequest,
-    PushPullChangesResponse, RefreshChannelRequest, RefreshChannelResponse, RemoveDocumentRequest,
-    RemoveDocumentResponse, WatchDocEvent, WatchDocEventType, WatchDocumentRequest,
-    WatchDocumentResponse,
+    BroadcastRequest, BroadcastResponse, DeactivateClientRequest, DeactivateClientResponse,
+    DetachDocumentRequest, DetachDocumentResponse, PeekChannelRequest, PeekChannelResponse,
+    PushPullChangesRequest, PushPullChangesResponse, RefreshChannelRequest, RefreshChannelResponse,
+    RemoveDocumentRequest, RemoveDocumentResponse, WatchChannelEvent, WatchChannelEventType,
+    WatchChannelRequest, WatchChannelResponse, WatchDocEvent, WatchDocEventType,
+    WatchDocumentRequest, WatchDocumentResponse,
 };
 use yorkie_core::ActorId;
 use yorkie_protocol::converter::{self, ProtocolError};
@@ -173,6 +174,80 @@ pub fn to_peek_channel_request(request: &PeekChannelRequest) -> api::PeekChannel
 pub fn from_peek_channel_response(response: &api::PeekChannelResponse) -> PeekChannelResponse {
     PeekChannelResponse {
         session_count: count_from_i64(response.session_count),
+    }
+}
+
+pub fn to_broadcast_request(request: &BroadcastRequest) -> api::BroadcastRequest {
+    api::BroadcastRequest {
+        client_id: request.client_id.to_string(),
+        channel_key: request.channel_key.clone(),
+        topic: request.topic.clone(),
+        payload: request.payload.clone(),
+    }
+}
+
+pub fn from_broadcast_response(_response: &api::BroadcastResponse) -> BroadcastResponse {
+    BroadcastResponse
+}
+
+/// Builds the unified `Watch` request for one channel, as JS
+/// `createChannelWatchStream` does: no actor, which channels do not use.
+pub fn to_watch_channel_request(request: &WatchChannelRequest) -> api::WatchRequest {
+    api::WatchRequest {
+        client_id: request.client_id.to_string(),
+        resources: vec![api::ResourceDescriptor {
+            resource: Some(api::resource_descriptor::Resource::Channel(
+                api::ChannelDescriptor {
+                    channel_key: request.channel_key.clone(),
+                },
+            )),
+        }],
+        actor_id: String::new(),
+        heartbeat_interval_ms: i64::try_from(request.heartbeat_interval_ms).unwrap_or(i64::MAX),
+    }
+}
+
+/// Converts a `Watch` response for a channel stream (JS
+/// `handleWatchChannelResponse`). Bodies for other resources return `None`
+/// and are skipped.
+pub fn from_watch_channel_response(response: &api::WatchResponse) -> Option<WatchChannelResponse> {
+    use api::watch_response::Body;
+
+    match response.body.as_ref()? {
+        Body::Initialization(init) => {
+            let channel_init =
+                init.resource_inits
+                    .iter()
+                    .find_map(|resource_init| match &resource_init.init {
+                        Some(api::resource_init::Init::ChannelInit(init)) => Some(init),
+                        _ => None,
+                    })?;
+            Some(WatchChannelResponse::Initialization {
+                session_count: count_from_i64(channel_init.session_count),
+                seq: count_from_i64(channel_init.seq),
+                heartbeat_interval_ms: u64::try_from(init.heartbeat_interval_ms).unwrap_or(0),
+            })
+        }
+        Body::Event(event) => {
+            let Some(api::watch_event::Event::ChannelEvent(channel_event)) = &event.event else {
+                return None;
+            };
+            let event = channel_event.event.as_ref()?;
+            let event_type = if event.r#type == api::channel_event::Type::Broadcast as i32 {
+                WatchChannelEventType::Broadcast
+            } else {
+                WatchChannelEventType::Presence
+            };
+            Some(WatchChannelResponse::Event(WatchChannelEvent {
+                event_type,
+                publisher: ActorId::new(event.publisher.clone()),
+                session_count: count_from_i64(event.session_count),
+                seq: count_from_i64(event.seq),
+                topic: event.topic.clone(),
+                payload: event.payload.clone(),
+            }))
+        }
+        Body::Heartbeat(_) => Some(WatchChannelResponse::Heartbeat),
     }
 }
 

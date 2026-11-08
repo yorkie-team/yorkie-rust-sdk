@@ -1,18 +1,30 @@
-//! Channel integration tests against a live Yorkie server.
+//! Channel and broadcast integration tests against a live Yorkie server.
 //!
-//! JS reference: `packages/sdk/test/integration/channel_test.ts` and
-//! `channel_polling_test.ts`, with `withTwoClientsAndChannels` from
-//! `integration_helper.ts`. As in JS, most clients are never activated: the
-//! first channel refresh activates them.
+//! JS reference: `packages/sdk/test/integration/channel_test.ts`,
+//! `channel_polling_test.ts`, and `broadcast_test.ts`, with
+//! `withTwoClientsAndChannels` from `integration_helper.ts`. As in JS, most
+//! clients are never activated: the first channel refresh activates them.
+//!
+//! JS "Should throw error when broadcasting unserializeable payload" is not
+//! ported: a `serde_json::Value` payload always serializes.
 
 mod integration_support;
 
+use async_trait::async_trait;
 use integration_support::{rpc_addr, unique_key};
+use serde_json::{json, Value};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use yorkie::{
-    AttachChannelOptions, Channel, ChannelEvent, Client, ClientError, ClientOptions,
-    DeactivateOptions, SharedChannel, SyncMode,
+    ActivateClientRequest, ActivateClientResponse, AttachChannelOptions, AttachDocumentRequest,
+    AttachDocumentResponse, BroadcastErrorHandler, BroadcastOptions, BroadcastRequest,
+    BroadcastResponse, Channel, ChannelEvent, ChannelWatchStream, Client, ClientError,
+    ClientOptions, ClientResult, ClientTransport, ConnectTransport, DeactivateClientRequest,
+    DeactivateClientResponse, DeactivateOptions, DetachDocumentRequest, DetachDocumentResponse,
+    PeekChannelRequest, PeekChannelResponse, PushPullChangesRequest, PushPullChangesResponse,
+    RefreshChannelRequest, RefreshChannelResponse, RemoveDocumentRequest, RemoveDocumentResponse,
+    SharedChannel, SyncMode, WatchChannelRequest, WatchDocumentRequest, WatchStream,
 };
 
 fn client(addr: &str) -> Client {
@@ -88,17 +100,27 @@ struct TwoChannels {
 
 impl TwoChannels {
     async fn attach(addr: &str, name: &str) -> Self {
+        Self::attach_with(client(addr), client(addr), name).await
+    }
+
+    /// Attaches both channels in `Realtime` and waits until both are
+    /// attached and watching. JS waits for the attach only; waiting for the
+    /// watch too keeps a broadcast from racing the receiver's stream.
+    async fn attach_with(c1: Client, c2: Client, name: &str) -> Self {
         let key = unique_key(name);
-        let (c1, c2) = (client(addr), client(addr));
         let (ch1, ch2) = (shared_channel(&key), shared_channel(&key));
+        let watching1 = watch_initialized(&ch1);
+        let watching2 = watch_initialized(&ch2);
         c1.attach_channel(ch1.clone(), AttachChannelOptions::default())
             .await
             .unwrap();
         c2.attach_channel(ch2.clone(), AttachChannelOptions::default())
             .await
             .unwrap();
-        wait_for("both channels to attach", Duration::from_secs(10), || {
-            is_attached(&ch1) && is_attached(&ch2)
+        wait_for("both channels to watch", Duration::from_secs(10), || {
+            is_attached(&ch1) && is_attached(&ch2) && *watching1.lock().unwrap() && {
+                *watching2.lock().unwrap()
+            }
         })
         .await;
         Self { c1, ch1, c2, ch2 }
@@ -111,6 +133,62 @@ impl TwoChannels {
             }
         }
     }
+}
+
+/// Whether the channel's watch stream reported `Initialized`.
+fn watch_initialized(channel: &SharedChannel) -> Arc<Mutex<bool>> {
+    let initialized = Arc::new(Mutex::new(false));
+    channel.lock().unwrap().subscribe({
+        let initialized = initialized.clone();
+        move |event| {
+            if matches!(event, ChannelEvent::Initialized { .. }) {
+                *initialized.lock().unwrap() = true;
+            }
+        }
+    });
+    initialized
+}
+
+/// `(topic, payload)` of the broadcasts a channel received.
+type Received = Arc<Mutex<Vec<(String, Value)>>>;
+
+/// Collects `(topic, payload)` of the broadcasts of `topic` (JS
+/// `subscribe(topic, ...)`), or of every topic for `None` (JS
+/// `subscribe('broadcast', ...)`).
+fn collect_broadcasts(
+    channel: &SharedChannel,
+    topic: Option<&str>,
+) -> (Received, yorkie::ChannelSubscriptionId) {
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let callback = {
+        let received = received.clone();
+        move |event: &ChannelEvent| {
+            if let ChannelEvent::Broadcast { topic, payload, .. } = event {
+                received
+                    .lock()
+                    .unwrap()
+                    .push((topic.clone(), payload.clone()));
+            }
+        }
+    };
+    let mut channel = channel.lock().unwrap();
+    let id = match topic {
+        Some(topic) => channel.subscribe_topic(topic, callback),
+        None => channel.subscribe(callback),
+    };
+    (received, id)
+}
+
+fn broadcast(channel: &SharedChannel, topic: &str, payload: Value) {
+    channel
+        .lock()
+        .unwrap()
+        .broadcast(topic, payload, BroadcastOptions::default())
+        .unwrap();
+}
+
+fn received_len(received: &Received) -> usize {
+    received.lock().unwrap().len()
 }
 
 /// JS "should subscribe to presence events": a subscriber registered before
@@ -368,4 +446,432 @@ async fn channels_reject_document_only_modes_and_a_zero_heartbeat() {
         .deactivate(DeactivateOptions::default())
         .await
         .unwrap();
+}
+
+/// JS "should subscribe to specific topic for broadcast events".
+#[tokio::test]
+async fn topic_subscribers_get_only_their_topic() {
+    let Some(addr) = rpc_addr() else { return };
+    let t = TwoChannels::attach(&addr, "channel-topic").await;
+    let (chat, _) = collect_broadcasts(&t.ch2, Some("chat"));
+    let (notification, _) = collect_broadcasts(&t.ch2, Some("notification"));
+
+    broadcast(&t.ch1, "chat", json!({"message": "Hello, world!"}));
+    wait_for("the chat message", Duration::from_secs(5), || {
+        received_len(&chat) == 1
+    })
+    .await;
+    broadcast(&t.ch1, "notification", json!({"alert": "New message"}));
+    wait_for("the notification", Duration::from_secs(5), || {
+        received_len(&notification) == 1
+    })
+    .await;
+
+    assert_eq!(
+        vec![("chat".to_owned(), json!({"message": "Hello, world!"}))],
+        *chat.lock().unwrap()
+    );
+    assert_eq!(
+        vec![("notification".to_owned(), json!({"alert": "New message"}))],
+        *notification.lock().unwrap()
+    );
+    t.detach().await;
+}
+
+/// JS "should support legacy broadcast subscription" and "Should trigger
+/// the handler for a subscribed broadcast event": a subscriber of every
+/// event filters broadcasts by topic itself.
+#[tokio::test]
+async fn broadcast_reaches_the_other_client() {
+    let Some(addr) = rpc_addr() else { return };
+    let t = TwoChannels::attach(&addr, "channel-broadcast").await;
+    let (received, _) = collect_broadcasts(&t.ch2, None);
+
+    broadcast(&t.ch1, "test", json!({"a": 1, "b": "2"}));
+    wait_for("the broadcast", Duration::from_secs(5), || {
+        received_len(&received) == 1
+    })
+    .await;
+
+    assert_eq!(
+        vec![("test".to_owned(), json!({"a": 1, "b": "2"}))],
+        *received.lock().unwrap()
+    );
+    t.detach().await;
+}
+
+/// JS "should mix topic-based and type-based subscriptions".
+#[tokio::test]
+async fn topic_and_all_event_subscriptions_mix() {
+    let Some(addr) = rpc_addr() else { return };
+    let t = TwoChannels::attach(&addr, "channel-mixed").await;
+    let (chat, _) = collect_broadcasts(&t.ch2, Some("chat"));
+    let (all, _) = collect_broadcasts(&t.ch2, None);
+
+    broadcast(&t.ch1, "chat", json!("message1"));
+    wait_for("the chat message", Duration::from_secs(5), || {
+        received_len(&chat) == 1
+    })
+    .await;
+    broadcast(&t.ch1, "notification", json!("message2"));
+    wait_for("both broadcasts", Duration::from_secs(5), || {
+        received_len(&all) == 2
+    })
+    .await;
+
+    assert_eq!(1, received_len(&chat));
+    assert_eq!(
+        vec![
+            ("chat".to_owned(), json!("message1")),
+            ("notification".to_owned(), json!("message2")),
+        ],
+        *all.lock().unwrap()
+    );
+    t.detach().await;
+}
+
+/// JS "Should successfully broadcast serializeable payload": `broadcast`
+/// accepts an attached channel; `Client::broadcast` waits for the send.
+#[tokio::test]
+async fn attached_channel_broadcasts() {
+    let Some(addr) = rpc_addr() else { return };
+    let client = active_client(&addr).await;
+    let key = unique_key("channel-broadcast-payload");
+    let channel = shared_channel(&key);
+    client
+        .attach_channel(channel.clone(), AttachChannelOptions::default())
+        .await
+        .unwrap();
+    wait_for("the first refresh", Duration::from_secs(8), || {
+        is_attached(&channel)
+    })
+    .await;
+
+    broadcast(&channel, "test", json!({"a": 1, "b": "2"}));
+    client
+        .broadcast(&key, "test", json!({"a": 1}), BroadcastOptions::default())
+        .await
+        .unwrap();
+
+    client.detach_channel(&channel).await.unwrap();
+    assert!(matches!(
+        channel
+            .lock()
+            .unwrap()
+            .broadcast("test", json!(1), BroadcastOptions::default()),
+        Err(ClientError::NotAttached(_))
+    ));
+    client
+        .deactivate(DeactivateOptions::default())
+        .await
+        .unwrap();
+}
+
+/// JS "Should not trigger the handler for an unsubscribed broadcast event"
+/// and "... after unsubscribing".
+#[tokio::test]
+async fn unsubscribed_topics_get_nothing() {
+    let Some(addr) = rpc_addr() else { return };
+    let t = TwoChannels::attach(&addr, "channel-unsubscribe").await;
+    let (test1, id) = collect_broadcasts(&t.ch2, Some("test1"));
+    let (test2, _) = collect_broadcasts(&t.ch2, Some("test2"));
+
+    broadcast(&t.ch1, "test1", json!({"a": 1}));
+    wait_for("the broadcast", Duration::from_secs(5), || {
+        received_len(&test1) == 1
+    })
+    .await;
+    assert_eq!(0, received_len(&test2));
+
+    t.ch2.lock().unwrap().unsubscribe(id);
+    broadcast(&t.ch1, "test1", json!({"a": 1}));
+    // As in JS, assume a broadcast arrives within a second.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(1, received_len(&test1));
+    t.detach().await;
+}
+
+/// JS "Should not trigger the handler for a broadcast event sent by the
+/// publisher to itself".
+#[tokio::test]
+async fn broadcast_is_not_echoed_to_the_sender() {
+    let Some(addr) = rpc_addr() else { return };
+    let t = TwoChannels::attach(&addr, "channel-no-echo").await;
+    let (sent, _) = collect_broadcasts(&t.ch1, None);
+    let (received, _) = collect_broadcasts(&t.ch2, None);
+
+    broadcast(&t.ch1, "test", json!({"a": 1}));
+    wait_for("the broadcast", Duration::from_secs(5), || {
+        received_len(&received) == 1
+    })
+    .await;
+    // The receiver has it, so the sender would have it too by now.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(0, received_len(&sent));
+    t.detach().await;
+}
+
+/// Wraps `ConnectTransport` and fails the first `failures` broadcasts with
+/// the error a browser `fetch` failure gives JS (`Unknown`). It also counts
+/// broadcasts and channel watches.
+struct FlakyBroadcastTransport {
+    inner: ConnectTransport,
+    failures: AtomicUsize,
+    broadcast_calls: AtomicUsize,
+    watch_channel_calls: AtomicUsize,
+}
+
+impl FlakyBroadcastTransport {
+    fn client(addr: &str, failures: usize) -> (Client, Arc<Self>) {
+        let options = ClientOptions {
+            rpc_addr: addr.to_owned(),
+            ..ClientOptions::default()
+        };
+        let transport = Arc::new(Self {
+            inner: ConnectTransport::new(&options).unwrap(),
+            failures: AtomicUsize::new(failures),
+            broadcast_calls: AtomicUsize::new(0),
+            watch_channel_calls: AtomicUsize::new(0),
+        });
+        (
+            Client::with_transport(options, transport.clone()),
+            transport,
+        )
+    }
+}
+
+#[async_trait]
+impl ClientTransport for FlakyBroadcastTransport {
+    async fn activate_client(
+        &self,
+        request: ActivateClientRequest,
+    ) -> ClientResult<ActivateClientResponse> {
+        self.inner.activate_client(request).await
+    }
+
+    async fn deactivate_client(
+        &self,
+        request: DeactivateClientRequest,
+    ) -> ClientResult<DeactivateClientResponse> {
+        self.inner.deactivate_client(request).await
+    }
+
+    async fn attach_document(
+        &self,
+        request: AttachDocumentRequest,
+    ) -> ClientResult<AttachDocumentResponse> {
+        self.inner.attach_document(request).await
+    }
+
+    async fn detach_document(
+        &self,
+        request: DetachDocumentRequest,
+    ) -> ClientResult<DetachDocumentResponse> {
+        self.inner.detach_document(request).await
+    }
+
+    async fn remove_document(
+        &self,
+        request: RemoveDocumentRequest,
+    ) -> ClientResult<RemoveDocumentResponse> {
+        self.inner.remove_document(request).await
+    }
+
+    async fn push_pull_changes(
+        &self,
+        request: PushPullChangesRequest,
+    ) -> ClientResult<PushPullChangesResponse> {
+        self.inner.push_pull_changes(request).await
+    }
+
+    async fn watch_document(&self, request: WatchDocumentRequest) -> ClientResult<WatchStream> {
+        self.inner.watch_document(request).await
+    }
+
+    async fn refresh_channel(
+        &self,
+        request: RefreshChannelRequest,
+    ) -> ClientResult<RefreshChannelResponse> {
+        self.inner.refresh_channel(request).await
+    }
+
+    async fn peek_channel(&self, request: PeekChannelRequest) -> ClientResult<PeekChannelResponse> {
+        self.inner.peek_channel(request).await
+    }
+
+    async fn watch_channel(
+        &self,
+        request: WatchChannelRequest,
+    ) -> ClientResult<ChannelWatchStream> {
+        self.watch_channel_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.watch_channel(request).await
+    }
+
+    async fn broadcast(&self, request: BroadcastRequest) -> ClientResult<BroadcastResponse> {
+        self.broadcast_calls.fetch_add(1, Ordering::SeqCst);
+        // Broadcasts of one client go out one at a time (the task queue).
+        if self.failures.load(Ordering::SeqCst) > 0 {
+            self.failures.fetch_sub(1, Ordering::SeqCst);
+            return Err(ClientError::Rpc {
+                code: "unknown".to_owned(),
+                message: "Failed to fetch".to_owned(),
+                yorkie_code: None,
+            });
+        }
+        self.inner.broadcast(request).await
+    }
+}
+
+/// JS "Should retry broadcasting on network failure with retry option and
+/// succeeds when network is restored": two failed sends are retried after
+/// 1s and 2s, and the third reaches the other client.
+#[tokio::test]
+async fn broadcast_retries_after_network_failures() {
+    let Some(addr) = rpc_addr() else { return };
+    let (c1, transport) = FlakyBroadcastTransport::client(&addr, 2);
+    let t = TwoChannels::attach_with(c1, client(&addr), "channel-broadcast-retry").await;
+    let (received, _) = collect_broadcasts(&t.ch2, Some("test"));
+
+    broadcast(&t.ch1, "test", json!({"a": 1, "b": "2"}));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(0, received_len(&received));
+    wait_for("the retried broadcast", Duration::from_secs(10), || {
+        received_len(&received) == 1
+    })
+    .await;
+
+    assert_eq!(3, transport.broadcast_calls.load(Ordering::SeqCst));
+    assert_eq!(
+        vec![("test".to_owned(), json!({"a": 1, "b": "2"}))],
+        *received.lock().unwrap()
+    );
+    t.detach().await;
+}
+
+/// JS "Should not retry broadcasting on network failure when maxRetries is
+/// set to zero": the error handler gets the error of the only try.
+#[tokio::test]
+async fn broadcast_without_retries_reports_the_failure() {
+    let Some(addr) = rpc_addr() else { return };
+    let (c1, transport) = FlakyBroadcastTransport::client(&addr, 1);
+    let t = TwoChannels::attach_with(c1, client(&addr), "channel-broadcast-no-retry").await;
+    let errors = Arc::new(Mutex::new(Vec::new()));
+    let options = BroadcastOptions {
+        max_retries: Some(0),
+        error: Some(BroadcastErrorHandler::new({
+            let errors = errors.clone();
+            move |err| errors.lock().unwrap().push(err.clone())
+        })),
+    };
+
+    t.ch1
+        .lock()
+        .unwrap()
+        .broadcast("test", json!({"a": 1}), options)
+        .unwrap();
+    wait_for("the error handler", Duration::from_secs(5), || {
+        !errors.lock().unwrap().is_empty()
+    })
+    .await;
+
+    assert!(matches!(
+        &errors.lock().unwrap()[..],
+        [ClientError::Rpc { code, .. }] if code == "unknown"
+    ));
+    assert_eq!(1, transport.broadcast_calls.load(Ordering::SeqCst));
+    t.detach().await;
+}
+
+/// JS "Polling mode does not open a watch stream".
+#[tokio::test]
+async fn polling_opens_no_watch_stream() {
+    let Some(addr) = rpc_addr() else { return };
+    let (client, transport) = FlakyBroadcastTransport::client(&addr, 0);
+    client.activate().await.unwrap();
+    let channel = shared_channel(&unique_key("channel-polling-no-watch"));
+
+    client
+        .attach_channel(channel.clone(), polling(None))
+        .await
+        .unwrap();
+    wait_for("the first refresh", Duration::from_secs(8), || {
+        is_attached(&channel)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(0, transport.watch_channel_calls.load(Ordering::SeqCst));
+    client.detach_channel(&channel).await.unwrap();
+    client
+        .deactivate(DeactivateOptions::default())
+        .await
+        .unwrap();
+}
+
+/// JS "changeSyncMode transitions Realtime <-> Polling for channels".
+#[tokio::test]
+async fn sync_mode_switches_between_realtime_and_polling() {
+    let Some(addr) = rpc_addr() else { return };
+    let (client, transport) = FlakyBroadcastTransport::client(&addr, 0);
+    client.activate().await.unwrap();
+    let channel = shared_channel(&unique_key("channel-mode-switch"));
+    client
+        .attach_channel(channel.clone(), AttachChannelOptions::default())
+        .await
+        .unwrap();
+    wait_for("the watch stream", Duration::from_secs(8), || {
+        transport.watch_channel_calls.load(Ordering::SeqCst) == 1
+    })
+    .await;
+
+    client
+        .change_channel_sync_mode(&channel, SyncMode::Polling)
+        .await
+        .unwrap();
+    assert!(session_count(&channel) >= 1);
+    client
+        .change_channel_sync_mode(&channel, SyncMode::Realtime)
+        .await
+        .unwrap();
+    assert_eq!(2, transport.watch_channel_calls.load(Ordering::SeqCst));
+
+    client.detach_channel(&channel).await.unwrap();
+    client
+        .deactivate(DeactivateOptions::default())
+        .await
+        .unwrap();
+}
+
+/// JS "Polling channel does not receive broadcast events".
+#[tokio::test]
+async fn polling_channel_gets_no_broadcasts() {
+    let Some(addr) = rpc_addr() else { return };
+    let key = unique_key("channel-polling-no-broadcast");
+    let (c1, c2) = (active_client(&addr).await, active_client(&addr).await);
+    let (ch1, ch2) = (shared_channel(&key), shared_channel(&key));
+    let watching = watch_initialized(&ch1);
+    c2.attach_channel(ch2.clone(), polling(Some(200)))
+        .await
+        .unwrap();
+    c1.attach_channel(ch1.clone(), AttachChannelOptions::default())
+        .await
+        .unwrap();
+    wait_for("both channels to attach", Duration::from_secs(5), || {
+        is_attached(&ch1) && is_attached(&ch2) && *watching.lock().unwrap()
+    })
+    .await;
+    let (received, _) = collect_broadcasts(&ch2, Some("chat"));
+
+    broadcast(&ch1, "chat", json!({"msg": "hello"}));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert_eq!(0, received_len(&received));
+    for (client, channel) in [(c1, ch1), (c2, ch2)] {
+        client.detach_channel(&channel).await.unwrap();
+        client
+            .deactivate(DeactivateOptions::default())
+            .await
+            .unwrap();
+    }
 }
