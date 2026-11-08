@@ -939,6 +939,11 @@ Gap:
   ported. Rust change events do not carry the JS `source` field, so an
   undo's `LocalChange` looks like any other local change.
 
+- JS `getUndoStackForTest`/`getRedoStackForTest` have no public Rust
+  counterpart: the stacks are readable only from yorkie-core unit tests.
+  The integration port of `doc_presence_test.ts:689` checks the stack depth
+  with `can_undo` and the entries through undo and redo results instead.
+
 Expected direction:
 
 - Port identity-preserving Text restore together with the removal ledger.

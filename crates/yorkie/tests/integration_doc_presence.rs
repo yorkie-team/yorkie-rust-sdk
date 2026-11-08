@@ -460,6 +460,8 @@ async fn receives_the_final_presence_of_an_update() {
         .unwrap();
 
     let changed = DocEvent::PresenceChanged(c1_id, my_presence(&doc1));
+    // The local event is published within the update itself.
+    assert_eq!(Some(&changed), events_p1.values().get(1));
     events_p1.wait_and_verify_nth(2, changed.clone()).await;
     events_p2.wait_and_verify_nth(1, changed).await;
 
@@ -686,9 +688,11 @@ async fn can_undo_and_redo_with_presence() {
 /// JS "Should not impact undo if presence is not added to history"
 /// (doc_presence_test.ts:689).
 ///
-/// The JS checks of `getUndoStackForTest` are left out: the Rust undo stack
-/// is only readable from the core crate's unit tests. The undo and redo
-/// results below are what those stacks decide.
+/// JS checks the undo stack entries with `getUndoStackForTest`, which Rust
+/// does not expose outside the core crate's unit tests. This checks the
+/// stack's depth with `history().can_undo()` instead (one entry after step
+/// 1, two after steps 2 and 3), and its entries through the undo and redo
+/// results.
 #[tokio::test]
 async fn presence_without_history_does_not_impact_undo() {
     let Some(addr) = rpc_addr() else { return };
@@ -704,6 +708,8 @@ async fn presence_without_history_does_not_impact_undo() {
         .await
         .unwrap();
     let expect = |value: Value| assert_eq!(presence(value), my_presence(&doc));
+    let can_undo = || doc.lock().unwrap().history().can_undo();
+    assert!(!can_undo());
 
     // 1. Setting addToHistory for both color and cursor
     set_presence_with_history(
@@ -712,8 +718,11 @@ async fn presence_without_history_does_not_impact_undo() {
     );
     expect(json!({ "color": "blue", "cursor": { "x": 1, "y": 1 } }));
 
+    assert!(can_undo());
+
     undo(&doc);
     expect(json!({ "color": "red", "cursor": { "x": 0, "y": 0 } }));
+    assert!(!can_undo(), "step 1 left one entry");
 
     redo(&doc);
     expect(json!({ "color": "blue", "cursor": { "x": 1, "y": 1 } }));
@@ -731,6 +740,7 @@ async fn presence_without_history_does_not_impact_undo() {
 
     undo(&doc);
     expect(json!({ "color": "green", "cursor": { "x": 1, "y": 1 } }));
+    assert!(can_undo(), "step 2 left two entries");
 
     redo(&doc);
     expect(json!({ "color": "green", "cursor": { "x": 2, "y": 2 } }));
@@ -748,6 +758,7 @@ async fn presence_without_history_does_not_impact_undo() {
 
     undo(&doc);
     expect(json!({ "color": "black", "cursor": { "x": 1, "y": 1 } }));
+    assert!(can_undo(), "step 3 kept two entries");
 
     redo(&doc);
     expect(json!({ "color": "black", "cursor": { "x": 3, "y": 3 } }));
