@@ -253,6 +253,80 @@ fn purges_a_removed_child_and_its_removed_parent_once() -> Result<()> {
     Ok(())
 }
 
+/// Checks that the running gc size matches a root rebuilt from the same
+/// content. Only gc: removing a text or tree node leaves its size in the
+/// running `live` (see the porting gaps), so `live` cannot be compared here.
+fn assert_gc_size_matches_rebuilt(d: &Document) {
+    let rebuilt = CrdtRoot::new(d.crdt_root.object().deepcopy());
+    assert_eq!(rebuilt.doc_size().gc, d.doc_size().gc, "gc vs rebuilt");
+}
+
+/// A GC pair whose container was purged before it is dropped, as JS
+/// `CRDTRoot.collect` purges it through the detached parent it holds:
+/// deleting `<p>ab</p>` leaves a pair for the paragraph and one for its text,
+/// and purging the paragraph takes the text node with it.
+#[test]
+fn drops_the_gc_pairs_under_a_purged_tree_node() -> Result<()> {
+    let (mut doc, _) = replicas();
+    doc.update(|root| {
+        root.set_tree(
+            "t",
+            TreeNodeInput::element(
+                "doc",
+                vec![
+                    TreeNodeInput::element("p", vec![TreeNodeInput::text("ab")]),
+                    TreeNodeInput::element("p", Vec::new()),
+                ],
+            ),
+        )
+        .map(|_| ())
+    })?;
+    doc.update(|root| root.get_tree_mut("t")?.edit(0, 4, Vec::new(), 0))?;
+    assert_eq!("<doc><p></p></doc>", xml(&doc)?);
+    assert_eq!(2, doc.garbage_len());
+
+    assert_eq!(2, doc.garbage_collect(&max_vector_of(&[A1])));
+    assert_eq!(0, doc.garbage_len());
+    assert_eq!("<doc><p></p></doc>", xml(&doc)?);
+    assert_eq!(crate::crdt::element::DataSize::default(), doc.doc_size().gc);
+    assert_gc_size_matches_rebuilt(&doc);
+    Ok(())
+}
+
+/// The GC pairs of a Text inside a removed object are dropped once the
+/// object is purged, as JS drops them through the detached Text it holds.
+#[test]
+fn drops_the_gc_pairs_of_a_text_in_a_purged_object() -> Result<()> {
+    let (mut doc, _) = replicas();
+    doc.update(|root| {
+        root.set("o", crate::JsonObject::new())?;
+        root.get_object_mut("o")?
+            .set_text("t")?
+            .edit(0, 0, "abc", None)?;
+        root.set("keep", 1)?;
+        Ok(())
+    })?;
+    doc.update(|root| {
+        root.get_object_mut("o")?
+            .get_text_mut("t")?
+            .edit(1, 2, "", None)
+            .map(|_| ())
+    })?;
+    doc.update(|root| {
+        root.remove("o");
+        Ok(())
+    })?;
+    assert_eq!(r#"{"keep":1}"#, doc.to_sorted_json());
+    assert_eq!(3, doc.garbage_len());
+
+    doc.garbage_collect(&max_vector_of(&[A1]));
+    assert_eq!(0, doc.garbage_len());
+    assert_eq!(r#"{"keep":1}"#, doc.to_sorted_json());
+    assert_eq!(crate::crdt::element::DataSize::default(), doc.doc_size().gc);
+    assert_gc_size_matches_rebuilt(&doc);
+    Ok(())
+}
+
 /// A text edit made after collection anchors on what survived it, and a
 /// replica that did not collect reaches the same text.
 #[test]

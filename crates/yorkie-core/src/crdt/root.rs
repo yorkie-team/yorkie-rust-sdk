@@ -580,7 +580,17 @@ impl CrdtRoot {
                 continue;
             }
 
+            // A child no longer in the tree went with its container: a
+            // purged element holding a Text or Tree, or a purged Tree node
+            // holding its descendants. JS keeps a reference to the parent and
+            // purges the child from the detached structure; here there is
+            // nothing left to purge, so the pair is only dropped, with the
+            // same accounting.
             let Some(site) = self.root_object.locate_gc_pair(&pair.child_id) else {
+                if let Some(pair) = self.gc_pair_by_child_id.remove(&pair.child_id) {
+                    sub_data_size(&mut self.doc_size.gc, pair.child_size);
+                }
+                count += 1;
                 continue;
             };
             if site.barrier.is_some_and(|at| !vector.after_or_equal(&at)) {
