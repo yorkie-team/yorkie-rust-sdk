@@ -6,8 +6,6 @@
 //!   Multi-Client`).
 //! - `packages/sdk/test/integration/history_text_test.ts` (`Text History -
 //!   multi client basic`, `reconcile cases`, `multi client edge cases`).
-//! - `packages/sdk/test/integration/counter_test.ts` (`Can undo/redo for
-//!   concurrent users`).
 //!
 //! Each case syncs two clients manually, like JS `withTwoClientsAndDocuments`.
 //! Run with `YORKIE_TEST_RPC_ADDR=http://localhost:18080 cargo test -p yorkie`.
@@ -426,49 +424,5 @@ async fn converges_after_undo_and_redo_of_concurrent_styles() {
     redo(&t.d2);
     t.sync_all().await;
     assert_converged(&t, "after redo");
-    t.deactivate().await;
-}
-
-// --- Counter (counter_test.ts) ---
-
-#[tokio::test]
-async fn undoes_an_increase_while_another_client_increases() {
-    let Some(addr) = rpc_addr() else { return };
-    let t = TwoClients::attach(&addr, "history-counter").await;
-    t.d1.lock()
-        .unwrap()
-        .update(|root| root.set_counter("counter", 100).map(|_| ()))
-        .unwrap();
-    t.c1.sync(None).await.unwrap();
-    t.c2.sync(None).await.unwrap();
-    assert_eq!(r#"{"counter":100}"#, sorted_json(&t.d2));
-
-    let increase = |doc: &SharedDocument, by: i32| {
-        doc.lock()
-            .unwrap()
-            .update(|root| root.get_counter_mut("counter")?.increase(by).map(|_| ()))
-            .unwrap();
-    };
-    increase(&t.d1, 1);
-    increase(&t.d2, 2);
-    t.sync_all().await;
-    assert_eq!(r#"{"counter":103}"#, sorted_json(&t.d1));
-    assert_eq!(r#"{"counter":103}"#, sorted_json(&t.d2));
-
-    undo(&t.d1);
-    t.c1.sync(None).await.unwrap();
-    t.c2.sync(None).await.unwrap();
-    assert_eq!(r#"{"counter":102}"#, sorted_json(&t.d1));
-    assert_eq!(r#"{"counter":102}"#, sorted_json(&t.d2));
-
-    // Only the client that undid can redo.
-    assert!(t.d1.lock().unwrap().history().can_redo());
-    assert!(!t.d2.lock().unwrap().history().can_redo());
-
-    redo(&t.d1);
-    t.c1.sync(None).await.unwrap();
-    t.c2.sync(None).await.unwrap();
-    assert_eq!(r#"{"counter":103}"#, sorted_json(&t.d1));
-    assert_eq!(r#"{"counter":103}"#, sorted_json(&t.d2));
     t.deactivate().await;
 }

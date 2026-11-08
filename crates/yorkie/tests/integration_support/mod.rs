@@ -37,3 +37,22 @@ pub async fn eventually(what: &str, mut condition: impl FnMut() -> bool) {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
+
+/// Undoes back to the first of `states`, redoes to the last, then undoes
+/// again, checking the document against each state on the way (JS
+/// `assertUndoRedo` in `integration_helper.ts`).
+pub fn assert_undo_redo(doc: &mut yorkie::Document, states: &[String]) {
+    let n = states.len();
+    for i in 0..n - 1 {
+        doc.history_mut().undo().unwrap();
+        assert_eq!(states[n - 2 - i], doc.to_sorted_json(), "undo 1-{i}");
+    }
+    for i in 0..n - 1 {
+        doc.history_mut().redo().unwrap();
+        assert_eq!(states[i + 1], doc.to_sorted_json(), "redo{i}");
+    }
+    for i in 0..n - 1 {
+        doc.history_mut().undo().unwrap();
+        assert_eq!(states[n - 2 - i], doc.to_sorted_json(), "undo 2-{i}");
+    }
+}
