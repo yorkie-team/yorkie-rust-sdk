@@ -2,6 +2,7 @@ use crate::channel::{ChannelSubscriptionId, SharedChannel};
 use crate::client::TaskHandle;
 use crate::error::{ClientError, ClientResult};
 use crate::options::{SyncMode, DEFAULT_POLLING_INTERVAL_MS};
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use yorkie_core::Document;
@@ -41,6 +42,12 @@ pub(crate) struct Attachment {
     /// loop skips this document until a sync succeeds (JS
     /// `markWriteRejected`, `isWriteRejected`, `clearWriteRejected`).
     pub(crate) write_rejected: bool,
+    /// `Client::change_sync_mode` calls to `RealtimePushOnly` or
+    /// `RealtimeSyncOff` that wait on the task queue (JS
+    /// `pendingPullPauses`). A sync already in flight drops the remote state
+    /// of its reply while one is pending, so the pull it is waiting behind is
+    /// not applied after the caller asked to stop receiving.
+    pub(crate) pending_pull_pauses: Arc<AtomicUsize>,
 }
 
 impl Attachment {
@@ -61,6 +68,7 @@ impl Attachment {
             last_synced_at: None,
             watch_task: None,
             write_rejected: false,
+            pending_pull_pauses: Arc::default(),
         }
     }
 

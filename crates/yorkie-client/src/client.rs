@@ -629,14 +629,31 @@ impl Client {
     ///
     /// Leaving the realtime modes for `Manual` or `Polling` closes the watch
     /// stream; coming back opens it again and waits for it as `attach` does.
-    /// Switching to `Realtime` pulls at the next sync-loop tick.
+    /// Switching to `Realtime` pulls at the next sync-loop tick. Switching to
+    /// `RealtimePushOnly` or `RealtimeSyncOff` also covers a sync already in
+    /// flight: the remote state of its reply is dropped, as in JS.
     pub async fn change_sync_mode(
         &self,
         doc: &SharedDocument,
         sync_mode: SyncMode,
     ) -> ClientResult<()> {
-        let _queue = self.lock_task_queue().await;
         let key = document_key(doc);
+        // As in JS, the switch runs on the task queue, so it waits for a sync
+        // that is already pulling. A pause must still cover that pull: the
+        // caller has asked not to receive anything (an IME composition, for
+        // example), so mark it now for the reply guard in `push_pull`. A
+        // document that is not attached has no attachment to mark.
+        let _pending_pause = matches!(
+            sync_mode,
+            SyncMode::RealtimePushOnly | SyncMode::RealtimeSyncOff
+        )
+        .then(|| {
+            self.with_attachment(&key, doc, |attachment| {
+                PendingPullPause::start(&attachment.pending_pull_pauses)
+            })
+        })
+        .flatten();
+        let _queue = self.lock_task_queue().await;
         let (stopped_watch, watch_ready) = {
             let mut state = self.state();
             state.session(&self.inner.key)?;
@@ -1120,11 +1137,29 @@ impl Client {
         // the server's minimum version vector, and collecting garbage with it
         // purges tombstones that the changes this document has not pulled yet
         // anchor on.
-        let drops_remote_state = target.request_mode == SyncMode::RealtimePushOnly
+        let mode_drops_remote_state = target.request_mode == SyncMode::RealtimePushOnly
             || matches!(
                 target.attachment_mode,
                 SyncMode::RealtimePushOnly | SyncMode::RealtimeSyncOff
             );
+        // A pause asked for but still waiting on the task queue counts as
+        // well (JS `pendingPullPauses`): this may be the very sync it waits
+        // behind. Not for a `Manual` document, where nothing would pull the
+        // dropped state again. In `Realtime` the sync loop cleared
+        // `change_event_received` before this sync, so set it again: a switch
+        // that never lands would otherwise leave the dropped state unpulled.
+        let pause_pending = !mode_drops_remote_state
+            && self
+                .with_attachment(&target.key, &target.doc, |attachment| {
+                    let pending = attachment.pending_pull_pauses.load(Ordering::SeqCst) > 0
+                        && attachment.sync_mode != SyncMode::Manual;
+                    if pending {
+                        attachment.change_event_received = true;
+                    }
+                    pending
+                })
+                .unwrap_or(false);
+        let drops_remote_state = mode_drops_remote_state || pause_pending;
 
         let mut doc = lock_document(&target.doc);
         if drops_remote_state {
@@ -1411,6 +1446,24 @@ impl SyncTarget {
             request_mode,
             attachment_mode: attachment.sync_mode,
         }
+    }
+}
+
+/// Counts one pending pause on an attachment for the lifetime of one
+/// `change_sync_mode` call (JS `pendingPullPauses` increment and the
+/// decrement in its `finally`).
+struct PendingPullPause(Arc<AtomicUsize>);
+
+impl PendingPullPause {
+    fn start(pauses: &Arc<AtomicUsize>) -> Self {
+        pauses.fetch_add(1, Ordering::SeqCst);
+        Self(pauses.clone())
+    }
+}
+
+impl Drop for PendingPullPause {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
