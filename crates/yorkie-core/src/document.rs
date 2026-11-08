@@ -745,9 +745,16 @@ impl Document {
             self.change_id = self.change_id.sync_clocks(change.id());
             // Undo text edits recorded before this change still name the
             // positions they had then; move them past what this edit changed.
-            for operation in &executed.operations {
-                if let Operation::Edit(operation) = operation {
-                    let (from, to) = operation.normalize_pos(&self.crdt_root)?;
+            // The change has already run, so a range that does not normalize
+            // only skips the reconcile instead of failing the apply.
+            if self.history.has_undo() || self.history.has_redo() {
+                for operation in &executed.operations {
+                    let Operation::Edit(operation) = operation else {
+                        continue;
+                    };
+                    let Ok((from, to)) = operation.normalize_pos(&self.crdt_root) else {
+                        continue;
+                    };
                     self.history.reconcile_text_edit(
                         operation.parent_created_at(),
                         from,
