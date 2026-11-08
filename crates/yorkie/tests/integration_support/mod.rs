@@ -1,6 +1,8 @@
 //! Shared helpers for integration tests against a live Yorkie server.
 #![allow(dead_code)]
 
+pub mod tree;
+
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Server address from `YORKIE_TEST_RPC_ADDR`, or `None` to skip the test.

@@ -2,147 +2,25 @@
 //!
 //! JS references: `packages/sdk/test/integration/tree_test.ts` (the
 //! two-client cases of "Tree", "Tree.style", "Tree.edit(concurrent ...)" and
-//! "TreeChange" that do not split or merge) and
-//! `packages/sdk/test/integration/tree_concurrency_test.ts` (its edit-edit,
-//! style-style and edit-style matrices without the merge and split
-//! operations). Like the JS `withTwoClientsAndDocuments` cases, each test
-//! syncs two clients manually.
+//! "TreeChange" that do not split or merge; `integration_tree_split.rs` has
+//! those) and `packages/sdk/test/integration/tree_concurrency_test.ts` (all
+//! its matrices, merge and split operations included). Like the JS
+//! `withTwoClientsAndDocuments` cases, each test syncs two clients manually.
 //! Run with `YORKIE_TEST_RPC_ADDR=http://localhost:18080 cargo test -p yorkie`.
 
 mod integration_support;
 
-use integration_support::{rpc_addr, unique_key};
-use serde_json::{json, Value};
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
-use yorkie::{
-    AttachOptions, Client, ClientOptions, DeactivateOptions, DetachOptions, DocEvent, Document,
-    JsonTree, JsonValue, OperationInfo, SharedDocument, SyncMode, TreeNodeInput, TreeStyleOpValue,
+use integration_support::tree::{
+    active_client, attach_pair, attributes, collect_ops, edit_tree, element, element_with,
+    set_tree, text, xml, TwoClients,
 };
-
-struct TwoClients {
-    c1: Client,
-    d1: SharedDocument,
-    c2: Client,
-    d2: SharedDocument,
-}
-
-impl TwoClients {
-    /// Attaches one document to two clients in manual sync mode (JS
-    /// `withTwoClientsAndDocuments`).
-    async fn attach(addr: &str, name: &str) -> Self {
-        let c1 = active_client(addr).await;
-        let c2 = active_client(addr).await;
-        let (d1, d2) = attach_pair(&c1, &c2, &unique_key(name)).await;
-        Self { c1, d1, c2, d2 }
-    }
-
-    /// Attaches, sets the tree at `t` from d1, and syncs it to d2.
-    async fn with_tree(addr: &str, name: &str, root: TreeNodeInput, expected: &str) -> Self {
-        let t = Self::attach(addr, name).await;
-        set_tree(&t.d1, root);
-        t.c1.sync(None).await.unwrap();
-        t.c2.sync(None).await.unwrap();
-        assert_eq!(expected, xml(&t.d1));
-        assert_eq!(expected, xml(&t.d2));
-        t
-    }
-
-    /// Syncs c1, c2, then c1 again, so both have every change.
-    async fn sync_all(&self) {
-        self.c1.sync(None).await.unwrap();
-        self.c2.sync(None).await.unwrap();
-        self.c1.sync(None).await.unwrap();
-    }
-
-    async fn deactivate(self) {
-        for client in [self.c1, self.c2] {
-            client
-                .deactivate(DeactivateOptions::default())
-                .await
-                .unwrap();
-        }
-    }
-}
-
-fn manual_attach() -> AttachOptions {
-    AttachOptions {
-        sync_mode: SyncMode::Manual,
-        ..AttachOptions::default()
-    }
-}
-
-async fn active_client(addr: &str) -> Client {
-    let client = Client::new(ClientOptions {
-        rpc_addr: addr.to_owned(),
-        ..ClientOptions::default()
-    })
-    .unwrap();
-    client.activate().await.unwrap();
-    client
-}
-
-async fn attach_pair(c1: &Client, c2: &Client, key: &str) -> (SharedDocument, SharedDocument) {
-    let d1 = c1.attach(shared(key), manual_attach()).await.unwrap();
-    let d2 = c2.attach(shared(key), manual_attach()).await.unwrap();
-    (d1, d2)
-}
-
-fn shared(key: &str) -> SharedDocument {
-    Arc::new(Mutex::new(Document::new(key)))
-}
-
-fn element(node_type: &str, children: Vec<TreeNodeInput>) -> TreeNodeInput {
-    TreeNodeInput::element(node_type, children)
-}
-
-fn element_with(node_type: &str, attrs: Value, children: Vec<TreeNodeInput>) -> TreeNodeInput {
-    TreeNodeInput::element_with_attributes(node_type, attributes(attrs), children)
-}
-
-fn text(value: &str) -> TreeNodeInput {
-    TreeNodeInput::text(value)
-}
-
-fn attributes(value: Value) -> BTreeMap<String, Value> {
-    serde_json::from_value(value).expect("attributes are an object")
-}
-
-fn set_tree(doc: &SharedDocument, root: TreeNodeInput) {
-    doc.lock()
-        .unwrap()
-        .update(|root_object| root_object.set_tree("t", root).map(|_| ()))
-        .unwrap();
-}
-
-/// Runs `edit` on the tree at `t` inside one update.
-fn edit_tree(doc: &SharedDocument, edit: impl FnOnce(&mut JsonTree) -> yorkie::Result<()>) {
-    doc.lock()
-        .unwrap()
-        .update(|root| edit(root.get_tree_mut("t")?))
-        .unwrap();
-}
-
-fn xml(doc: &SharedDocument) -> String {
-    let doc = doc.lock().unwrap();
-    match doc.get_root().get("t") {
-        Some(JsonValue::Tree(tree)) => tree.to_xml().unwrap(),
-        other => panic!("expected a tree, got {other:?}"),
-    }
-}
-
-/// Collects the op infos of every local and remote change under `$.t` (JS
-/// test helper `subscribeDocs`).
-fn collect_ops(doc: &SharedDocument) -> Arc<Mutex<Vec<OperationInfo>>> {
-    let ops = Arc::new(Mutex::new(Vec::new()));
-    let sink = ops.clone();
-    doc.lock().unwrap().subscribe_path("$.t", move |event| {
-        if let DocEvent::LocalChange(info) | DocEvent::RemoteChange(info) = event {
-            sink.lock().unwrap().extend(info.operations.iter().cloned());
-        }
-    });
-    ops
-}
+use integration_support::{rpc_addr, unique_key};
+use serde_json::json;
+use std::sync::Mutex;
+use yorkie::{
+    DeactivateOptions, DetachOptions, OperationInfo, SharedDocument, TreeNodeInput,
+    TreeStyleOpValue,
+};
 
 /// A tree edit op info as JS tests compare it: `(from, to, value)`.
 type EditSummary = (usize, usize, Option<Vec<TreeNodeInput>>);
@@ -761,10 +639,9 @@ async fn reports_concurrent_styles() {
     t.deactivate().await;
 }
 
-// The generated matrices of JS `tree_concurrency_test.ts`, without its merge
-// and split operations. JS runs each combination as its own test; here one
-// test per matrix runs them in turn on one pair of clients and reports every
-// combination that does not converge.
+// The generated matrices of JS `tree_concurrency_test.ts`. JS runs each
+// combination as its own test; here one test per matrix runs them in turn on
+// one pair of clients and reports every combination that does not converge.
 
 /// Two ranges, one per client, as `(from, mid, to)` (JS `makeTwoRanges`).
 struct TwoRanges {
@@ -790,15 +667,21 @@ enum Selector {
     Middle,
     Back,
     All,
+    OneQuarter,
+    ThreeQuarter,
 }
 
 impl Selector {
     fn range(self, (from, mid, to): (usize, usize, usize)) -> (usize, usize) {
+        let one_quarter = (from + mid + 1) >> 1;
+        let three_quarter = (mid + to) >> 1;
         match self {
             Self::Front => (from, from),
             Self::Middle => (mid, mid),
             Self::Back => (to, to),
             Self::All => (from, to),
+            Self::OneQuarter => (one_quarter, one_quarter),
+            Self::ThreeQuarter => (three_quarter, three_quarter),
         }
     }
 }
@@ -808,6 +691,16 @@ enum TreeOp {
     Edit {
         selector: Selector,
         content: Option<TreeNodeInput>,
+        desc: &'static str,
+    },
+    /// Deletes the element boundaries inside the range, merging the elements
+    /// around them (JS `EditOpCode.MergeUpdate`).
+    Merge { desc: &'static str },
+    /// Splits `level` elements at the selected position (JS
+    /// `EditOpCode.SplitUpdate`).
+    Split {
+        selector: Selector,
+        level: usize,
         desc: &'static str,
     },
     Style {
@@ -827,13 +720,24 @@ impl TreeOp {
         }
     }
 
+    fn split(selector: Selector, level: usize, desc: &'static str) -> Self {
+        Self::Split {
+            selector,
+            level,
+            desc,
+        }
+    }
+
     fn style(key: &'static str, value: Option<&'static str>, desc: &'static str) -> Self {
         Self::Style { key, value, desc }
     }
 
     fn desc(&self) -> &'static str {
         match self {
-            Self::Edit { desc, .. } | Self::Style { desc, .. } => desc,
+            Self::Edit { desc, .. }
+            | Self::Merge { desc }
+            | Self::Split { desc, .. }
+            | Self::Style { desc, .. } => desc,
         }
     }
 
@@ -846,6 +750,19 @@ impl TreeOp {
                 let contents = content.iter().cloned().collect();
                 edit_tree(doc, |tree| tree.edit(from, to, contents, 0));
             }
+            Self::Merge { .. } => {
+                let (from, to) = Selector::All.range(range);
+                if let Some((from, to)) = merge_range(&xml(doc), from, to) {
+                    edit_tree(doc, |tree| tree.edit(from, to, vec![], 0));
+                }
+            }
+            Self::Split {
+                selector, level, ..
+            } => {
+                let (from, to) = selector.range(range);
+                assert_eq!(from, to, "a split is at one position");
+                edit_tree(doc, |tree| tree.edit(from, to, vec![], *level));
+            }
             Self::Style { key, value, .. } => {
                 let (from, _, to) = range;
                 edit_tree(doc, |tree| match value {
@@ -854,6 +771,40 @@ impl TreeOp {
                 });
             }
         }
+    }
+}
+
+/// Returns the range from before the first end tag to the last start tag in
+/// `from..to` of `xml`, the boundaries a merge deletes (JS `getMergeRange`
+/// with `parseSimpleXML`).
+fn merge_range(xml: &str, from: usize, to: usize) -> Option<(usize, usize)> {
+    let mut tokens = Vec::new();
+    let mut chars = xml.chars().peekable();
+    while let Some(ch) = chars.next() {
+        let mut token = ch.to_string();
+        if ch == '<' {
+            for next in chars.by_ref() {
+                token.push(next);
+                if next == '>' {
+                    break;
+                }
+            }
+        }
+        tokens.push(token);
+    }
+
+    let (mut start, mut end) = (None, None);
+    for (index, token) in tokens.iter().enumerate().take(to + 1).skip(from + 1) {
+        if start.is_none() && token.starts_with("</") {
+            start = Some(index - 1);
+        }
+        if token.starts_with('<') && !token.starts_with("</") {
+            end = Some(index);
+        }
+    }
+    match (start, end) {
+        (Some(start), Some(end)) if start < end => Some((start, end)),
+        _ => None,
     }
 }
 
@@ -921,7 +872,7 @@ async fn run_matrix(
     assert!(diverged.is_empty(), "diverged:\n{}", diverged.join("\n"));
 }
 
-/// JS "concurrently-edit-edit-test" without the merge operation.
+/// JS "concurrently-edit-edit-test".
 #[tokio::test]
 async fn concurrently_edit_edit_matrix_converges() {
     let root = element(
@@ -960,6 +911,7 @@ async fn concurrently_edit_edit_matrix_converges() {
             TreeOp::edit(Selector::Back, element_node.clone(), "insertElementBack"),
             TreeOp::edit(Selector::All, element_node, "replaceElement"),
             TreeOp::edit(Selector::All, None, "delete"),
+            TreeOp::Merge { desc: "merge" },
         ]
     };
     run_matrix(
@@ -1009,7 +961,7 @@ async fn concurrently_style_style_matrix_converges() {
     .await;
 }
 
-/// JS "concurrently-edit-style-test" without the merge operation.
+/// JS "concurrently-edit-style-test".
 #[tokio::test]
 async fn concurrently_edit_style_matrix_converges() {
     let red_p = |value: &str| element_with("p", json!({"color": "red"}), vec![text(value)]);
@@ -1034,6 +986,7 @@ async fn concurrently_edit_style_matrix_converges() {
         TreeOp::edit(Selector::Back, content.clone(), "insertBack"),
         TreeOp::edit(Selector::All, None, "delete"),
         TreeOp::edit(Selector::All, content, "replace"),
+        TreeOp::Merge { desc: "merge" },
     ];
     let style_ops = [
         TreeOp::style("color", None, "remove-color"),
@@ -1046,6 +999,155 @@ async fn concurrently_edit_style_matrix_converges() {
         &two_ranges,
         &edit_ops,
         &style_ops,
+    )
+    .await;
+}
+
+/// `<r><p><p><p><p>abcd</p><p>efgh</p></p><p>ijkl</p></p></p></r>`, the tree
+/// of the JS split-split matrices.
+fn nested_paragraphs() -> TreeNodeInput {
+    let p = |children| element("p", children);
+    element(
+        "r",
+        vec![p(vec![p(vec![
+            p(vec![p(vec![text("abcd")]), p(vec![text("efgh")])]),
+            p(vec![text("ijkl")]),
+        ])])],
+    )
+}
+
+fn split_split_ranges() -> [TwoRanges; 5] {
+    [
+        ranges((3, 6, 9), (3, 6, 9), "equal-single"),
+        ranges((3, 9, 15), (3, 9, 15), "equal-multiple"),
+        ranges((3, 9, 15), (9, 12, 15), "A contains B same level"),
+        ranges((2, 16, 22), (9, 12, 15), "A contains B multiple level"),
+        ranges((3, 6, 9), (9, 12, 15), "B is next to A"),
+    ]
+}
+
+fn split_ops(level: usize) -> [TreeOp; 4] {
+    let descs = match level {
+        1 => [
+            "split-front-1",
+            "split-one-quarter-1",
+            "split-three-quarter-1",
+            "split-back-1",
+        ],
+        _ => [
+            "split-front-2",
+            "split-one-quarter-2",
+            "split-three-quarter-2",
+            "split-back-2",
+        ],
+    };
+    [
+        TreeOp::split(Selector::Front, level, descs[0]),
+        TreeOp::split(Selector::OneQuarter, level, descs[1]),
+        TreeOp::split(Selector::ThreeQuarter, level, descs[2]),
+        TreeOp::split(Selector::Back, level, descs[3]),
+    ]
+}
+
+/// JS "concurrently-split-split-test (splitLevel=1)".
+#[tokio::test]
+async fn concurrently_split_split_matrix_converges() {
+    let ops = split_ops(1);
+    run_matrix(
+        "concurrently-split-split-test",
+        nested_paragraphs(),
+        "<r><p><p><p><p>abcd</p><p>efgh</p></p><p>ijkl</p></p></p></r>",
+        &split_split_ranges(),
+        &ops,
+        &ops,
+    )
+    .await;
+}
+
+/// JS "concurrently-split-split-test (splitLevel>=2)".
+#[tokio::test]
+async fn concurrently_split_split_multi_level_matrix_converges() {
+    let ops = [split_ops(1), split_ops(2)].concat();
+    run_matrix(
+        "concurrently-split-split-multi-level-test",
+        nested_paragraphs(),
+        "<r><p><p><p><p>abcd</p><p>efgh</p></p><p>ijkl</p></p></p></r>",
+        &split_split_ranges(),
+        &ops,
+        &ops,
+    )
+    .await;
+}
+
+/// `<r><p><p><p italic="a">abcd</p><p italic="a">efgh</p></p><p
+/// italic="a">ijkl</p></p></r>`, the tree of the JS split-edit matrices.
+fn italic_paragraphs() -> TreeNodeInput {
+    let italic = |value| element_with("p", json!({"italic": "a"}), vec![text(value)]);
+    element(
+        "r",
+        vec![element(
+            "p",
+            vec![
+                element("p", vec![italic("abcd"), italic("efgh")]),
+                italic("ijkl"),
+            ],
+        )],
+    )
+}
+
+async fn run_split_edit_matrix(name: &str, split_ops: &[TreeOp]) {
+    let two_ranges = [
+        ranges((2, 5, 8), (2, 5, 8), "equal"),
+        ranges((2, 5, 8), (4, 5, 6), "A contains B"),
+        ranges((2, 5, 8), (2, 8, 14), "B contains A"),
+        ranges((2, 5, 8), (3, 4, 5), "left node(text)"),
+        ranges((2, 5, 8), (5, 6, 7), "right node(text)"),
+        ranges((2, 8, 14), (2, 5, 8), "left node(element)"),
+        ranges((2, 8, 14), (8, 11, 14), "right node(element)"),
+        ranges((2, 5, 8), (8, 11, 14), "A -> B"),
+        ranges((8, 11, 14), (2, 5, 8), "B -> A"),
+    ];
+    let content = Some(element("i", vec![]));
+    let edit_ops = [
+        TreeOp::edit(Selector::Front, content.clone(), "insertFront"),
+        TreeOp::edit(Selector::Middle, content.clone(), "insertMiddle"),
+        TreeOp::edit(Selector::Back, content.clone(), "insertBack"),
+        TreeOp::edit(Selector::All, content, "replace"),
+        TreeOp::edit(Selector::All, None, "delete"),
+        TreeOp::Merge { desc: "merge" },
+        TreeOp::style("bold", Some("aa"), "style"),
+        TreeOp::style("italic", None, "remove-style"),
+    ];
+    run_matrix(
+        name,
+        italic_paragraphs(),
+        r#"<r><p><p><p italic="a">abcd</p><p italic="a">efgh</p></p><p italic="a">ijkl</p></p></r>"#,
+        &two_ranges,
+        split_ops,
+        &edit_ops,
+    )
+    .await;
+}
+
+/// JS "concurrently-split-edit-test (splitLevel=1)".
+#[tokio::test]
+async fn concurrently_split_edit_matrix_converges() {
+    run_split_edit_matrix(
+        "concurrently-split-edit-test",
+        &[TreeOp::split(Selector::Middle, 1, "split-1")],
+    )
+    .await;
+}
+
+/// JS "concurrently-split-edit-test (splitLevel>=2)".
+#[tokio::test]
+async fn concurrently_split_edit_multi_level_matrix_converges() {
+    run_split_edit_matrix(
+        "concurrently-split-edit-multi-level-test",
+        &[
+            TreeOp::split(Selector::Middle, 1, "split-1"),
+            TreeOp::split(Selector::Middle, 2, "split-2"),
+        ],
     )
     .await;
 }
