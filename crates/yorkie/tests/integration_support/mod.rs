@@ -56,3 +56,37 @@ pub fn assert_undo_redo(doc: &mut yorkie::Document, states: &[String]) {
         assert_eq!(states[n - 2 - i], doc.to_sorted_json(), "undo 2-{i}");
     }
 }
+
+/// Builds a document value from a JSON literal, the way a JS test assigns an
+/// object or array literal: numbers that fit an `i32` become Integers, other
+/// integers Longs, and the rest Doubles.
+pub fn json_value(value: serde_json::Value) -> yorkie::JsonValue {
+    use serde_json::Value;
+    use yorkie::{JsonArray, JsonObject, JsonValue};
+    match value {
+        Value::Null => JsonValue::Null,
+        Value::Bool(value) => JsonValue::Bool(value),
+        Value::Number(number) => match number.as_i64() {
+            Some(value) => match i32::try_from(value) {
+                Ok(value) => JsonValue::Integer(value),
+                Err(_) => JsonValue::Long(value),
+            },
+            None => JsonValue::Double(number.as_f64().expect("a finite number")),
+        },
+        Value::String(value) => JsonValue::String(value),
+        Value::Array(values) => {
+            let mut array = JsonArray::new();
+            for value in values {
+                array.push(json_value(value)).unwrap();
+            }
+            JsonValue::Array(array)
+        }
+        Value::Object(members) => {
+            let mut object = JsonObject::new();
+            for (key, value) in members {
+                object.set(key, json_value(value)).unwrap();
+            }
+            JsonValue::Object(object)
+        }
+    }
+}
