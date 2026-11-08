@@ -921,8 +921,10 @@ Current Rust behavior:
   `ConnectTransport`). Its methods take `&self`. Because it spawns tokio
   tasks, it must be used inside a tokio runtime.
 - Client calls (`activate`, `deactivate`, `attach`, `detach`, `sync`,
-  `remove`, `change_sync_mode`) and each sync-loop round run one at a time on
-  an async task queue (JS `enqueueTask`). Watch streams do not use it.
+  `remove`, `change_sync_mode`, and the channel calls) and each sync-loop
+  round run one at a time on an async task queue (JS `enqueueTask`). Watch
+  streams do not use it; each broadcast try does, but not the waits between
+  tries.
 - Documents are shared as `SharedDocument` (`Arc<std::sync::Mutex<Document>>`).
   The client locks a document only for synchronous steps (build a pack, apply
   a response, publish an event) and never across an `.await`, and it never
@@ -1021,13 +1023,15 @@ JS/Go behavior:
 
 Gap:
 
-- Retry decisions use only the Connect code: Yorkie error codes carried in
-  error metadata (`ErrTooManySubscribers`, size rejections,
-  `ErrClientNotActivated`) are not decoded, so write-rejected parking, the
-  auth-token refresh and its backoff, and deactivation on a lost client are
-  not ported. `AuthError`/`EpochMismatch`/`WriteRejected` events are not
+- Retry decisions use only the Connect code. `ClientError::Rpc` carries the
+  Yorkie error code from the error details (JS `errorCodeOf`), but only
+  `ErrSessionNotFound` (channel refresh) is acted on: `ErrTooManySubscribers`
+  retries, write-rejected parking, the auth-token refresh and its backoff,
+  and deactivation on `ErrClientNotActivated`/`ErrClientNotFound` are not
+  ported. `AuthError`/`EpochMismatch`/`WriteRejected` events are not
   published.
-- `DOCUMENT_BROADCAST` watch events are ignored until broadcast lands.
+- `DOCUMENT_BROADCAST` watch events are ignored, as in JS: broadcasts travel
+  on channels.
 - Detach does not mark the attachment as detaching (JS `markDetaching`); the
   task queue keeps the sync loop from running during a detach instead.
 - A push-only or sync-off reply that carries changes is skipped whole; JS
@@ -1045,9 +1049,61 @@ Gap:
 
 Expected direction:
 
-- Decode Yorkie error metadata so retry, parking, and auth handling can
-  follow `handleConnectError`.
-- Deliver document broadcasts over the watch stream.
+- Use the decoded Yorkie error codes so retry, parking, and auth handling
+  can follow `handleConnectError`.
+
+## Channels and Broadcast
+
+Current Rust behavior:
+
+- `Channel` (`yorkie-client/src/channel.rs`) ports JS `Channel`: key
+  validation, status, actor, session ID, session count with seq ordering
+  (`updateSessionCount`), subscriptions for all events or one broadcast
+  topic, and `broadcast`. It is shared as `SharedChannel`
+  (`Arc<std::sync::Mutex<Channel>>`), locked like `SharedDocument`.
+- Channels follow the JS RefreshChannel-only lifecycle. `attach_channel`
+  registers the channel and starts the sync loop; the client need not be
+  active. The first `RefreshChannel` (no session ID) carries the client key
+  and metadata, and its reply gives the session ID (the channel becomes
+  `Attached`) and, for a client without one, a client ID that activates the
+  client. Later refreshes run every heartbeat interval (default 5s, JS
+  `DefaultChannelHeartbeatMs`) and publish `PresenceChanged` when the count
+  changes. `ErrSessionNotFound` clears the session so the next round
+  creates one; any other failure publishes `SyncError` and goes through the
+  sync loop's retry rules.
+- `Realtime` channels open the unified `Watch` RPC with a channel descriptor
+  after their first refresh, and publish `Initialized`, `PresenceChanged`,
+  and `Broadcast`. `Polling` channels only refresh; `Manual` channels refresh
+  only through `sync_channel`. `change_channel_sync_mode` opens or closes the
+  stream and resets an unpinned heartbeat interval.
+- `detach_channel` is local, as in JS: the server expires the session by TTL
+  (15s, checked every 10s), so peers see the count fall up to ~25s later.
+  `deactivate` detaches channels too. `peek_channel` reads a count without
+  activation or a session.
+- `Channel::broadcast` publishes `LocalBroadcast`; the client that attached
+  the channel sends it in the background through the `Broadcast` RPC with
+  the JSON encoding of the payload, retrying retryable failures after 1s,
+  2s, 4s, ... (at most 20s) up to `BroadcastOptions::max_retries`, and passes
+  a final failure to `BroadcastOptions::error`. `Client::broadcast` sends one
+  and waits for it.
+
+Gap:
+
+- JS `ChannelStatus.Removed` and the `AuthError` channel event are not
+  ported (there is no auth-token handling yet).
+- Deliberate differences from JS: `detach_channel` clears the session ID (JS
+  keeps it, so a re-attached channel stays `Detached` until the old session
+  expires); every broadcast try checks the channel is still attached (JS
+  checks once); `Client::broadcast` waits for its retries (JS resolves after
+  the first failed try) and returns a non-retryable failure (JS swallows it);
+  `change_channel_sync_mode` to `Realtime` on a client that is not active
+  yet leaves the stream to the first refresh (JS rejects the call with the
+  same end state). `attach_channel` rejects a key already attached as a
+  document or channel (JS overwrites the map entry).
+- JS "Should throw error when broadcasting unserializeable payload" has no
+  Rust case: a `serde_json::Value` payload always serializes.
+- Payload numbers are encoded by `serde_json`, which can differ from JS
+  `JSON.stringify` for edge cases (for example `1.0`).
 
 ## Error Behavior
 
