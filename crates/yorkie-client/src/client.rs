@@ -48,9 +48,9 @@ use crate::{sync_loop, watch};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Debug, Formatter};
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use yorkie_core::{ActorId, DocEvent, DocStatus, DocSyncStatus, Document, ErrorCode};
 
 /// Client activation state.
@@ -177,7 +177,12 @@ impl Client {
 
     /// Creates a client over the given transport, e.g. a test double.
     pub fn with_transport(options: ClientOptions, transport: Arc<dyn ClientTransport>) -> Self {
-        let key = options.key.clone().unwrap_or_else(generate_client_key);
+        // JS `opts.key || uuid()`: an empty key is generated too.
+        let key = options
+            .key
+            .clone()
+            .filter(|key| !key.is_empty())
+            .unwrap_or_else(generate_client_key);
         let state = ClientState {
             id: None,
             actor_id: None,
@@ -1656,16 +1661,31 @@ fn channel_key(channel: &SharedChannel) -> String {
     lock_channel(channel).key().to_owned()
 }
 
+/// Generates the key of a client created without one: a random (version 4)
+/// UUID drawn from the OS CSPRNG, as JS `uuid()` (`util/uuid.ts`) does with
+/// Web Crypto. The key must be unguessable, not merely unique: the server
+/// derives the actor from it, so a predictable key would let another client
+/// of the project activate as the same actor.
+///
+/// Panics if the OS has no random source. JS refuses to generate a key there
+/// too (it throws `ErrInvalidArgument`); such a runtime must pass its own
+/// `ClientOptions::key`.
 fn generate_client_key() -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(1);
-
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-
-    format!("rust-{timestamp:x}-{counter:x}")
+    let mut b = [0u8; 16];
+    getrandom::fill(&mut b)
+        .expect("the OS random source must be available to generate a client key");
+    // Version 4 (random) and RFC 4122 variant bits.
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    format!(
+        "{}-{}-{}-{}-{}",
+        hex(&b[0..4]),
+        hex(&b[4..6]),
+        hex(&b[6..8]),
+        hex(&b[8..10]),
+        hex(&b[10..16])
+    )
 }
 
 #[cfg(test)]
@@ -1975,6 +1995,41 @@ mod tests {
         let change = pack.changes.last()?;
         let presence_change = change.presence_change.as_ref()?;
         ChangeType::try_from(presence_change.r#type).ok()
+    }
+
+    /// Whether `key` is a lowercase RFC 4122 version 4 UUID, the format of
+    /// JS `uuid()`.
+    fn is_v4_uuid(key: &str) -> bool {
+        let groups: Vec<&str> = key.split('-').collect();
+        groups.iter().map(|group| group.len()).eq([8, 4, 4, 4, 12])
+            && groups.iter().all(|group| {
+                group
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            })
+            && groups[2].starts_with('4')
+            && groups[3].starts_with(['8', '9', 'a', 'b'])
+    }
+
+    /// JS `opts.key || uuid()`: a client without a key gets a random version
+    /// 4 UUID, and an empty key counts as none.
+    #[test]
+    fn generates_random_uuid_client_keys() {
+        let transport = Arc::new(MockTransport::default());
+        let first = mock_client(ClientOptions::default(), &transport);
+        let second = mock_client(ClientOptions::default(), &transport);
+        assert!(is_v4_uuid(first.key()), "{}", first.key());
+        assert!(is_v4_uuid(second.key()), "{}", second.key());
+        assert_ne!(first.key(), second.key());
+
+        let empty = mock_client(
+            ClientOptions {
+                key: Some(String::new()),
+                ..ClientOptions::default()
+            },
+            &transport,
+        );
+        assert!(is_v4_uuid(empty.key()), "{}", empty.key());
     }
 
     #[test]

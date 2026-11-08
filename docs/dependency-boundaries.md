@@ -114,7 +114,10 @@ Current `yorkie-client` module layout follows the same split:
 
 `yorkie-core` keeps `serde_json` as its only data dependency beyond the
 standard library, for presence and attribute values. It stays free of tokio,
-reqwest, and prost.
+reqwest, prost, and getrandom.
+
+`yorkie-client` uses `getrandom` only to generate client keys: a key must be
+unguessable, so it comes from the OS CSPRNG, as JS draws it from Web Crypto.
 
 Avoid sibling modules that call into each other in both directions. If that
 happens, extract the shared type or function into a lower-level module.

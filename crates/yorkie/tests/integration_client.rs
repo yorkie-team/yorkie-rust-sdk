@@ -146,7 +146,6 @@ async fn activate_attach_sync_detach_roundtrip() {
 
 /// JS "Can be activated, deactivated" (client_test.ts:45).
 #[tokio::test]
-#[ignore = "diverges from JS: generated client key is not a 36-char UUID"]
 async fn can_be_activated_and_deactivated() {
     let Some(addr) = rpc_addr() else { return };
     let client_key = unique_key("activate-deactivate");
