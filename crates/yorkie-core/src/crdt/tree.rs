@@ -295,42 +295,6 @@ impl TreeNode {
         self.children.insert(index, node);
     }
 
-    pub(crate) fn split_element_at(
-        &mut self,
-        visible_offset: usize,
-        id: TreeNodeId,
-    ) -> Result<(TreeNode, DataSize)> {
-        if self.is_text() {
-            return Err(YorkieError::InvalidTreePosition(
-                "text node cannot be split as element".to_owned(),
-            ));
-        }
-
-        let physical_offset = self.physical_child_offset(visible_offset)?;
-        let prev_size = self.data_size();
-        let right_children = self.children.split_off(physical_offset);
-        let mut right = TreeNode::create_element(
-            id,
-            self.node_type.clone(),
-            self.attrs.clone(),
-            right_children,
-        );
-        right.removed_at = self.removed_at.clone();
-        right.ins_prev_id = Some(self.id.clone());
-        right.ins_next_id = self.ins_next_id.clone();
-        self.ins_next_id = Some(right.id.clone());
-
-        let left_size = self.data_size();
-        let right_size = right.data_size();
-        Ok((
-            right,
-            DataSize {
-                data: left_size.data + right_size.data - prev_size.data,
-                meta: left_size.meta + right_size.meta - prev_size.meta,
-            },
-        ))
-    }
-
     pub(crate) fn split_text_child_at(
         &mut self,
         child_index: usize,
@@ -642,7 +606,9 @@ impl TreeNode {
 pub(crate) struct CrdtTree {
     meta: CrdtElementMeta,
     root: TreeNode,
-    node_by_id: BTreeMap<TreeNodeId, TreeNode>,
+    /// The IDs of every node, removed ones too, for floor lookups (JS
+    /// `nodeMapByID`). The nodes themselves are found by walking the tree.
+    node_ids: BTreeSet<TreeNodeId>,
     /// GC pairs of text pieces split off removed nodes, drained by the edit
     /// or style that split them (JS `pendingGCPairs`).
     pending_gc_pairs: Vec<(String, DataSize, TimeTicket)>,
@@ -665,7 +631,6 @@ pub(crate) struct TreeEditChange {
     pub(crate) from_path: Vec<usize>,
     pub(crate) to_path: Vec<usize>,
     pub(crate) value: Option<Vec<TreeNodeInput>>,
-    pub(crate) split_level: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -699,7 +664,7 @@ impl CrdtTree {
         let mut tree = Self {
             meta: CrdtElementMeta::new(created_at),
             root,
-            node_by_id: BTreeMap::new(),
+            node_ids: BTreeSet::new(),
             pending_gc_pairs: Vec::new(),
         };
         tree.rebuild_node_map();
@@ -767,12 +732,13 @@ impl CrdtTree {
     }
 
     pub(crate) fn find_floor_node(&self, id: &TreeNodeId) -> Option<&TreeNode> {
-        let (key, node) = self.node_by_id.range(..=id.clone()).next_back()?;
-        key.has_same_created_at(id).then_some(node)
+        let floor = self.floor_id(id)?;
+        let path = self.physical_path_by_node_id(&floor)?;
+        node_at_path(&self.root, &path).ok()
     }
 
     pub(crate) fn node_map_len(&self) -> usize {
-        self.node_by_id.len()
+        self.node_ids.len()
     }
 
     pub(crate) fn find_pos(&self, index: usize, prefer_text: bool) -> Result<TreePos> {
@@ -999,6 +965,10 @@ impl CrdtTree {
         Ok((gc_nodes, diff, changes, previous_attributes))
     }
 
+    /// Edits the range with `contents`, issuing the tickets of the elements a
+    /// split creates the way a replica does when the operation carries none
+    /// (JS `TreeEditOperation.execute` fallback): one delimiter after
+    /// another, starting past the top-level contents.
     pub(crate) fn edit_by_range_with_changes(
         &mut self,
         range: (TreePos, TreePos),
@@ -1007,33 +977,70 @@ impl CrdtTree {
         edited_at: TimeTicket,
         version_vector: Option<&crate::VersionVector>,
     ) -> Result<TreeEditResult> {
+        let mut issue_split_ticket =
+            fallback_split_tickets(&edited_at, contents.as_ref().map(Vec::len));
+        self.edit(
+            range,
+            contents,
+            split_level,
+            edited_at,
+            &mut issue_split_ticket,
+            version_vector,
+        )
+    }
+
+    /// Edits the range with `contents` and splits `split_level` levels at
+    /// its start (JS `CRDTTree.edit`). `issue_split_ticket` gives the ticket
+    /// of each element the split creates.
+    pub(crate) fn edit(
+        &mut self,
+        range: (TreePos, TreePos),
+        contents: Option<Vec<TreeNode>>,
+        split_level: usize,
+        edited_at: TimeTicket,
+        issue_split_ticket: &mut dyn FnMut() -> TimeTicket,
+        version_vector: Option<&crate::VersionVector>,
+    ) -> Result<TreeEditResult> {
         let mut diff = DataSize::default();
         let (from_parent_path, from_left_raw_path) =
             self.find_nodes_and_split_text(&range.0, &edited_at, false, &mut diff)?;
+        let from_parent = self.id_at(&from_parent_path)?;
+        let from_left_raw = self.id_at(&from_left_raw_path)?;
         let (to_parent_path, to_left_raw_path) =
             self.find_nodes_and_split_text(&range.1, &edited_at, false, &mut diff)?;
+        let to_parent = self.id_at(&to_parent_path)?;
+        let to_left_raw = self.id_at(&to_left_raw_path)?;
         let mut gc_pairs = Vec::new();
         let mut removed_nodes = Vec::new();
-        let from_left_path = if from_left_raw_path != from_parent_path {
+
+        // 01-1. Advance past the split siblings the editor did not know. The
+        // editing actor is passed so a same-boundary empty run resolves here
+        // as the split step resolves it (JS §7.7).
+        let actor_id = edited_at.actor_id().as_str().to_owned();
+        let from_left = if from_left_raw != from_parent {
             self.advance_past_unknown_split_siblings(
-                &from_left_raw_path,
+                &from_left_raw,
                 version_vector,
                 false,
-                None,
+                Some(&actor_id),
             )?
         } else {
-            from_left_raw_path
+            from_left_raw
         };
-        let to_left_path = if to_left_raw_path != to_parent_path {
+        let to_left = if to_left_raw != to_parent {
             self.advance_past_unknown_split_siblings(
-                &to_left_raw_path,
+                &to_left_raw,
                 version_vector,
                 false,
-                None,
+                Some(&actor_id),
             )?
         } else {
-            to_left_raw_path
+            to_left_raw
         };
+        let from_parent_path = self.path_of(&from_parent)?;
+        let from_left_path = self.path_of(&from_left)?;
+        let to_parent_path = self.path_of(&to_parent)?;
+        let to_left_path = self.path_of(&to_left)?;
 
         let from_idx = visible_index_of_physical(
             &self.root,
@@ -1044,7 +1051,6 @@ impl CrdtTree {
             physical_index_after_left_path(&self.root, &to_parent_path, &to_left_path)?,
         );
         let from_path = self.index_to_path(from_idx)?;
-        let to_path = self.index_to_path(to_idx)?;
         let mut collect_from_parent_path = from_parent_path.clone();
         let mut collect_from_left_path = from_left_path.clone();
         let mut merge_level = 0;
@@ -1112,20 +1118,29 @@ impl CrdtTree {
             }
         }
 
+        // 04. Split the elements for the split level.
         if split_level > 0 {
-            let contents_len = contents.as_ref().map(Vec::len).unwrap_or_default();
-            add_data_size(
-                &mut diff,
-                self.split_elements_at_position(
-                    &from_parent_path,
-                    &from_left_path,
+            let (split_idx, split_path) = self
+                .split_levels(
+                    &from_parent,
+                    &from_left,
                     split_level,
                     &edited_at,
-                    contents_len,
+                    issue_split_ticket,
                     version_vector,
-                )?,
-            );
+                    &mut diff,
+                )?
+                .unwrap_or_else(|| (from_idx, from_path.clone()));
+            changes.push(TreeEditChange {
+                from: split_idx,
+                to: split_idx,
+                from_path: split_path.clone(),
+                to_path: split_path,
+                value: None,
+            });
         }
+        let from_parent_path = self.path_of(&from_parent)?;
+        let from_left_path = self.path_of(&from_left)?;
 
         let mut inserted_size = 0;
         let mut inserted_value = contents.as_ref().map(|nodes| {
@@ -1171,20 +1186,7 @@ impl CrdtTree {
         self.rebuild_merge_state();
         gc_pairs.extend(self.drain_pending_gc_pairs());
 
-        let changes = if split_level > 0 {
-            // Split changes keep their single-change shape until splits are
-            // ported through the facade (Task 10).
-            vec![TreeEditChange {
-                from: from_idx,
-                to: to_idx,
-                from_path,
-                to_path,
-                value: inserted_value,
-                split_level: Some(split_level),
-            }]
-        } else {
-            attach_insertion_change(changes, from_idx, from_path, inserted_value)
-        };
+        let changes = attach_insertion_change(changes, from_idx, from_path, inserted_value);
 
         Ok(TreeEditResult {
             changes,
@@ -1229,7 +1231,7 @@ impl CrdtTree {
         let mut tree = Self {
             meta: self.meta.clone(),
             root: self.root.clone(),
-            node_by_id: BTreeMap::new(),
+            node_ids: BTreeSet::new(),
             pending_gc_pairs: Vec::new(),
         };
         tree.rebuild_node_map();
@@ -1505,7 +1507,6 @@ impl CrdtTree {
                 from_path: self.index_to_path(from)?,
                 to_path: self.index_to_path(to)?,
                 value: None,
-                split_level: None,
             });
         }
         changes.reverse();
@@ -1582,77 +1583,295 @@ impl CrdtTree {
         targets
     }
 
-    fn split_elements_at_position(
+    /// Splits `split_level` elements from the position after `left` in
+    /// `parent` upward (JS `CRDTTree.edit` step 04), and returns the index
+    /// and path where the first level opened, measured once it has split.
+    #[allow(clippy::too_many_arguments)]
+    fn split_levels(
         &mut self,
-        from_parent_path: &[usize],
-        from_left_path: &[usize],
+        parent: &TreeNodeId,
+        left: &TreeNodeId,
         split_level: usize,
         edited_at: &TimeTicket,
-        contents_len: usize,
+        issue_split_ticket: &mut dyn FnMut() -> TimeTicket,
         version_vector: Option<&crate::VersionVector>,
-    ) -> Result<DataSize> {
-        let mut parent_path = from_parent_path.to_vec();
-        let mut left_path = from_left_path.to_vec();
-        let mut diff = DataSize::default();
-
-        for split_index in 0..split_level {
-            if parent_path.is_empty() {
-                return Err(YorkieError::InvalidTreePosition(
-                    "root node cannot be split".to_owned(),
-                ));
-            }
-
-            if left_path != parent_path {
-                left_path = self.advance_past_unknown_split_siblings(
-                    &left_path,
+        diff: &mut DataSize,
+    ) -> Result<Option<(usize, Vec<usize>)>> {
+        let actor_id = edited_at.actor_id().as_str().to_owned();
+        let mut parent = parent.clone();
+        let mut left = left.clone();
+        let mut first_level = None;
+        for split_count in 0..split_level {
+            // §7.5: advance past the split siblings of this level the editor
+            // did not know, but not past its own split products (§7.7).
+            if left != parent {
+                left = self.advance_past_unknown_split_siblings(
+                    &left,
                     version_vector,
                     true,
-                    Some(edited_at.actor_id().as_str()),
+                    Some(&actor_id),
                 )?;
-                if let Some((next_parent_path, _)) = split_parent_path(&left_path) {
-                    if next_parent_path != parent_path {
-                        parent_path = next_parent_path;
+                if let Some(left_parent) = self.parent_id(&left) {
+                    parent = left_parent;
+                }
+            }
+
+            let Some(grand_parent) = self.parent_id(&parent) else {
+                break;
+            };
+
+            let offset = if left == parent {
+                0
+            } else {
+                self.node(&parent)?
+                    .all_children()
+                    .position(|child| child.id() == &left)
+                    .map_or(0, |index| index + 1)
+            };
+            let (target, offset) =
+                self.order_same_boundary_split(&parent, offset, edited_at, version_vector)?;
+            let split_diff =
+                self.split_element(&target, offset, issue_split_ticket, version_vector)?;
+            add_data_size(diff, split_diff);
+
+            // The split is reported at the end of what stayed in `parent`,
+            // where it opened on this replica: concurrent inserts at the
+            // boundary stay on its left (§7.3). A tombstone takes no room in
+            // the index, so the last live child measures the same place.
+            if split_count == 0 {
+                let last = self
+                    .node(&parent)?
+                    .children()
+                    .last()
+                    .map_or_else(|| parent.clone(), |child| child.id().clone());
+                if let Ok(index) = self.to_index(&parent, &last) {
+                    if let Ok(path) = self.index_to_path(index) {
+                        first_level = Some((index, path));
                     }
                 }
             }
 
-            let offset = if left_path == parent_path {
-                0
-            } else {
-                let Some((left_parent_path, physical_index)) = split_parent_path(&left_path) else {
-                    return Err(YorkieError::InvalidTreePosition(
-                        "left sibling not found".to_owned(),
-                    ));
-                };
-                if left_parent_path != parent_path {
-                    return Err(YorkieError::InvalidTreePosition(
-                        "left sibling parent mismatch".to_owned(),
-                    ));
-                }
-                let parent = node_at_path(&self.root, &parent_path)?;
-                visible_offset_for_physical_child(parent, physical_index)? + 1
-            };
+            left = parent;
+            parent = grand_parent;
+        }
+        Ok(first_level)
+    }
 
-            let Some((grand_parent_path, visible_index)) = split_parent_path(&parent_path) else {
-                return Err(YorkieError::InvalidTreePosition(
-                    "root node cannot be split".to_owned(),
-                ));
-            };
-            let split_id =
-                TreeNodeId::new(split_issue_ticket(edited_at, contents_len, split_index), 0);
-            let parent = node_at_visible_path_mut(&mut self.root, &grand_parent_path)?;
-            let physical_index = parent.physical_child_offset(visible_index)?;
-            let node = parent.children.get_mut(physical_index).ok_or_else(|| {
-                YorkieError::InvalidTreePosition("split element not found".to_owned())
-            })?;
-            let (right, split_diff) = node.split_element_at(offset, split_id)?;
-            add_data_size(&mut diff, split_diff);
-            parent.children.insert(physical_index + 1, right);
-
-            left_path = parent_path;
-            parent_path = grand_parent_path;
+    /// Decides which node a split at `offset` of `parent` splits, so that
+    /// concurrent splits of one node at one boundary order their products by
+    /// ticket, newest first, as RGA orders concurrent inserts (JS
+    /// `orderSameBoundarySplit`).
+    fn order_same_boundary_split(
+        &self,
+        parent: &TreeNodeId,
+        offset: usize,
+        edited_at: &TimeTicket,
+        version_vector: Option<&crate::VersionVector>,
+    ) -> Result<(TreeNodeId, usize)> {
+        // A concurrent split of the same boundary took everything right of
+        // it, so only a split at the end of `parent` can be one.
+        let Some(version_vector) = version_vector else {
+            return Ok((parent.clone(), offset));
+        };
+        if offset != self.node(parent)?.all_children().count() {
+            return Ok((parent.clone(), offset));
         }
 
+        let mut target = parent.clone();
+        let mut walker = InsNextWalker::default();
+        walker.visit(&target);
+        while let Some(ins_next_id) = self.node(&target)?.ins_next_id().cloned() {
+            let Some(next_id) = self.floor_id(&ins_next_id) else {
+                break;
+            };
+            let next = self.node(&next_id)?;
+            if next.is_text() || self.parent_id(&next_id).is_none() || !walker.visit(&next_id) {
+                break;
+            }
+            if !self.shares_split_family_parent(&target, &next_id)? {
+                break;
+            }
+            // Splitting a tombstoned sibling would give our product a
+            // tombstone a replica that applied us first never gives it.
+            if next.is_removed() {
+                break;
+            }
+
+            let created_at = next.id().created_at();
+            if created_at.actor_id() == edited_at.actor_id()
+                || version_vector
+                    .get(created_at.actor_id().as_str())
+                    .is_some_and(|known| known >= created_at.lamport())
+                || !created_at.after(edited_at)
+            {
+                break;
+            }
+            target = next_id;
+        }
+
+        Ok(if &target == parent {
+            (target, offset)
+        } else {
+            (target, 0)
+        })
+    }
+
+    /// Reports whether `next` sits under the parent of `node`, or under a
+    /// split product of that parent (JS `sharesSplitFamilyParent`).
+    fn shares_split_family_parent(&self, node: &TreeNodeId, next: &TreeNodeId) -> Result<bool> {
+        let (Some(node_parent), Some(next_parent)) = (self.parent_id(node), self.parent_id(next))
+        else {
+            return Ok(false);
+        };
+        if node_parent == next_parent {
+            return Ok(true);
+        }
+
+        let mut walker = InsNextWalker::default();
+        let mut current = Some(node_parent);
+        while let Some(current_id) = current {
+            if !walker.visit(&current_id) {
+                break;
+            }
+            if current_id == next_parent {
+                return Ok(true);
+            }
+            let Some(ins_next_id) = self.node(&current_id)?.ins_next_id() else {
+                return Ok(false);
+            };
+            current = self.floor_id(ins_next_id);
+        }
+        Ok(false)
+    }
+
+    /// Splits the element `id` at the physical child `offset` into itself and
+    /// a new element right after it (JS `CRDTTreeNode.split` of an element,
+    /// with `splitElement`), and returns the size the split added.
+    fn split_element(
+        &mut self,
+        id: &TreeNodeId,
+        offset: usize,
+        issue_split_ticket: &mut dyn FnMut() -> TimeTicket,
+        version_vector: Option<&crate::VersionVector>,
+    ) -> Result<DataSize> {
+        let path = self.path_of(id)?;
+        let Some((parent_path, index)) = split_parent_path(&path) else {
+            return Err(YorkieError::InvalidTreePosition(
+                "root node cannot be split".to_owned(),
+            ));
+        };
+        let split_id = TreeNodeId::new(issue_split_ticket(), 0);
+        let node = node_at_path_mut(&mut self.root, &path)?;
+        let prev_size = node.data_size();
+        let mut split = TreeNode::create_element(
+            split_id.clone(),
+            node.node_type.clone(),
+            node.attrs.clone(),
+            Vec::new(),
+        );
+        split.removed_at = node.removed_at.clone();
+        // The product holds the other half of the same moved node, so it
+        // carries the same merge stamp.
+        split.merged_from = node.merged_from.clone();
+        split.merged_at = node.merged_at.clone();
+
+        let mut right = node.children.split_off(offset.min(node.children.len()));
+        let mut left = std::mem::take(&mut node.children);
+
+        // Fix 8: a child a merge the editor did not know moved here from a
+        // sibling of this node was local to this level, so it stays left.
+        if let Some(version_vector) = version_vector {
+            let siblings = left
+                .iter()
+                .chain(right.iter())
+                .map(|child| child.id().clone())
+                .collect::<BTreeSet<_>>();
+            let (stay, moved): (Vec<_>, Vec<_>) = right.into_iter().partition(|child| {
+                match (child.merged_from(), child.merged_at()) {
+                    (Some(merged_from), Some(merged_at)) => {
+                        !version_vector.after_or_equal(merged_at) && siblings.contains(merged_from)
+                    }
+                    _ => false,
+                }
+            });
+            left.extend(stay);
+            right = moved;
+
+            // §7.3: inserts the editor did not know, at the boundary, stay
+            // left. Element split products are not inserts and are passed.
+            let mut moved_to_left = Vec::new();
+            let mut remaining = Vec::new();
+            let mut boundary_reached = false;
+            for child in right {
+                if !boundary_reached {
+                    if child.ins_prev_id().is_some() && !child.is_text() {
+                        remaining.push(child);
+                        continue;
+                    }
+                    let created_at = child.id().created_at();
+                    let known = version_vector.get(created_at.actor_id().as_str());
+                    if known.is_none_or(|known| known < created_at.lamport()) {
+                        moved_to_left.push(child);
+                        continue;
+                    }
+                }
+                boundary_reached = true;
+                remaining.push(child);
+            }
+            left.extend(moved_to_left);
+            right = remaining;
+        }
+
+        node.children = left;
+        split.children = right;
+        let next_id = node.ins_next_id.replace(split_id.clone());
+        split.ins_prev_id = Some(node.id.clone());
+        split.ins_next_id = next_id.clone();
+        let size = node.data_size();
+        let split_size = split.data_size();
+        let diff = DataSize {
+            data: size.data + split_size.data - prev_size.data,
+            meta: size.meta + split_size.meta - prev_size.meta,
+        };
+        let split_removed_at = split.removed_at.clone();
+        let split_is_empty = split.children.is_empty();
+        node_at_path_mut(&mut self.root, &parent_path)?.insert_at(index + 1, split);
+        self.rebuild_node_map();
+
+        // The former next split sibling now follows the product.
+        if let Some(next_id) = next_id.and_then(|next_id| self.floor_id(&next_id)) {
+            self.node_mut(&next_id)?
+                .set_ins_prev_id(Some(split_id.clone()));
+
+            // §7.4: an empty product goes in front of that sibling when a
+            // split of the level above has already moved it to another
+            // parent, unless the sibling is removed.
+            let next_parent = self.parent_id(&next_id);
+            if split_is_empty
+                && !self.node(&next_id)?.is_removed()
+                && next_parent.is_some()
+                && next_parent != self.parent_id(&split_id)
+            {
+                let split_path = self.path_of(&split_id)?;
+                let (split_parent, split_index) =
+                    split_parent_path(&split_path).expect("a split product has a parent");
+                let split = node_at_path_mut(&mut self.root, &split_parent)?
+                    .children
+                    .remove(split_index);
+                let next_path = self.path_of(&next_id)?;
+                let (next_parent_path, next_index) =
+                    split_parent_path(&next_path).expect("checked above");
+                node_at_path_mut(&mut self.root, &next_parent_path)?.insert_at(next_index, split);
+            }
+        }
+
+        // A piece split off a removed node was never live, so it goes to GC
+        // with the size the split added rather than to the live diff.
+        if let Some(removed_at) = split_removed_at {
+            self.pending_gc_pairs
+                .push((split_id.to_id_string(), diff, removed_at));
+            return Ok(DataSize::default());
+        }
         Ok(diff)
     }
 
@@ -1750,59 +1969,161 @@ impl CrdtTree {
     }
 
     fn floor_node_path(&self, id: &TreeNodeId) -> Option<Vec<usize>> {
-        let (key, _) = self.node_by_id.range(..=id.clone()).next_back()?;
-        if !key.has_same_created_at(id) {
-            return None;
-        }
-
-        self.physical_path_by_node_id(key)
+        self.physical_path_by_node_id(&self.floor_id(id)?)
     }
 
+    /// Returns the ID of the node holding `id`: the one with the greatest ID
+    /// not after it from the same change (JS `findFloorNode`).
+    fn floor_id(&self, id: &TreeNodeId) -> Option<TreeNodeId> {
+        let floor = self.node_ids.range(..=id.clone()).next_back()?;
+        floor.has_same_created_at(id).then(|| floor.clone())
+    }
+
+    /// Returns `id` when it names an element of this tree exactly (JS
+    /// `findMergeNode`). Merge pointers name elements, so a floor-only match
+    /// or a text node is no match.
+    fn merge_node_id(&self, id: Option<&TreeNodeId>) -> Option<TreeNodeId> {
+        let id = id?;
+        if self.floor_id(id).as_ref() != Some(id) {
+            return None;
+        }
+        let node = self.node(id).ok()?;
+        (!node.is_text()).then(|| id.clone())
+    }
+
+    /// Returns the physical path of the node `id`.
+    fn path_of(&self, id: &TreeNodeId) -> Result<Vec<usize>> {
+        self.physical_path_by_node_id(id).ok_or_else(|| {
+            YorkieError::InvalidTreePosition(format!("node {} not found", id.to_test_string()))
+        })
+    }
+
+    fn node(&self, id: &TreeNodeId) -> Result<&TreeNode> {
+        node_at_path(&self.root, &self.path_of(id)?)
+    }
+
+    fn node_mut(&mut self, id: &TreeNodeId) -> Result<&mut TreeNode> {
+        let path = self.path_of(id)?;
+        node_at_path_mut(&mut self.root, &path)
+    }
+
+    /// Returns the ID of the parent of `id`, or `None` for the root.
+    fn parent_id(&self, id: &TreeNodeId) -> Option<TreeNodeId> {
+        let path = self.physical_path_by_node_id(id)?;
+        let (parent_path, _) = split_parent_path(&path)?;
+        node_at_path(&self.root, &parent_path)
+            .ok()
+            .map(|parent| parent.id().clone())
+    }
+
+    fn id_at(&self, path: &[usize]) -> Result<TreeNodeId> {
+        Ok(node_at_path(&self.root, path)?.id().clone())
+    }
+
+    /// Returns the visible index right after `left`, or at the start of the
+    /// content of `parent` when the two are the same (JS `toIndex`).
+    fn to_index(&self, parent: &TreeNodeId, left: &TreeNodeId) -> Result<usize> {
+        Ok(visible_index_of_physical(
+            &self.root,
+            self.physical_index_after(parent, left)?,
+        ))
+    }
+
+    /// Returns the index, counting removed nodes, right after `left`, or at
+    /// the start of the content of `parent` when the two are the same.
+    fn physical_index_after(&self, parent: &TreeNodeId, left: &TreeNodeId) -> Result<usize> {
+        physical_index_after_left_path(&self.root, &self.path_of(parent)?, &self.path_of(left)?)
+    }
+
+    /// Follows the split chain of `node` past the element split siblings the
+    /// editor did not know (JS `advancePastUnknownSplitSiblings`).
     fn advance_past_unknown_split_siblings(
         &self,
-        path: &[usize],
+        node: &TreeNodeId,
         version_vector: Option<&crate::VersionVector>,
         relax_parent_check: bool,
         skip_actor_id: Option<&str>,
-    ) -> Result<Vec<usize>> {
+    ) -> Result<TreeNodeId> {
         let Some(version_vector) = version_vector else {
-            return Ok(path.to_vec());
+            return Ok(node.clone());
         };
 
-        let mut current_path = path.to_vec();
-        loop {
-            let current = node_at_path(&self.root, &current_path)?;
-            let Some(ins_next_id) = current.ins_next_id().cloned() else {
+        let mut current = node.clone();
+        let mut walker = InsNextWalker::default();
+        walker.visit(&current);
+        while let Some(ins_next_id) = self.node(&current)?.ins_next_id().cloned() {
+            let Some(next_id) = self.floor_id(&ins_next_id) else {
                 break;
             };
-            let Some(next_path) = self.floor_node_path(&ins_next_id) else {
-                break;
-            };
-            let next = node_at_path(&self.root, &next_path)?;
-            if next.is_text() {
+            let next = self.node(&next_id)?;
+            if next.is_text() || !walker.visit(&next_id) {
                 break;
             }
 
-            if !relax_parent_check
-                && split_parent_path(&next_path).map(|(path, _)| path)
-                    != split_parent_path(&current_path).map(|(path, _)| path)
+            // §7.5: a split of the level above may have moved the sibling to
+            // another parent.
+            if !relax_parent_check && self.parent_id(&next_id) != self.parent_id(&current) {
+                break;
+            }
+
+            // §7.7: our own split products are not concurrent ones.
+            let created_at = next.id().created_at();
+            if skip_actor_id.is_some_and(|skip| skip == created_at.actor_id().as_str()) {
+                break;
+            }
+            if version_vector
+                .get(created_at.actor_id().as_str())
+                .is_some_and(|known| known >= created_at.lamport())
             {
                 break;
             }
 
-            let actor_id = next.id().created_at().actor_id().as_str();
-            if skip_actor_id.is_some_and(|skip| skip == actor_id) {
-                break;
+            // Empty unknown siblings right before our own product are
+            // concurrent splits of the same boundary ordered ahead of ours.
+            if let Some(skip) = skip_actor_id {
+                if self.empty_run_reaches_actor(&next_id, skip, version_vector)? {
+                    break;
+                }
             }
 
-            if version_vector.after_or_equal(next.id().created_at()) {
-                break;
-            }
-
-            current_path = next_path;
+            current = next_id;
         }
 
-        Ok(current_path)
+        Ok(current)
+    }
+
+    /// Reports whether the split chain from `node` runs through empty element
+    /// split siblings the editor did not know only, and then reaches a node
+    /// `actor_id` created (JS `emptyRunReachesActor`).
+    fn empty_run_reaches_actor(
+        &self,
+        node: &TreeNodeId,
+        actor_id: &str,
+        version_vector: &crate::VersionVector,
+    ) -> Result<bool> {
+        let mut walker = InsNextWalker::default();
+        let mut current = Some(node.clone());
+        while let Some(current_id) = current {
+            let current_node = self.node(&current_id)?;
+            if current_node.is_text() || !walker.visit(&current_id) {
+                break;
+            }
+            let created_at = current_node.id().created_at();
+            if created_at.actor_id().as_str() == actor_id {
+                return Ok(&current_id != node);
+            }
+            if current_node.all_children().next().is_some()
+                || version_vector
+                    .get(created_at.actor_id().as_str())
+                    .is_some_and(|known| known >= created_at.lamport())
+            {
+                return Ok(false);
+            }
+            current = current_node
+                .ins_next_id()
+                .and_then(|next_id| self.floor_id(next_id));
+        }
+        Ok(false)
     }
 
     fn has_unknown_split_sibling(
@@ -1859,9 +2180,9 @@ impl CrdtTree {
     }
 
     fn rebuild_node_map(&mut self) {
-        let mut map = BTreeMap::new();
-        collect_node_map(&self.root, &mut map);
-        self.node_by_id = map;
+        let mut ids = BTreeSet::new();
+        collect_node_ids(&self.root, &mut ids);
+        self.node_ids = ids;
     }
 
     fn rebuild_merge_state(&mut self) {
@@ -2245,10 +2566,10 @@ fn collect_nodes<'a>(node: &'a TreeNode, nodes: &mut Vec<&'a TreeNode>) {
     }
 }
 
-fn collect_node_map(node: &TreeNode, map: &mut BTreeMap<TreeNodeId, TreeNode>) {
-    map.insert(node.id().clone(), node.clone());
+fn collect_node_ids(node: &TreeNode, ids: &mut BTreeSet<TreeNodeId>) {
+    ids.insert(node.id().clone());
     for child in node.all_children() {
-        collect_node_map(child, map);
+        collect_node_ids(child, ids);
     }
 }
 
@@ -2273,7 +2594,6 @@ fn attach_insertion_change(
             from_path: from_path.clone(),
             to_path: from_path,
             value: Some(value),
-            split_level: None,
         }),
     }
     changes
@@ -2566,20 +2886,37 @@ fn split_utf16(value: &str, offset: usize) -> (String, String) {
     )
 }
 
-fn split_issue_ticket(
+/// Issues the tickets of the elements a split creates when the operation
+/// carries none (JS `TreeEditOperation.execute` fallback): the tickets of the
+/// same change that follow the edit and its top-level contents.
+pub(crate) fn fallback_split_tickets(
     edited_at: &TimeTicket,
-    contents_len: usize,
-    split_index: usize,
-) -> TimeTicket {
-    TimeTicket::new(
-        edited_at.lamport(),
-        edited_at
-            .delimiter()
-            .saturating_add(contents_len as u32)
-            .saturating_add(split_index as u32)
-            .saturating_add(1),
-        edited_at.actor_id().clone(),
-    )
+    contents_len: Option<usize>,
+) -> impl FnMut() -> TimeTicket {
+    let lamport = edited_at.lamport();
+    let actor_id = edited_at.actor_id().clone();
+    let mut delimiter = edited_at
+        .delimiter()
+        .saturating_add(contents_len.unwrap_or_default() as u32);
+    move || {
+        delimiter = delimiter.saturating_add(1);
+        TimeTicket::new(lamport, delimiter, actor_id.clone())
+    }
+}
+
+/// Bounds a walk of a split chain: `ins_next_id` arrives from peers, so a
+/// chain that loops back on itself must not spin forever (JS
+/// `InsNextWalker`).
+#[derive(Default)]
+struct InsNextWalker {
+    seen: BTreeSet<TreeNodeId>,
+}
+
+impl InsNextWalker {
+    /// Records `id` and reports whether this walk had not passed it yet.
+    fn visit(&mut self, id: &TreeNodeId) -> bool {
+        self.seen.insert(id.clone())
+    }
 }
 
 fn escape_xml_text(value: &str) -> String {
@@ -3128,7 +3465,9 @@ mod tests {
         );
         assert_eq!(6, result.from_idx);
         assert_eq!(6, result.to_idx);
-        assert_eq!(Some(1), result.changes[0].split_level);
+        // JS reports a split as an empty change where it opened.
+        assert_eq!(vec![(6, 6, false)], change_ranges(&result));
+        assert_eq!(vec![0, 5], result.changes[0].from_path);
         assert_eq!(5, tree.node_map_len());
         Ok(())
     }
@@ -3540,6 +3879,259 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(vec!["10:b:0:0", "3:a:0:1"], ids);
         assert_eq!(super::DataSize::default(), result.diff);
+        Ok(())
+    }
+
+    /// `(from, to, from_path, to_path, has_value)` of a change.
+    type ChangePath = (usize, usize, Vec<usize>, Vec<usize>, bool);
+
+    fn change_paths(result: &super::TreeEditResult) -> Vec<ChangePath> {
+        result
+            .changes
+            .iter()
+            .map(|change| {
+                (
+                    change.from,
+                    change.to,
+                    change.from_path.clone(),
+                    change.to_path.clone(),
+                    change.value.is_some(),
+                )
+            })
+            .collect()
+    }
+
+    /// JS `CRDTTree.Split` "Can split element nodes level 1": a split
+    /// reports one empty change where it opened.
+    #[test]
+    fn splits_element_nodes_at_level_one() -> crate::Result<()> {
+        for (index, xml, path) in [
+            (1, "<root><p></p><p>ab</p></root>", vec![0, 0]),
+            (2, "<root><p>a</p><p>b</p></root>", vec![0, 1]),
+            (3, "<root><p>ab</p><p></p></root>", vec![0, 2]),
+        ] {
+            let mut tree = text_tree("ab");
+            let pos = tree.find_pos(index, true)?;
+            let result = tree.edit_by_range_with_changes(
+                (pos.clone(), pos),
+                None,
+                1,
+                ticket(10, "a"),
+                None,
+            )?;
+            assert_eq!(xml, tree.to_xml());
+            assert_eq!(6, tree.root().len());
+            assert_eq!(
+                vec![(index, index, path.clone(), path, false)],
+                change_paths(&result)
+            );
+        }
+        Ok(())
+    }
+
+    /// JS `CRDTTree.Split` "Can split element nodes multi-level".
+    #[test]
+    fn splits_element_nodes_at_several_levels() -> crate::Result<()> {
+        let bold_tree = || {
+            CrdtTree::create(
+                TreeNode::create_element(
+                    node_id(1, 0),
+                    "root",
+                    None,
+                    vec![TreeNode::create_element(
+                        node_id(2, 0),
+                        "p",
+                        None,
+                        vec![TreeNode::create_element(
+                            node_id(3, 0),
+                            "b",
+                            None,
+                            vec![TreeNode::create_text(node_id(4, 0), "ab")],
+                        )],
+                    )],
+                ),
+                ticket(1, "a"),
+            )
+        };
+        for (split_level, xml) in [
+            (1, "<root><p><b>a</b><b>b</b></p></root>"),
+            (2, "<root><p><b>a</b></p><p><b>b</b></p></root>"),
+        ] {
+            let mut tree = bold_tree();
+            let pos = tree.find_pos(3, true)?;
+            let result = tree.edit_by_range_with_changes(
+                (pos.clone(), pos),
+                None,
+                split_level,
+                ticket(10, "a"),
+                None,
+            )?;
+            assert_eq!(xml, tree.to_xml());
+            assert_eq!(
+                vec![(3, 3, vec![0, 0, 1], vec![0, 0, 1], false)],
+                change_paths(&result)
+            );
+        }
+        Ok(())
+    }
+
+    /// JS `CRDTTree.Split` "Can split and merge element nodes by edit".
+    #[test]
+    fn splits_and_merges_element_nodes_by_edit() -> crate::Result<()> {
+        let mut tree = text_tree("abcd");
+        let pos = tree.find_pos(3, true)?;
+        let result =
+            tree.edit_by_range_with_changes((pos.clone(), pos), None, 1, ticket(10, "a"), None)?;
+        assert_eq!("<root><p>ab</p><p>cd</p></root>", tree.to_xml());
+        assert_eq!(8, tree.root().len());
+        assert_eq!(
+            vec![(3, 3, vec![0, 2], vec![0, 2], false)],
+            change_paths(&result)
+        );
+
+        let range = (tree.find_pos(3, true)?, tree.find_pos(5, true)?);
+        let result = tree.edit_by_range_with_changes(range, None, 0, ticket(11, "a"), None)?;
+        assert_eq!("<root><p>abcd</p></root>", tree.to_xml());
+        assert_eq!(6, tree.root().len());
+        assert_eq!(
+            vec![(3, 5, vec![0, 2], vec![1, 0], false)],
+            change_paths(&result)
+        );
+        Ok(())
+    }
+
+    /// JS `CRDTTreeNode.split`: a split product sits between the node it was
+    /// split off and that node's former next split sibling, so the sibling
+    /// points back at the product.
+    #[test]
+    fn links_an_element_split_to_the_next_split_sibling() -> crate::Result<()> {
+        let mut tree = text_tree("abc");
+        let pos = tree.find_pos(3, true)?;
+        tree.edit_by_range_with_changes((pos.clone(), pos), None, 1, ticket(10, "a"), None)?;
+        let pos = tree.find_pos(2, true)?;
+        tree.edit_by_range_with_changes((pos.clone(), pos), None, 1, ticket(11, "a"), None)?;
+        assert_eq!("<root><p>a</p><p>b</p><p>c</p></root>", tree.to_xml());
+
+        let first = TreeNodeId::new(TimeTicket::new(10, 1, "a"), 0);
+        let second = TreeNodeId::new(TimeTicket::new(11, 1, "a"), 0);
+        let node = |id: &TreeNodeId| tree.find_floor_node(id).unwrap().clone();
+        assert_eq!(Some(&second), node(&node_id(2, 0)).ins_next_id());
+        assert_eq!(Some(&node_id(2, 0)), node(&second).ins_prev_id());
+        assert_eq!(Some(&first), node(&second).ins_next_id());
+        assert_eq!(Some(&second), node(&first).ins_prev_id());
+        Ok(())
+    }
+
+    /// JS `tree_split_opinfo_test.ts`: text typed concurrently at a split
+    /// boundary stays on the left of the split (JS `splitElement` §7.3), and
+    /// the split is reported after it.
+    #[test]
+    fn keeps_concurrent_inserts_at_a_split_boundary_on_the_left() -> crate::Result<()> {
+        let mut tree = CrdtTree::create(
+            TreeNode::create_element(
+                node_id(1, 0),
+                "doc",
+                None,
+                vec![TreeNode::create_element(
+                    node_id(2, 0),
+                    "p",
+                    None,
+                    vec![TreeNode::create_element(
+                        node_id(3, 0),
+                        "t",
+                        None,
+                        vec![TreeNode::create_text(node_id(4, 0), "가나다0123")],
+                    )],
+                )],
+            ),
+            ticket(1, "a"),
+        );
+        let split = tree.path_to_pos(&[0, 0, 7])?;
+        let four = tree.path_to_pos(&[0, 0, 7])?;
+        tree.edit_by_range_with_changes(
+            (four.clone(), four),
+            Some(vec![TreeNode::create_text(
+                TreeNodeId::new(ticket(10, "b"), 0),
+                "4",
+            )]),
+            0,
+            ticket(10, "b"),
+            None,
+        )?;
+        let five = tree.path_to_pos(&[0, 0, 8])?;
+        tree.edit_by_range_with_changes(
+            (five.clone(), five),
+            Some(vec![TreeNode::create_text(
+                TreeNodeId::new(ticket(11, "b"), 0),
+                "5",
+            )]),
+            0,
+            ticket(11, "b"),
+            None,
+        )?;
+
+        let mut version_vector = known("a", 5);
+        version_vector.set("c", 10);
+        let result = tree.edit_by_range_with_changes(
+            (split.clone(), split),
+            None,
+            1,
+            ticket(10, "c"),
+            Some(&version_vector),
+        )?;
+
+        assert_eq!(
+            "<doc><p><t>가나다012345</t><t></t></p></doc>",
+            tree.to_xml()
+        );
+        let change = &result.changes[0];
+        assert_eq!(
+            (11, 11, vec![0, 0, 9], vec![0, 0, 9]),
+            (
+                change.from,
+                change.to,
+                change.from_path.clone(),
+                change.to_path.clone()
+            )
+        );
+        Ok(())
+    }
+
+    /// JS `orderSameBoundarySplit`: concurrent splits of one node at one
+    /// boundary order their products by ticket, newest first, whichever
+    /// arrives first.
+    #[test]
+    fn orders_concurrent_splits_at_the_same_boundary() -> crate::Result<()> {
+        let origin = text_tree("ab");
+        let pos = origin.find_pos(3, true)?;
+        let mut b_known = known("a", 5);
+        b_known.set("b", 10);
+        let mut c_known = known("a", 5);
+        c_known.set("c", 10);
+        let b = (ticket(10, "b"), b_known);
+        let c = (ticket(10, "c"), c_known);
+
+        let mut orders = Vec::new();
+        for order in [[&b, &c], [&c, &b]] {
+            let mut tree = origin.clone();
+            for (edited_at, version_vector) in order {
+                tree.edit_by_range_with_changes(
+                    (pos.clone(), pos.clone()),
+                    None,
+                    1,
+                    edited_at.clone(),
+                    Some(version_vector),
+                )?;
+            }
+            assert_eq!("<root><p>ab</p><p></p><p></p></root>", tree.to_xml());
+            orders.push(
+                tree.root()
+                    .all_children()
+                    .map(|child| child.id().to_test_string())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(orders[0], orders[1]);
         Ok(())
     }
 

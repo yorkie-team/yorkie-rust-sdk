@@ -217,7 +217,9 @@ fn changes_to_op_infos(path: String, changes: Vec<TreeEditChange>) -> Vec<OpInfo
             from_path: change.from_path,
             to_path: change.to_path,
             value: change.value,
-            split_level: change.split_level,
+            // JS `TreeEditOpInfo.splitLevel` exists, but no change sets it: a
+            // split is reported as an empty change where it opened.
+            split_level: None,
         })
         .collect()
 }
@@ -469,7 +471,8 @@ mod tests {
                 assert_eq!(3, *from);
                 assert_eq!(3, *to);
                 assert!(value.is_none());
-                assert_eq!(Some(1), *split_level);
+                // As in JS, no change carries the split level.
+                assert_eq!(None, *split_level);
             }
             other => panic!("unexpected op info: {other:?}"),
         }
@@ -508,7 +511,7 @@ mod tests {
         assert_eq!(1, result.op_infos.len());
         match &result.op_infos[0] {
             OpInfo::TreeEdit { split_level, .. } => {
-                assert_eq!(Some(2), *split_level);
+                assert_eq!(None, *split_level);
             }
             other => panic!("unexpected op info: {other:?}"),
         }
