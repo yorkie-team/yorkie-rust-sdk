@@ -1,12 +1,21 @@
 use crate::crdt::counter::{CounterType, CounterValue, CrdtCounter};
 use crate::crdt::primitive::{CrdtPrimitive, PrimitiveValue};
 use crate::{Result, TimeTicket, YorkieError};
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt::{self, Write};
-use std::rc::Rc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-pub(crate) type JsonEditRecorderRef = Rc<RefCell<dyn JsonEditRecorder>>;
+pub(crate) type JsonEditRecorderRef = Arc<Mutex<dyn JsonEditRecorder + Send>>;
+
+/// Locks the recorder shared by the proxies of one `Document::update` call.
+///
+/// Each recorder lives for a single update, so a lock poisoned by a panic
+/// there is recovered rather than propagated.
+pub(crate) fn lock_recorder(
+    recorder: &JsonEditRecorderRef,
+) -> MutexGuard<'_, dyn JsonEditRecorder + Send + 'static> {
+    recorder.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 pub(crate) trait JsonEditRecorder {
     fn record_object_set(
@@ -194,9 +203,7 @@ impl JsonCounter {
         let value = value.into();
         self.apply_increase(value, None)?;
         if let Some(recorder) = self.recorder.clone() {
-            recorder
-                .borrow_mut()
-                .record_counter_increase(&self.created_at, value, None)?;
+            lock_recorder(&recorder).record_counter_increase(&self.created_at, value, None)?;
         }
 
         Ok(self)
@@ -219,9 +226,11 @@ impl JsonCounter {
         let value = CounterValue::Integer(1);
         self.apply_increase(value, Some(actor))?;
         if let Some(recorder) = self.recorder.clone() {
-            recorder
-                .borrow_mut()
-                .record_counter_increase(&self.created_at, value, Some(actor))?;
+            lock_recorder(&recorder).record_counter_increase(
+                &self.created_at,
+                value,
+                Some(actor),
+            )?;
         }
 
         Ok(self)
@@ -344,9 +353,7 @@ impl JsonObject {
         let value = value.into();
         let value = if let Some(recorder) = self.recorder.clone() {
             let mut recorded =
-                recorder
-                    .borrow_mut()
-                    .record_object_set(&self.created_at, &key, &value)?;
+                lock_recorder(&recorder).record_object_set(&self.created_at, &key, &value)?;
             recorded.value.attach_recorder(recorder);
             self.member_created_at
                 .insert(key.clone(), recorded.created_at);
@@ -394,9 +401,7 @@ impl JsonObject {
             self.recorder.clone(),
             self.member_created_at.get(key).cloned(),
         ) {
-            recorder
-                .borrow_mut()
-                .record_object_remove(&self.created_at, key, &created_at);
+            lock_recorder(&recorder).record_object_remove(&self.created_at, key, &created_at);
         }
 
         self.member_created_at.remove(key);
@@ -672,9 +677,7 @@ impl JsonArray {
             self.element_created_at.get(index).cloned(),
         ) {
             let mut recorded =
-                recorder
-                    .borrow_mut()
-                    .record_array_set(&self.created_at, &created_at, &value)?;
+                lock_recorder(&recorder).record_array_set(&self.created_at, &created_at, &value)?;
             recorded.value.attach_recorder(recorder);
             self.element_created_at[index] = recorded.created_at;
             self.position_created_at[index] = recorded.position_created_at;
@@ -709,7 +712,7 @@ impl JsonArray {
                     .cloned()
                     .unwrap_or_else(TimeTicket::initial)
             };
-            let mut recorded = recorder.borrow_mut().record_array_insert(
+            let mut recorded = lock_recorder(&recorder).record_array_insert(
                 &self.created_at,
                 &prev_created_at,
                 &value,
@@ -776,9 +779,7 @@ impl JsonArray {
             self.recorder.clone(),
             self.element_created_at.get(index).cloned(),
         ) {
-            recorder
-                .borrow_mut()
-                .record_array_remove(&self.created_at, &created_at);
+            lock_recorder(&recorder).record_array_remove(&self.created_at, &created_at);
         }
 
         if index < self.element_created_at.len() {
@@ -1023,9 +1024,7 @@ impl JsonArray {
             .index_by_element_id(id)
             .ok_or_else(|| YorkieError::MissingCrdtElement(id.to_id_string()))?;
         let position_created_at = if let Some(recorder) = self.recorder.clone() {
-            recorder
-                .borrow_mut()
-                .record_array_move(&self.created_at, &prev_created_at, id)
+            lock_recorder(&recorder).record_array_move(&self.created_at, &prev_created_at, id)
         } else {
             self.position_created_at[target_index].clone()
         };

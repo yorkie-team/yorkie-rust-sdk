@@ -57,3 +57,11 @@ fn removes_object_member() -> Result<()> {
 
     Ok(())
 }
+
+/// The client shares documents as `Arc<Mutex<Document>>` across tokio tasks,
+/// which requires `Document: Send`.
+#[test]
+fn document_is_send() {
+    fn assert_send<T: Send>() {}
+    assert_send::<Document>();
+}

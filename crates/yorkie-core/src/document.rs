@@ -17,9 +17,8 @@ use crate::{
     ActorId, JsonArray, JsonObject, JsonValue, Result, SchemaRule, TimeTicket, YorkieError,
     INITIAL_ACTOR_ID,
 };
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::rc::Rc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// A local Yorkie document.
 #[derive(Debug, Clone, PartialEq)]
@@ -147,7 +146,7 @@ impl Document {
         }
 
         let mut next_root = self.root.clone();
-        let recorder = Rc::new(RefCell::new(DocumentEditRecorder::new(
+        let recorder = Arc::new(Mutex::new(DocumentEditRecorder::new(
             self.change_id.clone(),
         )));
         let recorder_ref: JsonEditRecorderRef = recorder.clone();
@@ -161,7 +160,11 @@ impl Document {
         );
         update_fn(&mut next_root, &mut proxy)?;
 
-        let mut context = recorder.borrow().context.clone();
+        let mut context = recorder
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .context
+            .clone();
         context.set_presence_change(proxy.into_change());
         if context.operations().is_empty() {
             collect_object_changes(
