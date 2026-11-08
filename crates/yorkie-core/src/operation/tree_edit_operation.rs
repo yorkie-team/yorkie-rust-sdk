@@ -86,7 +86,12 @@ impl TreeEditOperation {
                 &mut issue_split_ticket,
                 version_vector,
             )?;
-            let reverse_op = self.to_reverse_operation(tree, &result)?;
+            // The reverse is measured on the tree after the edit, from
+            // indexes taken before it, which a concurrent merge can leave
+            // outside the tree. Tree undo is not ported yet, so a reverse
+            // that cannot be built is dropped rather than failing the edit,
+            // which JS applies.
+            let reverse_op = self.to_reverse_operation(tree, &result).ok().flatten();
             (result, reverse_op)
         };
 
@@ -286,7 +291,7 @@ mod tests {
     use crate::crdt::root::CrdtRoot;
     use crate::crdt::tree::{CrdtTree, TreeNode, TreeNodeId};
     use crate::operation::{OpInfo, OpSource, Operation};
-    use crate::TimeTicket;
+    use crate::{TimeTicket, VersionVector};
 
     #[test]
     fn inserts_tree_element_content() -> crate::Result<()> {
@@ -639,6 +644,80 @@ mod tests {
         assert_eq!(
             vec!["20:b:4", "20:b:9"],
             product_ids(vec![TimeTicket::new(20, 9, "b")])?
+        );
+        Ok(())
+    }
+
+    /// JS `tree_concurrency_test.ts` "intersect-element(merge,replaceText)":
+    /// the replacement applies after a merge it did not know. Its range was
+    /// measured on the tree before the merge, so a reverse built from it may
+    /// not fit the tree after it; Tree undo is not ported, and the edit
+    /// still applies.
+    #[test]
+    fn applies_an_edit_whose_reverse_does_not_fit_the_tree() -> crate::Result<()> {
+        let tree_at = ticket(1, "a");
+        let paragraph = |lamport: i64, value: &str| {
+            TreeNode::create_element(
+                TreeNodeId::new(ticket(lamport, "a"), 0),
+                "p",
+                None,
+                vec![TreeNode::create_text(
+                    TreeNodeId::new(ticket(lamport + 1, "a"), 0),
+                    value,
+                )],
+            )
+        };
+        let mut root = seeded_root(
+            tree_at.clone(),
+            vec![
+                paragraph(2, "abc"),
+                paragraph(4, "def"),
+                paragraph(6, "ghi"),
+            ],
+        );
+        let (merge, replace) = {
+            let tree = root.tree_by_created_at(&tree_at).unwrap();
+            (
+                (tree.find_pos(4, true)?, tree.find_pos(6, true)?),
+                (tree.find_pos(5, true)?, tree.find_pos(15, true)?),
+            )
+        };
+
+        let mut known = VersionVector::new();
+        known.set("a", 9);
+        known.set("b", 10);
+        TreeEditOperation::create(
+            tree_at.clone(),
+            merge.0,
+            merge.1,
+            None,
+            0,
+            Some(ticket(10, "b")),
+        )
+        .execute(&mut root, OpSource::Remote, Some(&known))?;
+        assert_eq!(
+            "<root><p>abcdef</p><p>ghi</p></root>",
+            root.tree_by_created_at(&tree_at).unwrap().to_xml()
+        );
+
+        let mut known = VersionVector::new();
+        known.set("a", 9);
+        known.set("c", 10);
+        TreeEditOperation::create(
+            tree_at.clone(),
+            replace.0,
+            replace.1,
+            Some(vec![TreeNode::create_text(
+                TreeNodeId::new(ticket(10, "c"), 0),
+                "B",
+            )]),
+            0,
+            Some(ticket(10, "c")),
+        )
+        .execute(&mut root, OpSource::Remote, Some(&known))?;
+        assert_eq!(
+            "<root><p>abc</p>B</root>",
+            root.tree_by_created_at(&tree_at).unwrap().to_xml()
         );
         Ok(())
     }
