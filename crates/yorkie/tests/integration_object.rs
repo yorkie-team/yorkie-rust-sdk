@@ -741,9 +741,9 @@ async fn undoes_locally_and_redoes_globally() {
 
 /// JS "Can properly apply remote operations that occurred before local
 /// undo" (object_test.ts:858). JS attaches both documents with
-/// `disableGC: true`.
+/// `disableGC: true`, which is not ported; the case passes with collection
+/// on.
 #[tokio::test]
-#[ignore = "disable-GC not ported, see docs/current-porting-gaps.md"]
 async fn applies_remote_sets_made_before_a_local_undo() {
     let Some(addr) = rpc_addr() else { return };
     let key = unique_key("object-remote-before-undo");
@@ -784,9 +784,11 @@ async fn applies_remote_sets_made_before_a_local_undo() {
 
 /// JS "Should handle case of reverse operations referencing already
 /// garbage-collected elements" (object_test.ts:923). JS attaches both
-/// documents with `disableGC: true`.
+/// documents with `disableGC: true` (with a TODO to remove it). With
+/// collection on, the undo's reverse operation names the replaced object
+/// after it has been purged, and the undo fails with `MissingCrdtElement`.
 #[tokio::test]
-#[ignore = "disable-GC not ported, see docs/current-porting-gaps.md"]
+#[ignore = "disable-GC not ported: with collection on, the undo names a purged object, see docs/current-porting-gaps.md"]
 async fn skips_an_undo_of_a_garbage_collected_object() {
     let Some(addr) = rpc_addr() else { return };
     let key = unique_key("object-undo-gc-element");

@@ -871,7 +871,7 @@ async fn concurrent_insert_and_delete(
 /// detach ("change not found"), and so does the Rust port against the local
 /// memory-backed server; it needs a Mongo-backed server.
 #[tokio::test]
-#[ignore = "needs a Mongo-backed server: synchronous deactivate fails on the memory backend"]
+#[ignore = "needs a Mongo-backed server, see docs/current-porting-gaps.md"]
 async fn collects_nodes_made_by_a_deactivated_client() {
     let Some(addr) = rpc_addr() else { return };
     let (c1, d1, c2, d2) = attach_two(&addr, "gc-deactivated-client").await;

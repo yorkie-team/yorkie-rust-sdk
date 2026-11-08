@@ -33,7 +33,7 @@ fn update(doc: &SharedDocument, f: impl FnOnce(&mut yorkie::JsonObject) -> yorki
 
 /// JS "should handle snapshot" (snapshot_test.ts:27).
 #[tokio::test]
-#[ignore = "too slow: a root with hundreds of members makes each local update quadratic, see docs/current-porting-gaps.md"]
+#[ignore = "diverges from JS: local update is quadratic in root member count, see docs/current-porting-gaps.md"]
 async fn handles_a_snapshot() {
     let Some(addr) = rpc_addr() else { return };
     let t = TwoClients::attach(&addr, "snapshot").await;
@@ -60,7 +60,7 @@ async fn handles_a_snapshot() {
 
 /// JS "should handle snapshot for text object" (snapshot_test.ts:52).
 #[tokio::test]
-#[ignore = "too slow: a root with hundreds of members makes each local update quadratic, see docs/current-porting-gaps.md"]
+#[ignore = "diverges from JS: local update is quadratic in root member count, see docs/current-porting-gaps.md"]
 async fn handles_a_snapshot_for_a_text() {
     let Some(addr) = rpc_addr() else { return };
     let t = TwoClients::attach(&addr, "snapshot-text").await;
