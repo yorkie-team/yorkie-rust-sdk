@@ -2,7 +2,8 @@
 //! server-streaming `Watch` call, for documents and channels.
 //!
 //! JS reference: `packages/sdk/src/client/client.ts` (Connect client setup,
-//! `x-api-key`, `x-shard-key` and `x-yorkie-user-agent` headers). Streaming
+//! `x-api-key`, `x-shard-key` and `x-yorkie-user-agent` headers) and
+//! `client/auth_interceptor.ts` (`authorization` header). Streaming
 //! follows the Connect protocol's enveloped messages: a flag byte, a 4-byte
 //! big-endian length, and the payload; flag `0x02` marks the end-stream
 //! message, a JSON object with an optional `error`.
@@ -21,6 +22,8 @@ use crate::transport::{
 use async_trait::async_trait;
 use futures_util::{stream, Stream, StreamExt};
 use prost::Message;
+use std::collections::HashMap;
+use std::sync::{Arc, PoisonError, RwLock};
 use yorkie_protocol::yorkie::v1 as api;
 
 const SERVICE_PATH: &str = "yorkie.v1.YorkieService";
@@ -32,13 +35,17 @@ const FLAG_COMPRESSED: u8 = 0x01;
 const FLAG_END_STREAM: u8 = 0x02;
 const ENVELOPE_HEADER_LEN: usize = 5;
 
-/// Unary RPC transport speaking the Connect protocol over HTTP.
+/// Transport speaking the Connect protocol over HTTP. Clones share the auth
+/// token.
 #[derive(Debug, Clone)]
 pub struct ConnectTransport {
     http: reqwest::Client,
     base_url: String,
     api_key: String,
     user_agent: String,
+    /// Sent as the `authorization` header when set and not empty (JS
+    /// `createAuthInterceptor`'s `currentToken`).
+    auth_token: Arc<RwLock<Option<String>>>,
 }
 
 impl ConnectTransport {
@@ -56,6 +63,7 @@ impl ConnectTransport {
             base_url: options.rpc_addr.trim_end_matches('/').to_owned(),
             api_key: options.api_key.clone(),
             user_agent,
+            auth_token: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -67,10 +75,18 @@ impl ConnectTransport {
             .header("connect-protocol-version", "1")
             .header("x-shard-key", shard_key)
             .header("x-yorkie-user-agent", &self.user_agent);
-        if self.api_key.is_empty() {
+        let builder = if self.api_key.is_empty() {
             builder
         } else {
             builder.header("x-api-key", &self.api_key)
+        };
+        let auth_token = self
+            .auth_token
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        match auth_token.as_deref() {
+            Some(token) if !token.is_empty() => builder.header("authorization", token),
+            _ => builder,
         }
     }
 
@@ -233,10 +249,12 @@ pub(crate) fn decode_end_stream(payload: &[u8]) -> ClientResult<()> {
         return Ok(());
     };
     let text = |field: &str| error.get(field).and_then(|value| value.as_str());
+    let mut metadata = error_metadata_of(error);
     Err(ClientError::Rpc {
         code: text("code").unwrap_or("unknown").to_owned(),
         message: text("message").unwrap_or_default().to_owned(),
-        yorkie_code: yorkie_code_of(error),
+        yorkie_code: metadata.remove("code"),
+        reason: metadata.remove("reason"),
     })
 }
 
@@ -248,14 +266,15 @@ struct ErrorInfo {
     #[prost(string, tag = "2")]
     domain: String,
     #[prost(map = "string, string", tag = "3")]
-    metadata: std::collections::HashMap<String, String>,
+    metadata: HashMap<String, String>,
 }
 
-/// Returns the Yorkie error code from the first `ErrorInfo` detail of a
-/// Connect JSON error (JS `errorCodeOf`, which reads only that detail), if it
-/// carries one. Connect sends each detail's protobuf bytes base64-encoded,
-/// with or without padding.
-fn yorkie_code_of(error: &serde_json::Value) -> Option<String> {
+/// Returns the metadata of the first `ErrorInfo` detail of a Connect JSON
+/// error (JS `errorMetadataOf`, which reads only that detail), or an empty
+/// map. Yorkie puts its error code under `code` and the auth webhook's reason
+/// under `reason`. Connect sends each detail's protobuf bytes
+/// base64-encoded, with or without padding.
+fn error_metadata_of(error: &serde_json::Value) -> HashMap<String, String> {
     use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
     use base64::engine::DecodePaddingMode;
     use base64::Engine;
@@ -266,16 +285,17 @@ fn yorkie_code_of(error: &serde_json::Value) -> Option<String> {
     );
 
     error
-        .get("details")?
-        .as_array()?
-        .iter()
+        .get("details")
+        .and_then(|details| details.as_array())
+        .into_iter()
+        .flatten()
         .filter(|detail| {
             detail.get("type").and_then(|value| value.as_str()) == Some("google.rpc.ErrorInfo")
         })
         .filter_map(|detail| BASE64.decode(detail.get("value")?.as_str()?).ok())
-        .find_map(|bytes| ErrorInfo::decode(bytes.as_slice()).ok())?
-        .metadata
-        .remove("code")
+        .find_map(|bytes| ErrorInfo::decode(bytes.as_slice()).ok())
+        .map(|info| info.metadata)
+        .unwrap_or_default()
 }
 
 fn protocol_error(err: impl ToString) -> ClientError {
@@ -291,7 +311,7 @@ pub(crate) fn decode_connect_error(status: u16, body: &[u8]) -> ClientError {
     struct Parsed {
         code: Option<String>,
         message: String,
-        yorkie_code: Option<String>,
+        metadata: HashMap<String, String>,
     }
     let parsed = serde_json::from_slice::<serde_json::Value>(body)
         .ok()
@@ -304,20 +324,25 @@ pub(crate) fn decode_connect_error(status: u16, body: &[u8]) -> ClientError {
                     .and_then(|m| m.as_str())
                     .unwrap_or_default()
                     .to_owned(),
-                yorkie_code: yorkie_code_of(&value),
+                metadata: error_metadata_of(&value),
             })
         })
         .unwrap_or_default();
     match parsed.code {
-        Some(code) => ClientError::Rpc {
-            code,
-            message: parsed.message,
-            yorkie_code: parsed.yorkie_code,
-        },
+        Some(code) => {
+            let mut metadata = parsed.metadata;
+            ClientError::Rpc {
+                code,
+                message: parsed.message,
+                yorkie_code: metadata.remove("code"),
+                reason: metadata.remove("reason"),
+            }
+        }
         None => ClientError::Rpc {
             code: http_status_to_code(status).to_owned(),
             message: String::from_utf8_lossy(body).into_owned(),
             yorkie_code: None,
+            reason: None,
         },
     }
 }
@@ -477,11 +502,116 @@ impl ClientTransport for ConnectTransport {
             .await?;
         Ok(conv::from_broadcast_response(&response))
     }
+
+    fn set_auth_token(&self, token: String) {
+        *self
+            .auth_token
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(token);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
+    use yorkie_core::ErrorCode;
+
+    /// A Connect JSON error whose `ErrorInfo` metadata holds `metadata`.
+    fn connect_error_json(code: &str, metadata: &[(&str, &str)]) -> String {
+        let info = ErrorInfo {
+            reason: String::new(),
+            domain: String::new(),
+            metadata: metadata
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect(),
+        };
+        let value = base64::engine::general_purpose::STANDARD.encode(info.encode_to_vec());
+        serde_json::json!({
+            "code": code,
+            "message": "m",
+            "details": [{"type": "google.rpc.ErrorInfo", "value": value}],
+        })
+        .to_string()
+    }
+
+    /// JS `createAuthInterceptor`: the token set last goes in the
+    /// `authorization` header of every request, unary or streaming, and
+    /// clones of the transport share it. No token, or an empty one, sends no
+    /// header.
+    #[test]
+    fn auth_token_sets_the_authorization_header() {
+        let transport = ConnectTransport::new(&ClientOptions {
+            api_key: "api-key".to_owned(),
+            ..ClientOptions::default()
+        })
+        .unwrap();
+        let headers = |transport: &ConnectTransport, content_type: &str| {
+            transport
+                .post("ActivateClient", "api-key/client", content_type)
+                .build()
+                .unwrap()
+                .headers()
+                .clone()
+        };
+        let authorization = |transport: &ConnectTransport, content_type: &str| {
+            headers(transport, content_type)
+                .get("authorization")
+                .map(|value| value.to_str().unwrap().to_owned())
+        };
+        assert_eq!(None, authorization(&transport, "application/proto"));
+        assert_eq!(
+            "api-key",
+            headers(&transport, "application/proto")["x-api-key"]
+        );
+
+        let clone = transport.clone();
+        transport.set_auth_token("token-1".to_owned());
+        assert_eq!(
+            Some("token-1".to_owned()),
+            authorization(&transport, "application/proto")
+        );
+        assert_eq!(
+            Some("token-1".to_owned()),
+            authorization(&clone, "application/connect+proto")
+        );
+
+        clone.set_auth_token("token-2".to_owned());
+        assert_eq!(
+            Some("token-2".to_owned()),
+            authorization(&transport, "application/proto")
+        );
+        transport.set_auth_token(String::new());
+        assert_eq!(None, authorization(&transport, "application/proto"));
+    }
+
+    /// JS `errorMetadataOf(err).reason`: the auth webhook's reason rides in
+    /// the same `ErrorInfo` metadata as the code.
+    #[test]
+    fn connect_error_metadata_carries_the_auth_reason() {
+        let body = connect_error_json(
+            "unauthenticated",
+            &[("code", "ErrUnauthenticated"), ("reason", "token expired")],
+        );
+        let err = decode_connect_error(401, body.as_bytes());
+        assert_eq!(
+            ClientError::Rpc {
+                code: "unauthenticated".to_owned(),
+                message: "m".to_owned(),
+                yorkie_code: Some("ErrUnauthenticated".to_owned()),
+                reason: Some("token expired".to_owned()),
+            },
+            err
+        );
+        assert_eq!(Some(ErrorCode::ErrUnauthenticated), err.code());
+        assert_eq!(Some("token expired"), err.error_reason());
+
+        let end_stream = format!(r#"{{"error":{body}}}"#);
+        let err = decode_end_stream(end_stream.as_bytes()).unwrap_err();
+        assert!(err.is_error_code(ErrorCode::ErrUnauthenticated));
+        assert_eq!(Some("token expired"), err.error_reason());
+    }
 
     #[test]
     fn connect_error_body_maps_to_rpc_error() {
@@ -494,6 +624,7 @@ mod tests {
                 code: "not_found".to_owned(),
                 message: "document not found".to_owned(),
                 yorkie_code: None,
+                reason: None,
             },
             err
         );
@@ -510,8 +641,9 @@ mod tests {
             ClientError::Rpc { code, yorkie_code: Some(yorkie_code), .. }
                 if code == "not_found" && yorkie_code == "ErrSessionNotFound"
         ));
-        assert!(err.has_yorkie_code("ErrSessionNotFound"));
-        assert!(!err.has_yorkie_code("ErrClientNotFound"));
+        assert!(err.is_error_code(ErrorCode::ErrSessionNotFound));
+        assert!(!err.is_error_code(ErrorCode::ErrClientNotFound));
+        assert_eq!(Some(ErrorCode::ErrSessionNotFound), err.code());
 
         // Only the first ErrorInfo counts, even without a code (JS
         // `errorMetadataOf`). "CgFy" is an ErrorInfo with reason "r" only.
@@ -527,7 +659,7 @@ mod tests {
         let end_stream = br#"{"error":{"code":"not_found","message":"m","details":[{"type":"google.rpc.ErrorInfo","value":"Cglub3RfZm91bmQaGgoEY29kZRISRXJyU2Vzc2lvbk5vdEZvdW5k"}]}}"#;
         assert!(decode_end_stream(end_stream)
             .unwrap_err()
-            .has_yorkie_code("ErrSessionNotFound"));
+            .is_error_code(ErrorCode::ErrSessionNotFound));
     }
 
     #[test]
@@ -537,6 +669,7 @@ mod tests {
                 code: "unauthenticated".to_owned(),
                 message: "nope".to_owned(),
                 yorkie_code: None,
+                reason: None,
             },
             decode_connect_error(401, b"nope")
         );
@@ -589,6 +722,7 @@ mod tests {
                 code: "unavailable".to_owned(),
                 message: "server stopped".to_owned(),
                 yorkie_code: None,
+                reason: None,
             }),
             decode_end_stream(payload)
         );

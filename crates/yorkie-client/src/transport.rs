@@ -314,4 +314,10 @@ pub trait ClientTransport: Send + Sync {
 
     /// Sends a message to the clients watching a channel (JS `broadcast`).
     async fn broadcast(&self, request: BroadcastRequest) -> ClientResult<BroadcastResponse>;
+
+    /// Sets the token sent in the `authorization` header of every later
+    /// request (JS `setToken` of `createAuthInterceptor`). The client calls it
+    /// with each token its auth token injector returns. A transport that does
+    /// not authenticate can ignore it, which the default does.
+    fn set_auth_token(&self, _token: String) {}
 }

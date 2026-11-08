@@ -717,6 +717,7 @@ impl ClientTransport for FlakyBroadcastTransport {
                 code: "unknown".to_owned(),
                 message: "Failed to fetch".to_owned(),
                 yorkie_code: None,
+                reason: None,
             });
         }
         self.inner.broadcast(request).await

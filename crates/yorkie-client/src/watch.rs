@@ -9,10 +9,13 @@
 //!
 //! A loop opens the stream, applies what it reports to the document or
 //! channel, and when the stream fails or ends opens it again after
-//! `reconnect_stream_delay`; a document also publishes
-//! `ConnectionChanged(Disconnected)`. An error that is not retryable stops
-//! the loop. Once the server reports a heartbeat interval, a stream silent
-//! for three times that long is treated as half-open and reconnected.
+//! `reconnect_stream_delay` (longer while the auth token refresh backs off,
+//! see `Client::loop_retry_delay`); a document also publishes
+//! `ConnectionChanged(Disconnected)`, and `AuthError` when the server refused
+//! the stream with `ErrUnauthenticated`. Errors are handled as JS
+//! `handleConnectError` does: one that is not retryable stops the loop. Once
+//! the server reports a heartbeat interval, a stream silent for three times
+//! that long is treated as half-open and reconnected.
 
 use crate::attachment::SharedDocument;
 use crate::channel::{first_key_path, Channel, ChannelEvent, SharedChannel};
@@ -29,7 +32,7 @@ use futures_util::{Stream, StreamExt};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::sync::oneshot;
-use yorkie_core::{DocEvent, Document, StreamConnectionStatus};
+use yorkie_core::{DocEvent, Document, ErrorCode, StreamConnectionStatus};
 
 /// JS `WatchIdleTimeoutFactor`.
 const WATCH_IDLE_TIMEOUT_FACTOR: u32 = 3;
@@ -80,7 +83,8 @@ pub(crate) fn watch_idle_timeout(heartbeat_interval_ms: u64) -> Option<Duration>
 
 /// What the loop does after a stream ends.
 enum StreamEnd {
-    Reconnect,
+    /// Open a new stream after the given wait.
+    Reconnect(Duration),
     Stop,
 }
 
@@ -99,7 +103,7 @@ async fn run(
 ) {
     let mut ready = Some(ready);
     loop {
-        let Some((transport, request, reconnect_delay)) = open_request(&inner, &key, &doc) else {
+        let Some((transport, request)) = open_request(&inner, &key, &doc) else {
             return;
         };
         let end = watch_stream(&inner, &key, &doc, transport, request, &mut ready).await;
@@ -108,7 +112,7 @@ async fn run(
         }
         match end {
             StreamEnd::Stop => return,
-            StreamEnd::Reconnect => tokio::time::sleep(reconnect_delay).await,
+            StreamEnd::Reconnect(delay) => tokio::time::sleep(delay).await,
         }
     }
 }
@@ -119,7 +123,7 @@ fn open_request(
     inner: &Weak<ClientInner>,
     key: &str,
     doc: &SharedDocument,
-) -> Option<(Arc<dyn ClientTransport>, WatchDocumentRequest, Duration)> {
+) -> Option<(Arc<dyn ClientTransport>, WatchDocumentRequest)> {
     let client = Client::upgrade(inner)?;
     let Ok(session) = client.session() else {
         client.set_condition(ClientCondition::WatchLoop, false);
@@ -142,11 +146,7 @@ fn open_request(
     lock_document(doc).publish(DocEvent::ConnectionChanged(
         StreamConnectionStatus::Connected,
     ));
-    Some((
-        client.inner.transport.clone(),
-        request,
-        client.options().reconnect_stream_delay,
-    ))
+    Some((client.inner.transport.clone(), request))
 }
 
 /// Opens one stream and handles it until it ends.
@@ -160,15 +160,15 @@ async fn watch_stream(
 ) -> StreamEnd {
     let mut stream = match transport.watch_document(request).await {
         Ok(stream) => stream,
-        Err(err) => return stream_failed(inner, key, doc, Some(&err)),
+        Err(err) => return stream_failed(inner, key, doc, Some(&err)).await,
     };
 
     let mut idle_timeout = None;
     loop {
         let response = match next_message(&mut stream, idle_timeout).await {
             Some(Ok(response)) => response,
-            Some(Err(err)) => return stream_failed(inner, key, doc, Some(&err)),
-            None => return stream_failed(inner, key, doc, None),
+            Some(Err(err)) => return stream_failed(inner, key, doc, Some(&err)).await,
+            None => return stream_failed(inner, key, doc, None).await,
         };
 
         let Some(client) = Client::upgrade(inner) else {
@@ -212,7 +212,7 @@ where
 
 /// Handles a stream that failed with `err`, or ended normally when `err` is
 /// `None` (JS `onError`/`onStreamEnd` and `handleConnectError`).
-fn stream_failed(
+async fn stream_failed(
     inner: &Weak<ClientInner>,
     key: &str,
     doc: &SharedDocument,
@@ -224,13 +224,31 @@ fn stream_failed(
     if client.with_attachment(key, doc, |_| ()).is_none() {
         return StreamEnd::Stop;
     }
-    publish_disconnected(&mut lock_document(doc));
-    match err {
-        Some(err) if !err.is_retryable() => {
-            client.set_condition(ClientCondition::WatchLoop, false);
-            StreamEnd::Stop
+    {
+        let mut doc = lock_document(doc);
+        publish_disconnected(&mut doc);
+        if let Some(err) = err.filter(|err| err.is_error_code(ErrorCode::ErrUnauthenticated)) {
+            doc.publish(DocEvent::AuthError {
+                reason: err.error_reason().map(str::to_owned),
+                method: "Watch".to_owned(),
+            });
         }
-        _ => StreamEnd::Reconnect,
+    }
+    reconnect_or_stop(&client, err).await
+}
+
+/// Decides what a watch loop does after its stream ended with `err`, or
+/// normally when `err` is `None`.
+async fn reconnect_or_stop(client: &Client, err: Option<&ClientError>) -> StreamEnd {
+    let delay = client.options().reconnect_stream_delay;
+    let Some(err) = err else {
+        return StreamEnd::Reconnect(delay);
+    };
+    if matches!(client.handle_connect_error(err, true).await, Ok(true)) {
+        StreamEnd::Reconnect(client.loop_retry_delay(err, delay))
+    } else {
+        client.set_condition(ClientCondition::WatchLoop, false);
+        StreamEnd::Stop
     }
 }
 
@@ -301,9 +319,7 @@ async fn run_channel(
 ) {
     let mut ready = Some(ready);
     loop {
-        let Some((transport, request, reconnect_delay)) =
-            open_channel_request(&inner, &key, &channel)
-        else {
+        let Some((transport, request)) = open_channel_request(&inner, &key, &channel) else {
             return;
         };
         let end =
@@ -313,7 +329,7 @@ async fn run_channel(
         }
         match end {
             StreamEnd::Stop => return,
-            StreamEnd::Reconnect => tokio::time::sleep(reconnect_delay).await,
+            StreamEnd::Reconnect(delay) => tokio::time::sleep(delay).await,
         }
     }
 }
@@ -324,7 +340,7 @@ fn open_channel_request(
     inner: &Weak<ClientInner>,
     key: &str,
     channel: &SharedChannel,
-) -> Option<(Arc<dyn ClientTransport>, WatchChannelRequest, Duration)> {
+) -> Option<(Arc<dyn ClientTransport>, WatchChannelRequest)> {
     let client = Client::upgrade(inner)?;
     let Ok(session) = client.session() else {
         client.set_condition(ClientCondition::WatchLoop, false);
@@ -337,11 +353,7 @@ fn open_channel_request(
         heartbeat_interval_ms: ceil_millis(client.options().watch_heartbeat_interval),
         shard_key: client.shard_key(first_key_path(key)),
     };
-    Some((
-        client.inner.transport.clone(),
-        request,
-        client.options().reconnect_stream_delay,
-    ))
+    Some((client.inner.transport.clone(), request))
 }
 
 /// Opens one channel stream and handles it until it ends.
@@ -355,15 +367,15 @@ async fn watch_channel_stream(
 ) -> StreamEnd {
     let mut stream = match transport.watch_channel(request).await {
         Ok(stream) => stream,
-        Err(err) => return channel_stream_failed(inner, key, channel, Some(&err)),
+        Err(err) => return channel_stream_failed(inner, key, channel, Some(&err)).await,
     };
 
     let mut idle_timeout = None;
     loop {
         let response = match next_message(&mut stream, idle_timeout).await {
             Some(Ok(response)) => response,
-            Some(Err(err)) => return channel_stream_failed(inner, key, channel, Some(&err)),
-            None => return channel_stream_failed(inner, key, channel, None),
+            Some(Err(err)) => return channel_stream_failed(inner, key, channel, Some(&err)).await,
+            None => return channel_stream_failed(inner, key, channel, None).await,
         };
 
         let Some(client) = Client::upgrade(inner) else {
@@ -396,8 +408,8 @@ async fn watch_channel_stream(
 }
 
 /// Handles a channel stream that failed with `err`, or ended normally when
-/// `err` is `None`. Unlike a document, a channel publishes nothing.
-fn channel_stream_failed(
+/// `err` is `None`. Unlike a document, a channel publishes nothing, as in JS.
+async fn channel_stream_failed(
     inner: &Weak<ClientInner>,
     key: &str,
     channel: &SharedChannel,
@@ -412,13 +424,7 @@ fn channel_stream_failed(
     {
         return StreamEnd::Stop;
     }
-    match err {
-        Some(err) if !err.is_retryable() => {
-            client.set_condition(ClientCondition::WatchLoop, false);
-            StreamEnd::Stop
-        }
-        _ => StreamEnd::Reconnect,
-    }
+    reconnect_or_stop(&client, err).await
 }
 
 /// Applies one channel stream message (JS `handleWatchChannelResponse`).

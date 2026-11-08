@@ -49,6 +49,16 @@ pub enum DocEvent {
     Unwatched(ActorId, Presence),
     /// A client's presence changed (JS `presence-changed`).
     PresenceChanged(ActorId, Presence),
+    /// The server refused this client's requests for the document (JS
+    /// `auth-error`): a sync (`method` `"PushPull"`) with
+    /// `ErrUnauthenticated` or `ErrPermissionDenied`, or the watch stream
+    /// (`"Watch"`) with `ErrUnauthenticated`. `reason` is the auth webhook's
+    /// reason, if the server gave one. After `ErrUnauthenticated` the client
+    /// asks the auth token injector for a new token and retries.
+    AuthError {
+        reason: Option<String>,
+        method: String,
+    },
 }
 
 /// The operations made by one change and its message (JS `ChangeInfo`).

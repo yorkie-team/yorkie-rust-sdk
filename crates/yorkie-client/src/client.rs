@@ -5,7 +5,12 @@
 //! JS reference: `packages/sdk/src/client/client.ts` (`activate`,
 //! `deactivate`, `attach`, `detach`, `sync`, `remove`, `changeSyncMode`,
 //! `attachChannel`, `detachChannel`, `peekChannel`, `enqueueTask`,
-//! `syncInternal`, `detachInternal`).
+//! `syncInternal`, `detachInternal`, `deactivateInternal`,
+//! `handleConnectError`, `refreshAuthToken`, `loopRetryDelay`).
+//!
+//! Errors: a one-shot call that fails on the server handles the error as JS
+//! does in its `catch` (refreshing the auth token or deactivating the client)
+//! and returns it; the background loops retry or stop by the same rules.
 //!
 //! Locking: the client keeps its own state behind one mutex, and each attached
 //! document or channel sits behind its own [`SharedDocument`] or
@@ -25,11 +30,12 @@ use crate::attachment::{
     default_document_poll_interval, resolve_document_poll_interval, uses_watch_stream,
     validate_channel_sync_mode, Attachment, ChannelAttachment, SharedDocument,
 };
+use crate::auth::{random_unit, AuthRefresh};
 use crate::channel::{
     first_key_path, BroadcastOptions, Channel, ChannelEvent, ChannelStatus, SharedChannel,
 };
 use crate::connect::ConnectTransport;
-use crate::error::{ClientError, ClientResult};
+use crate::error::{ClientError, ClientResult, ErrorHandling};
 use crate::options::{
     AttachChannelOptions, AttachOptions, ClientOptions, DeactivateOptions, DetachOptions, SyncMode,
 };
@@ -45,7 +51,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use yorkie_core::{ActorId, DocEvent, DocStatus, DocSyncStatus, Document};
+use yorkie_core::{ActorId, DocEvent, DocStatus, DocSyncStatus, Document, ErrorCode};
 
 /// Client activation state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,10 +59,6 @@ pub enum ClientStatus {
     Deactivated,
     Activated,
 }
-
-/// The Yorkie error code of a refresh for a session the server no longer
-/// has (JS `Code.ErrSessionNotFound`).
-const ERR_SESSION_NOT_FOUND: &str = "ErrSessionNotFound";
 
 /// The wait before the first broadcast retry, doubled for each later one
 /// (JS `DefaultBroadcastOptions.initialRetryInterval`).
@@ -110,6 +112,8 @@ pub(crate) struct ClientState {
     attaching: BTreeSet<String>,
     /// The sync loop task while the client is active.
     sync_loop: Option<TaskHandle>,
+    /// Token refreshes after `ErrUnauthenticated`.
+    auth_refresh: AuthRefresh,
 }
 
 /// The IDs an active client sends in requests and stamps into changes.
@@ -186,6 +190,7 @@ impl Client {
             channels: BTreeMap::new(),
             attaching: BTreeSet::new(),
             sync_loop: None,
+            auth_refresh: AuthRefresh::default(),
         };
 
         Self {
@@ -256,13 +261,27 @@ impl Client {
 
     /// Registers this client with the server and starts the sync loop (JS
     /// `activate`).
+    ///
+    /// With an auth token injector, it first asks the injector for a token
+    /// and fails with the injector's error if it fails.
     pub async fn activate(&self) -> ClientResult<()> {
+        if self.is_active() {
+            return Ok(());
+        }
+        // Outside the task queue, as in JS.
+        if let Some(injector) = &self.inner.options.auth_token_injector {
+            let token = injector(None).await?;
+            let mut state = self.state();
+            state.auth_refresh.activated();
+            self.inner.transport.set_auth_token(token);
+        }
+
         let _queue = self.lock_task_queue().await;
         if self.is_active() {
             return Ok(());
         }
 
-        let response = self
+        let response = match self
             .inner
             .transport
             .activate_client(ActivateClientRequest {
@@ -270,7 +289,11 @@ impl Client {
                 metadata: self.inner.options.metadata.clone(),
                 shard_key: self.shard_key(&self.inner.key),
             })
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => return self.rethrow(err).await,
+        };
 
         let mut state = self.state();
         state.actor_id = Some(
@@ -288,8 +311,13 @@ impl Client {
     }
 
     /// Deactivates this client, stops its loops, and detaches every attached
-    /// document and channel locally (JS `deactivate` and
-    /// `deactivateInternal`).
+    /// document and channel locally (JS `deactivate`).
+    ///
+    /// If the server refuses with `ErrUnauthenticated` and the auth token
+    /// injector fails to give a new token, the client is deactivated locally
+    /// anyway and the injector's error is returned: the app deactivates to
+    /// stop the retries when the token can no longer be refreshed, and the
+    /// server reaps the client later.
     pub async fn deactivate(&self, options: DeactivateOptions) -> ClientResult<()> {
         let _queue = self.lock_task_queue().await;
         let client_id = {
@@ -300,15 +328,36 @@ impl Client {
             state.session(&self.inner.key)?.client_id
         };
 
-        self.inner
+        let result = self
+            .inner
             .transport
             .deactivate_client(DeactivateClientRequest {
                 client_id,
                 synchronous: options.synchronous,
                 shard_key: self.shard_key(&self.inner.key),
             })
-            .await?;
+            .await;
+        if let Err(err) = result {
+            if err.is_error_code(ErrorCode::ErrUnauthenticated)
+                && self.inner.options.auth_token_injector.is_some()
+            {
+                if let Err(refresh_err) = self.refresh_auth_token(err.error_reason(), false).await {
+                    self.deactivate_internal();
+                    return Err(refresh_err);
+                }
+                return Err(err);
+            }
+            return self.rethrow(err).await;
+        }
 
+        self.deactivate_internal();
+        Ok(())
+    }
+
+    /// Marks this client deactivated, stops its loops, and detaches every
+    /// attached document and channel locally (JS `deactivateInternal`). It
+    /// takes no task queue, so the loops can call it.
+    fn deactivate_internal(&self) {
         let (attachments, channels, sync_loop) = {
             let mut state = self.state();
             state.status = ClientStatus::Deactivated;
@@ -328,7 +377,6 @@ impl Client {
         for attachment in channels.into_values() {
             release_channel_attachment(attachment);
         }
-        Ok(())
     }
 
     /// Attaches the document and returns it (JS `attach`).
@@ -373,7 +421,7 @@ impl Client {
             doc.create_change_pack()
         };
 
-        let response = self
+        let response = match self
             .inner
             .transport
             .attach_document(AttachDocumentRequest {
@@ -382,7 +430,11 @@ impl Client {
                 schema_key: schema,
                 shard_key: self.shard_key(&key),
             })
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => return self.rethrow(err).await,
+        };
 
         let removed = {
             let mut doc = lock_document(&doc);
@@ -473,7 +525,7 @@ impl Client {
             doc.create_change_pack()
         };
 
-        let response = self
+        let response = match self
             .inner
             .transport
             .detach_document(DetachDocumentRequest {
@@ -483,7 +535,11 @@ impl Client {
                 remove_if_not_attached: false,
                 shard_key: self.shard_key(&key),
             })
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => return self.rethrow(err).await,
+        };
 
         {
             let mut doc = lock_document(doc);
@@ -525,7 +581,9 @@ impl Client {
         };
 
         for target in targets {
-            self.sync_document(&session.client_id, target).await?;
+            if let Err(err) = self.sync_document(&session.client_id, target).await {
+                return self.rethrow(err).await;
+            }
         }
         Ok(())
     }
@@ -545,7 +603,7 @@ impl Client {
             change_pack
         };
 
-        let response = self
+        let response = match self
             .inner
             .transport
             .remove_document(RemoveDocumentRequest {
@@ -554,7 +612,11 @@ impl Client {
                 change_pack,
                 shard_key: self.shard_key(&key),
             })
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => return self.rethrow(err).await,
+        };
 
         lock_document(doc).apply_change_pack(&response.change_pack)?;
         self.remove_attachment(&key, doc);
@@ -725,7 +787,10 @@ impl Client {
         {
             return Err(ClientError::NotAttached(key));
         }
-        self.refresh_channel(key, channel.clone()).await
+        match self.refresh_channel(key, channel.clone()).await {
+            Ok(()) => Ok(()),
+            Err(err) => self.rethrow(err).await,
+        }
     }
 
     /// Changes the sync mode of an attached channel (JS
@@ -802,8 +867,10 @@ impl Client {
     /// channel attached under `key` (JS `client.broadcast`), sending its JSON
     /// encoding (JS `JSON.stringify`).
     ///
-    /// A failure that `ClientError::is_retryable` accepts is retried after
-    /// 1s, 2s, 4s, and so on up to 20s, at most `options.max_retries` times,
+    /// A failure that JS `handleConnectError` retries is retried after 1s,
+    /// 2s, 4s, and so on up to 20s (or until the next auth token refresh may
+    /// run, at most 5s, after `ErrUnauthenticated`, which also publishes
+    /// `ChannelEvent::AuthError`), at most `options.max_retries` times,
     /// and the call returns when the broadcast is sent or fails for good.
     /// Each try waits for the task queue; the waits between tries do not
     /// hold it. Unlike JS, which checks the attachment once, every try
@@ -898,7 +965,7 @@ impl Client {
                     return Err(err);
                 }
                 let mut channel = lock_channel(&channel);
-                if err.has_yorkie_code(ERR_SESSION_NOT_FOUND) {
+                if err.is_error_code(ErrorCode::ErrSessionNotFound) {
                     channel.set_session_id(None);
                     return Ok(());
                 }
@@ -996,6 +1063,10 @@ impl Client {
         } else {
             self.with_attachment(&target.key, &target.doc, |attachment| {
                 attachment.last_synced_at = Some(Instant::now());
+                // JS `clearWriteRejected`: a push went through, so the sync
+                // loop takes this document again. An explicit `sync` is the
+                // way back for a document parked by a size rejection.
+                attachment.write_rejected = false;
             });
         }
         Ok(())
@@ -1029,6 +1100,97 @@ impl Client {
         let mut doc = lock_document(&target.doc);
         doc.apply_change_pack(&response.change_pack)?;
         Ok(doc.status() == DocStatus::Removed)
+    }
+
+    /// Handles a failed server call and returns whether to retry it (JS
+    /// `handleConnectError`); see [`ClientError::handling`] for the rules.
+    ///
+    /// `ErrUnauthenticated` asks the auth token injector for a new token,
+    /// passing the server's reason. `in_retry_loop` is true for the loops
+    /// that retry on their own (the sync loop, the watch loops, and broadcast
+    /// retries): their refusals skip the injector while its backoff runs, and
+    /// an injector failure is not returned. A one-shot call always calls the
+    /// injector and gets its error. `ErrClientNotActivated` and
+    /// `ErrClientNotFound` deactivate the client.
+    pub(crate) async fn handle_connect_error(
+        &self,
+        err: &ClientError,
+        in_retry_loop: bool,
+    ) -> ClientResult<bool> {
+        match err.handling() {
+            ErrorHandling::Retry => Ok(true),
+            ErrorHandling::RefreshToken => {
+                self.refresh_auth_token(err.error_reason(), in_retry_loop)
+                    .await?;
+                Ok(true)
+            }
+            ErrorHandling::Deactivate => {
+                self.deactivate_internal();
+                Ok(false)
+            }
+            ErrorHandling::Stop => Ok(false),
+        }
+    }
+
+    /// Handles the error of a one-shot call as JS does in its `catch`, and
+    /// returns it, or the auth token injector's error if that failed.
+    async fn rethrow<T>(&self, err: ClientError) -> ClientResult<T> {
+        self.handle_connect_error(&err, false).await?;
+        Err(err)
+    }
+
+    /// Asks the auth token injector, if there is one, for a new token after
+    /// a refusal and sets it on the transport (JS `refreshAuthToken`). See
+    /// [`crate::auth`] for which calls are made and which tokens are kept.
+    async fn refresh_auth_token(
+        &self,
+        reason: Option<&str>,
+        in_retry_loop: bool,
+    ) -> ClientResult<()> {
+        let Some(injector) = &self.inner.options.auth_token_injector else {
+            return Ok(());
+        };
+        let Some(call) = self
+            .state()
+            .auth_refresh
+            .begin(in_retry_loop, tokio::time::Instant::now())
+        else {
+            return Ok(());
+        };
+        match injector(reason.map(str::to_owned)).await {
+            Ok(token) => {
+                // Under the state lock, so a newer token is never overwritten.
+                let mut state = self.state();
+                if state.auth_refresh.succeeded(call) {
+                    self.inner.transport.set_auth_token(token);
+                }
+                Ok(())
+            }
+            Err(err) => {
+                self.state()
+                    .auth_refresh
+                    .failed(call, tokio::time::Instant::now(), random_unit());
+                if in_retry_loop {
+                    Ok(())
+                } else {
+                    Err(err)
+                }
+            }
+        }
+    }
+
+    /// Returns how long a loop waits to retry after `err`: `delay`, or for
+    /// `ErrUnauthenticated`, until the next token refresh may run if that is
+    /// later, but at most 5s (JS `loopRetryDelay`). Other errors keep their
+    /// delay: a method the auth webhook does not guard still works with the
+    /// refused token.
+    pub(crate) fn loop_retry_delay(&self, err: &ClientError, delay: Duration) -> Duration {
+        if !err.is_error_code(ErrorCode::ErrUnauthenticated) {
+            return delay;
+        }
+        self.state()
+            .auth_refresh
+            .loop_retry_delay(delay, tokio::time::Instant::now())
     }
 
     /// Waits for the task queue, which serializes client calls and sync-loop
@@ -1344,11 +1506,29 @@ async fn broadcast_with_retry(
             Ok(()) => return Ok(()),
             Err(err) => err,
         };
-        if !err.is_retryable() || max_retries.is_some_and(|max| retries >= max) {
+        // Only the retries are a loop: the first try is the app's call.
+        if !client.handle_connect_error(&err, retries > 0).await? {
             return Err(err);
         }
+        if err.is_error_code(ErrorCode::ErrUnauthenticated) {
+            let channel = client
+                .state()
+                .channels
+                .get(key)
+                .map(|attachment| attachment.channel.clone());
+            if let Some(channel) = channel {
+                lock_channel(&channel).publish(ChannelEvent::AuthError {
+                    reason: err.error_reason().unwrap_or("unauthenticated").to_owned(),
+                    method: "Broadcast".to_owned(),
+                });
+            }
+        }
+        if max_retries.is_some_and(|max| retries >= max) {
+            return Err(err);
+        }
+        let delay = client.loop_retry_delay(&err, broadcast_retry_delay(retries));
         drop(client);
-        tokio::time::sleep(broadcast_retry_delay(retries)).await;
+        tokio::time::sleep(delay).await;
         retries += 1;
     }
 }
@@ -1398,10 +1578,10 @@ mod tests {
     };
     use crate::error::{ClientError, ClientResult};
     use crate::options::{
-        AttachChannelOptions, AttachOptions, ClientOptions, DeactivateOptions, DetachOptions,
-        SyncMode, DEFAULT_CHANNEL_HEARTBEAT_INTERVAL_MS, DEFAULT_POLLING_INTERVAL_MS,
-        DEFAULT_RECONNECT_STREAM_DELAY_MS, DEFAULT_RETRY_SYNC_LOOP_DELAY_MS, DEFAULT_RPC_ADDR,
-        DEFAULT_SYNC_LOOP_DURATION_MS,
+        AttachChannelOptions, AttachOptions, AuthTokenInjector, ClientOptions, DeactivateOptions,
+        DetachOptions, SyncMode, DEFAULT_CHANNEL_HEARTBEAT_INTERVAL_MS,
+        DEFAULT_POLLING_INTERVAL_MS, DEFAULT_RECONNECT_STREAM_DELAY_MS,
+        DEFAULT_RETRY_SYNC_LOOP_DELAY_MS, DEFAULT_RPC_ADDR, DEFAULT_SYNC_LOOP_DURATION_MS,
     };
     use crate::transport::{
         ActivateClientRequest, ActivateClientResponse, AttachDocumentRequest,
@@ -1421,8 +1601,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use yorkie_core::{
-        ActorId, DocEvent, DocStatus, DocSyncStatus, Document, JsonObject, Presence, SchemaRule,
-        StreamConnectionStatus, TreeNodeRule, YorkieError,
+        ActorId, DocEvent, DocStatus, DocSyncStatus, Document, ErrorCode, JsonObject, Presence,
+        SchemaRule, StreamConnectionStatus, TreeNodeRule, YorkieError,
     };
     use yorkie_protocol::converter;
     use yorkie_protocol::yorkie::v1::presence_change::ChangeType;
@@ -1457,6 +1637,15 @@ mod tests {
         broadcast_requests: Mutex<Vec<BroadcastRequest>>,
         /// Errors for the next broadcasts, in order; later ones succeed.
         broadcast_errors: Mutex<Vec<ClientError>>,
+        /// Errors for the next deactivations, in order; later ones succeed.
+        deactivate_errors: Mutex<Vec<ClientError>>,
+        /// Errors for the next push-pulls of a document key, in order; the
+        /// first one for the key is used.
+        push_pull_errors: Mutex<Vec<(String, ClientError)>>,
+        /// The tokens set on the transport, in order.
+        auth_tokens: Mutex<Vec<String>>,
+        /// The token in use at each push-pull.
+        push_pull_tokens: Mutex<Vec<Option<String>>>,
     }
 
     impl Default for MockTransport {
@@ -1482,6 +1671,10 @@ mod tests {
                 channel_watch_scripts: Mutex::new(Vec::new()),
                 broadcast_requests: Mutex::new(Vec::new()),
                 broadcast_errors: Mutex::new(Vec::new()),
+                deactivate_errors: Mutex::new(Vec::new()),
+                push_pull_errors: Mutex::new(Vec::new()),
+                auth_tokens: Mutex::new(Vec::new()),
+                push_pull_tokens: Mutex::new(Vec::new()),
             }
         }
     }
@@ -1504,6 +1697,10 @@ mod tests {
             request: DeactivateClientRequest,
         ) -> ClientResult<DeactivateClientResponse> {
             self.deactivate_requests.lock().unwrap().push(request);
+            let mut errors = self.deactivate_errors.lock().unwrap();
+            if !errors.is_empty() {
+                return Err(errors.remove(0));
+            }
             Ok(DeactivateClientResponse)
         }
 
@@ -1544,7 +1741,14 @@ mod tests {
             request: PushPullChangesRequest,
         ) -> ClientResult<PushPullChangesResponse> {
             let change_pack = request.change_pack.clone();
+            let key = change_pack.document_key().to_owned();
             self.push_pull_requests.lock().unwrap().push(request);
+            let token = self.auth_tokens.lock().unwrap().last().cloned();
+            self.push_pull_tokens.lock().unwrap().push(token);
+            let mut errors = self.push_pull_errors.lock().unwrap();
+            if let Some(index) = errors.iter().position(|(error_key, _)| *error_key == key) {
+                return Err(errors.remove(index).1);
+            }
             Ok(PushPullChangesResponse { change_pack })
         }
 
@@ -1624,6 +1828,10 @@ mod tests {
                 return Err(errors.remove(0));
             }
             Ok(BroadcastResponse)
+        }
+
+        fn set_auth_token(&self, token: String) {
+            self.auth_tokens.lock().unwrap().push(token);
         }
     }
 
@@ -1761,6 +1969,7 @@ mod tests {
             channel_heartbeat_interval: Duration::from_secs(10),
             watch_heartbeat_interval: Duration::from_secs(5),
             user_agent: Some("test-agent".to_owned()),
+            auth_token_injector: None,
         };
 
         let client = Client::new(options.clone()).unwrap();
@@ -2483,6 +2692,7 @@ mod tests {
             code: "permission_denied".to_owned(),
             message: "denied".to_owned(),
             yorkie_code: None,
+            reason: None,
         })]];
         let client = mock_client(fast_loop_options(), &transport);
         let doc = shared("doc-key");
@@ -2798,6 +3008,7 @@ mod tests {
                 code: "not_found".to_owned(),
                 message: "session not found".to_owned(),
                 yorkie_code: Some("ErrSessionNotFound".to_owned()),
+                reason: None,
             });
         eventually(|| channel.lock().unwrap().session_id() == Some("session-2")).await;
 
@@ -2827,6 +3038,7 @@ mod tests {
             code: "permission_denied".to_owned(),
             message: "denied".to_owned(),
             yorkie_code: None,
+            reason: None,
         };
         transport.refresh_errors.lock().unwrap().push(error.clone());
         let client = mock_client(fast_loop_options(), &transport);
@@ -3273,6 +3485,7 @@ mod tests {
             code: "permission_denied".to_owned(),
             message: "denied".to_owned(),
             yorkie_code: None,
+            reason: None,
         };
         transport
             .broadcast_errors
@@ -3310,6 +3523,7 @@ mod tests {
                 code: "permission_denied".to_owned(),
                 message: "denied".to_owned(),
                 yorkie_code: None,
+                reason: None,
             });
         let client = mock_client(fast_loop_options(), &transport);
         client
@@ -3346,6 +3560,7 @@ mod tests {
                 code: "permission_denied".to_owned(),
                 message: "denied".to_owned(),
                 yorkie_code: None,
+                reason: None,
             });
         let client = mock_client(fast_loop_options(), &transport);
         client
@@ -3362,6 +3577,454 @@ mod tests {
             .await?;
         eventually(|| second.lock().unwrap().is_attached()).await;
         assert!(client.is_active());
+        Ok(())
+    }
+
+    /// A server error with the given Connect code, Yorkie code, and reason.
+    fn rpc_error(code: &str, yorkie_code: ErrorCode, reason: Option<&str>) -> ClientError {
+        ClientError::Rpc {
+            code: code.to_owned(),
+            message: code.to_owned(),
+            yorkie_code: Some(yorkie_code.as_str().to_owned()),
+            reason: reason.map(str::to_owned),
+        }
+    }
+
+    /// The refusal the server sends when the auth webhook rejects an expired
+    /// token (JS `unauthenticated()` in `auth_refresh_test.ts`).
+    fn token_expired() -> ClientError {
+        rpc_error(
+            "unauthenticated",
+            ErrorCode::ErrUnauthenticated,
+            Some("token expired"),
+        )
+    }
+
+    /// What a failing token API makes the injector return.
+    fn token_api_unavailable() -> ClientError {
+        ClientError::Transport("token api unavailable".to_owned())
+    }
+
+    /// An auth token injector that gives `answers` in order and then
+    /// `token-<n>` for its n-th call, with the reasons it was called with.
+    fn injector(
+        answers: Vec<ClientResult<String>>,
+    ) -> (AuthTokenInjector, Arc<Mutex<Vec<Option<String>>>>) {
+        let reasons = Arc::new(Mutex::new(Vec::new()));
+        let answers = Arc::new(Mutex::new(answers));
+        let calls = reasons.clone();
+        let injector: AuthTokenInjector = Arc::new(move |reason| {
+            let mut calls = calls.lock().unwrap();
+            calls.push(reason);
+            let call = calls.len();
+            let mut answers = answers.lock().unwrap();
+            let answer = if answers.is_empty() {
+                Ok(format!("token-{call}"))
+            } else {
+                answers.remove(0)
+            };
+            Box::pin(async move { answer })
+        });
+        (injector, reasons)
+    }
+
+    fn auth_options(injector: AuthTokenInjector) -> ClientOptions {
+        ClientOptions {
+            auth_token_injector: Some(injector),
+            ..fast_loop_options()
+        }
+    }
+
+    fn auth_errors(events: &Mutex<Vec<DocEvent>>) -> Vec<DocEvent> {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event, DocEvent::AuthError { .. }))
+            .cloned()
+            .collect()
+    }
+
+    /// JS `activate`: the injector gives the first token, with no reason,
+    /// before the client registers; if it fails, so does `activate`.
+    #[tokio::test]
+    async fn activate_asks_the_injector_for_the_first_token() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        let (injector, reasons) = injector(vec![Err(token_api_unavailable())]);
+        let client = mock_client(auth_options(injector), &transport);
+
+        assert_eq!(Err(token_api_unavailable()), client.activate().await);
+        assert!(!client.is_active());
+        assert!(transport.activate_requests.lock().unwrap().is_empty());
+
+        client.activate().await?;
+        assert!(client.is_active());
+        assert_eq!(vec![None, None], *reasons.lock().unwrap());
+        assert_eq!(vec!["token-2"], *transport.auth_tokens.lock().unwrap());
+        client.deactivate(DeactivateOptions::default()).await?;
+        Ok(())
+    }
+
+    /// JS `handleConnectError` for `ErrUnauthenticated` in the sync loop: the
+    /// injector is called once with the server's reason, the new token is
+    /// set, and the next round pushes with it. The document gets
+    /// `auth-error` (JS webhook_test "should refresh token when receiving
+    /// expired token error").
+    #[tokio::test]
+    async fn sync_loop_refreshes_an_expired_token_once_and_retries() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        transport
+            .push_pull_errors
+            .lock()
+            .unwrap()
+            .push(("doc-key".to_owned(), token_expired()));
+        let (injector, reasons) = injector(Vec::new());
+        let client = mock_client(auth_options(injector), &transport);
+        let doc = shared("doc-key");
+
+        client.activate().await?;
+        client.attach(doc.clone(), AttachOptions::default()).await?;
+        let events = collect_events(&doc);
+        set_title(&doc);
+        eventually(|| !doc.lock().unwrap().has_local_changes()).await;
+
+        assert_eq!(
+            vec![None, Some("token expired".to_owned())],
+            *reasons.lock().unwrap()
+        );
+        assert_eq!(
+            vec!["token-1", "token-2"],
+            *transport.auth_tokens.lock().unwrap()
+        );
+        assert_eq!(
+            vec![Some("token-1".to_owned()), Some("token-2".to_owned())],
+            transport.push_pull_tokens.lock().unwrap()[..2]
+        );
+        assert_eq!(
+            vec![DocEvent::AuthError {
+                reason: Some("token expired".to_owned()),
+                method: "PushPull".to_owned(),
+            }],
+            auth_errors(&events)
+        );
+        assert!(client.condition(ClientCondition::SyncLoop));
+        client.deactivate(DeactivateOptions::default()).await?;
+        Ok(())
+    }
+
+    /// JS `auth-error` for `ErrPermissionDenied`: published like a refusal,
+    /// but the sync loop stops, as JS `handleConnectError` does not retry it.
+    #[tokio::test]
+    async fn permission_denied_publishes_an_auth_error_and_stops_the_loop() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        transport.push_pull_errors.lock().unwrap().push((
+            "doc-key".to_owned(),
+            rpc_error(
+                "permission_denied",
+                ErrorCode::ErrPermissionDenied,
+                Some("no write"),
+            ),
+        ));
+        let (injector, reasons) = injector(Vec::new());
+        let client = mock_client(auth_options(injector), &transport);
+        let doc = shared("doc-key");
+
+        client.activate().await?;
+        client.attach(doc.clone(), AttachOptions::default()).await?;
+        let events = collect_events(&doc);
+        set_title(&doc);
+        eventually(|| !client.condition(ClientCondition::SyncLoop)).await;
+
+        assert_eq!(
+            vec![DocEvent::AuthError {
+                reason: Some("no write".to_owned()),
+                method: "PushPull".to_owned(),
+            }],
+            auth_errors(&events)
+        );
+        assert_eq!(vec![None], *reasons.lock().unwrap());
+        assert!(client.is_active());
+        Ok(())
+    }
+
+    /// JS `onError` of the document watch stream: a refusal publishes
+    /// `auth-error` with method `Watch`, refreshes the token, and the stream
+    /// is opened again.
+    #[tokio::test]
+    async fn watch_refusal_publishes_an_auth_error_and_reconnects() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        *transport.watch_scripts.lock().unwrap() = vec![vec![Err(token_expired())]];
+        let (injector, reasons) = injector(Vec::new());
+        let client = mock_client(auth_options(injector), &transport);
+        let doc = shared("doc-key");
+        let events = collect_events(&doc);
+
+        client.activate().await?;
+        client.attach(doc.clone(), AttachOptions::default()).await?;
+        eventually(|| transport.watch_requests.lock().unwrap().len() >= 2).await;
+
+        assert_eq!(
+            vec![DocEvent::AuthError {
+                reason: Some("token expired".to_owned()),
+                method: "Watch".to_owned(),
+            }],
+            auth_errors(&events)
+        );
+        assert_eq!(
+            vec![None, Some("token expired".to_owned())],
+            *reasons.lock().unwrap()
+        );
+        assert!(client.condition(ClientCondition::WatchLoop));
+        client.deactivate(DeactivateOptions::default()).await?;
+        Ok(())
+    }
+
+    /// JS `handleConnectError` for `ErrTooManySubscribers`: the watch stream
+    /// is opened again rather than given up.
+    #[tokio::test]
+    async fn too_many_subscribers_reconnects_the_watch_stream() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        *transport.watch_scripts.lock().unwrap() = vec![vec![Err(rpc_error(
+            "resource_exhausted",
+            ErrorCode::ErrTooManySubscribers,
+            None,
+        ))]];
+        let client = mock_client(fast_loop_options(), &transport);
+        let doc = shared("doc-key");
+
+        client.activate().await?;
+        client.attach(doc.clone(), AttachOptions::default()).await?;
+        eventually(|| transport.watch_requests.lock().unwrap().len() >= 2).await;
+        assert!(client.condition(ClientCondition::WatchLoop));
+        client.deactivate(DeactivateOptions::default()).await?;
+        Ok(())
+    }
+
+    /// JS "lets a one-shot sync call the injector during the backoff and
+    /// throw its error": `sync` returns the injector's error when it fails,
+    /// and otherwise sets the new token and returns the refusal for the app
+    /// to retry.
+    #[tokio::test]
+    async fn one_shot_sync_returns_the_injector_error_or_the_refusal() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        transport.push_pull_errors.lock().unwrap().extend([
+            ("doc-key".to_owned(), token_expired()),
+            ("doc-key".to_owned(), token_expired()),
+        ]);
+        let (injector, reasons) =
+            injector(vec![Ok("token-1".to_owned()), Err(token_api_unavailable())]);
+        let client = mock_client(auth_options(injector), &transport);
+        let doc = shared("doc-key");
+        client.activate().await?;
+        client
+            .attach(
+                doc.clone(),
+                AttachOptions {
+                    sync_mode: SyncMode::Manual,
+                    ..AttachOptions::default()
+                },
+            )
+            .await?;
+
+        assert_eq!(Err(token_api_unavailable()), client.sync(Some(&doc)).await);
+        assert_eq!(vec!["token-1"], *transport.auth_tokens.lock().unwrap());
+        assert_eq!(Err(token_expired()), client.sync(Some(&doc)).await);
+        assert_eq!(
+            vec!["token-1", "token-3"],
+            *transport.auth_tokens.lock().unwrap()
+        );
+        assert_eq!(3, reasons.lock().unwrap().len());
+        client.sync(Some(&doc)).await?;
+        client.deactivate(DeactivateOptions::default()).await?;
+        Ok(())
+    }
+
+    /// JS "deactivates locally when the deactivation gets a 401 that cannot
+    /// be refreshed".
+    #[tokio::test]
+    async fn deactivate_stops_locally_when_the_token_cannot_be_refreshed() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        transport
+            .deactivate_errors
+            .lock()
+            .unwrap()
+            .extend([token_expired(), token_expired()]);
+        let (injector, _) = injector(vec![
+            Ok("token-1".to_owned()),
+            Ok("token-2".to_owned()),
+            Err(ClientError::Transport("signed out".to_owned())),
+        ]);
+        let client = mock_client(auth_options(injector), &transport);
+        let doc = shared("doc-key");
+        client.activate().await?;
+        client.attach(doc.clone(), AttachOptions::default()).await?;
+
+        // A token the injector refreshes: the app may retry, so stay active.
+        assert_eq!(
+            Err(token_expired()),
+            client.deactivate(DeactivateOptions::default()).await
+        );
+        assert!(client.is_active());
+
+        // Signed out: stop locally and return the injector's error.
+        assert_eq!(
+            Err(ClientError::Transport("signed out".to_owned())),
+            client.deactivate(DeactivateOptions::default()).await
+        );
+        assert!(!client.is_active());
+        assert!(!client.has("doc-key"));
+        assert_eq!(DocStatus::Detached, doc.lock().unwrap().status());
+        eventually(|| client.running_task_count() == 0).await;
+        Ok(())
+    }
+
+    /// JS `handleConnectError` for `ErrClientNotFound`: the client fixes its
+    /// state by deactivating itself (`deactivateInternal`).
+    #[tokio::test]
+    async fn client_not_found_deactivates_the_client() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        transport.push_pull_errors.lock().unwrap().push((
+            "doc-key".to_owned(),
+            rpc_error("not_found", ErrorCode::ErrClientNotFound, None),
+        ));
+        let client = mock_client(fast_loop_options(), &transport);
+        let doc = shared("doc-key");
+
+        client.activate().await?;
+        client.attach(doc.clone(), AttachOptions::default()).await?;
+        set_title(&doc);
+        eventually(|| !client.is_active()).await;
+
+        assert!(!client.has("doc-key"));
+        assert_eq!(DocStatus::Detached, doc.lock().unwrap().status());
+        assert!(!client.condition(ClientCondition::SyncLoop));
+        eventually(|| client.running_task_count() == 0).await;
+        Ok(())
+    }
+
+    /// JS `markWriteRejected` (write_rejected_test.ts): a push refused for
+    /// its size parks that document only; the loop goes on with the others,
+    /// and an explicit `sync` that succeeds lets the loop take it again.
+    #[tokio::test]
+    async fn rejected_write_parks_only_that_document() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        transport.push_pull_errors.lock().unwrap().push((
+            "big".to_owned(),
+            rpc_error(
+                "resource_exhausted",
+                ErrorCode::ErrDocumentSizeExceedsLimit,
+                None,
+            ),
+        ));
+        let client = mock_client(fast_loop_options(), &transport);
+        let big = shared("big");
+        let small = shared("small");
+        client.activate().await?;
+        client.attach(big.clone(), AttachOptions::default()).await?;
+        client
+            .attach(small.clone(), AttachOptions::default())
+            .await?;
+
+        set_title(&big);
+        eventually(|| pushed_keys(&transport).contains(&"big".to_owned())).await;
+        set_title(&small);
+        eventually(|| !small.lock().unwrap().has_local_changes()).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let big_pushes = || {
+            pushed_keys(&transport)
+                .iter()
+                .filter(|key| *key == "big")
+                .count()
+        };
+        assert_eq!(1, big_pushes());
+        assert!(big.lock().unwrap().has_local_changes());
+        assert!(client.condition(ClientCondition::SyncLoop));
+
+        client.sync(Some(&big)).await?;
+        assert_eq!(2, big_pushes());
+        set_title(&big);
+        eventually(|| big_pushes() == 3).await;
+        eventually(|| !big.lock().unwrap().has_local_changes()).await;
+        client.deactivate(DeactivateOptions::default()).await?;
+        Ok(())
+    }
+
+    /// JS `broadcast` after `ErrUnauthenticated`: the channel gets
+    /// `auth-error` with method `Broadcast`, the token is refreshed, and the
+    /// retry goes through.
+    #[tokio::test(start_paused = true)]
+    async fn broadcast_refusal_publishes_a_channel_auth_error() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        let (injector, reasons) = injector(Vec::new());
+        let client = mock_client(auth_options(injector), &transport);
+        client.activate().await?;
+        let channel = shared_channel("room");
+        client
+            .attach_channel(channel.clone(), fast_channel(SyncMode::Polling))
+            .await?;
+        eventually(|| channel.lock().unwrap().is_attached()).await;
+        let events = collect_channel_events(&channel);
+        transport
+            .broadcast_errors
+            .lock()
+            .unwrap()
+            .push(token_expired());
+
+        client
+            .broadcast("room", "chat", json!(1), BroadcastOptions::default())
+            .await?;
+
+        assert_eq!(2, transport.broadcast_requests.lock().unwrap().len());
+        assert_eq!(
+            vec![None, Some("token expired".to_owned())],
+            *reasons.lock().unwrap()
+        );
+        let auth_errors = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event, ChannelEvent::AuthError { .. }))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            vec![ChannelEvent::AuthError {
+                reason: "token expired".to_owned(),
+                method: "Broadcast".to_owned(),
+            }],
+            auth_errors
+        );
+        Ok(())
+    }
+
+    /// JS "calls the injector on a broadcast's first try during the backoff":
+    /// the first try is a one-shot call, so it returns the injector's error.
+    #[tokio::test]
+    async fn broadcast_first_try_returns_the_injector_error() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        let (injector, reasons) =
+            injector(vec![Ok("token-1".to_owned()), Err(token_api_unavailable())]);
+        let client = mock_client(auth_options(injector), &transport);
+        client.activate().await?;
+        let channel = shared_channel("room");
+        client
+            .attach_channel(channel.clone(), fast_channel(SyncMode::Polling))
+            .await?;
+        eventually(|| channel.lock().unwrap().is_attached()).await;
+        transport
+            .broadcast_errors
+            .lock()
+            .unwrap()
+            .push(token_expired());
+
+        assert_eq!(
+            Err(token_api_unavailable()),
+            client
+                .broadcast("room", "chat", json!(1), BroadcastOptions::default())
+                .await
+        );
+        assert_eq!(1, transport.broadcast_requests.lock().unwrap().len());
+        assert_eq!(2, reasons.lock().unwrap().len());
         Ok(())
     }
 }

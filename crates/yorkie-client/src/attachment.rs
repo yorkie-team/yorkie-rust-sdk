@@ -32,6 +32,11 @@ pub(crate) struct Attachment {
     pub(crate) last_synced_at: Option<Instant>,
     /// The watch loop task, while the attachment watches the document.
     pub(crate) watch_task: Option<TaskHandle>,
+    /// The server refused the last push for its content
+    /// (`ErrDocumentSizeExceedsLimit`, `ErrChangeTooLarge`), so the sync
+    /// loop skips this document until a sync succeeds (JS
+    /// `markWriteRejected`, `isWriteRejected`, `clearWriteRejected`).
+    pub(crate) write_rejected: bool,
 }
 
 impl Attachment {
@@ -51,6 +56,7 @@ impl Attachment {
             change_event_received: false,
             last_synced_at: None,
             watch_task: None,
+            write_rejected: false,
         }
     }
 

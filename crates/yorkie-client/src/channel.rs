@@ -39,7 +39,8 @@ pub enum ChannelStatus {
 /// An event that occurs in a channel (JS `ChannelEvent`).
 ///
 /// JS `subscribe('presence', cb)` takes `PresenceChanged` and `Initialized`,
-/// `subscribe('broadcast', cb)` takes `Broadcast`; in Rust, match on the
+/// `subscribe('broadcast', cb)` takes `Broadcast`, and
+/// `subscribe('auth-error', cb)` takes `AuthError`; in Rust, match on the
 /// variant.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChannelEvent {
@@ -67,6 +68,12 @@ pub enum ChannelEvent {
     /// failed session refresh (JS `sync-error`). The client keeps retrying,
     /// so a later event means it recovered.
     SyncError { error: ClientError, method: String },
+    /// The server refused a broadcast with `ErrUnauthenticated` (JS
+    /// `auth-error`). `reason` is the auth webhook's reason, or
+    /// `"unauthenticated"` when the server gave none; `method` is
+    /// `"Broadcast"`. The client has asked the auth token injector for a new
+    /// token and retries.
+    AuthError { reason: String, method: String },
 }
 
 /// Options for a broadcast (JS `BroadcastOptions`).

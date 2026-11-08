@@ -3,8 +3,8 @@
 
 pub use yorkie_client::{
     ActivateClientRequest, ActivateClientResponse, AttachChannelOptions, AttachDocumentRequest,
-    AttachDocumentResponse, AttachOptions, BroadcastErrorHandler, BroadcastOptions,
-    BroadcastRequest, BroadcastResponse, Channel, ChannelEvent, ChannelStatus,
+    AttachDocumentResponse, AttachOptions, AuthTokenInjector, BroadcastErrorHandler,
+    BroadcastOptions, BroadcastRequest, BroadcastResponse, Channel, ChannelEvent, ChannelStatus,
     ChannelSubscriptionId, ChannelWatchStream, Client, ClientCondition, ClientError, ClientOptions,
     ClientResult, ClientStatus, ClientTransport, ConnectTransport, DeactivateClientRequest,
     DeactivateClientResponse, DeactivateOptions, DetachDocumentRequest, DetachDocumentResponse,
@@ -16,9 +16,9 @@ pub use yorkie_client::{
 };
 pub use yorkie_core::{
     ActorId, ChangePack, Checkpoint, CounterType, CounterValue, DataSize, DocEvent, DocSize,
-    DocStatus, DocSyncStatus, Document, HistoryMut, HistoryRef, JsonArray, JsonCounter, JsonObject,
-    JsonText, JsonTree, JsonValue, OperationInfo, Presence, PresenceProxy, Result, SchemaRule,
-    StreamConnectionStatus, TextChunk, TimeTicket, TimeTicketStruct, TreeNodeInput, TreeNodeRule,
-    TreeStyleOpValue, VersionVector, YorkieError,
+    DocStatus, DocSyncStatus, Document, ErrorCode, HistoryMut, HistoryRef, JsonArray, JsonCounter,
+    JsonObject, JsonText, JsonTree, JsonValue, OperationInfo, Presence, PresenceProxy, Result,
+    SchemaRule, StreamConnectionStatus, TextChunk, TimeTicket, TimeTicketStruct, TreeNodeInput,
+    TreeNodeRule, TreeStyleOpValue, VersionVector, YorkieError,
 };
 pub use yorkie_protocol::YORKIE_PROTO_PACKAGE;

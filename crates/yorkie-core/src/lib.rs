@@ -25,7 +25,7 @@ pub use crdt::counter::{CounterType, CounterValue};
 pub use crdt::element::DataSize;
 pub use crdt::root::DocSize;
 pub use document::{DocStatus, Document};
-pub use error::{Result, YorkieError};
+pub use error::{ErrorCode, Result, YorkieError};
 pub use event::{
     ChangeInfo, DocEvent, DocSyncStatus, EditOpValue, OperationInfo, StreamConnectionStatus,
     StyleOpValue, SubscriptionId, TreeStyleOpValue,

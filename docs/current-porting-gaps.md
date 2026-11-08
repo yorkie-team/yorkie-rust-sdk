@@ -733,9 +733,9 @@ Gap:
   remote presence changes, and status transitions publish
   `PresenceChanged`/`Watched`/`Unwatched`. A remote `Clear` takes the actor
   offline. The client publishes `Initialized`, watch-driven
-  `Watched`/`Unwatched`, `ConnectionChanged`, and `SyncStatusChanged`.
-  Broadcast is a channel event, not a document event, as in JS. JS
-  `AuthError`, `EpochMismatch`, `WriteRejected`, `LocalChangesDropped`, and
+  `Watched`/`Unwatched`, `ConnectionChanged`, `SyncStatusChanged`, and
+  `AuthError`. Broadcast is a channel event, not a document event, as in
+  JS. JS `EpochMismatch`, `WriteRejected`, `LocalChangesDropped`, and
   `PersistDisabled` events are not ported. `ChangeInfo` omits JS
   `clientSeq`/`serverSeq`/`rawChange`.
 - Change packs can be projected to generated protobuf payloads and
@@ -972,9 +972,14 @@ Current Rust behavior:
   changes or a pending remote-change notice, `RealtimePushOnly` with local
   changes (push-only request), `Polling` once per poll interval, never
   `RealtimeSyncOff` or `Manual`. The notice is cleared before the request and
-  restored if the sync fails. After a retryable error (network failures and
-  the Connect codes JS retries) it waits `retry_sync_loop_delay`; any other
-  error stops the loop.
+  restored if the sync fails. A failed round is handled after it leaves the
+  task queue, as in JS: after a retryable error it waits
+  `retry_sync_loop_delay` (up to 5s longer while the auth token refresh
+  backs off); any other error stops the loop. A document whose push is
+  refused for its size (`ErrDocumentSizeExceedsLimit`, `ErrChangeTooLarge`)
+  is parked instead, as JS `markWriteRejected` does: the loop skips it and
+  goes on with the rest until a sync of it succeeds, such as an explicit
+  `Client::sync`.
 - The watch loop (`watch.rs`, JS `runWatchLoop`/`runWatchStream`) is one
   tokio task per attachment in `Realtime`, `RealtimePushOnly`, or
   `RealtimeSyncOff`. It opens the unified `Watch` RPC with a document
@@ -985,8 +990,10 @@ Current Rust behavior:
   `DOCUMENT_WATCHED`/`UNWATCHED` update the online set and publish
   `Watched`/`Unwatched` (`Document::apply_watched`/`apply_unwatched`);
   heartbeats are ignored. When the stream fails or ends it clears the online
-  clients, publishes `Initialized` and `ConnectionChanged(Disconnected)`, and
-  reconnects after `reconnect_stream_delay`; a non-retryable error stops it.
+  clients, publishes `Initialized` and `ConnectionChanged(Disconnected)` (and
+  `AuthError` for `ErrUnauthenticated`), and reconnects after
+  `reconnect_stream_delay` (longer while the auth token refresh backs off);
+  a non-retryable error stops it.
   Once the server reports a nonzero heartbeat interval, a stream silent for
   three times that interval (1s to 24h) is treated as half-open and
   reconnected (JS `watchIdleTimeout`).
@@ -1011,6 +1018,25 @@ Current Rust behavior:
   committing it, as JS `update` does: schema rules first, then the size. A
   rejected change leaves the document untouched. Remote changes and undo/redo
   are not checked, as in JS.
+- Server errors are handled as JS `handleConnectError` does
+  (`Client::handle_connect_error`), using the Yorkie code and reason from
+  the error's `ErrorInfo` metadata: size rejections are not retried,
+  transient Connect codes and `ErrTooManySubscribers` are retried,
+  `ErrUnauthenticated` refreshes the auth token and is retried, and
+  `ErrClientNotActivated`/`ErrClientNotFound` deactivate the client locally
+  (JS `deactivateInternal`). One-shot calls run it and return the error, as
+  JS does in their `catch`.
+- `ClientOptions::auth_token_injector` (JS `authTokenInjector`) gives the
+  token `ConnectTransport` sends as the `authorization` header (JS
+  `createAuthInterceptor`): at activation with no reason, and after each
+  `ErrUnauthenticated` with the auth webhook's reason. A failing injector
+  fails `activate` and one-shot calls with its error; the loops keep the old
+  token and back off their injector calls (1s doubling to 30s, jittered),
+  with the JS rules for overlapping calls (`refreshAuthToken`). `deactivate`
+  refused with a token that cannot be refreshed deactivates locally and
+  returns the injector's error. Documents publish `AuthError` for refused
+  syncs (`ErrUnauthenticated`, `ErrPermissionDenied`) and watch streams
+  (`ErrUnauthenticated`); channels publish it for refused broadcasts.
 
 JS/Go behavior:
 
@@ -1023,13 +1049,13 @@ JS/Go behavior:
 
 Gap:
 
-- Retry decisions use only the Connect code. `ClientError::Rpc` carries the
-  Yorkie error code from the error details (JS `errorCodeOf`), but only
-  `ErrSessionNotFound` (channel refresh) is acted on: `ErrTooManySubscribers`
-  retries, write-rejected parking, the auth-token refresh and its backoff,
-  and deactivation on `ErrClientNotActivated`/`ErrClientNotFound` are not
-  ported. `AuthError`/`EpochMismatch`/`WriteRejected` events are not
-  published.
+- `EpochMismatch` and `WriteRejected` events are not published: a parked
+  document only gets `SyncStatusChanged(SyncFailed)`, and an
+  `ErrEpochMismatch` stops the sync loop without telling the document.
+- JS's `deactivating` flag is not modeled: Rust `deactivate` holds the task
+  queue, so the sync loop cannot run during it. The auth webhook path is
+  covered by unit tests with a mock transport only; JS `webhook_test.ts`
+  needs a server configured with an auth webhook and is not ported.
 - `DOCUMENT_BROADCAST` watch events are ignored, as in JS: broadcasts travel
   on channels.
 - Detach does not mark the attachment as detaching (JS `markDetaching`); the
@@ -1043,14 +1069,13 @@ Gap:
   `UpdateDocument` schema cases, are not ported.
 - When a tree text node carries several disallowed marks, the schema error
   names the first by key; JS names the first set.
-- `DeactivateOptions::keepalive`, `disableGC`, auth token refresh,
+- `DeactivateOptions::keepalive`, `disableGC`,
   gRPC-web/Connect transport choice, Go TLS options, and Go receive-size/logger
   options are not modeled yet.
 
 Expected direction:
 
-- Use the decoded Yorkie error codes so retry, parking, and auth handling
-  can follow `handleConnectError`.
+- Publish `WriteRejected` and `EpochMismatch` when those events are ported.
 
 ## Channels and Broadcast
 
@@ -1089,8 +1114,7 @@ Current Rust behavior:
 
 Gap:
 
-- JS `ChannelStatus.Removed` and the `AuthError` channel event are not
-  ported (there is no auth-token handling yet).
+- JS `ChannelStatus.Removed` is not ported.
 - Deliberate differences from JS: `detach_channel` clears the session ID (JS
   keeps it, so a re-attached channel stays `Detached` until the old session
   expires); every broadcast try checks the channel is still attached (JS
@@ -1111,6 +1135,11 @@ Gap:
 Current Rust behavior:
 
 - `YorkieError` is small and strongly typed for the current implementation.
+- `ErrorCode` has one variant per JS `Code`, with the JS strings
+  (`as_str`, `FromStr`). `YorkieError::code` maps every core variant to the
+  JS code thrown for the same failure, and `ClientError::code` gives the
+  server's Yorkie code for `Rpc`, the JS code for lifecycle errors, and the
+  core code for `Core`.
 
 JS/Go behavior:
 
@@ -1119,17 +1148,20 @@ JS/Go behavior:
 
 Gap:
 
-- Rust error variants and messages are not yet aligned with JS error codes.
-  `SchemaValidationFailed` and `DocumentSizeExceedsLimit` carry the JS
-  messages and name their JS codes in their docs, but `YorkieError` has no
-  code accessor.
-- Some temporary errors use generic `MissingCrdtElement` or
-  `UnexpectedCrdtElement` where JS/Go may report more specific cases.
+- Rust variants are finer than JS codes, so several map to one code: missing
+  elements, keys, and execution times and invalid positions, indexes,
+  lamports, primitives, and counter operations are all
+  `ErrInvalidArgument`; `UnexpectedType`/`UnexpectedCrdtElement` are
+  `ErrInvalidType`. Messages other than the schema and size ones are not
+  the JS messages.
+- `ClientError::code` is `None` for `Transport` errors and for server codes
+  this SDK does not know; JS keeps the raw string.
+- JS `ChangeApplyError` (`ErrChangeApplyFailed` with change and operation
+  details) has no Rust counterpart.
 
 Expected direction:
 
-- Align public-facing errors with JS error codes before stabilizing the SDK
-  surface.
+- Align public-facing messages with JS before stabilizing the SDK surface.
 - Keep internal errors specific enough to debug CRDT state issues.
 
 ## Test Coverage

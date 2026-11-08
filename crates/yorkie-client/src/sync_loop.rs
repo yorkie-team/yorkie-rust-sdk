@@ -4,15 +4,25 @@
 //! JS reference: `packages/sdk/src/client/client.ts` (`runSyncLoop`) and
 //! `client/attachment.ts` (`needRealtimeSync`, `needSync`). Each round runs on
 //! the client's task queue, syncs every attachment that needs it at once, and
-//! then waits `sync_loop_duration`; after a retryable error it waits
-//! `retry_sync_loop_delay` instead, and any other error stops the loop.
+//! then waits `sync_loop_duration`. A failed round is handled as JS
+//! `handleConnectError` does, after the round leaves the queue: a retryable
+//! error waits `retry_sync_loop_delay` (longer while the auth token refresh
+//! backs off, see `Client::loop_retry_delay`), and any other error stops the
+//! loop.
+//!
+//! A document whose push the server refuses for its content
+//! (`ErrDocumentSizeExceedsLimit`, `ErrChangeTooLarge`) is parked instead:
+//! the loop skips it until a sync of it succeeds, and goes on with the rest.
+//! A sync refused with `ErrUnauthenticated` or `ErrPermissionDenied`
+//! publishes `DocEvent::AuthError` on the document.
 
 use crate::attachment::SharedDocument;
 use crate::channel::SharedChannel;
 use crate::client::{lock_document, Client, ClientCondition, ClientInner, SyncTarget, TaskHandle};
-use crate::error::ClientResult;
+use crate::error::{ClientError, ClientResult, UNRETRYABLE_WRITE_CODES};
 use futures_util::future::{join, join_all};
 use std::sync::{Arc, Weak};
+use yorkie_core::{DocEvent, ErrorCode};
 
 /// Starts the sync loop of a client that is active or has channels.
 pub(crate) fn spawn(inner: &Arc<ClientInner>) -> TaskHandle {
@@ -26,19 +36,28 @@ async fn run(inner: Weak<ClientInner>) {
         let Some(client) = Client::upgrade(&inner) else {
             return;
         };
-        let delay = {
+        let failure = {
             let _queue = client.lock_task_queue().await;
-            match sync_attachments(&client).await {
-                Ok(()) => client.options().sync_loop_duration,
-                Err(err) if err.is_retryable() => client.options().retry_sync_loop_delay,
-                Err(_) => {
-                    // Cleared before the queue is released, as JS clears it
-                    // synchronously: a call queued behind this round, such as
-                    // `attach_channel`, must see the loop as stopped and start
-                    // a new one.
+            let result = sync_attachments(&client).await;
+            if let Err(err) = &result {
+                if !err.is_retryable() {
+                    // Cleared before the queue is released: a call queued
+                    // behind this round, such as `attach_channel`, must see
+                    // the loop as stopped and start a new one.
                     client.set_condition(ClientCondition::SyncLoop, false);
+                }
+            }
+            result.err()
+        };
+        let delay = match failure {
+            None => client.options().sync_loop_duration,
+            // Outside the queue, as in JS: a token refresh waits for the
+            // injector without holding up the app's calls.
+            Some(err) => {
+                if !matches!(client.handle_connect_error(&err, true).await, Ok(true)) {
                     return;
                 }
+                client.loop_retry_delay(&err, client.options().retry_sync_loop_delay)
             }
         };
         drop(client);
@@ -83,11 +102,16 @@ async fn sync_attachments(client: &Client) -> ClientResult<()> {
                 let key = target.key.clone();
                 let doc = target.doc.clone();
                 let result = client.sync_document(client_id, target).await;
-                if result.is_err() && change_event_received {
-                    // The pull this sync owed never happened; ask again.
-                    client.with_attachment(&key, &doc, |attachment| {
-                        attachment.change_event_received = true;
-                    });
+                if let Err(err) = &result {
+                    if change_event_received {
+                        // The pull this sync owed never happened; ask again.
+                        client.with_attachment(&key, &doc, |attachment| {
+                            attachment.change_event_received = true;
+                        });
+                    }
+                    if handle_document_error(client, &key, &doc, err) {
+                        return Ok(());
+                    }
                 }
                 result
             })
@@ -100,8 +124,39 @@ async fn sync_attachments(client: &Client) -> ClientResult<()> {
     synced.into_iter().chain(refreshed).collect()
 }
 
+/// Handles a failed sync of one document as the JS sync loop does before the
+/// error reaches `handleConnectError`: publishes `AuthError` for a refusal,
+/// and parks the document for a push refused for its content. Returns
+/// whether it parked it, in which case the error does not fail the round:
+/// that would stop the loop for every other document and channel.
+fn handle_document_error(
+    client: &Client,
+    key: &str,
+    doc: &SharedDocument,
+    err: &ClientError,
+) -> bool {
+    if err.is_error_code(ErrorCode::ErrUnauthenticated)
+        || err.is_error_code(ErrorCode::ErrPermissionDenied)
+    {
+        lock_document(doc).publish(DocEvent::AuthError {
+            reason: err.error_reason().map(str::to_owned),
+            method: "PushPull".to_owned(),
+        });
+    }
+    if !UNRETRYABLE_WRITE_CODES
+        .iter()
+        .any(|code| err.is_error_code(*code))
+    {
+        return false;
+    }
+    client.with_attachment(key, doc, |attachment| {
+        attachment.write_rejected = true;
+    });
+    true
+}
+
 /// Picks the documents to sync this round, each with the remote-change
-/// notice it consumed.
+/// notice it consumed. Parked documents are skipped.
 fn document_targets(client: &Client) -> Vec<(SyncTarget, bool)> {
     // Read local changes without the client lock held, then decide under it.
     let docs: Vec<(String, SharedDocument)> = client
@@ -124,7 +179,7 @@ fn document_targets(client: &Client) -> Vec<(SyncTarget, bool)> {
                 .attachments
                 .get_mut(&key)
                 .filter(|attachment| attachment.holds(&doc))?;
-            if !attachment.need_realtime_sync(has_local_changes) {
+            if attachment.write_rejected || !attachment.need_realtime_sync(has_local_changes) {
                 return None;
             }
             // Cleared before the request goes out, so a change event that
