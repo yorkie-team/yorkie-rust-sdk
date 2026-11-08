@@ -4385,6 +4385,48 @@ mod tests {
         Ok(())
     }
 
+    /// JS `CRDTTree.Merge` "Can delete nodes between elements in different
+    /// level with edit": the merged paragraph's content moves into the
+    /// deepest element the range starts in.
+    #[test]
+    fn merges_elements_at_different_levels() -> crate::Result<()> {
+        let mut tree = CrdtTree::create(
+            TreeNode::create_element(
+                node_id(1, 0),
+                "root",
+                None,
+                vec![
+                    TreeNode::create_element(
+                        node_id(2, 0),
+                        "p",
+                        None,
+                        vec![TreeNode::create_element(
+                            node_id(3, 0),
+                            "b",
+                            None,
+                            vec![TreeNode::create_text(node_id(4, 0), "ab")],
+                        )],
+                    ),
+                    TreeNode::create_element(
+                        node_id(5, 0),
+                        "p",
+                        None,
+                        vec![TreeNode::create_text(node_id(6, 0), "cd")],
+                    ),
+                ],
+            ),
+            ticket(1, "a"),
+        );
+        let range = (tree.find_pos(3, true)?, tree.find_pos(8, true)?);
+        let result = tree.edit_by_range_with_changes(range, None, 0, ticket(10, "a"), None)?;
+        assert_eq!(
+            vec![(3, 8, vec![0, 0, 1], vec![1, 1], false)],
+            change_paths(&result)
+        );
+        assert_eq!("<root><p><b>ad</b></p></root>", tree.to_xml());
+        Ok(())
+    }
+
     /// JS `CRDTTree.Merge` "Can merge different levels with edit", skipped
     /// upstream (`test/unit/document/crdt/tree_test.ts:1700`, `it.skip` with a
     /// TODO to fix the test). See `docs/crdt-parity/upstream-skipped-tests.md`.
