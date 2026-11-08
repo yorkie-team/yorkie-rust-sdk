@@ -25,12 +25,24 @@ impl TwoClients {
     /// Activates two clients and attaches a fresh document, keyed by `name`
     /// plus a timestamp, to each in manual sync mode.
     pub async fn attach(addr: &str, name: &str) -> Self {
+        Self::attach_in(addr, name, SyncMode::Manual).await
+    }
+
+    /// Like `attach`, in the given sync mode (the JS helper's `syncMode`
+    /// argument).
+    pub async fn attach_in(addr: &str, name: &str, sync_mode: SyncMode) -> Self {
         let mut c1 = active_client(addr).await;
         let mut c2 = active_client(addr).await;
         if c1.actor_id() > c2.actor_id() {
             std::mem::swap(&mut c1, &mut c2);
         }
-        let (d1, d2) = attach_pair(&c1, &c2, &unique_key(name)).await;
+        let key = unique_key(name);
+        let options = || AttachOptions {
+            sync_mode,
+            ..AttachOptions::default()
+        };
+        let d1 = c1.attach(shared(&key), options()).await.unwrap();
+        let d2 = c2.attach(shared(&key), options()).await.unwrap();
         Self { c1, d1, c2, d2 }
     }
 

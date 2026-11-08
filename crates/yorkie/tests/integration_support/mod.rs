@@ -1,6 +1,8 @@
 //! Shared helpers for integration tests against a live Yorkie server.
 #![allow(dead_code)]
 
+pub mod events;
+pub mod stub_transport;
 pub mod tree;
 pub mod two_clients;
 
@@ -27,8 +29,17 @@ pub fn unique_key(prefix: &str) -> String {
 }
 
 /// Polls `condition` every 10ms until it holds, failing after five seconds.
-pub async fn eventually(what: &str, mut condition: impl FnMut() -> bool) {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+pub async fn eventually(what: &str, condition: impl FnMut() -> bool) {
+    eventually_within(what, std::time::Duration::from_secs(5), condition).await;
+}
+
+/// Polls `condition` every 10ms until it holds, failing after `timeout`.
+pub async fn eventually_within(
+    what: &str,
+    timeout: std::time::Duration,
+    mut condition: impl FnMut() -> bool,
+) {
+    let deadline = tokio::time::Instant::now() + timeout;
     while !condition() {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -55,6 +66,24 @@ impl<T: Clone + PartialEq + std::fmt::Debug + Send + 'static> EventCollector<T> 
 
     pub fn len(&self) -> usize {
         self.0.lock().unwrap().len()
+    }
+
+    /// Drops the values collected so far (JS `reset`).
+    pub fn reset(&self) {
+        self.0.lock().unwrap().clear();
+    }
+
+    /// The values collected so far.
+    pub fn values(&self) -> Vec<T> {
+        self.0.lock().unwrap().clone()
+    }
+
+    /// Waits until a value equal to `expected` has arrived (JS `waitFor`).
+    pub async fn wait_for(&self, expected: T) {
+        eventually(&format!("{expected:?}"), || {
+            self.0.lock().unwrap().contains(&expected)
+        })
+        .await;
     }
 
     /// Waits until `n` values have arrived and checks the `n`-th (JS
@@ -139,4 +168,25 @@ pub fn json_value(value: serde_json::Value) -> yorkie::JsonValue {
             JsonValue::Object(object)
         }
     }
+}
+
+/// The presence the document stores for `actor`, whether or not that client
+/// is online (JS `getPresenceForTest`). `Document::presence` only answers for
+/// online clients, so this marks the client online for the read and then
+/// restores the online set.
+pub fn presence_for_test(
+    doc: &yorkie::SharedDocument,
+    actor: &yorkie::ActorId,
+) -> Option<yorkie::Presence> {
+    let mut doc = doc.lock().unwrap();
+    if !doc.has_presence(actor) {
+        return None;
+    }
+    if let Some(presence) = doc.presence(actor) {
+        return Some(presence);
+    }
+    doc.add_online_client(actor.clone());
+    let presence = doc.presence(actor);
+    doc.remove_online_client(actor);
+    presence
 }
