@@ -1096,9 +1096,10 @@ Gap:
   expires); every broadcast try checks the channel is still attached (JS
   checks once); `Client::broadcast` waits for its retries (JS resolves after
   the first failed try) and returns a non-retryable failure (JS swallows it);
-  `change_channel_sync_mode` to `Realtime` on a client that is not active
-  yet leaves the stream to the first refresh (JS rejects the call with the
-  same end state). `attach_channel` rejects a key already attached as a
+  `BroadcastOptions::error` gets any final failure of a `Channel::broadcast`
+  (JS calls it only when the first try fails and no retry is left, that is
+  with `maxRetries: 0`: a failure after retries and a non-retryable failure
+  never reach it). `attach_channel` rejects a key already attached as a
   document or channel (JS overwrites the map entry).
 - JS "Should throw error when broadcasting unserializeable payload" has no
   Rust case: a `serde_json::Value` payload always serializes.

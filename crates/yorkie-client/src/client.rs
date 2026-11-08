@@ -763,9 +763,9 @@ impl Client {
                     self.inner.options.channel_heartbeat_interval
                 };
             }
-            // Only `Realtime` watches. A client that is not active yet opens
-            // the stream after its first refresh instead (JS rejects here,
-            // with the same outcome once that refresh lands).
+            // Only `Realtime` watches. As in JS, a client that is not active
+            // yet opens the stream after its first refresh instead (JS
+            // `runWatchLoop` swallows the `ErrClientNotActivated`).
             let watch_ready = (sync_mode == SyncMode::Realtime && active).then(|| {
                 let (task, ready) = watch::spawn_channel(&self.inner, key.clone(), channel.clone());
                 attachment.watch_task = Some(task);
