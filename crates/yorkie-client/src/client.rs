@@ -935,10 +935,15 @@ impl Client {
                 attachment.last_heartbeat_at = Some(Instant::now());
                 // JS: a realtime channel opens its stream once the first
                 // refresh has given the client an ID; it is not awaited.
+                // A stream that stopped is opened again, as JS
+                // `runWatchLoop` does when it has none.
                 if first_call
                     && active
                     && attachment.sync_mode == SyncMode::Realtime
-                    && attachment.watch_task.is_none()
+                    && attachment
+                        .watch_task
+                        .as_ref()
+                        .is_none_or(TaskHandle::is_finished)
                 {
                     let (task, _ready) =
                         watch::spawn_channel(&self.inner, key.clone(), channel.clone());
