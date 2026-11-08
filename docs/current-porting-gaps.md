@@ -1111,9 +1111,10 @@ Gap:
   `UpdateDocument` schema cases, are not ported.
 - When a tree text node carries several disallowed marks, the schema error
   names the first by key; JS names the first set.
-- `DeactivateOptions::keepalive`, `disableGC`,
-  gRPC-web/Connect transport choice, Go TLS options, and Go receive-size/logger
-  options are not modeled yet.
+- `DeactivateOptions::keepalive` exists but has no effect: in JS it keeps a
+  browser `fetch` alive during page unload, which has no Rust counterpart.
+  `disableGC`, gRPC-web/Connect transport choice, Go TLS options, and Go
+  receive-size/logger options are not modeled yet.
 
 Expected direction:
 

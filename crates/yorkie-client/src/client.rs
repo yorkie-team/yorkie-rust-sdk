@@ -356,7 +356,9 @@ impl Client {
 
     /// Marks this client deactivated, stops its loops, and detaches every
     /// attached document and channel locally (JS `deactivateInternal`). It
-    /// takes no task queue, so the loops can call it.
+    /// takes no task queue, so the loops can call it. Called from a loop, it
+    /// aborts that loop's own task at its next `.await`, so the caller must
+    /// return without awaiting anything after it.
     fn deactivate_internal(&self) {
         let (attachments, channels, sync_loop) = {
             let mut state = self.state();

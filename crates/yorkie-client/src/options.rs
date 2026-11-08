@@ -42,6 +42,10 @@ pub enum SyncMode {
 /// caller to retry; the background loops keep the previous token, retry, and
 /// call it again only after a backoff of 1s, doubling up to 30s, jittered by
 /// 20%. A loop that got a refusal waits for that backoff, but at most 5s.
+///
+/// It may run while the client holds its task queue, so it must not call a
+/// one-shot `Client` method (`attach`, `sync`, `deactivate`, and so on):
+/// that waits for the same queue and deadlocks.
 pub type AuthTokenInjector =
     Arc<dyn Fn(Option<String>) -> BoxFuture<'static, ClientResult<String>> + Send + Sync>;
 
@@ -141,9 +145,12 @@ impl PartialEq for ClientOptions {
 
 impl Eq for ClientOptions {}
 
-/// User-settable options for deactivating clients.
+/// User-settable options for deactivating clients (JS `deactivate`
+/// options).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DeactivateOptions {
+    /// Accepted for parity with JS and ignored: in JS it keeps a browser
+    /// `fetch` alive while the page unloads, which has no Rust counterpart.
     pub keepalive: bool,
     pub synchronous: bool,
 }

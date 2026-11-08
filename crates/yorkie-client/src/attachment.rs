@@ -12,6 +12,10 @@ use yorkie_core::Document;
 /// The client locks it only for synchronous steps and never across an
 /// `.await`. Document event callbacks run while the client holds this lock,
 /// so a callback must not lock the same document again: that deadlocks.
+/// A callback that panics stops the sync or watch loop it ran in, as a
+/// throwing callback stops the JS loop, but the loop's `ClientCondition`
+/// stays `true` and the documents are not synced again until the client is
+/// activated again.
 pub type SharedDocument = Arc<Mutex<Document>>;
 
 /// A document attached to a client (JS `Attachment`).
