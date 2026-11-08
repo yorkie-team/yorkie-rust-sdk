@@ -313,11 +313,18 @@ async fn watch_reconnects_after_stream_error() {
     .await;
     let disconnected = DocEvent::ConnectionChanged(StreamConnectionStatus::Disconnected);
     assert!(has_event(&events, &disconnected));
-    eventually("the second stream to connect", || {
-        events.lock().unwrap().last()
-            != Some(&DocEvent::ConnectionChanged(
-                StreamConnectionStatus::Disconnected,
-            ))
+    // `Connected` is published before the second Watch request is sent, so
+    // the server may not watch for `a` yet. Its `Initialized` comes after it
+    // does; the one before `Disconnected` is the closed stream's.
+    eventually("the second stream to initialize", || {
+        let events = events.lock().unwrap();
+        let after_disconnect = events
+            .iter()
+            .rposition(|event| event == &disconnected)
+            .map_or(&events[..], |index| &events[index + 1..]);
+        after_disconnect
+            .iter()
+            .any(|event| matches!(event, DocEvent::Initialized(_)))
     })
     .await;
 
