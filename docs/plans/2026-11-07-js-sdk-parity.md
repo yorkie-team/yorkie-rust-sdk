@@ -5,6 +5,9 @@
 > superpowers:executing-plans to implement this plan task-by-task. Steps use
 > checkbox (`- [ ]`) syntax for tracking.
 
+**Status:** Done (2026-11-08). Task 7 (document broadcast) was folded into
+Task 13: JS has no document broadcast, so broadcast exists only on `Channel`.
+
 **Goal:** Bring the Rust SDK from "CRDT core + transport boundary" to a usable
 SDK comparable to the JS SDK: real network sync against a Yorkie server,
 realtime watch, presence, document events, public Text/Tree, undo/redo,
@@ -96,12 +99,12 @@ commit `54b96762`.
 - Produces: generated types including `PeekChannel*`, `WatchHeartbeat`,
   `ActivateClientResponse.actor_id`, `ChangePack.epoch`.
 
-- [ ] Copy protos, run `cargo run -p protogen`, confirm `git diff --stat`
+- [x] Copy protos, run `cargo run -p protogen`, confirm `git diff --stat`
   only touches proto, generated, and compile-fix files.
-- [ ] Add test `protogen_output_is_up_to_date` (in `tools/protogen/tests/`)
+- [x] Add test `protogen_output_is_up_to_date` (in `tools/protogen/tests/`)
   that regenerates into a temp dir and asserts byte equality with the
   checked-in file.
-- [ ] Verification gate (fmt/clippy/test). Commit
+- [x] Verification gate (fmt/clippy/test). Commit
   "Refresh vendored protos to Yorkie 54b96762".
 
 ### Task 2: Connect transport and integration harness
@@ -129,18 +132,18 @@ commit `54b96762`.
   - `ClientTransport::watch_document(&self, req) -> ClientResult<WatchStream>`
     is added in Task 7, not here.
 
-- [ ] Test `connect_error_body_maps_to_rpc_error` (unit, no network): feed
+- [x] Test `connect_error_body_maps_to_rpc_error` (unit, no network): feed
   `{"code":"not_found","message":"document not found"}` to the decoder and
   assert `ClientError::Rpc { code: "not_found", .. }`.
-- [ ] Integration test `activate_attach_sync_detach_roundtrip`: client A
+- [x] Integration test `activate_attach_sync_detach_roundtrip`: client A
   activates, attaches doc K, sets `k1 = "v1"`, syncs, detaches; client B
   attaches K and asserts `to_sorted_json() == r#"{"k1":"v1"}"#`; both
   deactivate.
-- [ ] Integration test `attach_twice_fails`: second attach of the same key on
+- [x] Integration test `attach_twice_fails`: second attach of the same key on
   one client returns the existing `ClientError` for already-attached.
-- [ ] Implement `ConnectTransport` with reqwest
+- [x] Implement `ConnectTransport` with reqwest
   (`default-features = false, features = ["rustls-tls", "http2"]`).
-- [ ] Verification gate plus integration run against the local server.
+- [x] Verification gate plus integration run against the local server.
   Commit "Add Connect transport for unary RPCs".
 
 ## Milestone 2: Realtime client
@@ -177,13 +180,13 @@ JS refs: `src/document/presence/{presence,change}.ts`, `document.ts`
   - Wire: proto `Presence.data` is `map<string,string>`, each value the JSON
     encoding of the presence value (JS `JSON.stringify`).
 
-- [ ] Port `test/unit/document/presence_test.ts`-style cases: set presence in
+- [x] Port `test/unit/document/presence_test.ts`-style cases: set presence in
   update, `my_presence` reflects it, `to_sorted_json` unaffected.
-- [ ] Test `presence_change_roundtrips_through_change_pack`: encode → decode
+- [x] Test `presence_change_roundtrips_through_change_pack`: encode → decode
   `ChangePack` keeps `PresenceChange::Put` with string `{"name":"\"a\""}` on
   the wire.
-- [ ] Test `snapshot_restores_presences`.
-- [ ] Verification gate. Commit "Add document presence".
+- [x] Test `snapshot_restores_presences`.
+- [x] Verification gate. Commit "Add document presence".
 
 ### Task 4: Document events and subscriptions
 
@@ -219,12 +222,12 @@ JS refs: `document.ts` `DocEventType`, `subscribe` overloads, `publish`;
   remote changes → `RemoteChange`, snapshot → `Snapshot`; `apply_status` →
   `StatusChanged`; presence-only change → `PresenceChanged` for remote actors.
 
-- [ ] Tests `local_change_event_carries_set_and_remove_ops`,
+- [x] Tests `local_change_event_carries_set_and_remove_ops`,
   `remote_change_event_after_apply_change_pack`,
   `subscribe_path_filters_operations` (`$.todos` sees `$.todos` and
   `$.todos.0` paths, not `$.other`), `unsubscribe_stops_delivery`,
   `status_changed_on_apply_status`.
-- [ ] Verification gate. Commit "Add document event subscriptions".
+- [x] Verification gate. Commit "Add document event subscriptions".
 
 ### Task 5: Client owns transport and shares documents
 
@@ -256,14 +259,14 @@ JS refs: `client.ts` `activate`, `attach`, `detach`, `sync`, `deactivate`;
 - Existing mock-transport unit tests are kept by moving them to
   `with_transport` with a `MockTransport` implementing the new trait.
 
-- [ ] Integration test `two_clients_converge_with_manual_sync` (A sets,
+- [x] Integration test `two_clients_converge_with_manual_sync` (A sets,
   sync; B syncs; equal JSON; then B edits, both sync, equal JSON).
-- [ ] Integration test `attach_with_initial_presence` (B sees A's presence
+- [x] Integration test `attach_with_initial_presence` (B sees A's presence
   after both sync in manual mode).
-- [ ] Integration test `deactivate_detaches_documents_and_stops_tasks`
+- [x] Integration test `deactivate_detaches_documents_and_stops_tasks`
   (Review Focus 5): after deactivate, every attached doc status is
   `Detached` and `client.is_active() == false`.
-- [ ] Verification gate. Commit "Let Client own its transport and documents".
+- [x] Verification gate. Commit "Let Client own its transport and documents".
 
 ### Task 6: Watch stream and realtime sync loop
 
@@ -297,20 +300,22 @@ JS refs: `client.ts` `runSyncLoop`, `runWatchLoop`, `handleWatchStream`,
   - `SyncMode::{Realtime, RealtimePushOnly, RealtimeSyncOff, Manual}` follow
     JS semantics; `SyncStatusChanged(Synced | SyncFailed)` published per sync.
 
-- [ ] Unit test `connect_envelope_roundtrip` (encode/decode, end-stream
+- [x] Unit test `connect_envelope_roundtrip` (encode/decode, end-stream
   error JSON → `ClientError::Rpc`).
-- [ ] Integration test `realtime_clients_converge_without_manual_sync`
+- [x] Integration test `realtime_clients_converge_without_manual_sync`
   (poll up to 5 s for equal JSON).
-- [ ] Integration test `watched_and_unwatched_events` (A observes B's
+- [x] Integration test `watched_and_unwatched_events` (A observes B's
   `Watched` with B's initial presence, then `Unwatched` after B detaches).
-- [ ] Integration test `presence_changed_event_in_realtime`.
-- [ ] Integration test `watch_reconnects_after_stream_error` (Review Focus 1):
+- [x] Integration test `presence_changed_event_in_realtime`.
+- [x] Integration test `watch_reconnects_after_stream_error` (Review Focus 1):
   use a test transport wrapper that fails the first watch stream after one
   message; assert a second stream is opened and convergence still happens.
-- [ ] Integration test `change_sync_mode_manual_stops_auto_sync`.
-- [ ] Verification gate. Commit "Add watch stream and realtime sync loop".
+- [x] Integration test `change_sync_mode_manual_stops_auto_sync`.
+- [x] Verification gate. Commit "Add watch stream and realtime sync loop".
 
-### Task 7: Document broadcast
+### Task 7: Document broadcast (folded into Task 13)
+
+> Not implemented as written: broadcast lives on `Channel` (see Task 13).
 
 JS refs: `document.ts` `broadcast`, `client.ts` `broadcast`,
 `test/integration/broadcast_test.ts`.
@@ -325,11 +330,11 @@ JS refs: `document.ts` `broadcast`, `client.ts` `broadcast`,
   `DocEvent::Broadcast`. Payload bytes are the JSON encoding (JS
   `JSON.stringify`).
 
-- [ ] Integration tests `broadcast_reaches_other_client` and
+- [x] Integration tests `broadcast_reaches_other_client` and
   `broadcast_is_not_echoed_to_sender`; unit test that a non-JSON-encodable
   payload cannot be constructed is unnecessary (serde_json::Value is always
   encodable).
-- [ ] Verification gate. Commit "Add document broadcast".
+- [x] Verification gate. Commit "Add document broadcast".
 
 ## Milestone 3: Public data types
 
@@ -357,14 +362,14 @@ JS refs: `src/document/json/text.ts`, `test/unit/document/crdt/text_test.ts`,
   - `EditOperation` op info emits the JS value-change list (one entry per
     affected range), mapped to `OperationInfo::Edit`.
 
-- [ ] Port JS text unit cases: edit/delete/insert sequences,
+- [x] Port JS text unit cases: edit/delete/insert sequences,
   `set_style` and attribute JSON output, `to_sorted_json`.
-- [ ] Test `text_edit_uses_utf16_indexes` (Review Focus 3): insert "안녕😀" then
+- [x] Test `text_edit_uses_utf16_indexes` (Review Focus 3): insert "안녕😀" then
   edit `(2, 4, "")` removes the emoji (2 UTF-16 units); `len()` == 2.
-- [ ] Integration tests from `test/integration/text_test.ts`: concurrent
+- [x] Integration tests from `test/integration/text_test.ts`: concurrent
   insert at same position, concurrent delete-overlap, concurrent style;
   both clients converge.
-- [ ] Verification gate. Commit "Add public Text facade".
+- [x] Verification gate. Commit "Add public Text facade".
 
 ### Task 9: Public Tree facade (insert, delete, style)
 
@@ -387,12 +392,12 @@ JS refs: `src/document/json/tree.ts`, `test/integration/tree_test.ts`
     `style(from, to, attrs)`, `remove_style(from, to, keys)`, `to_xml()`,
     `size()`, `index_to_path`, `path_to_index`, `to_json()`.
 
-- [ ] Port JS tree tests for created-tree XML, insert text/element, delete
+- [x] Port JS tree tests for created-tree XML, insert text/element, delete
   ranges, `edit_by_path`, style/remove_style, and their op-info events.
-- [ ] Integration tests: concurrent insert at same/different positions and
+- [x] Integration tests: concurrent insert at same/different positions and
   concurrent style converge (subset of `tree_concurrency_test.ts`
   without split/merge).
-- [ ] Verification gate. Commit "Add public Tree facade".
+- [x] Verification gate. Commit "Add public Tree facade".
 
 ### Task 10: Tree split and merge through the facade
 
@@ -408,11 +413,11 @@ JS refs: `tree_test.ts` split sections, `tree_concurrent_split_merge_test.ts`,
   boundary range; tree edit op info for split carries `split_level`.
   `TreeEdit` wire carries `split_tickets` as upstream does.
 
-- [ ] Port JS split/merge unit cases and `tree_split_opinfo_test.ts`.
-- [ ] Integration tests from `tree_concurrent_split_merge_test.ts`; known
+- [x] Port JS split/merge unit cases and `tree_split_opinfo_test.ts`.
+- [x] Integration tests from `tree_concurrent_split_merge_test.ts`; known
   upstream-skipped cases stay `#[ignore]` with a reference to
   `docs/crdt-parity/upstream-skipped-tests.md`.
-- [ ] Verification gate. Commit "Support Tree split and merge edits".
+- [x] Verification gate. Commit "Support Tree split and merge edits".
 
 ## Milestone 4: History and validation
 
@@ -434,11 +439,11 @@ JS refs: `src/document/history.ts`, `document.ts` `history` getters and
   presence restored on undo like JS `HistoryOperation` presence entries.
   Tree undo is out of scope and returns no reverse ops (documented gap).
 
-- [ ] Port JS history unit tests for object set/remove, array
+- [x] Port JS history unit tests for object set/remove, array
   add/remove/move, counter increase, text edit/style, presence undo.
-- [ ] Integration test from `history_array_test.ts` (two clients, undo
+- [x] Integration test from `history_array_test.ts` (two clients, undo
   after remote change converges).
-- [ ] Verification gate. Commit "Add document undo and redo".
+- [x] Verification gate. Commit "Add document undo and redo".
 
 ### Task 12: Schema and max-size validation
 
@@ -455,13 +460,13 @@ JS refs: `document.ts` `update` validation block,
   JS messages; validation runs after the updater against the cloned root and
   before commit.
 
-- [ ] Test `rejected_update_rolls_back` (Review Focus 4): with a rule
+- [x] Test `rejected_update_rolls_back` (Review Focus 4): with a rule
   `$.title: string`, setting `title = 1` errors and leaves JSON, pending
   changes, and history unchanged; same for exceeding max size.
-- [ ] Integration tests from `document_schema_test.ts` (attach with schema
+- [x] Integration tests from `document_schema_test.ts` (attach with schema
   key created through the admin API is out of scope; use rules set via
   `set_schema_rules`) and `document_limit_test.ts`.
-- [ ] Verification gate. Commit "Validate updates against schema and size".
+- [x] Verification gate. Commit "Validate updates against schema and size".
 
 ## Milestone 5: Channels and hardening
 
@@ -480,9 +485,9 @@ watch, `test/integration/channel_test.ts`.
   `detach_channel`, `Client::broadcast_channel`; heartbeat refresh every
   `channel_heartbeat_interval_ms`.
 
-- [ ] Integration tests from `channel_test.ts`: count increases when two
+- [x] Integration tests from `channel_test.ts`: count increases when two
   clients attach, decreases after detach; broadcast through channel.
-- [ ] Verification gate. Commit "Add channels".
+- [x] Verification gate. Commit "Add channels".
 
 ### Task 14: Auth token and error codes
 
@@ -499,9 +504,9 @@ JS refs: `client.ts` `authTokenInjector`, `auth_interceptor.ts`,
   re-inject once and retry (JS behavior); `ErrorCode` enum with JS code
   strings and `ClientError::code()`/`YorkieError::code()`; `DocEvent::AuthError`.
 
-- [ ] Unit tests with a mock transport for retry-once-on-expired and
+- [x] Unit tests with a mock transport for retry-once-on-expired and
   error-code mapping.
-- [ ] Verification gate. Commit "Add auth token injector and error codes".
+- [x] Verification gate. Commit "Add auth token injector and error codes".
 
 ### Task 15: Facade, examples, docs, CI
 
@@ -513,8 +518,8 @@ JS refs: `client.ts` `authTokenInjector`, `auth_interceptor.ts`,
   `.github/workflows/ci.yml` (fmt, clippy, unit tests; integration job
   builds `yorkie` from a pinned release and runs it in the background)
 
-- [ ] `cargo run -p yorkie --example quickstart` against the local server
+- [x] `cargo run -p yorkie --example quickstart` against the local server
   prints the converged JSON.
-- [ ] Gap doc reflects the new state: every closed gap removed, remaining
+- [x] Gap doc reflects the new state: every closed gap removed, remaining
   out-of-scope items listed with their JS source paths.
-- [ ] Verification gate. Commit "Document the SDK surface and add CI".
+- [x] Verification gate. Commit "Document the SDK surface and add CI".

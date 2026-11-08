@@ -1,6 +1,6 @@
 # Current Porting Gaps
 
-Last reviewed: 2026-05-19
+Last reviewed: 2026-11-08
 
 This document records known differences between the current Rust SDK and the
 JS/Go implementations. It is intentionally practical: each section explains
@@ -17,6 +17,27 @@ Skipped upstream CRDT tests are tracked in
 while they remain skipped upstream. If ported into Rust, they should stay
 ignored unless the upstream behavior changes or a deliberate Rust divergence is
 documented.
+
+## Out-of-Scope Items
+
+These JS SDK features are deliberately not ported. Each has a JS source to
+start from when it is picked up. Smaller differences are recorded in the
+section of the area they touch.
+
+| Item | JS source | Notes |
+| --- | --- | --- |
+| Offline persistence (doc-store, session-lock, persist policy) | `packages/sdk/src/client/doc-store.ts`, `client/session-lock.ts`, `client/persist-policy.ts`; `test/integration/offline_persistence_test.ts` | Also the `EpochMismatch`, `WriteRejected` (persist), `LocalChangesDropped`, and `PersistDisabled` events. |
+| Devtools | `packages/sdk/src/devtools/` | Browser-only inspector protocol. |
+| Revisions API | `packages/sdk/src/api/revision.ts`, `yorkie.ts`; `test/integration/revision_test.ts` | Admin-side document revisions. |
+| Epoch re-anchor | `packages/sdk/src/document/document.ts` (`EpochMismatch`, minting suspension), `client/client.ts` | `ErrEpochMismatch` stops the sync loop without telling the document. |
+| Identity-preserving undo restore spans and the removal ledger | `packages/sdk/src/document/crdt/rga_tree_split.ts` (`recordRemoval`, `isRemovedInView`), `document/crdt/text.ts`, `document/history.ts` | `restore_spans`/`restore_mode` stay at their defaults. See Undo and Redo and Text. |
+| Disable-GC attach option | `packages/sdk/src/document/document.ts` (`disableGC`), `client/client.ts` | `AttachOptions` has no such field. |
+| Tree undo and redo | `packages/sdk/src/document/operation/tree_edit_operation.ts`, `tree_style_operation.ts`, `document/crdt/tree.ts`, `document/history.ts` | Split and merge reverse machinery. See Undo and Redo. |
+| Auth webhook integration test | `packages/sdk/test/integration/webhook_test.ts` | Needs a server with an auth webhook; the auth path is unit-tested with a mock transport. |
+| Schema and project admin API cases | `packages/sdk/test/integration/document_test.ts`, `schema_test.ts` | `CreateSchema`, `UpdateProject`, `UpdateDocument` need the admin API. |
+| History options | `packages/sdk/src/document/document.ts` (`maxUndoDepth`, `clearHistory`) | See Undo and Redo. |
+| `ChannelStatus.Removed` | `packages/sdk/src/channel/channel.ts` | See Channels and Broadcast. |
+| Text and Tree range helpers | `packages/sdk/src/document/json/text.ts`, `json/tree.ts` | Position-range conversions, `styleByPath`, `removeStyleByPath`. See Public JSON API. |
 
 ## Reference Areas
 
@@ -81,16 +102,15 @@ Gap:
 - Rust has ID-based array insert/delete/move APIs and splice-like array edits,
   but these still operate on the cloned public JSON view and hidden identity
   metadata rather than live CRDT containers.
-- Counter public editing methods are connected to the edit recorder. Text and
-  Tree public editing methods are not connected yet.
+- Counter, Text, and Tree public editing methods are connected to the edit
+  recorder. Text and Tree hold a copy of their CRDT value and apply each edit
+  to it as the callback runs.
 
 Expected direction:
 
 - Continue moving public mutation methods onto the edit recorder.
 - Either remove the clone/diff fallback or narrow it to explicitly unsupported
   compatibility cases once direct mutable JSON escape hatches are redesigned.
-- Connect Text and Tree public facades through the same update-time operation
-  recorder.
 
 ## Public JSON API
 
@@ -745,15 +765,15 @@ Gap:
   `Document::apply_change_pack`.
 - Raw snapshot bytes that have not been decoded by the protocol converter are
   still rejected by core to keep protobuf parsing out of `yorkie-core`.
-- Full sync status transitions are not implemented.
+- `DocStatus` transitions (`Detached`, `Attached`, `Removed`) and the
+  `SyncStatusChanged` and `ConnectionChanged` events are driven by the client
+  (see Client, Sync, and Watch).
 
 Expected direction:
 
 - Add live change context before expanding public document mutation APIs.
 - Extend snapshot handling with presence, GC, and cross-language binary
   fixtures before real client sync.
-- Extend status handling with presence, events, and client-driven lifecycle
-  transitions.
 
 ## Undo and Redo
 
@@ -888,7 +908,7 @@ Gap:
   merge-state root bytes at core wire level, tree protobuf payload round trips
   at protocol level, snapshot-root `ChangePack` protobuf round trips,
   simple and mixed change-pack replay, and a generated-protobuf snapshot apply
-  path. Presence remains blocked by the missing presence model.
+  path. Presence changes and snapshot presences are converted (see above).
 
 Expected direction:
 
@@ -1170,6 +1190,12 @@ Current Rust behavior:
 
 - Unit tests cover current CRDT primitives, object/RHT behavior, array/RGA
   basics, operations, change packs, and document JSON round trips.
+- Integration tests (`crates/yorkie/tests/integration_*.rs`) run against a
+  live server when `YORKIE_TEST_RPC_ADDR` is set and skip themselves
+  otherwise. They cover the client lifecycle, realtime sync and presence,
+  text, tree (including split and merge matrices), history, schema and size
+  limits, and channels with broadcast. CI runs them against a pinned server
+  image (`.github/workflows/ci.yml`).
 
 JS/Go behavior:
 
@@ -1178,7 +1204,8 @@ JS/Go behavior:
 
 Gap:
 
-- Rust tests are hand-picked slices, not a systematic JS test port.
+- Rust tests are hand-picked slices, not a systematic JS test port, though
+  the integration suites port the JS cases of their areas by name.
 - No automated parity harness exists.
 - Array/RGA and operation tests now cover the JS/Go-style insert/move/set/remove
   matrix at CRDT and root-operation layers.
