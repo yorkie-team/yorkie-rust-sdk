@@ -13,11 +13,11 @@ mod integration_support;
 
 use integration_support::events::{collect_connection, collect_presence};
 use integration_support::two_clients::{active_client, shared};
-use integration_support::{presence_for_test, rpc_addr, unique_key};
+use integration_support::{deactivate, presence_for_test, rpc_addr, unique_key};
 use serde_json::{json, Value};
 use yorkie::{
-    ActorId, AttachOptions, Client, DeactivateOptions, DetachOptions, DocEvent, JsonCounter,
-    Presence, SharedDocument, StreamConnectionStatus, SyncMode,
+    ActorId, AttachOptions, Client, DetachOptions, DocEvent, JsonCounter, Presence, SharedDocument,
+    StreamConnectionStatus, SyncMode,
 };
 
 /// JS `DefaultSnapshotThreshold` (`test/helper/helper.ts`).
@@ -73,15 +73,6 @@ fn set_presence(doc: &SharedDocument, value: Value) {
 fn sorted(mut presences: Vec<(ActorId, Presence)>) -> Vec<(ActorId, Presence)> {
     presences.sort_by(|a, b| a.0.cmp(&b.0));
     presences
-}
-
-async fn deactivate(clients: &[&Client]) {
-    for client in clients {
-        client
-            .deactivate(DeactivateOptions::default())
-            .await
-            .unwrap();
-    }
 }
 
 /// JS "Can be built from a snapshot" (doc_presence_test.ts:42).

@@ -28,6 +28,16 @@ pub fn unique_key(prefix: &str) -> String {
     format!("{prefix}-{millis}")
 }
 
+/// Deactivates each client in turn.
+pub async fn deactivate(clients: &[&yorkie::Client]) {
+    for client in clients {
+        client
+            .deactivate(yorkie::DeactivateOptions::default())
+            .await
+            .unwrap();
+    }
+}
+
 /// Polls `condition` every 10ms until it holds, failing after five seconds.
 pub async fn eventually(what: &str, condition: impl FnMut() -> bool) {
     eventually_within(what, std::time::Duration::from_secs(5), condition).await;

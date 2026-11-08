@@ -23,7 +23,7 @@ use integration_support::stub_transport::{
 };
 use integration_support::tree::{edit_tree, element, set_tree, text, xml};
 use integration_support::two_clients::{active_client, manual_attach, shared, TwoClients};
-use integration_support::{eventually, rpc_addr, unique_key};
+use integration_support::{deactivate, eventually, rpc_addr, unique_key};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -115,15 +115,6 @@ fn set_two_paragraphs(doc: &SharedDocument) {
             ],
         ),
     );
-}
-
-async fn deactivate(clients: &[&Client]) {
-    for client in clients {
-        client
-            .deactivate(DeactivateOptions::default())
-            .await
-            .unwrap();
-    }
 }
 
 #[tokio::test]

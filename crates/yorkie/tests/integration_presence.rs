@@ -10,12 +10,12 @@
 mod integration_support;
 
 use integration_support::two_clients::active_client;
-use integration_support::{eventually_within, rpc_addr, unique_key};
+use integration_support::{deactivate, eventually_within, rpc_addr, unique_key};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use yorkie::{
     AttachChannelOptions, Channel, ChannelEvent, ChannelStatus, Client, ClientOptions,
-    DeactivateOptions, SharedChannel, SyncMode,
+    SharedChannel, SyncMode,
 };
 
 fn shared_channel(key: &str) -> SharedChannel {
@@ -64,15 +64,6 @@ async fn wait_for_count(channel: &SharedChannel, expected: u64, timeout: Option<
 }
 
 const EIGHT_SECONDS: Option<Duration> = Some(Duration::from_secs(8));
-
-async fn deactivate(clients: &[&Client]) {
-    for client in clients {
-        client
-            .deactivate(DeactivateOptions::default())
-            .await
-            .unwrap();
-    }
-}
 
 /// JS "single client presence counter test" (presence_test.ts:64).
 #[tokio::test]
