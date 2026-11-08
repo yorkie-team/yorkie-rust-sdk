@@ -1715,9 +1715,11 @@ mod tests {
     };
     use async_trait::async_trait;
     use futures_util::stream::{self, StreamExt};
+    use futures_util::FutureExt;
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::future::Future;
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use yorkie_core::{
@@ -1766,6 +1768,12 @@ mod tests {
         auth_tokens: Mutex<Vec<String>>,
         /// The token in use at each push-pull.
         push_pull_tokens: Mutex<Vec<Option<String>>>,
+        /// When set, the next push-pull waits for it before answering.
+        push_pull_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
+        /// When set, push-pull replies carry no changes and this server seq,
+        /// so a reply that is applied moves the document's server seq and one
+        /// taken as a push ack does not.
+        push_pull_server_seq: Mutex<Option<i64>>,
     }
 
     impl Default for MockTransport {
@@ -1795,6 +1803,8 @@ mod tests {
                 push_pull_errors: Mutex::new(Vec::new()),
                 auth_tokens: Mutex::new(Vec::new()),
                 push_pull_tokens: Mutex::new(Vec::new()),
+                push_pull_gate: Mutex::new(None),
+                push_pull_server_seq: Mutex::new(None),
             }
         }
     }
@@ -1865,10 +1875,26 @@ mod tests {
             self.push_pull_requests.lock().unwrap().push(request);
             let token = self.auth_tokens.lock().unwrap().last().cloned();
             self.push_pull_tokens.lock().unwrap().push(token);
-            let mut errors = self.push_pull_errors.lock().unwrap();
-            if let Some(index) = errors.iter().position(|(error_key, _)| *error_key == key) {
-                return Err(errors.remove(index).1);
+            {
+                let mut errors = self.push_pull_errors.lock().unwrap();
+                if let Some(index) = errors.iter().position(|(error_key, _)| *error_key == key) {
+                    return Err(errors.remove(index).1);
+                }
             }
+            let gate = self.push_pull_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
+            let server_seq = *self.push_pull_server_seq.lock().unwrap();
+            let change_pack = match server_seq {
+                Some(server_seq) => {
+                    let mut pack = converter::to_change_pack(&change_pack).unwrap();
+                    pack.changes.clear();
+                    pack.checkpoint.get_or_insert_default().server_seq = server_seq;
+                    converter::from_change_pack(&pack).unwrap()
+                }
+                None => change_pack,
+            };
             Ok(PushPullChangesResponse { change_pack })
         }
 
@@ -2651,6 +2677,112 @@ mod tests {
         assert!(transport.push_pull_requests.lock().unwrap()[0].push_only);
         assert_eq!(1, doc.lock().unwrap().garbage_len());
         Ok(())
+    }
+
+    /// Sets up a document attached in `sync_mode` with one local change,
+    /// whose next push-pull waits for the returned gate and answers with
+    /// server seq 7.
+    async fn attach_with_gated_push_pull(
+        transport: &Arc<MockTransport>,
+        client: &Client,
+        sync_mode: SyncMode,
+    ) -> ClientResult<(SharedDocument, Arc<tokio::sync::Notify>)> {
+        let doc = shared("doc-key");
+        client.apply_activation("000000000000000000000001");
+        client
+            .attach(
+                doc.clone(),
+                AttachOptions {
+                    sync_mode,
+                    ..AttachOptions::default()
+                },
+            )
+            .await?;
+        doc.lock()
+            .unwrap()
+            .update(|root| root.set("title", "hello").map(|_| ()))?;
+        let gate = Arc::new(tokio::sync::Notify::new());
+        *transport.push_pull_gate.lock().unwrap() = Some(gate.clone());
+        *transport.push_pull_server_seq.lock().unwrap() = Some(7);
+        Ok((doc, gate))
+    }
+
+    /// JS `syncInternal`: a pending pause does not drop the reply of an
+    /// explicit sync of a `Manual` document. Nothing would pull the dropped
+    /// state again, and the caller asked for it.
+    #[test]
+    fn pending_pause_keeps_the_pull_of_a_manual_document() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        let client = mock_client(keyed_options(), &transport);
+        block_on(async {
+            let (doc, gate) =
+                attach_with_gated_push_pull(&transport, &client, SyncMode::Manual).await?;
+
+            // The sync runs up to its request and waits at the gate; the
+            // switch marks its pause and waits behind it on the task queue.
+            let mut sync = Box::pin(client.sync(Some(&doc)));
+            assert!((&mut sync).now_or_never().is_none());
+            let mut switch = Box::pin(client.change_sync_mode(&doc, SyncMode::RealtimePushOnly));
+            assert!((&mut switch).now_or_never().is_none());
+            assert_eq!(
+                1,
+                client.state().attachments["doc-key"]
+                    .pending_pull_pauses
+                    .load(Ordering::SeqCst)
+            );
+
+            gate.notify_one();
+            sync.await?;
+            assert_eq!(7, doc.lock().unwrap().checkpoint().server_seq());
+
+            switch.await?;
+            let state = client.state();
+            let attachment = &state.attachments["doc-key"];
+            assert_eq!(SyncMode::RealtimePushOnly, attachment.sync_mode);
+            assert_eq!(0, attachment.pending_pull_pauses.load(Ordering::SeqCst));
+            Ok(())
+        })
+    }
+
+    /// JS `syncInternal`: a reply dropped for a pending pause re-arms
+    /// `change_event_received`, so a switch that never lands (here, its
+    /// future is dropped before it reaches the task queue) leaves `Realtime`
+    /// pulling the dropped state again. The dropped switch unmarks its pause.
+    #[test]
+    fn pause_that_never_lands_rearms_the_pull() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        let client = mock_client(keyed_options(), &transport);
+        block_on(async {
+            let (doc, gate) =
+                attach_with_gated_push_pull(&transport, &client, SyncMode::Realtime).await?;
+            // As the sync loop does before it syncs.
+            client
+                .state()
+                .attachments
+                .get_mut("doc-key")
+                .unwrap()
+                .change_event_received = false;
+            let server_seq = doc.lock().unwrap().checkpoint().server_seq();
+
+            let mut sync = Box::pin(client.sync(Some(&doc)));
+            assert!((&mut sync).now_or_never().is_none());
+            let mut switch = Box::pin(client.change_sync_mode(&doc, SyncMode::RealtimeSyncOff));
+            assert!((&mut switch).now_or_never().is_none());
+
+            gate.notify_one();
+            sync.await?;
+            // The reply was taken as a push ack only.
+            assert_eq!(server_seq, doc.lock().unwrap().checkpoint().server_seq());
+            assert!(!doc.lock().unwrap().has_local_changes());
+
+            drop(switch);
+            let state = client.state();
+            let attachment = &state.attachments["doc-key"];
+            assert_eq!(SyncMode::Realtime, attachment.sync_mode);
+            assert_eq!(0, attachment.pending_pull_pauses.load(Ordering::SeqCst));
+            assert!(attachment.change_event_received);
+            Ok(())
+        })
     }
 
     #[test]
