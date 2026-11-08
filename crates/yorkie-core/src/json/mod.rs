@@ -1,12 +1,30 @@
+mod text;
+mod tree;
+
 use crate::crdt::counter::{CounterType, CounterValue, CrdtCounter};
 use crate::crdt::primitive::{CrdtPrimitive, PrimitiveValue};
+use crate::crdt::rga_tree_split::RgaTreeSplitPosRange;
+use crate::crdt::tree::TreePos;
+use crate::operation::TreeEditOperation;
 use crate::{Result, TimeTicket, YorkieError};
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt::{self, Write};
-use std::rc::Rc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-pub(crate) type JsonEditRecorderRef = Rc<RefCell<dyn JsonEditRecorder>>;
+pub use text::{JsonText, TextChunk};
+pub use tree::{JsonTree, TreeNodeInput};
+
+pub(crate) type JsonEditRecorderRef = Arc<Mutex<dyn JsonEditRecorder + Send>>;
+
+/// Locks the recorder shared by the proxies of one `Document::update` call.
+///
+/// Each recorder lives for a single update, so a lock poisoned by a panic
+/// there is recovered rather than propagated.
+pub(crate) fn lock_recorder(
+    recorder: &JsonEditRecorderRef,
+) -> MutexGuard<'_, dyn JsonEditRecorder + Send + 'static> {
+    recorder.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 pub(crate) trait JsonEditRecorder {
     fn record_object_set(
@@ -52,6 +70,53 @@ pub(crate) trait JsonEditRecorder {
         value: CounterValue,
         actor: Option<&str>,
     ) -> Result<()>;
+
+    /// Issues the ticket for a text edit or style, which the text applies
+    /// locally before recording it.
+    fn issue_time_ticket(&mut self) -> TimeTicket;
+
+    fn record_text_edit(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        range: RgaTreeSplitPosRange,
+        content: &str,
+        attributes: BTreeMap<String, String>,
+        executed_at: TimeTicket,
+    );
+
+    fn record_text_style(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        range: RgaTreeSplitPosRange,
+        attributes: BTreeMap<String, String>,
+        executed_at: TimeTicket,
+    );
+
+    /// Returns the last ticket issued, which a tree edit runs at (JS
+    /// `ChangeContext.getLastTimeTicket`).
+    fn last_time_ticket(&self) -> TimeTicket;
+
+    /// Records a tree edit the facade built, as JS `Tree.editInternal`
+    /// pushes its operation to the change context.
+    fn record_tree_edit(&mut self, operation: TreeEditOperation);
+
+    fn record_tree_style(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        from_pos: TreePos,
+        to_pos: TreePos,
+        attributes: BTreeMap<String, String>,
+        executed_at: TimeTicket,
+    );
+
+    fn record_tree_remove_style(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        from_pos: TreePos,
+        to_pos: TreePos,
+        attributes_to_remove: Vec<String>,
+        executed_at: TimeTicket,
+    );
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -85,6 +150,8 @@ pub enum JsonValue {
     Double(f64),
     String(String),
     Counter(JsonCounter),
+    Text(JsonText),
+    Tree(JsonTree),
     Object(JsonObject),
     Array(JsonArray),
 }
@@ -124,6 +191,8 @@ impl JsonValue {
             Self::Double(_) => "null".to_owned(),
             Self::String(value) => format!("\"{}\"", escape_json_string(value)),
             Self::Counter(value) => value.to_sorted_json(),
+            Self::Text(value) => value.to_sorted_json(),
+            Self::Tree(value) => value.to_json_string(),
             Self::Object(value) => value.to_sorted_json(),
             Self::Array(value) => value.to_sorted_json(),
         }
@@ -194,9 +263,7 @@ impl JsonCounter {
         let value = value.into();
         self.apply_increase(value, None)?;
         if let Some(recorder) = self.recorder.clone() {
-            recorder
-                .borrow_mut()
-                .record_counter_increase(&self.created_at, value, None)?;
+            lock_recorder(&recorder).record_counter_increase(&self.created_at, value, None)?;
         }
 
         Ok(self)
@@ -219,9 +286,11 @@ impl JsonCounter {
         let value = CounterValue::Integer(1);
         self.apply_increase(value, Some(actor))?;
         if let Some(recorder) = self.recorder.clone() {
-            recorder
-                .borrow_mut()
-                .record_counter_increase(&self.created_at, value, Some(actor))?;
+            lock_recorder(&recorder).record_counter_increase(
+                &self.created_at,
+                value,
+                Some(actor),
+            )?;
         }
 
         Ok(self)
@@ -344,9 +413,7 @@ impl JsonObject {
         let value = value.into();
         let value = if let Some(recorder) = self.recorder.clone() {
             let mut recorded =
-                recorder
-                    .borrow_mut()
-                    .record_object_set(&self.created_at, &key, &value)?;
+                lock_recorder(&recorder).record_object_set(&self.created_at, &key, &value)?;
             recorded.value.attach_recorder(recorder);
             self.member_created_at
                 .insert(key.clone(), recorded.created_at);
@@ -360,15 +427,6 @@ impl JsonObject {
         Ok(self)
     }
 
-    pub(crate) fn set_unchecked(
-        &mut self,
-        key: impl Into<String>,
-        value: impl Into<JsonValue>,
-    ) -> &mut Self {
-        self.members.insert(key.into(), value.into());
-        self
-    }
-
     pub(crate) fn set_tracked_unchecked(
         &mut self,
         key: impl Into<String>,
@@ -379,6 +437,13 @@ impl JsonObject {
         self.members.insert(key.clone(), value.into());
         self.member_created_at.insert(key, created_at);
         self
+    }
+
+    /// Returns the recorder of the update this object belongs to, so a test
+    /// can record an operation the public API cannot produce.
+    #[cfg(test)]
+    pub(crate) fn recorder_for_test(&self) -> Option<JsonEditRecorderRef> {
+        self.recorder.clone()
     }
 
     pub fn get(&self, key: &str) -> Option<&JsonValue> {
@@ -394,9 +459,7 @@ impl JsonObject {
             self.recorder.clone(),
             self.member_created_at.get(key).cloned(),
         ) {
-            recorder
-                .borrow_mut()
-                .record_object_remove(&self.created_at, key, &created_at);
+            lock_recorder(&recorder).record_object_remove(&self.created_at, key, &created_at);
         }
 
         self.member_created_at.remove(key);
@@ -433,6 +496,28 @@ impl JsonObject {
         }
     }
 
+    pub fn get_text_mut(&mut self, key: &str) -> Result<&mut JsonText> {
+        match self.members.get_mut(key) {
+            Some(JsonValue::Text(value)) => Ok(value),
+            Some(_) => Err(YorkieError::UnexpectedType {
+                key: key.to_owned(),
+                expected: "text",
+            }),
+            None => Err(YorkieError::MissingKey(key.to_owned())),
+        }
+    }
+
+    pub fn get_tree_mut(&mut self, key: &str) -> Result<&mut JsonTree> {
+        match self.members.get_mut(key) {
+            Some(JsonValue::Tree(value)) => Ok(value),
+            Some(_) => Err(YorkieError::UnexpectedType {
+                key: key.to_owned(),
+                expected: "tree",
+            }),
+            None => Err(YorkieError::MissingKey(key.to_owned())),
+        }
+    }
+
     pub fn get_object_mut(&mut self, key: &str) -> Result<&mut JsonObject> {
         match self.members.get_mut(key) {
             Some(JsonValue::Object(value)) => Ok(value),
@@ -464,6 +549,26 @@ impl JsonObject {
         let key = key.into();
         self.set(key.clone(), JsonCounter::dedup())?;
         self.get_counter_mut(&key)
+    }
+
+    /// Sets a new empty text at `key` and returns it for editing (JS
+    /// `root[key] = new Text()`).
+    pub fn set_text(&mut self, key: impl Into<String>) -> Result<&mut JsonText> {
+        let key = key.into();
+        self.set(key.clone(), JsonText::new())?;
+        self.get_text_mut(&key)
+    }
+
+    /// Sets a new tree built from `root` at `key` and returns it for editing
+    /// (JS `root[key] = new Tree(root)`).
+    pub fn set_tree(
+        &mut self,
+        key: impl Into<String>,
+        root: TreeNodeInput,
+    ) -> Result<&mut JsonTree> {
+        let key = key.into();
+        self.set(key.clone(), JsonTree::new(root))?;
+        self.get_tree_mut(&key)
     }
 
     pub fn to_sorted_json(&self) -> String {
@@ -552,6 +657,13 @@ impl JsonArray {
     pub fn push_dedup_counter(&mut self) -> Result<&mut JsonCounter> {
         self.push(JsonCounter::dedup())?;
         self.get_counter_mut(self.elements.len() - 1)
+    }
+
+    /// Appends a new empty text and returns it for editing (JS
+    /// `array.push(new Text())`).
+    pub fn push_text(&mut self) -> Result<&mut JsonText> {
+        self.push(JsonText::new())?;
+        self.get_text_mut(self.elements.len() - 1)
     }
 
     pub fn len(&self) -> usize {
@@ -672,9 +784,7 @@ impl JsonArray {
             self.element_created_at.get(index).cloned(),
         ) {
             let mut recorded =
-                recorder
-                    .borrow_mut()
-                    .record_array_set(&self.created_at, &created_at, &value)?;
+                lock_recorder(&recorder).record_array_set(&self.created_at, &created_at, &value)?;
             recorded.value.attach_recorder(recorder);
             self.element_created_at[index] = recorded.created_at;
             self.position_created_at[index] = recorded.position_created_at;
@@ -709,7 +819,7 @@ impl JsonArray {
                     .cloned()
                     .unwrap_or_else(TimeTicket::initial)
             };
-            let mut recorded = recorder.borrow_mut().record_array_insert(
+            let mut recorded = lock_recorder(&recorder).record_array_insert(
                 &self.created_at,
                 &prev_created_at,
                 &value,
@@ -776,9 +886,7 @@ impl JsonArray {
             self.recorder.clone(),
             self.element_created_at.get(index).cloned(),
         ) {
-            recorder
-                .borrow_mut()
-                .record_array_remove(&self.created_at, &created_at);
+            lock_recorder(&recorder).record_array_remove(&self.created_at, &created_at);
         }
 
         if index < self.element_created_at.len() {
@@ -882,10 +990,8 @@ impl JsonArray {
             }
         }
 
-        let mut insert_at = from;
-        for item in items {
+        for (insert_at, item) in (from..).zip(items) {
             self.insert(insert_at, item)?;
-            insert_at += 1;
         }
 
         Ok(removed_values)
@@ -912,6 +1018,20 @@ impl JsonArray {
             Some(_) => Err(YorkieError::UnexpectedType {
                 key: index.to_string(),
                 expected: "counter",
+            }),
+            None => Err(YorkieError::InvalidIndex(format!(
+                "array index {index} out of bounds for length {len}"
+            ))),
+        }
+    }
+
+    pub fn get_text_mut(&mut self, index: usize) -> Result<&mut JsonText> {
+        let len = self.elements.len();
+        match self.elements.get_mut(index) {
+            Some(JsonValue::Text(value)) => Ok(value),
+            Some(_) => Err(YorkieError::UnexpectedType {
+                key: index.to_string(),
+                expected: "text",
             }),
             None => Err(YorkieError::InvalidIndex(format!(
                 "array index {index} out of bounds for length {len}"
@@ -1025,9 +1145,7 @@ impl JsonArray {
             .index_by_element_id(id)
             .ok_or_else(|| YorkieError::MissingCrdtElement(id.to_id_string()))?;
         let position_created_at = if let Some(recorder) = self.recorder.clone() {
-            recorder
-                .borrow_mut()
-                .record_array_move(&self.created_at, &prev_created_at, id)
+            lock_recorder(&recorder).record_array_move(&self.created_at, &prev_created_at, id)
         } else {
             self.position_created_at[target_index].clone()
         };
@@ -1054,6 +1172,8 @@ impl JsonValue {
     pub(crate) fn attach_recorder(&mut self, recorder: JsonEditRecorderRef) {
         match self {
             Self::Counter(value) => value.attach_recorder(recorder),
+            Self::Text(value) => value.attach_recorder(recorder),
+            Self::Tree(value) => value.attach_recorder(recorder),
             Self::Object(value) => value.attach_recorder(recorder),
             Self::Array(value) => value.attach_recorder(recorder),
             Self::Null
@@ -1068,6 +1188,8 @@ impl JsonValue {
     fn detach_recorder(&mut self) {
         match self {
             Self::Counter(value) => value.detach_recorder(),
+            Self::Text(value) => value.detach_recorder(),
+            Self::Tree(value) => value.detach_recorder(),
             Self::Object(value) => value.detach_recorder(),
             Self::Array(value) => value.detach_recorder(),
             Self::Null
@@ -1205,6 +1327,18 @@ impl From<JsonArray> for JsonValue {
 impl From<JsonCounter> for JsonValue {
     fn from(value: JsonCounter) -> Self {
         Self::Counter(value)
+    }
+}
+
+impl From<JsonText> for JsonValue {
+    fn from(value: JsonText) -> Self {
+        Self::Text(value)
+    }
+}
+
+impl From<JsonTree> for JsonValue {
+    fn from(value: JsonTree) -> Self {
+        Self::Tree(value)
     }
 }
 

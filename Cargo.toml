@@ -4,6 +4,7 @@ members = [
     "crates/yorkie-client",
     "crates/yorkie-core",
     "crates/yorkie-protocol",
+    "tools/protogen",
 ]
 resolver = "2"
 

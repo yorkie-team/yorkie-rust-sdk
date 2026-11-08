@@ -1,5 +1,6 @@
 use super::{Change, ChangeId};
 use crate::operation::Operation;
+use crate::presence::PresenceChange;
 use crate::{TimeTicket, INITIAL_DELIMITER};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -9,6 +10,7 @@ pub(crate) struct ChangeContext {
     delimiter: u32,
     message: Option<String>,
     operations: Vec<Operation>,
+    presence_change: Option<PresenceChange>,
 }
 
 impl ChangeContext {
@@ -20,6 +22,7 @@ impl ChangeContext {
             delimiter: INITIAL_DELIMITER,
             message,
             operations: Vec::new(),
+            presence_change: None,
         }
     }
 
@@ -60,6 +63,7 @@ impl ChangeContext {
         };
 
         Change::new(id, self.operations.clone(), self.message.clone())
+            .with_presence_change(self.presence_change.clone())
     }
 
     pub(crate) fn is_presence_only_change(&self) -> bool {
@@ -67,7 +71,11 @@ impl ChangeContext {
     }
 
     pub(crate) fn has_change(&self) -> bool {
-        !self.operations.is_empty()
+        !self.operations.is_empty() || self.presence_change.is_some()
+    }
+
+    pub(crate) fn set_presence_change(&mut self, presence_change: Option<PresenceChange>) {
+        self.presence_change = presence_change;
     }
 
     pub(crate) fn operations(&self) -> &[Operation] {

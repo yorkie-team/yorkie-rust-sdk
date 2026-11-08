@@ -1,6 +1,8 @@
 use super::{Change, Checkpoint};
 use crate::crdt::object::CrdtObject;
-use crate::VersionVector;
+use crate::presence::Presence;
+use crate::{ActorId, VersionVector};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChangePack {
@@ -10,6 +12,7 @@ pub struct ChangePack {
     changes: Vec<Change>,
     snapshot: Option<Vec<u8>>,
     snapshot_root: Option<CrdtObject>,
+    snapshot_presences: BTreeMap<ActorId, Presence>,
     version_vector: Option<VersionVector>,
 }
 
@@ -29,6 +32,7 @@ impl ChangePack {
             changes,
             snapshot,
             snapshot_root: None,
+            snapshot_presences: BTreeMap::new(),
             version_vector,
         }
     }
@@ -70,6 +74,18 @@ impl ChangePack {
         );
         pack.snapshot_root = snapshot_root;
         pack
+    }
+
+    pub(crate) fn with_snapshot_presences(
+        mut self,
+        presences: BTreeMap<ActorId, Presence>,
+    ) -> Self {
+        self.snapshot_presences = presences;
+        self
+    }
+
+    pub(crate) fn snapshot_presences(&self) -> &BTreeMap<ActorId, Presence> {
+        &self.snapshot_presences
     }
 
     pub fn document_key(&self) -> &str {

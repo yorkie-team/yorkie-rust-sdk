@@ -99,13 +99,25 @@ Current `yorkie-client` module layout follows the same split:
 
 | Module | Role |
 | --- | --- |
-| `client.rs` | Client orchestration, lifecycle state, and public client methods. |
-| `options.rs` | Client, attach, detach, channel, and sync mode option types. |
-| `attachment.rs` | Per-resource attachment metadata and sync interval helpers. |
-| `transport.rs` | Request/response DTOs and transport traits for RPC boundaries. |
+| `client.rs` | Client orchestration, lifecycle state, the async task queue, and public client methods (documents and channels). |
+| `options.rs` | Client, attach, detach, channel, and sync mode option types, default intervals, and `AuthTokenInjector`. |
+| `attachment.rs` | `SharedDocument`, per-document attachment metadata, and sync interval helpers. |
+| `channel.rs` | `Channel`, `SharedChannel`, channel status, events, subscriptions, and broadcast options. |
+| `sync_loop.rs` | The background sync loop (JS `runSyncLoop`) for documents and channels. |
+| `watch.rs` | Document and channel watch loops (JS `runWatchLoop`), reconnect, and idle timeout. |
+| `auth.rs` | Auth token refresh state and backoff around `AuthTokenInjector` (JS `refreshAuthToken`). |
+| `transport.rs` | Request/response DTOs and the `ClientTransport` trait for RPC boundaries. |
+| `connect.rs` | `ConnectTransport`: unary and server-streaming RPCs over the Connect protocol (reqwest). |
 | `protocol.rs` | Conversion between client transport DTOs and generated protobuf request/response types. |
-| `error.rs` | Client-layer error and result types. |
+| `error.rs` | Client-layer error and result types, including `ClientError::code`. |
 | `lib.rs` | Crate entrypoint and public re-exports only. |
+
+`yorkie-core` keeps `serde_json` as its only data dependency beyond the
+standard library, for presence and attribute values. It stays free of tokio,
+reqwest, prost, and getrandom.
+
+`yorkie-client` uses `getrandom` only to generate client keys: a key must be
+unguessable, so it comes from the OS CSPRNG, as JS draws it from Web Crypto.
 
 Avoid sibling modules that call into each other in both directions. If that
 happens, extract the shared type or function into a lower-level module.

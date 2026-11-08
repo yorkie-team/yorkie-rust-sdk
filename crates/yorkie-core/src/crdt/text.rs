@@ -1,11 +1,13 @@
-use super::element::{CrdtElementMeta, DataSize};
+use super::element::{CrdtElementMeta, DataSize, GcPairSite};
 use super::rga_tree_split::{
     RgaTreeSplit, RgaTreeSplitNode, RgaTreeSplitNodeId, RgaTreeSplitPos, RgaTreeSplitPosRange,
-    RgaTreeSplitValue,
+    RgaTreeSplitValue, SplitEditResult,
 };
 use super::rht::{Rht, RhtNode};
-use crate::json::escape_json_string;
-use crate::{JsonArray, JsonObject, JsonValue, Result, TimeTicket, VersionVector};
+use crate::event::parse_attrs;
+use crate::json::{escape_json_string, TextChunk};
+use crate::{Result, TimeTicket, VersionVector, YorkieError};
+use serde_json::Value;
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,20 +57,14 @@ impl TextValue {
         self.attributes.to_object()
     }
 
-    pub(crate) fn to_json_object(&self) -> Result<JsonObject> {
-        let mut object = JsonObject::new();
+    /// Returns this value as a public text chunk, decoding the stored
+    /// attribute values (JS `CRDTText.values` entry).
+    pub(crate) fn to_chunk(&self) -> TextChunk {
         let attributes = self.get_attributes();
-
-        if !attributes.is_empty() {
-            let mut attrs = JsonObject::new();
-            for (key, value) in attributes {
-                attrs.set_unchecked(key, attribute_value_to_json_value(&value));
-            }
-            object.set("attrs", attrs)?;
+        TextChunk {
+            content: self.content.clone(),
+            attributes: (!attributes.is_empty()).then(|| parse_attrs(attributes)),
         }
-
-        object.set("val", self.content.clone())?;
-        Ok(object)
     }
 
     pub(crate) fn purge(&mut self, node: &RhtNode) {
@@ -163,6 +159,29 @@ pub(crate) struct TextStyleChange {
     pub(crate) attributes_to_remove: Vec<String>,
 }
 
+type TextStyleResult = (
+    Vec<RhtNode>,
+    DataSize,
+    Vec<TextStyleChange>,
+    BTreeMap<String, String>,
+    Vec<String>,
+);
+type TextRemoveStyleResult = (
+    Vec<RhtNode>,
+    DataSize,
+    Vec<TextStyleChange>,
+    BTreeMap<String, String>,
+);
+
+impl std::fmt::Display for CrdtText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for node in self.rga_tree_split.iter().filter(|node| !node.is_removed()) {
+            f.write_str(node.value().content())?;
+        }
+        Ok(())
+    }
+}
+
 impl CrdtText {
     pub(crate) fn new(created_at: TimeTicket, rga_tree_split: RgaTreeSplit<TextValue>) -> Self {
         Self {
@@ -193,6 +212,10 @@ impl CrdtText {
 
     pub(crate) fn positioned_at(&self) -> &TimeTicket {
         self.meta.positioned_at()
+    }
+
+    pub(crate) fn set_created_at(&mut self, created_at: TimeTicket) {
+        self.meta.set_created_at(created_at);
     }
 
     pub(crate) fn set_moved_at(&mut self, moved_at: Option<TimeTicket>) -> bool {
@@ -239,6 +262,53 @@ impl CrdtText {
         self.rga_tree_split.index_to_pos(index)
     }
 
+    /// Returns the position range of the given index range for a local edit
+    /// or style (JS `CRDTText.createRange`). Unlike `index_range_to_pos_range`
+    /// it rejects an index that splits a UTF-16 surrogate pair. JS also
+    /// rejects content holding a lone surrogate, which a Rust `&str` cannot
+    /// hold.
+    pub(crate) fn create_range(
+        &self,
+        from_idx: usize,
+        to_idx: usize,
+    ) -> Result<RgaTreeSplitPosRange> {
+        let range = self.index_range_to_pos_range(from_idx, to_idx)?;
+        self.validate_utf16_boundary(&range.0)?;
+        if from_idx != to_idx {
+            self.validate_utf16_boundary(&range.1)?;
+        }
+
+        Ok(range)
+    }
+
+    /// Fails when `pos` falls between the halves of a surrogate pair. JS also
+    /// reads the neighbouring node at either end of the node, for a pair that
+    /// an earlier mid-pair split left in two nodes. Rust text nodes hold
+    /// `String`s, which cannot hold half a pair, so no pair spans two nodes.
+    fn validate_utf16_boundary(&self, pos: &RgaTreeSplitPos) -> Result<()> {
+        let Some(node) = self.rga_tree_split.find_node(pos.id()) else {
+            return Err(YorkieError::InvalidTextPosition(format!(
+                "node not found for {}",
+                pos.id().to_test_string()
+            )));
+        };
+
+        let mut units = 0;
+        for ch in node.value().content().chars() {
+            if units >= pos.relative_offset() {
+                break;
+            }
+            units += ch.len_utf16();
+        }
+        if units != pos.relative_offset() {
+            return Err(YorkieError::InvalidTextPosition(
+                "index must not split a UTF-16 surrogate pair".to_owned(),
+            ));
+        }
+
+        Ok(())
+    }
+
     pub(crate) fn find_indexes_from_range(
         &self,
         range: &RgaTreeSplitPosRange,
@@ -262,7 +332,7 @@ impl CrdtText {
         attributes: Option<BTreeMap<String, String>>,
         edited_at: TimeTicket,
         version_vector: Option<&VersionVector>,
-    ) -> Result<(Vec<RgaTreeSplitNode<TextValue>>, DataSize, Vec<TextValue>)> {
+    ) -> Result<SplitEditResult<TextValue>> {
         let range = self.index_range_to_pos_range(from_idx, to_idx)?;
         self.edit_by_range(range, content, attributes, edited_at, version_vector)
     }
@@ -274,7 +344,7 @@ impl CrdtText {
         attributes: Option<BTreeMap<String, String>>,
         edited_at: TimeTicket,
         version_vector: Option<&VersionVector>,
-    ) -> Result<(Vec<RgaTreeSplitNode<TextValue>>, DataSize, Vec<TextValue>)> {
+    ) -> Result<SplitEditResult<TextValue>> {
         let content = content.into();
         let value = if content.is_empty() {
             None
@@ -288,10 +358,8 @@ impl CrdtText {
             Some(value)
         };
 
-        let (_, pairs, diff, removed_values) =
-            self.rga_tree_split
-                .edit(range, edited_at, value, version_vector)?;
-        Ok((pairs, diff, removed_values))
+        self.rga_tree_split
+            .edit(range, edited_at, value, version_vector)
     }
 
     pub(crate) fn set_style_by_index(
@@ -324,13 +392,7 @@ impl CrdtText {
         attributes: BTreeMap<String, String>,
         edited_at: TimeTicket,
         version_vector: Option<&VersionVector>,
-    ) -> Result<(
-        Vec<RhtNode>,
-        DataSize,
-        Vec<TextStyleChange>,
-        BTreeMap<String, String>,
-        Vec<String>,
-    )> {
+    ) -> Result<TextStyleResult> {
         let mut diff = DataSize::default();
         let (_, diff_to, to_right) = self
             .rga_tree_split
@@ -478,12 +540,7 @@ impl CrdtText {
         attributes_to_remove: &[String],
         edited_at: TimeTicket,
         version_vector: Option<&VersionVector>,
-    ) -> Result<(
-        Vec<RhtNode>,
-        DataSize,
-        Vec<TextStyleChange>,
-        BTreeMap<String, String>,
-    )> {
+    ) -> Result<TextRemoveStyleResult> {
         let mut diff = DataSize::default();
         let (_, diff_to, to_right) = self
             .rga_tree_split
@@ -602,30 +659,18 @@ impl CrdtText {
         self.rga_tree_split.to_json()
     }
 
-    pub(crate) fn to_json_array(&self) -> Result<JsonArray> {
-        let mut array = JsonArray::new();
-        for node in self.rga_tree_split.iter() {
-            if node.is_removed() {
-                continue;
-            }
-
-            array.push(node.value().to_json_object()?)?;
-        }
-
-        Ok(array)
+    /// Returns the content-attributes pairs of the live nodes (JS
+    /// `CRDTText.values`).
+    pub(crate) fn values(&self) -> Vec<TextChunk> {
+        self.rga_tree_split
+            .iter()
+            .filter(|node| !node.is_removed())
+            .map(|node| node.value().to_chunk())
+            .collect()
     }
 
     pub(crate) fn to_sorted_json(&self) -> String {
         self.to_json()
-    }
-
-    pub(crate) fn to_string(&self) -> String {
-        self.rga_tree_split
-            .iter()
-            .filter(|node| !node.is_removed())
-            .map(|node| node.value().content())
-            .collect::<Vec<_>>()
-            .join("")
     }
 
     pub(crate) fn to_test_string(&self) -> String {
@@ -652,6 +697,22 @@ impl CrdtText {
         }
 
         pairs
+    }
+
+    /// Looks up the GC pair child `child_id`, a removed text node or a
+    /// removed attribute, in the order `purge_gc_pair_by_id` purges (see
+    /// `CrdtElement::locate_gc_pair`). Attributes are not ordered, so
+    /// nothing bars their purge.
+    pub(crate) fn locate_gc_pair(&self, child_id: &str) -> Option<GcPairSite> {
+        self.rga_tree_split
+            .purge_barrier_by_id(child_id)
+            .or_else(|| {
+                self.rga_tree_split
+                    .iter()
+                    .any(|node| node.value().attributes().has_id(child_id))
+                    .then_some(None)
+            })
+            .map(|barrier| GcPairSite::new(self.created_at(), barrier))
     }
 
     pub(crate) fn purge_gc_pair_by_id(&mut self, child_id: &str) -> bool {
@@ -693,71 +754,16 @@ fn split_utf16(value: &str, offset: usize) -> (String, String) {
     )
 }
 
+/// Encodes a stored attribute value for `to_json` (JS `CRDTTextValue.toJSON`):
+/// a value that parses as JSON is re-encoded, and one that does not is
+/// emitted as a string. Re-encoding, rather than splicing the raw value in,
+/// keeps a peer-chosen value from forging structure in the document JSON.
 fn attribute_value_to_json(value: &str) -> String {
-    let trimmed = value.trim();
-    if trimmed.starts_with('"') && trimmed.ends_with('"') {
-        return trimmed.to_owned();
+    match serde_json::from_str::<Value>(value) {
+        Ok(Value::String(value)) => format!("\"{}\"", escape_json_string(&value)),
+        Ok(value) => value.to_string(),
+        Err(_) => format!("\"{}\"", escape_json_string(value)),
     }
-
-    match trimmed {
-        "true" | "false" | "null" => trimmed.to_owned(),
-        _ if trimmed.parse::<f64>().is_ok() => trimmed.to_owned(),
-        _ => format!("\"{}\"", escape_json_string(value)),
-    }
-}
-
-fn attribute_value_to_json_value(value: &str) -> JsonValue {
-    let trimmed = value.trim();
-    if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
-        return JsonValue::String(unescape_json_string(&trimmed[1..trimmed.len() - 1]));
-    }
-
-    match trimmed {
-        "true" => JsonValue::Bool(true),
-        "false" => JsonValue::Bool(false),
-        "null" => JsonValue::Null,
-        _ => trimmed
-            .parse::<i32>()
-            .map(JsonValue::Integer)
-            .or_else(|_| trimmed.parse::<i64>().map(JsonValue::Long))
-            .or_else(|_| trimmed.parse::<f64>().map(JsonValue::Double))
-            .unwrap_or_else(|_| JsonValue::String(value.to_owned())),
-    }
-}
-
-fn unescape_json_string(value: &str) -> String {
-    let mut unescaped = String::new();
-    let mut chars = value.chars();
-
-    while let Some(ch) = chars.next() {
-        if ch != '\\' {
-            unescaped.push(ch);
-            continue;
-        }
-
-        match chars.next() {
-            Some('"') => unescaped.push('"'),
-            Some('\\') => unescaped.push('\\'),
-            Some('/') => unescaped.push('/'),
-            Some('b') => unescaped.push('\u{08}'),
-            Some('f') => unescaped.push('\u{0c}'),
-            Some('n') => unescaped.push('\n'),
-            Some('r') => unescaped.push('\r'),
-            Some('t') => unescaped.push('\t'),
-            Some('u') => {
-                let hex = chars.by_ref().take(4).collect::<String>();
-                if let Ok(code) = u32::from_str_radix(&hex, 16) {
-                    if let Some(ch) = char::from_u32(code) {
-                        unescaped.push(ch);
-                    }
-                }
-            }
-            Some(ch) => unescaped.push(ch),
-            None => unescaped.push('\\'),
-        }
-    }
-
-    unescaped
 }
 
 fn add_data_size(target: &mut DataSize, size: DataSize) {
@@ -800,15 +806,27 @@ mod tests {
     }
 
     #[test]
-    fn converts_text_values_to_json_objects_without_document_key_validation() -> crate::Result<()> {
+    fn serializes_attribute_keys_without_document_key_validation() {
         let mut value = TextValue::create("H");
         value.set_attr("font.size", "12", ticket(1));
 
+        assert_eq!(r#"{"attrs":{"font.size":12},"val":"H"}"#, value.to_json());
+    }
+
+    // JS `CRDTTextValue.toJSON` re-encodes a parsed value and emits a raw
+    // one as a string, so neither can break out of the document JSON.
+    #[test]
+    fn serializes_attribute_values_by_parsing_them_as_json() {
+        let mut value = TextValue::create("H");
+        value.set_attr("color", "red", ticket(1));
+        value.set_attr("list", r#"[1, "a"]"#, ticket(2));
+        value.set_attr("raw", r#"x","y":"z"#, ticket(3));
+        value.set_attr("nan", "NaN", ticket(4));
+
         assert_eq!(
-            r#"{"attrs":{"font.size":12},"val":"H"}"#,
-            value.to_json_object()?.to_sorted_json()
+            r#"{"attrs":{"color":"red","list":[1,"a"],"nan":"NaN","raw":"x\",\"y\":\"z"},"val":"H"}"#,
+            value.to_json()
         );
-        Ok(())
     }
 
     #[test]
@@ -1052,10 +1070,20 @@ mod tests {
         )?;
 
         left.edit_by_range(insert_range, "C", None, right_insert_at, Some(&seen_base))?;
-        right.edit_by_range(delete_range, "", None, left_delete_at, Some(&seen_base))?;
+        let result =
+            right.edit_by_range(delete_range, "", None, left_delete_at, Some(&seen_base))?;
 
         assert_eq!(r#"[{"val":"C"}]"#, left.to_json());
         assert_eq!(left.to_json(), right.to_json());
+
+        // The deletion did not see "C", so it removes two runs around it
+        // and reports each, last first (JS `RGATreeSplit.makeChanges`).
+        let ranges = result
+            .changes
+            .iter()
+            .map(|change| (change.from, change.to, change.value.is_none()))
+            .collect::<Vec<_>>();
+        assert_eq!(vec![(2, 3, true), (0, 1, true)], ranges);
         Ok(())
     }
 
@@ -1235,11 +1263,10 @@ mod tests {
         let mut text = CrdtText::create(ticket(1));
         text.edit_by_index(0, 0, "Hello", None, ticket(2), None)?;
 
-        let (removed_nodes, _, removed_values) =
-            text.edit_by_index(1, 4, "", None, ticket(3), None)?;
+        let result = text.edit_by_index(1, 4, "", None, ticket(3), None)?;
 
-        assert_eq!(1, removed_nodes.len());
-        assert_eq!(1, removed_values.len());
+        assert_eq!(1, result.removed_nodes.len());
+        assert_eq!(1, result.removed_values.len());
         assert_eq!("Ho", text.to_string());
         assert_eq!(r#"[{"val":"H"},{"val":"o"}]"#, text.to_json());
 

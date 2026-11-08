@@ -154,7 +154,7 @@ impl StyleOperation {
         self.meta.executed_at()
     }
 
-    pub(crate) fn from_pos(&self) -> &RgaTreeSplitPos {
+    pub(crate) fn range_from(&self) -> &RgaTreeSplitPos {
         &self.from_pos
     }
 

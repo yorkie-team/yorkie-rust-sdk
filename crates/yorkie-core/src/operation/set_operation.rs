@@ -99,6 +99,10 @@ impl SetOperation {
         &self.value
     }
 
+    pub(crate) fn value_mut(&mut self) -> &mut CrdtElement {
+        &mut self.value
+    }
+
     pub(crate) fn to_test_string(&self) -> String {
         format!(
             "{}.SET.{}={}",

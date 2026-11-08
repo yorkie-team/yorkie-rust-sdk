@@ -93,8 +93,16 @@ impl AddOperation {
         &self.prev_created_at
     }
 
+    pub(crate) fn set_prev_created_at(&mut self, prev_created_at: TimeTicket) {
+        self.prev_created_at = prev_created_at;
+    }
+
     pub(crate) fn value(&self) -> &CrdtElement {
         &self.value
+    }
+
+    pub(crate) fn value_mut(&mut self) -> &mut CrdtElement {
+        &mut self.value
     }
 
     pub(crate) fn to_test_string(&self) -> String {

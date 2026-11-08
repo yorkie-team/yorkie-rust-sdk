@@ -1,5 +1,5 @@
 use super::counter::CrdtCounter;
-use super::element::{CrdtElement, CrdtElementMeta, DataSize};
+use super::element::{CrdtElement, CrdtElementMeta, DataSize, GcPairSite};
 use super::object::CrdtObject;
 use super::rga_tree_list::{RgaTreeList, RgaTreeListNode};
 use super::text::CrdtText;
@@ -54,6 +54,10 @@ impl CrdtArray {
 
     pub(crate) fn positioned_at(&self) -> &TimeTicket {
         self.meta.positioned_at()
+    }
+
+    pub(crate) fn set_created_at(&mut self, created_at: TimeTicket) {
+        self.meta.set_created_at(created_at);
     }
 
     pub(crate) fn set_moved_at(&mut self, moved_at: Option<TimeTicket>) -> bool {
@@ -489,6 +493,38 @@ impl CrdtArray {
         }
 
         None
+    }
+
+    /// Clears the split-sibling links of every tree under this array,
+    /// removed elements included (the array half of JS
+    /// `dropSplitLinksInElement`).
+    pub(crate) fn drop_split_links(&mut self) {
+        for node in self.elements.iter_all_mut() {
+            if let Some(element) = node.element_mut() {
+                super::split_links::drop_split_links_in_element(element);
+            }
+        }
+    }
+
+    /// Returns the ticket that must be covered before the removed element
+    /// `created_at` may be purged: purging it unlinks the position node
+    /// holding it, so the array's order decides when that is safe (JS
+    /// `CRDTArray.purgeBarrierAt`).
+    pub(crate) fn purge_barrier_at(&self, created_at: &TimeTicket) -> Option<TimeTicket> {
+        self.elements.purge_barrier_at(created_at)
+    }
+
+    /// Looks up the GC pair child `child_id` in this array's dead position
+    /// nodes and then under its elements (see
+    /// `CrdtElement::locate_gc_pair`).
+    pub(crate) fn locate_gc_pair(&self, child_id: &str) -> Option<GcPairSite> {
+        self.elements
+            .purge_barrier_by_id(child_id)
+            .map(|barrier| GcPairSite::new(self.created_at(), barrier))
+            .or_else(|| {
+                self.iter_all()
+                    .find_map(|child| child.locate_gc_pair(child_id))
+            })
     }
 
     pub(crate) fn purge_gc_pair_by_id(&mut self, child_id: &str) -> bool {

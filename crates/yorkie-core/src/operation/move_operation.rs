@@ -105,8 +105,16 @@ impl MoveOperation {
         &self.prev_created_at
     }
 
+    pub(crate) fn set_prev_created_at(&mut self, prev_created_at: TimeTicket) {
+        self.prev_created_at = prev_created_at;
+    }
+
     pub(crate) fn created_at(&self) -> &TimeTicket {
         &self.created_at
+    }
+
+    pub(crate) fn set_created_at(&mut self, created_at: TimeTicket) {
+        self.created_at = created_at;
     }
 
     pub(crate) fn to_test_string(&self) -> String {

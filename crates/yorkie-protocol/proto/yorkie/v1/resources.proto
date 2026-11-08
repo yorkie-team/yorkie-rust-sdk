@@ -44,9 +44,25 @@ message ChangePack {
   Checkpoint checkpoint = 2;
   bytes snapshot = 3;
   repeated Change changes = 4;
-  TimeTicket min_synced_ticket = 5; // deprecated
+  // min_synced_ticket is superseded by version_vector and is written by no
+  // SDK and read by no server. It stays declared rather than `reserved`
+  // because the repository gates proto changes on buf's FILE category, whose
+  // FIELD_NO_DELETE fires on a removed number even when it is reserved.
+  TimeTicket min_synced_ticket = 5 [deprecated = true];
   bool is_removed = 6;
   VersionVector version_vector = 7;
+  int64 epoch = 8;
+  // capabilities is the negotiation channel for wire features a peer may not
+  // understand. A server sets it on the pack it returns to advertise what it
+  // supports; a client must treat absence as "unsupported" rather than as
+  // "unknown", because a server that predates a feature cannot say so.
+  //
+  // It exists because a server does not store the bytes a client sent: it
+  // re-encodes from its own domain model, so a field it does not know is
+  // dropped from the stored change log and the push still succeeds. Without a
+  // handshake a client cannot tell that its restore was silently downgraded to
+  // an ordinary insert. Measured against a pinned v0.7.20 server.
+  repeated string capabilities = 9;
 }
 
 message Change {
@@ -74,12 +90,14 @@ message Operation {
     string key = 2;
     JSONElementSimple value = 3;
     TimeTicket executed_at = 4;
+    RestoreMode restore_mode = 5;
   }
   message Add {
     TimeTicket parent_created_at = 1;
     TimeTicket prev_created_at = 2;
     JSONElementSimple value = 3;
     TimeTicket executed_at = 4;
+    RestoreMode restore_mode = 5;
   }
   message Move {
     TimeTicket parent_created_at = 1;
@@ -96,10 +114,21 @@ message Operation {
     TimeTicket parent_created_at = 1;
     TextNodePos from = 2;
     TextNodePos to = 3;
-    map<string, TimeTicket> created_at_map_by_actor = 4; // deprecated
+    // created_at_map_by_actor is superseded by the change's version vector and
+    // is written by no SDK. See ChangePack.min_synced_ticket for why it is
+    // deprecated rather than reserved.
+    map<string, TimeTicket> created_at_map_by_actor = 4 [deprecated = true];
     string content = 5;
     TimeTicket executed_at = 6;
     map<string, string> attributes = 7;
+    repeated RestoreSpan restore_spans = 8; // identity-preserving undo/redo
+    RestoreMode restore_mode = 9;
+    // retombstone_spans is the companion span set for an identity-preserving
+    // reverse op: restore_spans is content the reversed edit removed (to
+    // revive), retombstone_spans is content it inserted (to re-remove). Both
+    // are addressed by original identity so a revived neighbour keeps its
+    // relative order across chained undo/redo. restore_mode selects direction.
+    repeated RestoreSpan retombstone_spans = 10;
   }
   message Style {
     TimeTicket parent_created_at = 1;
@@ -107,7 +136,8 @@ message Operation {
     TextNodePos to = 3;
     map<string, string> attributes = 4;
     TimeTicket executed_at = 5;
-    map<string, TimeTicket> created_at_map_by_actor = 6; // deprecated
+    // Deprecated for the same reason as Edit.created_at_map_by_actor.
+    map<string, TimeTicket> created_at_map_by_actor = 6 [deprecated = true];
     repeated string attributes_to_remove = 7;
   }
   message Increase {
@@ -120,10 +150,19 @@ message Operation {
     TimeTicket parent_created_at = 1;
     TreePos from = 2;
     TreePos to = 3;
-    map<string, TimeTicket> created_at_map_by_actor = 4; // deprecated
+    // Deprecated for the same reason as Edit.created_at_map_by_actor.
+    map<string, TimeTicket> created_at_map_by_actor = 4 [deprecated = true];
     repeated TreeNodes contents = 5;
     int32 split_level = 7;
     TimeTicket executed_at = 6;
+    repeated TreeRestoreSpan restore_spans = 8; // identity-preserving undo/redo
+    RestoreMode restore_mode = 9;
+    repeated TreeRestoreSpan retombstone_spans = 10;
+    // split_tickets carries the tickets the originating replica issued for the
+    // nodes an element split creates, in issue order. Empty for a change
+    // written before this field existed, which replays through the simulation
+    // that reconstructed them from executed_at and the content count.
+    repeated TimeTicket split_tickets = 11;
   }
   message TreeStyle {
     TimeTicket parent_created_at = 1;
@@ -132,13 +171,15 @@ message Operation {
     map<string, string> attributes = 4;
     TimeTicket executed_at = 5;
     repeated string attributes_to_remove = 6;
-    map<string, TimeTicket> created_at_map_by_actor = 7; // deprecated
+    // Deprecated for the same reason as Edit.created_at_map_by_actor.
+    map<string, TimeTicket> created_at_map_by_actor = 7 [deprecated = true];
   }
   message ArraySet {
     TimeTicket parent_created_at = 1;
     TimeTicket created_at = 2;
     JSONElementSimple value = 3;
     TimeTicket executed_at = 4;
+    RestoreMode restore_mode = 5;
   }
 
   oneof body {
@@ -155,10 +196,17 @@ message Operation {
   }
 }
 
+// JSONElementSimple is the value an operation carries: the element's identity
+// plus its encoded contents. Its moved_at and removed_at carry no lifecycle
+// state -- nothing ever wrote them, because an element reaching a replica
+// inside an operation has neither moved nor been removed yet. The snapshot
+// form, JSONElement, is where both are actually populated.
 message JSONElementSimple {
   TimeTicket created_at = 1;
-  TimeTicket moved_at = 2;
-  TimeTicket removed_at = 3;
+  // Never written. See the message comment; deprecated rather than reserved
+  // for the reason given on ChangePack.min_synced_ticket.
+  TimeTicket moved_at = 2 [deprecated = true];
+  TimeTicket removed_at = 3 [deprecated = true];
   ValueType type = 4;
   bytes value = 5;
 }
@@ -173,12 +221,16 @@ message JSONElement {
     TimeTicket created_at = 2;
     TimeTicket moved_at = 3;
     TimeTicket removed_at = 4;
+    // revived_at is the revive half of the liveness register. See the comment
+    // on RestoreMode for why an element needs one.
+    TimeTicket revived_at = 5;
   }
   message JSONArray {
     repeated RGANode nodes = 1;
     TimeTicket created_at = 2;
     TimeTicket moved_at = 3;
     TimeTicket removed_at = 4;
+    TimeTicket revived_at = 5;
   }
   message Primitive {
     ValueType type = 1;
@@ -186,12 +238,14 @@ message JSONElement {
     TimeTicket created_at = 3;
     TimeTicket moved_at = 4;
     TimeTicket removed_at = 5;
+    TimeTicket revived_at = 6;
   }
   message Text {
     repeated TextNode nodes = 1;
     TimeTicket created_at = 2;
     TimeTicket moved_at = 3;
     TimeTicket removed_at = 4;
+    TimeTicket revived_at = 5;
   }
   message Counter {
     ValueType type = 1;
@@ -201,12 +255,14 @@ message JSONElement {
     TimeTicket removed_at = 5;
     reserved 6; // was is_dedup, now encoded in ValueType
     bytes hll_registers = 7;
+    TimeTicket revived_at = 8;
   }
   message Tree {
     repeated TreeNode nodes = 1;
     TimeTicket created_at = 2;
     TimeTicket moved_at = 3;
     TimeTicket removed_at = 4;
+    TimeTicket revived_at = 5;
   }
 
   oneof body {
@@ -224,8 +280,16 @@ message RHTNode {
   JSONElement element = 2;
 }
 
+// RGANode is one position slot of an array, serialized as a flat repeated
+// field by its container rather than as a linked list. The recursive `next`
+// is a leftover of the linked-list form: nothing writes it, and because it
+// stays declared, a server unmarshalling element bytes is still obliged to be
+// ready to parse a chain as deep as the array is long.
 message RGANode {
-  RGANode next = 1;
+  // Never written; the container's flat `nodes` carries the order instead.
+  // Deprecated rather than reserved for the reason given on
+  // ChangePack.min_synced_ticket.
+  RGANode next = 1 [deprecated = true];
   JSONElement element = 2;
   TimeTicket position_created_at = 3;
   TimeTicket position_moved_at = 4;
@@ -244,6 +308,15 @@ message TextNode {
   TimeTicket removed_at = 3;
   TextNodeID ins_prev_id = 4;
   map<string, NodeAttr> attributes = 5;
+  // removal_events is the removal ledger beyond removed_at: every removal of
+  // this node and every undo that cancelled one, except removed_at itself.
+  // An actor's events alternate in ticket order, a removal then the undo
+  // cancelling it, so each is told apart by its place. Empty when removed_at
+  // says it all. A piece recreated after GC records a stand-in removal by the
+  // undoing actor at lamport 0, then its cancel. The pairing relies on an
+  // undo cancelling only its own actor's removal; a change to that rule needs
+  // a new field, not a new reading of this one.
+  repeated TimeTicket removal_events = 6;
 }
 
 message TextNodeID {
@@ -330,6 +403,7 @@ message Project {
   int32 max_size_per_document = 15;
   bool remove_on_detach = 16;
   bool auto_revision_enabled = 27;
+  string channel_session_ttl = 28;
   repeated string allowed_origins = 14;
   google.protobuf.Timestamp created_at = 12;
   google.protobuf.Timestamp updated_at = 13;
@@ -374,6 +448,7 @@ message UpdatableProjectFields {
   google.protobuf.Int32Value max_size_per_document = 10;
   google.protobuf.BoolValue remove_on_detach = 11;
   google.protobuf.BoolValue auto_revision_enabled = 22;
+  google.protobuf.StringValue channel_session_ttl = 23;
   AllowedOrigins allowed_origins = 9;
 }
 
@@ -396,9 +471,19 @@ message PresenceChange {
     CHANGE_TYPE_PUT = 1;
     CHANGE_TYPE_DELETE = 2;
     CHANGE_TYPE_CLEAR = 3;
+    // CHANGE_TYPE_PATCH carries only the top-level keys that changed since
+    // the sender's previous presence: set entries in presence, deleted keys
+    // in removed_keys. Clients send it only to a server that advertises the
+    // "presence-patch" capability on ChangePack. The server folds it into
+    // a CHANGE_TYPE_PUT of the full presence before storing, so it never
+    // appears in a pulled change.
+    CHANGE_TYPE_PATCH = 4;
   }
   ChangeType type = 1;
   Presence presence = 2;
+  // removed_keys lists the top-level keys a CHANGE_TYPE_PATCH deletes. Unused
+  // by the other change types.
+  repeated string removed_keys = 3;
 }
 
 message Presence {
@@ -419,6 +504,62 @@ message TextNodePos {
   TimeTicket created_at = 1;
   int32 offset = 2;
   int32 relative_offset = 3;
+}
+
+// RestoreSpan carries a run of characters from a single original text
+// insertion, addressed by split-invariant absolute offsets [start, end),
+// for identity-preserving undo/redo. content and attributes are a deep
+// copy of the removed value so restore is independent of GC state.
+message RestoreSpan {
+  TimeTicket created_at = 1;
+  int32 start = 2;
+  int32 end = 3;
+  string content = 4;
+  map<string, string> attributes = 5;
+}
+
+// RestoreMode selects the identity-preserving path. RESTORE_MODE_UNSPECIFIED
+// means an ordinary edit (no restore semantics), keeping forward edits
+// unchanged on the wire.
+//
+// For elements it selects between reviving the element already in the tree and
+// inserting a copy of it. The copy is what undo does today, and because a
+// deep copy keeps every descendant's created_at, it puts a second live element
+// under ids the document is indexed by. Reviving needs a replicated liveness
+// register -- removed_at paired with revived_at on each element -- so that
+// every replica resolves a remove/revive race the same way, with a tie going
+// to the removal as the shipped remove register already does.
+//
+// The branch cannot be chosen from local state. A replica that collected
+// between the removal and the undo has purged the tombstone, and one that
+// joined from a later snapshot never had it, so "revive if a tombstone is
+// present" is a function of local collection timing and the same change log
+// would produce different documents. That is why the branch is on the wire.
+enum RestoreMode {
+  RESTORE_MODE_UNSPECIFIED = 0;
+  RESTORE_MODE_RESTORE = 1;
+  RESTORE_MODE_RETOMBSTONE = 2;
+}
+
+// TreeRestoreSpan carries a tree node run from a single deletion, addressed
+// by TreeNodeID identity, for identity-preserving Tree undo/redo. Unlike the
+// text RestoreSpan (flat offsets), a tree span records the node's structure
+// (type/attrs) and its position anchors, because in a tree id-order is not
+// sibling-order: left_sibling_id and right_sibling_id are redundant external
+// boundary anchors of the deleted run, so restore can reconstruct the run's
+// internal order from the op's own spans and needs only one surviving
+// boundary to place it. value/attributes are a deep copy so a GC-purged node
+// can be recreated.
+message TreeRestoreSpan {
+  TreeNodeID id = 1;
+  string node_type = 2;
+  bool is_text = 3;
+  int32 length = 4;
+  string value = 5;
+  map<string, NodeAttr> attributes = 6;
+  TreeNodeID parent_id = 7;
+  TreeNodeID left_sibling_id = 8;
+  TreeNodeID right_sibling_id = 9;
 }
 
 message TimeTicket {

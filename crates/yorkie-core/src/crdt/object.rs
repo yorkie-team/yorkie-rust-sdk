@@ -1,6 +1,6 @@
 use super::array::CrdtArray;
 use super::counter::CrdtCounter;
-use super::element::{CrdtElement, CrdtElementMeta, DataSize};
+use super::element::{CrdtElement, CrdtElementMeta, DataSize, GcPairSite};
 use super::element_rht::ElementRht;
 use super::text::CrdtText;
 use super::tree::CrdtTree;
@@ -57,6 +57,10 @@ impl CrdtObject {
 
     pub(crate) fn positioned_at(&self) -> &TimeTicket {
         self.meta.positioned_at()
+    }
+
+    pub(crate) fn set_created_at(&mut self, created_at: TimeTicket) {
+        self.meta.set_created_at(created_at);
     }
 
     pub(crate) fn set_moved_at(&mut self, moved_at: Option<TimeTicket>) -> bool {
@@ -430,6 +434,23 @@ impl CrdtObject {
         }
 
         None
+    }
+
+    /// Clears the split-sibling links of every tree under this object,
+    /// removed members included (the object half of JS
+    /// `dropSplitLinksInElement`).
+    pub(crate) fn drop_split_links(&mut self) {
+        for node in self.member_nodes.iter_mut() {
+            super::split_links::drop_split_links_in_element(node.value_mut());
+        }
+    }
+
+    /// Looks up the GC pair child `child_id` under this object's members
+    /// (see `CrdtElement::locate_gc_pair`).
+    pub(crate) fn locate_gc_pair(&self, child_id: &str) -> Option<GcPairSite> {
+        self.member_nodes
+            .iter()
+            .find_map(|node| node.value().locate_gc_pair(child_id))
     }
 
     pub(crate) fn purge_gc_pair_by_id(&mut self, child_id: &str) -> bool {

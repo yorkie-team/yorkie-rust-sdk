@@ -316,10 +316,41 @@ impl RgaTreeList {
             .element_map_by_created_at
             .get(&created_id)
             .copied()
-            .ok_or_else(|| YorkieError::MissingCrdtElement(created_id))?;
+            .ok_or(YorkieError::MissingCrdtElement(created_id))?;
         self.remove_at_position_index(position_index);
         self.rebuild_indexes();
         Ok(())
+    }
+
+    /// Returns the ticket that must be covered before the removed element
+    /// `created_at` may be unlinked: the positioning ticket of the node
+    /// behind its position node, which `find_next_before_executed_at` would
+    /// read in its place. `None` at the tail, or when the element has no
+    /// position here (JS `RGATreeList.purgeBarrierAt` for an element).
+    pub(crate) fn purge_barrier_at(&self, created_at: &TimeTicket) -> Option<TimeTicket> {
+        let position_index = self.position_index_by_element_created_at(created_at)?;
+        self.successor_barrier_at(position_index)
+    }
+
+    /// Looks up the dead position node `child_id` that `purge_by_id` would
+    /// purge. Returns `None` when this list holds no such node, and
+    /// otherwise `Some` of its barrier, as `purge_barrier_at` computes it
+    /// (JS `RGATreeList.purgeBarrierAt` for a dead position node).
+    pub(crate) fn purge_barrier_by_id(&self, child_id: &str) -> Option<Option<TimeTicket>> {
+        let position_index = self.node_map_by_created_at.get(child_id).copied()?;
+        let node = self.node_at_position_index(position_index)?;
+        if node.element.is_some() || node.removed_at.is_none() {
+            return None;
+        }
+        Some(self.successor_barrier_at(position_index))
+    }
+
+    /// Returns the positioning ticket of the node that would become
+    /// `find_next_before_executed_at`'s stopping point once the node at
+    /// `position_index` is unlinked (JS `successorBarrierAt`).
+    fn successor_barrier_at(&self, position_index: usize) -> Option<TimeTicket> {
+        self.node_at_position_index(position_index + 1)
+            .map(|next| next.positioned_at().clone())
     }
 
     pub(crate) fn purge_by_id(&mut self, child_id: &str) -> bool {

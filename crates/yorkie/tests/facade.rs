@@ -1,105 +1,154 @@
+use async_trait::async_trait;
+use futures_util::stream;
 use std::future::Future;
-use std::task::{Context, Poll, Waker};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use yorkie::{
     ActivateClientRequest, ActivateClientResponse, ActorId, AttachChannelOptions,
-    AttachDocumentRequest, AttachDocumentResponse, AttachOptions, ChangePack, Checkpoint, Client,
-    ClientCondition, ClientError, ClientStatus, ClientTransport, CounterType, CounterValue,
-    DeactivateClientRequest, DeactivateClientResponse, DeactivateOptions, DetachDocumentRequest,
-    DetachDocumentResponse, DetachOptions, DocStatus, Document, JsonCounter,
-    PushPullChangesRequest, PushPullChangesResponse, RemoveDocumentRequest, RemoveDocumentResponse,
-    Result, SchemaRule, SyncMode, SyncOptions, TimeTicket, TimeTicketStruct, TreeNodeRule,
-    VersionVector,
+    AttachDocumentRequest, AttachDocumentResponse, AttachOptions, BroadcastRequest,
+    BroadcastResponse, ChangePack, ChannelWatchStream, Checkpoint, Client, ClientCondition,
+    ClientError, ClientStatus, ClientTransport, CounterType, CounterValue, DeactivateClientRequest,
+    DeactivateClientResponse, DeactivateOptions, DetachDocumentRequest, DetachDocumentResponse,
+    DetachOptions, DocStatus, Document, JsonCounter, PeekChannelRequest, PeekChannelResponse,
+    Presence, PushPullChangesRequest, PushPullChangesResponse, RefreshChannelRequest,
+    RefreshChannelResponse, RemoveDocumentRequest, RemoveDocumentResponse, Result, SchemaRule,
+    SharedDocument, SyncMode, TimeTicket, TimeTicketStruct, TreeNodeRule, VersionVector,
+    WatchChannelRequest, WatchDocumentRequest, WatchStream,
 };
 
 #[derive(Debug, Default)]
 struct FacadeTransport {
-    activate_requests: usize,
-    attach_requests: usize,
-    detach_requests: usize,
-    remove_requests: usize,
-    push_pull_requests: usize,
+    activate_requests: AtomicUsize,
+    attach_requests: AtomicUsize,
+    detach_requests: AtomicUsize,
+    remove_requests: AtomicUsize,
+    push_pull_requests: AtomicUsize,
 }
 
+#[async_trait]
 impl ClientTransport for FacadeTransport {
     async fn activate_client(
-        &mut self,
+        &self,
         _request: ActivateClientRequest,
     ) -> yorkie::ClientResult<ActivateClientResponse> {
-        self.activate_requests += 1;
+        self.activate_requests.fetch_add(1, Ordering::SeqCst);
         Ok(ActivateClientResponse {
             client_id: ActorId::new("000000000000000000000001"),
+            actor_id: None,
         })
     }
 
     async fn deactivate_client(
-        &mut self,
+        &self,
         _request: DeactivateClientRequest,
     ) -> yorkie::ClientResult<DeactivateClientResponse> {
         Ok(DeactivateClientResponse)
     }
 
     async fn attach_document(
-        &mut self,
+        &self,
         request: AttachDocumentRequest,
     ) -> yorkie::ClientResult<AttachDocumentResponse> {
-        self.attach_requests += 1;
+        self.attach_requests.fetch_add(1, Ordering::SeqCst);
         Ok(AttachDocumentResponse {
             document_id: "document-id".to_owned(),
             change_pack: request.change_pack,
             max_size_per_document: 1024,
+            // Updates are checked against these rules: the test sets a
+            // string title. Tree node rules apply to `yorkie.Tree` rules only.
             schema_rules: vec![SchemaRule::new(
-                "$.profile",
-                "object",
+                "$.title",
+                "string",
                 vec![TreeNodeRule::new("paragraph", "text*", "bold", "block")],
             )],
         })
     }
 
     async fn detach_document(
-        &mut self,
+        &self,
         request: DetachDocumentRequest,
     ) -> yorkie::ClientResult<DetachDocumentResponse> {
-        self.detach_requests += 1;
+        self.detach_requests.fetch_add(1, Ordering::SeqCst);
         Ok(DetachDocumentResponse {
             change_pack: request.change_pack,
         })
     }
 
     async fn remove_document(
-        &mut self,
+        &self,
         request: RemoveDocumentRequest,
     ) -> yorkie::ClientResult<RemoveDocumentResponse> {
-        self.remove_requests += 1;
+        self.remove_requests.fetch_add(1, Ordering::SeqCst);
         Ok(RemoveDocumentResponse {
             change_pack: request.change_pack,
         })
     }
 
     async fn push_pull_changes(
-        &mut self,
+        &self,
         request: PushPullChangesRequest,
     ) -> yorkie::ClientResult<PushPullChangesResponse> {
-        self.push_pull_requests += 1;
+        self.push_pull_requests.fetch_add(1, Ordering::SeqCst);
         Ok(PushPullChangesResponse {
             change_pack: request.change_pack,
         })
     }
+
+    async fn watch_document(
+        &self,
+        _request: WatchDocumentRequest,
+    ) -> yorkie::ClientResult<WatchStream> {
+        Ok(Box::pin(stream::pending()))
+    }
+
+    async fn refresh_channel(
+        &self,
+        _request: RefreshChannelRequest,
+    ) -> yorkie::ClientResult<RefreshChannelResponse> {
+        Err(ClientError::Transport(
+            "channels are not used here".to_owned(),
+        ))
+    }
+
+    async fn peek_channel(
+        &self,
+        _request: PeekChannelRequest,
+    ) -> yorkie::ClientResult<PeekChannelResponse> {
+        Err(ClientError::Transport(
+            "channels are not used here".to_owned(),
+        ))
+    }
+
+    async fn watch_channel(
+        &self,
+        _request: WatchChannelRequest,
+    ) -> yorkie::ClientResult<ChannelWatchStream> {
+        Err(ClientError::Transport(
+            "channels are not used here".to_owned(),
+        ))
+    }
+
+    async fn broadcast(
+        &self,
+        _request: BroadcastRequest,
+    ) -> yorkie::ClientResult<BroadcastResponse> {
+        Err(ClientError::Transport(
+            "channels are not used here".to_owned(),
+        ))
+    }
 }
 
+/// Runs one client call on a fresh runtime; the loops it starts stop when
+/// the runtime is dropped.
 fn block_on<F>(future: F) -> F::Output
 where
     F: Future,
 {
-    let waker = Waker::noop();
-    let mut context = Context::from_waker(waker);
-    let mut future = std::pin::pin!(future);
-
-    loop {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(output) => return output,
-            Poll::Pending => std::thread::yield_now(),
-        }
-    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(future)
 }
 
 #[test]
@@ -151,11 +200,12 @@ fn facade_exports_time_api() {
 
 #[test]
 fn facade_exports_client_api() {
-    let mut client = Client::default();
-    let mut transport = FacadeTransport::default();
-    let mut doc = Document::new("doc-key");
+    let transport = Arc::new(FacadeTransport::default());
+    let client = Client::with_transport(Default::default(), transport.clone());
+    let doc: SharedDocument = Arc::new(Mutex::new(Document::new("doc-key")));
     let attach_options = AttachOptions {
-        sync_mode: Some(SyncMode::Polling),
+        sync_mode: SyncMode::Polling,
+        initial_presence: Presence::new(),
         ..AttachOptions::default()
     };
     let channel_options = AttachChannelOptions {
@@ -168,28 +218,29 @@ fn facade_exports_client_api() {
     assert!(!client.condition(ClientCondition::SyncLoop));
     assert_eq!(
         ClientError::ClientNotActivated(client.key().to_owned()),
-        block_on(client.attach(&mut transport, &mut doc, attach_options.clone())).unwrap_err()
+        block_on(client.attach(doc.clone(), attach_options.clone())).unwrap_err()
     );
-    block_on(client.activate(&mut transport)).unwrap();
+    block_on(client.activate()).unwrap();
     assert_eq!(ClientStatus::Activated, client.status());
-    assert_eq!(1, transport.activate_requests);
-    assert_eq!(Some(SyncMode::Polling), attach_options.sync_mode);
+    assert_eq!(1, transport.activate_requests.load(Ordering::SeqCst));
+    assert_eq!(SyncMode::Polling, attach_options.sync_mode);
     assert_eq!(Some(SyncMode::Realtime), channel_options.sync_mode);
-    block_on(client.attach(&mut transport, &mut doc, attach_options)).unwrap();
+    block_on(client.attach(doc.clone(), attach_options)).unwrap();
     assert!(client.has("doc-key"));
-    assert_eq!(1024, doc.max_size_per_document());
-    assert_eq!(1, doc.schema_rules().len());
-    assert_eq!(1, transport.attach_requests);
-    doc.update(|root| root.set("title", "hello").map(|_| ()))
+    assert_eq!(1024, doc.lock().unwrap().max_size_per_document());
+    assert_eq!(1, doc.lock().unwrap().schema_rules().len());
+    assert_eq!(1, transport.attach_requests.load(Ordering::SeqCst));
+    doc.lock()
+        .unwrap()
+        .update(|root| root.set("title", "hello").map(|_| ()))
         .unwrap();
-    block_on(client.sync(&mut transport, &mut doc)).unwrap();
-    assert!(!doc.has_local_changes());
-    assert_eq!(1, transport.push_pull_requests);
-    assert_eq!(SyncOptions::default(), SyncOptions { sync_mode: None });
-    block_on(client.remove(&mut transport, &mut doc)).unwrap();
+    block_on(client.sync(Some(&doc))).unwrap();
+    assert!(!doc.lock().unwrap().has_local_changes());
+    assert_eq!(1, transport.push_pull_requests.load(Ordering::SeqCst));
+    block_on(client.remove(&doc)).unwrap();
     assert!(!client.has("doc-key"));
-    assert_eq!(DocStatus::Removed, doc.status());
-    assert_eq!(1, transport.remove_requests);
+    assert_eq!(DocStatus::Removed, doc.lock().unwrap().status());
+    assert_eq!(1, transport.remove_requests.load(Ordering::SeqCst));
     assert_eq!(
         DeactivateOptions::default(),
         DeactivateOptions {
@@ -198,5 +249,5 @@ fn facade_exports_client_api() {
         }
     );
     assert_eq!(DetachOptions, DetachOptions);
-    assert_eq!(0, transport.detach_requests);
+    assert_eq!(0, transport.detach_requests.load(Ordering::SeqCst));
 }

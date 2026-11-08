@@ -1,14 +1,20 @@
 use super::ChangeId;
 use crate::crdt::root::CrdtRoot;
 use crate::operation::{OpInfo, OpSource, Operation};
+use crate::presence::{Presence, PresenceChange};
 use crate::time::ActorId;
 use crate::Result;
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Change {
     id: ChangeId,
     operations: Vec<Operation>,
     message: Option<String>,
+    presence_change: Option<PresenceChange>,
+    /// Whether an undo or a redo produced this change (JS `isUndoRedo`).
+    /// Local only: it picks the source a replay runs the change with.
+    undo_redo: bool,
 }
 
 impl Change {
@@ -17,6 +23,53 @@ impl Change {
             id,
             operations,
             message,
+            presence_change: None,
+            undo_redo: false,
+        }
+    }
+
+    /// Marks this change as produced by an undo or a redo (JS
+    /// `markAsUndoRedo`).
+    pub(crate) fn mark_as_undo_redo(&mut self) {
+        self.undo_redo = true;
+    }
+
+    /// Returns the source a replay of this local change runs with (JS
+    /// `replaySourceOf`): the source it first ran with.
+    pub(crate) fn replay_source(&self) -> OpSource {
+        if self.undo_redo {
+            OpSource::UndoRedo
+        } else {
+            OpSource::Local
+        }
+    }
+
+    pub(crate) fn with_presence_change(mut self, presence_change: Option<PresenceChange>) -> Self {
+        self.presence_change = presence_change;
+        self
+    }
+
+    pub(crate) fn presence_change(&self) -> Option<&PresenceChange> {
+        self.presence_change.as_ref()
+    }
+
+    /// Applies this change's presence change to the actor's entry (JS
+    /// `Change.execute`, presence part).
+    pub(crate) fn apply_presence_change(&self, presences: &mut BTreeMap<ActorId, Presence>) {
+        match &self.presence_change {
+            Some(PresenceChange::Put(presence)) => {
+                presences.insert(self.id.actor_id().clone(), presence.clone());
+            }
+            Some(PresenceChange::Patch(patch)) => {
+                let entry = presences.entry(self.id.actor_id().clone()).or_default();
+                for (key, value) in patch {
+                    entry.insert(key.clone(), value.clone());
+                }
+            }
+            Some(PresenceChange::Clear) => {
+                presences.remove(self.id.actor_id());
+            }
+            None => {}
         }
     }
 
@@ -33,32 +86,58 @@ impl Change {
         root: &mut CrdtRoot,
         source: OpSource,
     ) -> Result<ChangeExecutionResult> {
-        let mut op_infos = Vec::new();
-        let mut operations = Vec::new();
-        let mut reverse_ops = Vec::new();
-
+        let mut result = ChangeExecutionResult::default();
         for operation in &self.operations {
-            let Some(execution_result) = operation.execute_with_version_vector(
-                root,
-                source,
-                Some(self.id.version_vector()),
-            )?
-            else {
-                continue;
-            };
-
-            op_infos.extend(execution_result.op_infos);
-            operations.push(operation.clone());
-            if let Some(reverse_op) = execution_result.reverse_op {
-                reverse_ops.insert(0, reverse_op);
-            }
+            self.execute_operation(operation, root, source, &mut result)?;
         }
+        Ok(result)
+    }
 
-        Ok(ChangeExecutionResult {
-            operations,
-            op_infos,
-            reverse_ops,
-        })
+    /// Executes a change built from a history entry, with
+    /// `OpSource::UndoRedo`.
+    ///
+    /// Each undo edit is first refined against the text as it stands when the
+    /// edit runs, and keeps the refined positions: JS refines by mutating the
+    /// operation inside `execute`, so those are the positions the change
+    /// carries to other replicas.
+    pub(crate) fn execute_undo_redo(
+        &mut self,
+        root: &mut CrdtRoot,
+    ) -> Result<ChangeExecutionResult> {
+        let mut result = ChangeExecutionResult::default();
+        for index in 0..self.operations.len() {
+            if let Operation::Edit(operation) = &mut self.operations[index] {
+                operation.refine_undo_positions(root)?;
+            }
+            self.execute_operation(
+                &self.operations[index],
+                root,
+                OpSource::UndoRedo,
+                &mut result,
+            )?;
+        }
+        Ok(result)
+    }
+
+    fn execute_operation(
+        &self,
+        operation: &Operation,
+        root: &mut CrdtRoot,
+        source: OpSource,
+        result: &mut ChangeExecutionResult,
+    ) -> Result<()> {
+        let Some(execution_result) =
+            operation.execute_with_version_vector(root, source, Some(self.id.version_vector()))?
+        else {
+            return Ok(());
+        };
+
+        result.op_infos.extend(execution_result.op_infos);
+        result.operations.push(operation.clone());
+        if let Some(reverse_op) = execution_result.reverse_op {
+            result.reverse_ops.insert(0, reverse_op);
+        }
+        Ok(())
     }
 
     pub(crate) fn id(&self) -> &ChangeId {
@@ -96,7 +175,7 @@ impl Change {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct ChangeExecutionResult {
     pub(crate) operations: Vec<Operation>,
     pub(crate) op_infos: Vec<OpInfo>,

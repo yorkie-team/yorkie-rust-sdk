@@ -1,6 +1,8 @@
 use super::{ExecutionResult, OpInfo, OpSource, Operation, OperationMeta};
 use crate::crdt::root::CrdtRoot;
-use crate::crdt::tree::{TreeEditChange, TreeEditResult, TreeNode, TreeNodeId, TreePos};
+use crate::crdt::tree::{
+    fallback_split_tickets, TreeEditChange, TreeEditResult, TreeNode, TreeNodeId, TreePos,
+};
 use crate::time::ActorId;
 use crate::{Result, TimeTicket, VersionVector, YorkieError};
 
@@ -11,6 +13,11 @@ pub(crate) struct TreeEditOperation {
     to_pos: TreePos,
     contents: Option<Vec<TreeNode>>,
     split_level: usize,
+    /// The tickets the editing replica issued for the elements its split
+    /// created, in issue order (JS `splitTickets`). Empty for a change
+    /// written before the field existed, which falls back to rebuilding
+    /// them from `executed_at`.
+    split_tickets: Vec<TimeTicket>,
 }
 
 impl TreeEditOperation {
@@ -28,6 +35,7 @@ impl TreeEditOperation {
             to_pos,
             contents,
             split_level,
+            split_tickets: Vec::new(),
         }
     }
 
@@ -64,14 +72,32 @@ impl TreeEditOperation {
                 return Err(self.tree_parent_error(root));
             };
 
-            let result = tree.edit_by_range_with_changes(
+            // The split takes the carried tickets in order, then the ones a
+            // replica rebuilds from the edit and its top-level contents.
+            let mut split_tickets = self.split_tickets.iter().cloned();
+            let mut fallback =
+                fallback_split_tickets(&executed_at, self.contents.as_ref().map(Vec::len));
+            let mut issue_split_ticket = || split_tickets.next().unwrap_or_else(&mut fallback);
+            let result = tree.edit(
                 range,
                 self.contents.clone(),
                 self.split_level,
                 executed_at,
+                &mut issue_split_ticket,
                 version_vector,
             )?;
-            let reverse_op = self.to_reverse_operation(tree, &result)?;
+            // The reverse is measured on the tree after the edit, from
+            // indexes taken before it, which a concurrent merge can leave
+            // outside the tree. Tree undo is not ported yet, so a reverse
+            // that cannot be built is dropped rather than failing the edit,
+            // which JS applies.
+            //
+            // NOTE: this drops every error, local edits included, and
+            // `HistoryOperation::entry` drops the reverse that is built:
+            // nothing reaches the undo stack today. A Tree undo port has to
+            // keep the errors of local edits, or an undo entry goes missing
+            // without notice.
+            let reverse_op = self.to_reverse_operation(tree, &result).ok().flatten();
             (result, reverse_op)
         };
 
@@ -94,7 +120,7 @@ impl TreeEditOperation {
         self.meta.executed_at()
     }
 
-    pub(crate) fn from_pos(&self) -> &TreePos {
+    pub(crate) fn range_from(&self) -> &TreePos {
         &self.from_pos
     }
 
@@ -110,11 +136,29 @@ impl TreeEditOperation {
         self.split_level
     }
 
+    /// Returns the tickets issued for the elements the split created (JS
+    /// `getSplitTickets`).
+    pub(crate) fn split_tickets(&self) -> &[TimeTicket] {
+        &self.split_tickets
+    }
+
+    /// Records the tickets issued for the elements the split created (JS
+    /// `setSplitTickets`).
+    pub(crate) fn set_split_tickets(&mut self, split_tickets: Vec<TimeTicket>) {
+        self.split_tickets = split_tickets;
+    }
+
     pub(crate) fn set_executed_at(&mut self, executed_at: TimeTicket) {
         self.meta.set_executed_at(executed_at);
     }
 
+    /// Sets the actor of this operation and of the tickets its split issued,
+    /// which carry the actor of the change (JS `setActor`).
     pub(crate) fn set_actor(&mut self, actor_id: impl Into<ActorId>) {
+        let actor_id = actor_id.into();
+        for ticket in &mut self.split_tickets {
+            *ticket = ticket.set_actor(actor_id.clone());
+        }
         self.meta.set_actor(actor_id);
     }
 
@@ -217,7 +261,9 @@ fn changes_to_op_infos(path: String, changes: Vec<TreeEditChange>) -> Vec<OpInfo
             from_path: change.from_path,
             to_path: change.to_path,
             value: change.value,
-            split_level: change.split_level,
+            // JS `TreeEditOpInfo.splitLevel` exists, but no change sets it: a
+            // split is reported as an empty change where it opened.
+            split_level: None,
         })
         .collect()
 }
@@ -251,7 +297,7 @@ mod tests {
     use crate::crdt::root::CrdtRoot;
     use crate::crdt::tree::{CrdtTree, TreeNode, TreeNodeId};
     use crate::operation::{OpInfo, OpSource, Operation};
-    use crate::TimeTicket;
+    use crate::{TimeTicket, VersionVector};
 
     #[test]
     fn inserts_tree_element_content() -> crate::Result<()> {
@@ -284,9 +330,10 @@ mod tests {
                 to: 0,
                 from_path: vec![0],
                 to_path: vec![0],
-                value: Some(vec![
-                    r#"{"type":"p","children":[{"type":"text","value":"hello"}]}"#.to_owned()
-                ]),
+                value: Some(vec![crate::TreeNodeInput::element(
+                    "p",
+                    vec![crate::TreeNodeInput::text("hello")]
+                )]),
                 split_level: None,
             }],
             result.op_infos
@@ -374,10 +421,7 @@ mod tests {
                 assert_eq!("$.body", path);
                 assert_eq!(3, *from);
                 assert_eq!(3, *to);
-                assert_eq!(
-                    Some(vec![r#"{"type":"text","value":"X"}"#.to_owned()]),
-                    *value
-                );
+                assert_eq!(Some(vec![crate::TreeNodeInput::text("X")]), *value);
             }
             other => panic!("unexpected op info: {other:?}"),
         }
@@ -471,7 +515,8 @@ mod tests {
                 assert_eq!(3, *from);
                 assert_eq!(3, *to);
                 assert!(value.is_none());
-                assert_eq!(Some(1), *split_level);
+                // As in JS, no change carries the split level.
+                assert_eq!(None, *split_level);
             }
             other => panic!("unexpected op info: {other:?}"),
         }
@@ -510,7 +555,7 @@ mod tests {
         assert_eq!(1, result.op_infos.len());
         match &result.op_infos[0] {
             OpInfo::TreeEdit { split_level, .. } => {
-                assert_eq!(Some(2), *split_level);
+                assert_eq!(None, *split_level);
             }
             other => panic!("unexpected op info: {other:?}"),
         }
@@ -554,6 +599,132 @@ mod tests {
             }
             other => panic!("unexpected op info: {other:?}"),
         }
+        Ok(())
+    }
+
+    /// JS `TreeEditOperation.execute`: the elements a split creates take the
+    /// tickets the operation carries, in order, then fall back to the
+    /// tickets that follow the edit and its top-level contents.
+    #[test]
+    fn splits_with_the_tickets_the_operation_carries() -> crate::Result<()> {
+        let tree_at = ticket(1, "a");
+        let product_ids = |split_tickets: Vec<TimeTicket>| -> crate::Result<Vec<String>> {
+            let mut root = seeded_nested_root(tree_at.clone());
+            let pos = root
+                .tree_by_created_at(&tree_at)
+                .unwrap()
+                .path_to_pos(&[0, 0, 0, 2])?;
+            let mut operation = TreeEditOperation::create(
+                tree_at.clone(),
+                pos.clone(),
+                pos,
+                None,
+                2,
+                Some(TimeTicket::new(20, 3, "b")),
+            );
+            operation.set_split_tickets(split_tickets);
+            operation.execute(&mut root, OpSource::Remote, None)?;
+
+            let tree = root.tree_by_created_at(&tree_at).unwrap();
+            assert_eq!(
+                r#"<doc><tc><p><tn>12</tn></p><p><tn>34</tn></p><p><tn>5678</tn></p></tc></doc>"#,
+                tree.to_xml()
+            );
+            Ok(tree
+                .nodes()
+                .filter(|node| node.id().created_at().lamport() == 20)
+                .map(|node| node.id().created_at().to_test_string())
+                .collect())
+        };
+
+        assert_eq!(
+            vec!["20:b:7", "20:b:9"],
+            product_ids(vec![
+                TimeTicket::new(20, 9, "b"),
+                TimeTicket::new(20, 7, "b")
+            ])?
+        );
+        // A change written before the field existed carries none.
+        assert_eq!(vec!["20:b:5", "20:b:4"], product_ids(Vec::new())?);
+        // The fallback starts past the edit, whatever was consumed.
+        assert_eq!(
+            vec!["20:b:4", "20:b:9"],
+            product_ids(vec![TimeTicket::new(20, 9, "b")])?
+        );
+        Ok(())
+    }
+
+    /// JS `tree_concurrency_test.ts` "intersect-element(merge,replaceText)":
+    /// the replacement applies after a merge it did not know. Its range was
+    /// measured on the tree before the merge, so a reverse built from it may
+    /// not fit the tree after it; Tree undo is not ported, and the edit
+    /// still applies.
+    #[test]
+    fn applies_an_edit_whose_reverse_does_not_fit_the_tree() -> crate::Result<()> {
+        let tree_at = ticket(1, "a");
+        let paragraph = |lamport: i64, value: &str| {
+            TreeNode::create_element(
+                TreeNodeId::new(ticket(lamport, "a"), 0),
+                "p",
+                None,
+                vec![TreeNode::create_text(
+                    TreeNodeId::new(ticket(lamport + 1, "a"), 0),
+                    value,
+                )],
+            )
+        };
+        let mut root = seeded_root(
+            tree_at.clone(),
+            vec![
+                paragraph(2, "abc"),
+                paragraph(4, "def"),
+                paragraph(6, "ghi"),
+            ],
+        );
+        let (merge, replace) = {
+            let tree = root.tree_by_created_at(&tree_at).unwrap();
+            (
+                (tree.find_pos(4, true)?, tree.find_pos(6, true)?),
+                (tree.find_pos(5, true)?, tree.find_pos(15, true)?),
+            )
+        };
+
+        let mut known = VersionVector::new();
+        known.set("a", 9);
+        known.set("b", 10);
+        TreeEditOperation::create(
+            tree_at.clone(),
+            merge.0,
+            merge.1,
+            None,
+            0,
+            Some(ticket(10, "b")),
+        )
+        .execute(&mut root, OpSource::Remote, Some(&known))?;
+        assert_eq!(
+            "<root><p>abcdef</p><p>ghi</p></root>",
+            root.tree_by_created_at(&tree_at).unwrap().to_xml()
+        );
+
+        let mut known = VersionVector::new();
+        known.set("a", 9);
+        known.set("c", 10);
+        TreeEditOperation::create(
+            tree_at.clone(),
+            replace.0,
+            replace.1,
+            Some(vec![TreeNode::create_text(
+                TreeNodeId::new(ticket(10, "c"), 0),
+                "B",
+            )]),
+            0,
+            Some(ticket(10, "c")),
+        )
+        .execute(&mut root, OpSource::Remote, Some(&known))?;
+        assert_eq!(
+            "<root><p>abc</p>B</root>",
+            root.tree_by_created_at(&tree_at).unwrap().to_xml()
+        );
         Ok(())
     }
 

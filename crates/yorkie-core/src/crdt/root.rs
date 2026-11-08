@@ -45,10 +45,21 @@ impl CrdtGcPair {
     }
 }
 
+/// The size of a document in bytes (JS `DocSize`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct DocSize {
-    pub(crate) live: DataSize,
-    pub(crate) gc: DataSize,
+pub struct DocSize {
+    /// The size of the elements and nodes still in the document.
+    pub live: DataSize,
+    /// The size of the removed ones waiting for garbage collection.
+    pub gc: DataSize,
+}
+
+impl DocSize {
+    /// Returns the live and garbage sizes added up, the size a document's
+    /// maximum size is checked against (JS `totalDocSize`).
+    pub fn total(&self) -> usize {
+        self.live.total() + self.gc.total()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -64,6 +75,14 @@ pub(crate) struct CrdtRoot {
     element_pair_by_created_at: BTreeMap<String, CrdtElementPair>,
     gc_element_set_by_created_at: BTreeSet<String>,
     gc_pair_by_child_id: BTreeMap<String, CrdtGcPair>,
+    /// The exact size charged to `doc_size.gc` for every registered element
+    /// whose size counts toward gc rather than live (JS `sizeInGC`). An
+    /// element gets there by its own removal or by a removed ancestor, and
+    /// recording the amount, not a flag, keeps both sides balanced although
+    /// `data_size` grows by a ticket once `removed_at` is set. JS keys this
+    /// by element identity, since an undo copy can share a tombstone's
+    /// createdAt; Rust keys it by createdAt (see the porting gaps).
+    size_in_gc: BTreeMap<String, DataSize>,
     doc_size: DocSize,
 }
 
@@ -74,6 +93,7 @@ impl CrdtRoot {
             element_pair_by_created_at: BTreeMap::new(),
             gc_element_set_by_created_at: BTreeSet::new(),
             gc_pair_by_child_id: BTreeMap::new(),
+            size_in_gc: BTreeMap::new(),
             doc_size: DocSize::default(),
         };
         let root_element = root.root_element();
@@ -138,16 +158,82 @@ impl CrdtRoot {
         count
     }
 
+    /// Registers a removed element for collection and moves its size, with
+    /// its descendants', from live to gc (JS `registerRemovedElement`).
     pub(crate) fn register_removed_element(&mut self, element: &CrdtElement) {
+        let moved = self.book_removed_element(element);
+
+        // The removal set `removed_at` after the element was registered, so
+        // the size just moved holds a ticket live was never charged. Live
+        // gets it back, but only on the move that carried it: a size already
+        // in gc did not take it from live.
+        if moved && element.removed_at().is_some() {
+            self.doc_size.live.meta += TIME_TICKET_SIZE;
+        }
+    }
+
+    /// Registers an element that already carried its `removed_at` when it
+    /// was registered, such as the losing value of a concurrent set (JS
+    /// `adoptRemovedElement`). It is `register_removed_element` without the
+    /// ticket refund: the size registered in live already held the ticket.
+    fn adopt_removed_element(&mut self, element: &CrdtElement) {
+        self.book_removed_element(element);
+    }
+
+    /// Puts `element` on the collection worklist and moves its size, with
+    /// its descendants', to gc. Reports whether its own size left live.
+    fn book_removed_element(&mut self, element: &CrdtElement) -> bool {
         let created_at = element.created_at().to_id_string();
         if let Some(pair) = self.element_pair_by_created_at.get_mut(&created_at) {
             pair.element = element.deepcopy();
         }
 
-        add_data_size(&mut self.doc_size.gc, element.data_size());
-        sub_data_size(&mut self.doc_size.live, element.data_size());
-        self.doc_size.live.meta += TIME_TICKET_SIZE;
+        let moved = self.move_size_to_gc(element);
+        self.move_descendants_to_gc(element);
         self.gc_element_set_by_created_at.insert(created_at);
+        moved
+    }
+
+    /// Moves the size of every descendant of `element` from live to gc (JS
+    /// `moveDescendantsToGC`). A container's own size is its metadata only,
+    /// so moving the container alone would strand its members in live.
+    fn move_descendants_to_gc(&mut self, element: &CrdtElement) {
+        match element {
+            CrdtElement::Object(object) => {
+                for (_, child) in object.iter_all() {
+                    self.move_size_to_gc(child);
+                    self.move_descendants_to_gc(child);
+                }
+            }
+            CrdtElement::Array(array) => {
+                for child in array.iter_all() {
+                    self.move_size_to_gc(child);
+                    self.move_descendants_to_gc(child);
+                }
+            }
+            CrdtElement::Primitive(_)
+            | CrdtElement::Counter(_)
+            | CrdtElement::Text(_)
+            | CrdtElement::Tree(_) => {}
+        }
+    }
+
+    /// Moves the size of `element` from live to gc and reports whether it
+    /// moved a size live was holding (JS `moveSizeToGC`). A size already in
+    /// gc, because the element or a container above it was removed before,
+    /// only has its charge topped up to the current size.
+    fn move_size_to_gc(&mut self, element: &CrdtElement) -> bool {
+        let size = element.data_size();
+        let created_at = element.created_at().to_id_string();
+
+        if let Some(charged) = self.size_in_gc.insert(created_at, size) {
+            adjust_data_size(&mut self.doc_size.gc, charged, size);
+            return false;
+        }
+
+        add_data_size(&mut self.doc_size.gc, size);
+        sub_data_size(&mut self.doc_size.live, size);
+        true
     }
 
     pub(crate) fn register_gc_pair(&mut self, child: &RgaTreeListNode) {
@@ -255,7 +341,7 @@ impl CrdtRoot {
             self.register_removed_element(removed);
         }
         if inserted.removed_at().is_some() {
-            self.register_removed_element(&inserted);
+            self.adopt_removed_element(&inserted);
         }
 
         Ok((inserted, removed))
@@ -336,7 +422,7 @@ impl CrdtRoot {
 
         self.register_element(&inserted, Some(&parent));
         if inserted.removed_at().is_some() {
-            self.register_removed_element(&inserted);
+            self.adopt_removed_element(&inserted);
         }
 
         Ok(inserted)
@@ -427,7 +513,7 @@ impl CrdtRoot {
         self.register_element(&inserted, Some(&parent));
         self.register_removed_element(&removed);
         if inserted.removed_at().is_some() {
-            self.register_removed_element(&inserted);
+            self.adopt_removed_element(&inserted);
         }
 
         Ok((inserted, removed))
@@ -471,8 +557,39 @@ impl CrdtRoot {
         self.get_garbage_element_set_size() + self.gc_pair_by_child_id.len()
     }
 
-    pub(crate) fn garbage_collect(&mut self, vector: &crate::VersionVector) -> Result<usize> {
+    /// Purges the tombstones `vector` covers and returns how many it purged
+    /// (JS `CRDTRoot.garbageCollect`).
+    ///
+    /// A pass can hold a purge back (see `collect`), and holding one back
+    /// can be the only reason another is held back: purging a node hands its
+    /// successor to the node in front of it, and that successor is one this
+    /// pass already found stable. So a pass that both purged and deferred may
+    /// have more to do, and the loop repeats until a pass purges nothing new
+    /// or defers nothing. Everything held back stays on the worklist for the
+    /// next vector that covers it.
+    pub(crate) fn garbage_collect(&mut self, vector: &crate::VersionVector) -> usize {
         let mut count = 0;
+        loop {
+            let (purged, deferred) = self.collect(vector);
+            count += purged;
+            if purged == 0 || deferred == 0 {
+                return count;
+            }
+        }
+    }
+
+    /// Runs one collection pass and returns how much it purged and how much
+    /// it held back on a barrier (JS `CRDTRoot.collect`).
+    ///
+    /// A tombstone is not only a value that is gone, it is also a place in
+    /// its parent that other replicas may still be deciding against:
+    /// `removed_at` covers the value, and the barrier covers the place. An
+    /// RGA resolves a concurrent insert by walking forward past newer nodes,
+    /// tombstones included, so purging a node is safe only once the node
+    /// that would end that walk in its place is causally stable as well.
+    fn collect(&mut self, vector: &crate::VersionVector) -> (usize, usize) {
+        let mut count = 0;
+        let mut deferred = 0;
 
         let removed_element_ids = self
             .gc_element_set_by_created_at
@@ -480,25 +597,60 @@ impl CrdtRoot {
             .cloned()
             .collect::<Vec<_>>();
         for created_id in removed_element_ids {
-            let Some(pair) = self.element_pair_by_created_at.get(&created_id).cloned() else {
+            // The indexed copy may be stale: purging another element of this
+            // pass can have removed this one, or a descendant of it, from the
+            // live tree. Skip what is gone, and purge and deregister what the
+            // live tree holds, as JS does with its live references.
+            let Some(pair) = self.element_pair_by_created_at.get(&created_id) else {
                 continue;
             };
-            let Some(removed_at) = pair.element().removed_at() else {
+            let Some(parent_created_at) = pair.parent().map(|p| p.created_at().clone()) else {
+                continue;
+            };
+            let created_at = pair.element().created_at().clone();
+            let Some(element) = self.actual_element_by_created_at(&created_at) else {
+                continue;
+            };
+            let Some(removed_at) = element.removed_at() else {
                 continue;
             };
             if !vector.after_or_equal(removed_at) {
                 continue;
             }
 
-            if let Some(parent) = pair.parent() {
-                if let Some(object) = self.object_by_created_at_mut(parent.created_at()) {
-                    object.purge(pair.element())?;
-                } else if let Some(array) = self.array_by_created_at_mut(parent.created_at()) {
-                    array.purge(pair.element())?;
+            if let Some(array) = self.array_by_created_at(&parent_created_at) {
+                let barrier = array.purge_barrier_at(&created_at);
+                if barrier.is_some_and(|at| !vector.after_or_equal(&at)) {
+                    deferred += 1;
+                    continue;
                 }
             }
 
-            count += self.deregister_element(pair.element());
+            // As in JS, a member that cannot be purged is skipped, not
+            // reported: collection runs inside every change pack apply, and
+            // failing there would stop the document from syncing for good.
+            // It stays on the worklist, charged to gc.
+            let purged = if let Some(object) = self.object_by_created_at_mut(&parent_created_at) {
+                object.purge(&element)
+            } else if let Some(array) = self.array_by_created_at_mut(&parent_created_at) {
+                array.purge(&element)
+            } else {
+                // Unreachable: `element` was just found in the live tree, and
+                // only objects and arrays hold elements. Were the indexed
+                // parent stale, deregistering without a purge would still
+                // match JS, which purges from the detached parent it holds.
+                debug_assert!(
+                    false,
+                    "removed element {created_id} has no container parent"
+                );
+                Ok(())
+            };
+            if purged.is_err() {
+                continue;
+            }
+
+            count += self.deregister_element(&element);
+            self.refresh_element_pair_and_ancestors(&parent_created_at);
         }
 
         let gc_pairs = self
@@ -511,15 +663,34 @@ impl CrdtRoot {
                 continue;
             }
 
+            // A child no longer in the tree went with its container: a
+            // purged element holding a Text or Tree, or a purged Tree node
+            // holding its descendants. JS keeps a reference to the parent and
+            // purges the child from the detached structure; here there is
+            // nothing left to purge, so the pair is only dropped, with the
+            // same accounting.
+            let Some(site) = self.root_object.locate_gc_pair(&pair.child_id) else {
+                if let Some(pair) = self.gc_pair_by_child_id.remove(&pair.child_id) {
+                    sub_data_size(&mut self.doc_size.gc, pair.child_size);
+                }
+                count += 1;
+                continue;
+            };
+            if site.barrier.is_some_and(|at| !vector.after_or_equal(&at)) {
+                deferred += 1;
+                continue;
+            }
+
             if self.purge_gc_pair_by_child_id(&pair.child_id) {
                 if let Some(pair) = self.gc_pair_by_child_id.remove(&pair.child_id) {
                     sub_data_size(&mut self.doc_size.gc, pair.child_size);
                 }
                 count += 1;
+                self.refresh_element_pair_and_ancestors(&site.container);
             }
         }
 
-        Ok(count)
+        (count, deferred)
     }
 
     pub(crate) fn object(&self) -> &CrdtObject {
@@ -807,7 +978,14 @@ impl CrdtRoot {
 
     fn deregister_element_internal(&mut self, element: &CrdtElement, count: &mut usize) {
         let created_at = element.created_at().to_id_string();
-        sub_data_size(&mut self.doc_size.gc, element.data_size());
+        // Take the size out of the side that holds it, by the amount charged
+        // there (JS `deregisterElement`). A member a peer set into a container
+        // already removed here never went through a removal, so it is still
+        // in live.
+        match self.size_in_gc.remove(&created_at) {
+            Some(charged) => sub_data_size(&mut self.doc_size.gc, charged),
+            None => sub_data_size(&mut self.doc_size.live, element.data_size()),
+        }
         self.element_pair_by_created_at.remove(&created_at);
         self.gc_element_set_by_created_at.remove(&created_at);
         *count += 1;
@@ -841,20 +1019,27 @@ impl CrdtRoot {
             CrdtElementPair::new(element.deepcopy(), parent.map(|parent| parent.deepcopy())),
         );
 
-        if !ancestor_removed && !element.is_removed() {
+        // A removed element and everything under it count toward gc, as
+        // JS charges them when it adopts the tombstones it registers.
+        let in_removed_subtree = ancestor_removed || element.is_removed();
+        if in_removed_subtree {
+            let size = element.data_size();
+            add_data_size(&mut self.doc_size.gc, size);
+            self.size_in_gc
+                .insert(element.created_at().to_id_string(), size);
+        } else {
             add_data_size(&mut self.doc_size.live, element.data_size());
         }
 
-        let descendant_removed = ancestor_removed || element.is_removed();
         match element {
             CrdtElement::Object(object) => {
                 for (_, child) in object.iter_all() {
-                    self.register_element_for_rebuild(child, Some(element), descendant_removed);
+                    self.register_element_for_rebuild(child, Some(element), in_removed_subtree);
                 }
             }
             CrdtElement::Array(array) => {
                 for child in array.iter_all() {
-                    self.register_element_for_rebuild(child, Some(element), descendant_removed);
+                    self.register_element_for_rebuild(child, Some(element), in_removed_subtree);
                 }
             }
             CrdtElement::Primitive(_)
@@ -871,7 +1056,6 @@ impl CrdtRoot {
                 pair.element = element.deepcopy();
             }
 
-            add_data_size(&mut self.doc_size.gc, element.data_size());
             self.gc_element_set_by_created_at.insert(created_at);
         }
 
@@ -1155,11 +1339,11 @@ mod tests {
 
         let mut vector = VersionVector::new();
         vector.set("a", 3);
-        assert_eq!(0, root.garbage_collect(&vector)?);
+        assert_eq!(0, root.garbage_collect(&vector));
         assert_eq!(1, root.get_garbage_len());
 
         vector.set("a", 4);
-        assert_eq!(1, root.garbage_collect(&vector)?);
+        assert_eq!(1, root.garbage_collect(&vector));
         assert_eq!(0, root.get_garbage_len());
         assert_eq!(0, root.stats().gc_pairs);
         assert_eq!(r#"{"items":["two","one"]}"#, root.to_json());
@@ -1250,14 +1434,14 @@ mod tests {
 
         let mut vector = VersionVector::new();
         vector.set("a", 5);
-        assert_eq!(1, rebuilt.garbage_collect(&vector)?);
+        assert_eq!(1, rebuilt.garbage_collect(&vector));
         assert_eq!(1, rebuilt.stats().gc_elements);
         assert_eq!(0, rebuilt.stats().gc_pairs);
         assert_eq!(1, rebuilt.get_garbage_len());
         assert_eq!(r#"{"items":[2,0]}"#, rebuilt.to_json());
 
         vector.set("a", 6);
-        assert_eq!(1, rebuilt.garbage_collect(&vector)?);
+        assert_eq!(1, rebuilt.garbage_collect(&vector));
         assert_eq!(0, rebuilt.get_garbage_len());
         assert!(rebuilt.find_by_created_at(&one_at).is_none());
         assert_eq!(r#"{"items":[2,0]}"#, rebuilt.to_json());
@@ -1321,7 +1505,7 @@ mod tests {
 
         let mut vector = VersionVector::new();
         vector.set("a", 5);
-        assert_eq!(3, root.garbage_collect(&vector)?);
+        assert_eq!(3, root.garbage_collect(&vector));
 
         assert_eq!(0, root.get_garbage_len());
         assert_eq!(r#"{"message":[{"val":"Yorkie"}]}"#, root.to_json());
@@ -1405,11 +1589,11 @@ mod tests {
 
         let mut vector = VersionVector::new();
         vector.set("a", 6);
-        assert_eq!(1, root.garbage_collect(&vector)?);
+        assert_eq!(1, root.garbage_collect(&vector));
         assert_eq!(1, root.stats().gc_pairs);
 
         vector.set("a", 7);
-        assert_eq!(1, root.garbage_collect(&vector)?);
+        assert_eq!(1, root.garbage_collect(&vector));
         assert_eq!(0, root.get_garbage_len());
         assert_eq!(
             r#"{"body":{"type":"root","children":[{"type":"p","children":[{"type":"text","value":"Hi"}]}]}}"#,

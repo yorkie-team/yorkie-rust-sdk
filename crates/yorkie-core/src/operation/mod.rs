@@ -20,10 +20,12 @@ pub(crate) use style_operation::StyleOperation;
 pub(crate) use tree_edit_operation::TreeEditOperation;
 pub(crate) use tree_style_operation::TreeStyleOperation;
 
+use crate::crdt::counter::CounterValue;
 use crate::crdt::primitive::PrimitiveValue;
 use crate::crdt::root::CrdtRoot;
+use crate::event::{parse_attrs, EditOpValue, OperationInfo, StyleOpValue, TreeStyleOpValue};
 use crate::time::ActorId;
-use crate::{TimeTicket, VersionVector};
+use crate::{TimeTicket, TreeNodeInput, VersionVector};
 
 use crate::Result;
 use std::collections::BTreeMap;
@@ -94,9 +96,136 @@ pub(crate) enum OpInfo {
         to: usize,
         from_path: Vec<usize>,
         to_path: Vec<usize>,
-        value: Option<Vec<String>>,
+        value: Option<Vec<TreeNodeInput>>,
         split_level: Option<usize>,
     },
+}
+
+impl From<OpInfo> for OperationInfo {
+    /// Shapes an internal op info as the JS `OpInfo` delivered to
+    /// subscribers: array removal folds into `Remove` with an index, and
+    /// attribute values are decoded from their stored JSON form.
+    fn from(info: OpInfo) -> Self {
+        match info {
+            OpInfo::Set { path, key } => Self::Set { path, key },
+            OpInfo::Remove { path, key } => Self::Remove {
+                path,
+                key: Some(key),
+                index: None,
+            },
+            OpInfo::ArrayRemove { path, index } => Self::Remove {
+                path,
+                key: None,
+                index: Some(index),
+            },
+            OpInfo::Add { path, index } => Self::Add { path, index },
+            OpInfo::Increase { path, value } => Self::Increase {
+                path,
+                value: counter_value_of(value),
+            },
+            OpInfo::Move {
+                path,
+                index,
+                previous_index,
+            } => Self::Move {
+                path,
+                index,
+                previous_index,
+            },
+            OpInfo::ArraySet { path } => Self::ArraySet { path },
+            OpInfo::Edit {
+                path,
+                from,
+                to,
+                content,
+                attributes,
+            } => Self::Edit {
+                path,
+                from,
+                to,
+                value: EditOpValue {
+                    attributes: parse_attrs(attributes),
+                    content,
+                },
+            },
+            OpInfo::Style {
+                path,
+                from,
+                to,
+                attributes,
+                attributes_to_remove,
+            } => {
+                // JS reports a removed text attribute as `null`.
+                let mut attributes = parse_attrs(attributes);
+                for key in attributes_to_remove {
+                    attributes.insert(key, serde_json::Value::Null);
+                }
+                Self::Style {
+                    path,
+                    from,
+                    to,
+                    value: StyleOpValue { attributes },
+                }
+            }
+            OpInfo::TreeStyle {
+                path,
+                from,
+                to,
+                from_path,
+                to_path,
+                attributes,
+                attributes_to_remove,
+            } => {
+                let value = if attributes.is_empty() {
+                    TreeStyleOpValue {
+                        attributes: None,
+                        attributes_to_remove: Some(attributes_to_remove),
+                    }
+                } else {
+                    TreeStyleOpValue {
+                        attributes: Some(parse_attrs(attributes)),
+                        attributes_to_remove: None,
+                    }
+                };
+                Self::TreeStyle {
+                    path,
+                    from,
+                    to,
+                    from_path,
+                    to_path,
+                    value,
+                }
+            }
+            OpInfo::TreeEdit {
+                path,
+                from,
+                to,
+                from_path,
+                to_path,
+                value,
+                split_level,
+            } => Self::TreeEdit {
+                path,
+                from,
+                to,
+                value,
+                split_level,
+                from_path,
+                to_path,
+            },
+        }
+    }
+}
+
+/// Counter operands are numeric: `CrdtRoot::increase_counter` rejects any
+/// other primitive before an op info is produced.
+fn counter_value_of(value: PrimitiveValue) -> CounterValue {
+    match value {
+        PrimitiveValue::Integer(value) => CounterValue::Integer(value),
+        PrimitiveValue::Long(value) | PrimitiveValue::Date(value) => CounterValue::Long(value),
+        PrimitiveValue::Double(value) => CounterValue::Double(value),
+        _ => CounterValue::Integer(0),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -139,6 +268,21 @@ impl Operation {
             Self::Style(operation) => operation.execute(root, source, version_vector),
             Self::TreeEdit(operation) => operation.execute(root, source, version_vector),
             Self::TreeStyle(operation) => operation.execute(root, source, version_vector),
+        }
+    }
+
+    pub(crate) fn set_executed_at(&mut self, executed_at: TimeTicket) {
+        match self {
+            Self::Set(operation) => operation.set_executed_at(executed_at),
+            Self::Remove(operation) => operation.set_executed_at(executed_at),
+            Self::Add(operation) => operation.set_executed_at(executed_at),
+            Self::Increase(operation) => operation.set_executed_at(executed_at),
+            Self::Move(operation) => operation.set_executed_at(executed_at),
+            Self::ArraySet(operation) => operation.set_executed_at(executed_at),
+            Self::Edit(operation) => operation.set_executed_at(executed_at),
+            Self::Style(operation) => operation.set_executed_at(executed_at),
+            Self::TreeEdit(operation) => operation.set_executed_at(executed_at),
+            Self::TreeStyle(operation) => operation.set_executed_at(executed_at),
         }
     }
 

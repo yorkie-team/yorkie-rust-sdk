@@ -1,6 +1,6 @@
 # Current Porting Gaps
 
-Last reviewed: 2026-05-19
+Last reviewed: 2026-11-08
 
 This document records known differences between the current Rust SDK and the
 JS/Go implementations. It is intentionally practical: each section explains
@@ -17,6 +17,28 @@ Skipped upstream CRDT tests are tracked in
 while they remain skipped upstream. If ported into Rust, they should stay
 ignored unless the upstream behavior changes or a deliberate Rust divergence is
 documented.
+
+## Out-of-Scope Items
+
+These JS SDK features are deliberately not ported. Each has a JS source to
+start from when it is picked up. Smaller differences are recorded in the
+section of the area they touch.
+
+| Item | JS source | Notes |
+| --- | --- | --- |
+| Offline persistence (doc-store, session-lock, persist policy) | `packages/sdk/src/client/doc-store.ts`, `client/session-lock.ts`, `client/persist-policy.ts`; `test/integration/offline_persistence_test.ts` | Also the `EpochMismatch`, `WriteRejected` (persist), `LocalChangesDropped`, and `PersistDisabled` events. |
+| Devtools | `packages/sdk/src/devtools/` | Browser-only inspector protocol. |
+| Revisions API | `packages/sdk/src/api/revision.ts`, `yorkie.ts`; `test/integration/revision_test.ts` | Admin-side document revisions. |
+| Epoch re-anchor | `packages/sdk/src/document/document.ts` (`EpochMismatch`, minting suspension), `client/client.ts` | `ErrEpochMismatch` stops the sync loop without telling the document. |
+| Identity-preserving undo restore spans and the removal ledger | `packages/sdk/src/document/crdt/rga_tree_split.ts` (`recordRemoval`, `isRemovedInView`), `document/crdt/text.ts`, `document/history.ts`; receive side `api/converter.ts` (`fromOperation` Edit and TreeEdit cases) | Rust sends `restore_spans`/`restore_mode` at their defaults, and drops them on receive, so a Rust replica diverges from a JS peer that undoes a Text or Tree edit. See Undo and Redo. |
+| Pre-attach ticket re-issue | `packages/sdk/src/document/document.ts` (`setActor` with `ReissueToken`, `reissueActor`, `neverSynced`), `api/reissue.ts` (`reissueOperations`, `reissueVersionVector`), `client/client.ts` (`claimReissue`, `markReissueClaim`); `docs/design/pre-attach-ticket-reissue.md` | Elements edited before `attach` keep the initial actor's tickets. See Document Editing Model. |
+| Disable-GC attach option | `packages/sdk/src/document/document.ts` (`disableGC`), `client/client.ts` | `AttachOptions` has no such field. |
+| Tree undo and redo | `packages/sdk/src/document/operation/tree_edit_operation.ts`, `tree_style_operation.ts`, `document/crdt/tree.ts`, `document/history.ts` | Split and merge reverse machinery. See Undo and Redo. |
+| Auth webhook integration test | `packages/sdk/test/integration/webhook_test.ts` | Needs a server with an auth webhook; the auth path is unit-tested with a mock transport. |
+| Schema and project admin API cases | `packages/sdk/test/integration/document_test.ts`, `schema_test.ts` | `CreateSchema`, `UpdateProject`, `UpdateDocument` need the admin API. |
+| History options | `packages/sdk/src/document/document.ts` (`maxUndoDepth`, `clearHistory`) | See Undo and Redo. |
+| `ChannelStatus.Removed` | `packages/sdk/src/channel/channel.ts` | See Channels and Broadcast. |
+| Text and Tree range helpers | `packages/sdk/src/document/json/text.ts`, `json/tree.ts` | Position-range conversions, `styleByPath`, `removeStyleByPath`. See Public JSON API. |
 
 ## Reference Areas
 
@@ -45,7 +67,8 @@ Current Rust behavior:
 
 - `Document::update` clones the public `JsonObject`, attaches an edit recorder
   to that clone, lets the callback mutate it, then executes the recorded
-  operations against `CrdtRoot` after the callback succeeds.
+  operations against a copy of `CrdtRoot` after the callback succeeds, and
+  replaces the root with the copy once every operation has run.
 - `Document` tracks `Detached`, `Attached`, and `Removed` status, exposes the
   current actor ID, applies actor assignment to pending local changes, and
   rejects edits after removal.
@@ -80,39 +103,74 @@ Gap:
 - Rust has ID-based array insert/delete/move APIs and splice-like array edits,
   but these still operate on the cloned public JSON view and hidden identity
   metadata rather than live CRDT containers.
-- Counter public editing methods are connected to the edit recorder. Text and
-  Tree public editing methods are not connected yet.
+- Counter, Text, and Tree public editing methods are connected to the edit
+  recorder. Text and Tree hold a copy of their CRDT value and apply each edit
+  to it as the callback runs.
+- Pre-attach ticket re-issue is not ported. `Client::attach` calls
+  `Document::set_actor`, which, like JS `setActor` without `reissue`, rewrites
+  only each pending change's ID and each operation's `executed_at` (and moves
+  the self presence). Every other ticket an edit made before `attach` minted
+  keeps the initial actor: element `created_at`s in `crdt_root` and inside the
+  operations, Text and Tree node IDs, and positions. JS `Client.attach`
+  instead calls `setActor(actor, { reissue: ReissueToken })` when
+  `claimReissue` allows it (generated client key, actor has minted nothing in
+  that document key) and the document never synced (`neverSynced`).
+  `reissueActor` then rewrites every ticket of the previous actor in the
+  local changes (`api/reissue.ts`), rebuilds the root and presences by
+  replaying them on a fresh `CRDTRoot`, and clears the undo/redo stacks.
+  Without it, two clients that edit the same document key before attaching
+  push elements with the same `created_at`, so replicas can disagree on the
+  winner, and the local root names Text/Tree nodes by tickets the pushed
+  operations no longer carry. Documents edited only after `attach`, and
+  `AttachOptions::initial_root` (applied after the attach response), are not
+  affected. Porting it needs ticket rewriting for every operation and
+  element payload, the replay, and the per-client claim bookkeeping.
 
 Expected direction:
 
 - Continue moving public mutation methods onto the edit recorder.
 - Either remove the clone/diff fallback or narrow it to explicitly unsupported
   compatibility cases once direct mutable JSON escape hatches are redesigned.
-- Connect Text and Tree public facades through the same update-time operation
-  recorder.
 
 ## Public JSON API
 
 Current Rust behavior:
 
 - `JsonObject` supports `set`, `get`, `get_mut`, `remove`,
-  `get_object_mut`, `get_array_mut`, `get_counter_mut`, `set_counter`,
-  `set_long_counter`, and `set_dedup_counter`.
+  `get_object_mut`, `get_array_mut`, `get_counter_mut`, `get_text_mut`,
+  `get_tree_mut`, `set_counter`, `set_long_counter`, `set_dedup_counter`,
+  `set_text`, and `set_tree`.
 - `JsonArray` supports `push`, index `get`/`get_mut`, `set`/`set_value`,
   `insert`, `insert_after_index`, `insert_integer_after`, `remove`/`delete`,
   element-ID lookup, `get_by_id`, `get_mut_by_id`, `get_element_by_index`,
   `get_element_by_id`, `get_last`, `insert_after`, `insert_before`,
   `delete_by_id`, `move_after`, `move_before`, `move_front`, `move_last`,
   `move_after_by_index`, `splice`, nested `get_object_mut`/`get_array_mut`,
-  `get_counter_mut`, `push_counter`, `push_long_counter`,
-  `push_dedup_counter`, value search, ID search, `len`, `is_empty`, `iter`,
-  and `as_slice`.
+  `get_counter_mut`, `get_text_mut`, `push_counter`, `push_long_counter`,
+  `push_dedup_counter`, `push_text`, value search, ID search, `len`,
+  `is_empty`, `iter`, and `as_slice`.
   Mutation methods can return errors because they may create CRDT operations
   during `Document::update`.
-- `JsonValue` is a simple enum wrapper around primitive, counter, object, and
-  array values.
-- During `Document::update`, public object, array, and counter values are
-  temporarily attached to a recorder and hidden CRDT identity metadata.
+- `JsonValue` is a simple enum wrapper around primitive, counter, text,
+  tree, object, and array values.
+- `JsonText` (JS `Text`) supports `edit`, `delete`, `empty`, `set_style`,
+  `to_string`, `len`, `is_empty`, `values`, `id`, and `to_sorted_json`. It
+  holds a copy of the CRDT text, applies each edit to it with a ticket from the
+  update's change context, and records the matching `EditOperation` or
+  `StyleOperation`, so later edits in the same update see earlier ones, as in
+  JS.
+- `JsonTree` (JS `Tree`) supports `edit` (JS `edit`/`editBulk`, splits
+  included), `edit_by_path` (JS `editByPath`/`editBulkByPath`),
+  `split_by_path`, `merge_by_path`, `style`, `remove_style`, `to_xml`,
+  `to_json`, `size`, `index_to_path`, and `path_to_index`. Like
+  `JsonText`, it holds a copy of the CRDT tree, applies each edit or style to
+  it, and records the matching `TreeEditOperation` or `TreeStyleOperation`.
+  Input nodes are `TreeNodeInput` values (JS `ElementNode`/`TextNode`),
+  validated like JS `validateTreeNodes`, and tree edit op infos report the
+  inserted nodes as `TreeNodeInput` values too.
+- During `Document::update`, public object, array, counter, text, and tree
+  values are temporarily attached to a recorder and hidden CRDT identity
+  metadata.
 
 JS/Go behavior:
 
@@ -125,7 +183,8 @@ JS/Go behavior:
 
 Gap:
 
-- Rust public object, array, and counter values are only partially CRDT-aware.
+- Rust public object, array, counter, and text values are only partially
+  CRDT-aware.
   The existing method calls record operations, but the values are still not
   stable live wrappers around CRDT elements.
 - Rust public arrays now expose element-ID access and lightweight
@@ -135,7 +194,24 @@ Gap:
 - Rust value-based array search uses `JsonValue` equality. For non-primitive
   containers, JS compares wrapped element identity; Rust callers should use the
   explicit ID search methods when identity matters.
-- Text and Tree do not have public context-backed facades yet.
+- `JsonTree` does not port JS `styleByPath`,
+  `removeStyleByPath`, `getNodeSize`, `getIndexTree`, `getRootTreeNode`, the
+  position-range conversions (`indexRangeToPosRange`, `posRangeToIndexRange`,
+  `pathRangeToPosRange`, `posRangeToPathRange`), or the test helpers. There is
+  no `JsonArray::push_tree` or `JsonArray::get_tree_mut` either.
+- Rust rejects two inputs with `YorkieError::InvalidArgument` that JS has no
+  check for: an element whose type is `"text"` and a text root. In JS the type
+  alone makes a node a text node, so such input would crash JS when it reads
+  the missing value or children. As in JS and Go, the attributes of the root
+  given to `JsonTree::new` are dropped.
+- Setting a `JsonTree` read from a document into another key copies its
+  current nodes. JS builds an empty tree in that case, because such a `Tree`
+  has no initial root.
+- `JsonText` does not port JS `indexRangeToPosRange`/`posRangeToIndexRange`
+  (`TextPosStruct`), `toTestString`, `toJSForTest`, `createRangeForTest`, or
+  the index/ID tree accessors.
+- Setting a `JsonText` that already has content creates an empty text, as JS
+  does for `root.k = new Text()`; there is no API to copy a text's content.
 
 Expected direction:
 
@@ -171,6 +247,28 @@ Gap:
 - The ownership model is not yet settled. Future code may need an arena,
   stable IDs with lookup back into the tree, or another explicit ownership
   strategy.
+- The copies cost time. Every pair holds a deep copy of its parent, so a root
+  with `n` members holds `n` copies of the root, and a local update, which
+  runs on a copy of `CrdtRoot`, costs time quadratic in `n`. 500 updates on
+  a root that grows to 500 members take about six minutes in a debug build.
+  The two JS snapshot integration cases that build such a root are ignored
+  for this (`integration_snapshot.rs`); both pass in a release build.
+- Collection is slow in the same way. For each GC pair it walks the whole
+  document twice, once to find the pair's barrier and container
+  (`locate_gc_pair`) and once to purge it, so a pass costs time in GC pairs
+  times nodes. Each purge then refreshes the copied pairs of the container
+  and of every ancestor up to the root, and refreshing the root re-copies
+  every pair in the document, so each purge alone costs time in the size of
+  the whole document.
+- `actual_element_by_created_at` resolves a createdAt to the first match in
+  the tree, and `deregister_element` drops the index entries and the gc
+  charge (`size_in_gc`) by createdAt. JS `deregisterElement` drops an entry
+  only if it names the element being collected, and keys `sizeInGC` by
+  element, because undo restores a copy of a removed container whose
+  members keep their createdAts while the tombstones are still there.
+  Collecting such a tombstone in Rust could evict the live copy's entry, so
+  a later remote change addressed at it would fail inside
+  `apply_change_pack`. Not verified that Rust undo aliases members this way.
 
 Expected direction:
 
@@ -178,6 +276,61 @@ Expected direction:
   deliberately redesigned.
 - Add tests that mutate nested object/array descendants and immediately verify
   `create_path`, `find_by_created_at`, and visible JSON output.
+- Add a test that undoes an array removal, collects the tombstone, and then
+  edits a restored member from a remote change; key the index and the gc
+  charge by element identity if it fails.
+
+## Garbage Collection
+
+Current Rust behavior:
+
+- `Document::apply_change_pack` collects garbage with the pack's version
+  vector after the pack has applied and the checkpoint has moved, and not
+  for a snapshot pack, as JS `applyChangePack` does. The server's vector
+  covers only what this client pushed, so a pending local removal keeps its
+  tombstone.
+- A push-only or sync-off reply is taken as a push acknowledgement only
+  (`Document::acknowledge_pushed_changes`, JS `acknowledgePushedChanges`):
+  its remote state and its version vector never reach collection.
+- `CrdtRoot::garbage_collect` holds a purge back until the node behind the
+  tombstone is causally stable (the successor barrier of JS `dbff8892`, Go
+  `ba82ed91`) for array positions, text nodes, and tree siblings, and
+  repeats a pass that both purged and deferred.
+- `Document::garbage_collect`, `garbage_len`, and `version_vector` are
+  hidden public hooks, as JS exposes them for tests.
+
+JS/Go behavior:
+
+- JS skips collection for a document attached with `disableGC`.
+- Before collecting, JS prunes the Text removal ledgers and keeps a text
+  tombstone whose ledger still matters (`heldFromPurge`).
+- JS drops a GC pair whose child was revived without unregistering it.
+
+Gap:
+
+- `disableGC` is not ported (see Out-of-Scope Items).
+- The removal ledger is not ported (see Out-of-Scope Items), so neither is
+  the ledger pruning or `heldFromPurge`.
+- Rust has no step that drops a GC pair whose child was revived without
+  being unregistered; JS `collect` drops such a pair.
+- The running `doc_size` disagrees with a root rebuilt from the same content:
+  removing a text or tree node does not move its size from `live` to `gc`,
+  and a moved element's ticket is not charged the way a rebuild charges it
+  (JS `accMovedElement`). This holds with or without collection. The JS
+  barrier tests check the running size against a rebuild; the Rust ports
+  check the garbage count only. Removed elements and their descendants do
+  match a rebuild (JS `sizeInGC`), before and after collection.
+- JS keeps a clone root and collects it too (`getGarbageLenFromClone`).
+  Rust has no clone to collect: a local change runs on a copy that replaces
+  the root.
+- The JS case "gc targeting nodes made by deactivated client"
+  (`gc_test.ts:1397`) deactivates with `synchronous: true`, which the
+  memory-backed server fails ("change not found"), as the JS NOTE says. It
+  needs a Mongo-backed server. CI runs the memory backend, so the Rust port
+  (`integration_gc.rs`) is ignored and never runs there.
+- With collection on, JS object case `object_test.ts:923` fails: the undo
+  names an object that has been purged. JS runs it with `disableGC`, which
+  is not ported, so the Rust port stays ignored.
 
 ## CRDT Array and RGA List
 
@@ -275,9 +428,9 @@ Gap:
   protobuf-shaped object/array/tree payload bytes and from-wire operation
   construction. Broader replay tests for text/tree operation payloads are still
   needed before treating this as full sync parity.
-- Rust `OpInfo` currently uses a separate `ArrayRemove` enum variant for
-  clarity, while JS represents array removal as a `remove` op info carrying an
-  index. This internal Rust shape may need to converge before exposing events.
+- Rust `OpInfo` keeps a separate internal `ArrayRemove` variant; the public
+  `OperationInfo` delivered to subscribers folds it into `Remove { index }`,
+  as JS does.
 
 Expected direction:
 
@@ -285,7 +438,6 @@ Expected direction:
   remaining clone/diff fallback surface.
 - Add version-vector parameters to operation execution when sync/replay
   behavior is ported.
-- Align event/op-info shape before exposing watch or local event APIs.
 
 ## Counter and Increase Operation
 
@@ -332,8 +484,9 @@ Gap:
   `yorkie_protocol::converter`. Binary `ChangePack` round-trip tests cover
   counter replay, and full `JSONElement.Counter` conversion carries HLL
   register payloads for dedup counters.
-- Change-level concurrent counter tests are still missing because the public
-  editing path does not yet include client sync/history.
+- Concurrent counter undo/redo is covered by
+  `crates/yorkie/tests/integration_history.rs`; other change-level concurrent
+  counter tests are still missing.
 
 Expected direction:
 
@@ -431,7 +584,17 @@ Current Rust behavior:
   helpers.
 - `CrdtText` is now a `CrdtElement` variant, participates in root path lookup,
   can be found through root text lookup helpers, and converts to public
-  `JsonValue::Array` for internal document-root materialization.
+  `JsonValue::Text` for document-root materialization.
+- The public `JsonText` facade edits through `ChangeContext` (see Public JSON
+  API). Local edits and styles reject an index inside a UTF-16 surrogate pair,
+  like JS `CRDTText.createRange`.
+- `RgaTreeSplit::edit` returns the JS value-change list: one change per run of
+  removed nodes between the kept ones, last run first, with the inserted value
+  on the change at the insertion index (JS `deleteNodes`/`makeChanges`).
+  `EditOperation` turns each change into one `OpInfo::Edit`, so edit events
+  match JS `EditOpInfo`s.
+- `CRDTTextValue.toJSON` attribute output follows JS: a stored value that
+  parses as JSON is re-encoded, and one that does not is emitted as a string.
 - `CrdtRoot` can rebuild GC pair indexes for removed text nodes and removed
   text attribute nodes when it is created from an existing CRDT tree.
 - Root garbage collection can physically purge removed text nodes and removed
@@ -465,27 +628,27 @@ Gap:
   mutations instead of using JS/Go-style linked nodes with stable per-node index
   handles. Read lookup now follows the same splay/ID-map route, but write-side
   index maintenance is still conservative.
-- Rust `CrdtText` is not yet exposed through a public Text facade. Wire
-  conversion exists for full `JSONElement.Text` snapshots and text
-  edit/style operation bodies, but replay coverage is still narrower than
-  JS/Go integration tests.
-- `StyleOperation` emits per-block style operation info from the text helper,
-  but `EditOperation` still emits a single requested range instead of the full
-  value-change list produced by JS `RGATreeSplit.edit`.
-- Text operation info is still internal and shaped for Rust tests; it has not
-  yet been aligned with the external watch/event payload shape.
+- Integration tests cover concurrent insertion at one position, insertion
+  against deletion, overlapping deletions, style against insertion, and
+  overlapping styles (`crates/yorkie/tests/integration_text.rs`). The JS
+  Peritext cases ex4-ex9 and the LWW tombstone-ticket checks are not ported;
+  the latter read CRDT internals the public API does not expose.
+- JS `deleteNodes` keeps a node the deleter saw live but someone else removed
+  and records the deletion on it (`recordRemoval`, the removal ledger used by
+  identity-preserving undo). Rust keeps the earlier rule: a node is removed
+  when its creation is known and it is not yet tombstoned.
+- Re-encoded numeric attribute values can differ in form from JS:
+  `serde_json` writes the stored `1.0` as `1.0` where JS writes `1`.
 - Version-vector-aware edit/style conflict behavior is modeled at the internal
   helper level and is passed through `Change`, but it still needs broader
   multi-change replay coverage at the operation layer.
-- Rust strings cannot represent invalid standalone UTF-16 surrogate halves, so
-  splitting inside a surrogate pair currently uses lossy UTF-16 decoding. Exact
-  JS string parity for that edge case needs a deliberate representation choice.
+- Rust strings cannot represent invalid standalone UTF-16 surrogate halves.
+  Local edits refuse a mid-pair index, but a remote position inside a pair
+  (which only an SDK without that check can send) still splits the node with
+  lossy UTF-16 decoding, as Go does.
 
 Expected direction:
 
-- Connect public Text methods through `ChangeContext`.
-- Align edit operation info with the JS value-change list before exposing text
-  watch/event APIs.
 - Continue porting JS history and multi-client text scenarios at the operation
   layer.
 - Replace rebuild-on-mutation indexing with stable node handles to align the
@@ -497,18 +660,31 @@ Current Rust behavior:
 
 - `TreeNodeId` models the same creation-ticket plus UTF-16 offset identity used
   by JS `CRDTTreeNodeID` and Go `TreeNodeID`.
-- `CrdtTree` stores a root `TreeNode`, rebuilds a node lookup map by ID, and
-  resolves split-node floor lookups only when the requested ID has the same
-  creation ticket.
+- `CrdtTree` stores a root `TreeNode`, rebuilds the set of node IDs after
+  each structural change, and resolves split-node floor lookups only when the
+  requested ID has the same creation ticket. Nodes are found by walking the
+  tree, so each lookup costs a tree walk where JS and Go keep an LLRB map.
 - `TreeNode` supports element nodes, text nodes, optional `Rht` attributes,
   tombstones, split-link metadata, merge metadata, JSON/XML output, UTF-16 text
   sizing, active attribute data size, and internal GC pair discovery.
 - `CrdtTree` can convert between linear tree indexes, paths, and CRDT tree
   positions using the JS/Go element padding and text-child path rules.
-- `CrdtTree` now resolves edit positions through parent/left sibling paths,
-  advances unknown split siblings via `insNextID`, narrows collection ranges
-  across split siblings, and falls back to floor-style text lookup when a text
-  node has moved under a concurrent split sibling.
+- `CrdtTree` resolves edit and style positions like JS
+  `findNodesAndSplitText`: it finds the parent and left sibling by node ID,
+  removed nodes included, follows `insPrevID` from the start of a split node,
+  splits the text node the position falls in, and moves the left sibling past
+  nodes inserted at the same position after the edit, as in RGA. It advances
+  unknown split siblings via `insNextID` and narrows collection ranges across
+  split siblings.
+- Edit ranges are walked over indexes that count removed nodes, as JS
+  `traverseInPosRange` walks tombstones, and content is inserted right after
+  the left sibling. Content inserted into a parent removed concurrently is
+  born removed and registered as garbage.
+- Tree edit changes follow JS `makeDeletionChanges`: one deletion change per
+  run of adjacent removed tokens, last run first, with the inserted nodes
+  attached to the change that starts at the insertion index. An edit that
+  changes nothing visible reports no change, and style changes skip removed
+  nodes and report the range of the node's start token.
 - `CrdtTree` can apply simple style/remove-style ranges to visible element
   tokens, split text nodes at style boundaries, ignore text-only ranges after
   applying the boundary splits, collect tree style operation info, and report
@@ -517,18 +693,36 @@ Current Rust behavior:
 - `CrdtTree` can apply split-free element insert/delete edits and text-node
   split insert/delete edits, collect tree edit operation info, register removed
   node GC pairs, and report reverse operation inputs.
-- `CrdtTree` can apply multi-level element splits by cloning the split element
-  type and attributes, moving the right-side children into new siblings, and
-  issuing split node IDs with the same delimiter progression used by JS/Go.
-- `CrdtTree` can merge visible element boundaries by tombstoning merge source
-  elements, moving live children into the left-side parent, and recording basic
-  `mergedFrom`, `mergedAt`, and `mergedInto` metadata.
-- `CrdtTree` covers representative concurrent split cases ported from JS/Go:
-  same-position splits, different-position splits on the same node, and
-  different-level splits.
-- `CrdtTree` also covers representative concurrent insert/delete cases around
-  split positions, including inserts into the original node, split boundary, and
-  split node.
+- `CrdtTree::edit` ports JS `CRDTTree.edit` step by step, by node ID:
+  - 01-1: the ends advance past the split siblings the editor did not know,
+    stopping at the editor's own split products (§7.7), and the traversal is
+    narrowed when a concurrent split put the ends in different parents;
+  - 02: the traversal removes what the editor knew, reaches the unknown split
+    siblings of a deleted element (JS `collectUnknownSplitSiblings`), and
+    resolves concurrent deletions last writer wins;
+  - 03: a merge moves every child of a merged element, removed ones too, to
+    the resolved merge target (chained merges stay flat), stamps
+    `mergedFrom`/`mergedAt` on the first move only, points the source at the
+    target, and tombstones in place what would close a cycle;
+  - 03-1: deleting a merge source deletes the children it gave away, unless
+    the edit's own positions declared it (JS `declaredBoundaries`);
+  - 04: splits use physical child offsets, keep merge-moved children of the
+    level (Fix 8) and concurrent inserts at the boundary (§7.3) on the left,
+    move an empty product in front of a re-parented sibling (§7.4), advance
+    per level past unknown split siblings (§7.5), order same-boundary splits
+    by ticket (JS `orderSameBoundarySplit`), and link the next split sibling
+    back to the product. A split is reported as one empty change where it
+    opened;
+  - 05: content inserted at a position declared in a merged-away parent is
+    stamped with that parent and the merge ticket (§9.4).
+- The tickets of the elements a split creates come from the recorded
+  `TreeEditOperation.split_tickets` (JS `splitTickets`), then from the JS
+  fallback that rebuilds them from `executed_at` and the top-level content
+  count. The wire shape and the proto converter carry `split_tickets`.
+- Purging a removed node links its split siblings to each other, as JS
+  `CRDTTree.purge` does.
+- `rebuild_merge_state` follows JS `rebuildMergeState` for trees loaded from
+  a snapshot.
 - `CrdtElement::Tree` participates in metadata dispatch, JSON conversion,
   data-size accounting, removal, and deep copy.
 - `CrdtRoot` can find tree elements by creation time, rebuild tree internal GC
@@ -566,37 +760,55 @@ Gap:
 - Rust Tree style operation is still partial. It now propagates style/remove
   style to direct unknown split siblings in the JS/Go shape, but the broader
   concurrent style matrices and range-narrowing edge cases are not yet ported.
-- Rust Tree edit operation is still partial. It now supports text split ranges,
-  multi-level element split, visible element-boundary merge, representative
-  concurrent split/insert/delete cases, range narrowing, and basic merge metadata, but
-  redo tagging after split undo, full `insPrevID`/`insNextID` maintenance across
-  existing neighbors, and the broader concurrent edit matrix still need JS/Go
-  parity work.
+- Tree undo and redo are not ported. Reverse tree edit operations are still
+  built for insert/delete, pure split and merge edits, but the document
+  history drops them (see Undo and Redo), and a reverse that
+  does not fit the tree after a concurrent merge is dropped rather than
+  failing the edit, and the JS reverse machinery (restore spans, split
+  reconciliation, `mergeSourceOf`, `redoSplitLevel`, `dropDuplicateContents`
+  for copy-reinserted content) is not ported.
 - Like `CrdtText`, Tree text-node splitting uses valid Rust strings. Splitting
   inside an invalid standalone UTF-16 surrogate edge would need the same
   deliberate representation choice as Text.
-- Split and merge metadata is stored, new text/element split nodes receive the
-  basic split identity/link metadata, and merge source children receive basic
-  merge metadata. Neighbor-link maintenance and concurrent split/merge metadata
-  still need broader parity coverage.
+- A split does not register the attribute tombstones its product copies
+  (JS `pushPendingGCPair` for `split.getGCPairs()`): the root keys GC pairs by
+  ID string, and the copy carries the same attribute IDs as the original. They
+  stay uncollected garbage; content is unaffected.
+- TreeEdit content decoded from the wire keeps the split links and merge
+  lineage it carries; JS drops them (`dropEngineOnlyLinks`). Content created
+  by JS, Go, or Rust editors never carries them.
+  A Set, Add or ArraySet element payload, by contrast, does drop the split
+  links of every tree it holds, removed members included, both on decode and
+  on the copy an undo restores (JS `dropSplitLinksInElement` in
+  `crdt/split_links.ts`); its merge lineage is kept, as in JS.
+- Rust style resolution does not port the JS §9.4 interloper guards
+  (`mergedAnchorInterloperGuard`, `reversedFromAnchorRecovery`) or the
+  declared-lineage checks of `styleTargets`. The ported style matrices,
+  merge and split included, converge and match JS.
 - Operation-time GC registration exists for split-free tree-node deletion,
   text-node split deletion, and visible-boundary merge source tombstones, but
   concurrent element split/merge deletion paths still need JS/Go parity.
-- Public Tree facade is missing. Wire conversion exists for full
-  `JSONElement.Tree` payloads and tree edit/style operation bodies, but
-  broader JS/Go protocol replay fixtures are still needed.
-- Tree attribute JSON/XML output follows the same scalar parsing helper as
-  Text, but object/array attribute values still need broader JS parity tests
-  before public style APIs expose them.
+- Wire conversion exists for full `JSONElement.Tree` payloads and tree
+  edit/style operation bodies, but broader JS/Go protocol replay fixtures are
+  still needed.
+- All the matrices of JS `tree_concurrency_test.ts` are ported, merge and
+  split operations included. Every combination converges, and on 2026-11-08
+  each ended with the same XML as the JS SDK run against the same server.
+- Tree attribute JSON output still uses its own scalar parsing helper. JS
+  re-encodes every value through `JSON.parse`, emits `"attributes":{}` for a
+  node whose attributes were all removed, and does not escape text in
+  `toXML`, where Rust escapes `&`, `<`, and `>`; Rust XML attributes also do
+  not escape `'` as JS does.
+- Rust `TreeNode::can_style` still refuses a removed node unless the style is
+  later than the removal, where JS styles removed nodes too. Removed nodes
+  report no change either way, so only an undo restore could tell them apart.
 
 Expected direction:
 
 - Extend path/index conversion tests around removed nodes and mixed
   element/text children so edit/style operations can reuse the same position
   semantics.
-- Add Tree edit operation tests from JS/Go around redo after split undo,
-  removed-node ranges, mixed-level merge cases, and the broader generated
-  concurrent edit matrix before exposing public Tree methods.
+- Port Tree undo and redo, with the JS split and merge reverse operations.
 - Extend Tree style parity from direct split-sibling propagation toward the full
   version-vector and concurrent style matrices in JS/Go.
 
@@ -608,6 +820,13 @@ Current Rust behavior:
 - `Document::update` uses an update-time recorder backed by `ChangeContext` for
   current public object and array mutation methods.
 - `Change` executes operations and stacks reverse operations.
+- `Document::update` runs the change on a copy of the CRDT root and keeps the
+  copy only when every operation succeeds, as JS runs a change on its clone
+  root first. A change that fails partway leaves the document as it was:
+  JSON, CRDT root, pending changes, history, and change ID. Nothing reached
+  the root, so no lamport is burned; JS burns it only when its second pass,
+  on the root, fails after the clone pass succeeded, which cannot happen
+  here. A presence-only change runs without a copy.
 - `ChangePack` carries document key, checkpoint, changes, version vector,
   removal flag, and optional snapshot bytes.
 - `Document::apply_change_pack` applies changes or decoded snapshot roots,
@@ -626,7 +845,20 @@ Gap:
 
 - Rust change context now mediates the first public object/array mutation
   methods, but it does not yet own full live JSON/CRDT wrappers.
-- Presence changes are not implemented.
+- Presence is implemented for `Put`/`Clear`: `Document::update_with_presence`,
+  presence-only changes, remote presence application, snapshot presences, and
+  online-client tracking. Rust never emits JS `Patch` changes (it decodes them);
+  `disablePresence` is not ported. Presence undo/redo is ported (see Undo
+  and Redo).
+- Document events follow JS `reconcilePresence`: local presence updates,
+  remote presence changes, and status transitions publish
+  `PresenceChanged`/`Watched`/`Unwatched`. A remote `Clear` takes the actor
+  offline. The client publishes `Initialized`, watch-driven
+  `Watched`/`Unwatched`, `ConnectionChanged`, `SyncStatusChanged`, and
+  `AuthError`. Broadcast is a channel event, not a document event, as in
+  JS. JS `EpochMismatch`, `WriteRejected`, `LocalChangesDropped`, and
+  `PersistDisabled` events are not ported. `ChangeInfo` omits JS
+  `clientSeq`/`serverSeq`/`rawChange`.
 - Change packs can be projected to generated protobuf payloads and
   reconstructed back into core `ChangePack` values for the current operation
   set. Binary round-trip tests cover nested object/array/counter replay, and
@@ -634,40 +866,104 @@ Gap:
   `Document::apply_change_pack`.
 - Raw snapshot bytes that have not been decoded by the protocol converter are
   still rejected by core to keep protobuf parsing out of `yorkie-core`.
-- Full sync status transitions are not implemented.
+- `DocStatus` transitions (`Detached`, `Attached`, `Removed`) and the
+  `SyncStatusChanged` and `ConnectionChanged` events are driven by the client
+  (see Client, Sync, and Watch).
 
 Expected direction:
 
 - Add live change context before expanding public document mutation APIs.
 - Extend snapshot handling with presence, GC, and cross-language binary
   fixtures before real client sync.
-- Extend status handling with presence, events, and client-driven lifecycle
-  transitions.
 
 ## Undo and Redo
 
 Current Rust behavior:
 
-- Some operations create reverse operations.
-- Undo/redo source handling exists as an enum and has narrow operation tests.
+- `Document::history()` returns a `HistoryRef` with `can_undo`/`can_redo`;
+  `Document::history_mut()` returns a `HistoryMut` that also has
+  `undo`/`redo` (JS `doc.history`). The stacks keep 50 entries each (JS
+  `MaxUndoRedoStackDepth`).
+- A local change pushes its reverse operations, newest first, and the
+  previous values of the presence keys set with
+  `PresenceProxy::set_with_history` (JS `addToHistory: true`). A change with
+  operation info clears the redo stack; a presence-only change does not.
+- Object set/remove, array add/remove/move/set, counter increase, text
+  edit/style, and presence are undoable. An undo or redo is a new local
+  change: it is queued for the server, publishes `LocalChange`, and replays
+  with `OpSource::UndoRedo` after a snapshot (JS `replaySourceOf`). An empty
+  stack makes `undo`/`redo` a no-op, as in JS.
+- An array set and an undo that adds an element back re-point the stacks to
+  the element's new creation time (JS `reconcileCreatedAt`). A remote or
+  replayed text edit shifts the undo text edits of the same text (JS
+  `reconcileTextEdit`/`reconcileOperation`).
+- An undo text edit is refined against the current split chain when it runs,
+  and the change keeps the refined positions for other replicas. JS does this
+  by mutating the operation inside `execute`; Rust refines in
+  `Change::execute_undo_redo` before each edit runs.
+- A snapshot clears both stacks, as in JS `applySnapshot`.
+- An undo or redo runs on a copy of the CRDT root, like a local update (see
+  Change, ChangeContext, and ChangePack). One that fails leaves the document
+  as it was and queues nothing. As in JS, the popped entry is dropped. The
+  re-pointing of the other entries (`reconcile_created_at`) waits until the
+  change has run, so a failed one leaves them as they were; JS has already
+  re-pointed them to tickets the failed change never committed.
 
 JS/Go behavior:
 
-- Undo/redo is integrated with history, operation grouping, and array/object
-  operation semantics.
+- JS reverses Text edits by identity (`RestoreSpan`, `restoreMode`,
+  `retombstoneSpans`, and the removal ledger `recordRemoval`/
+  `isRemovedInView`), so overlapping undos of concurrent deletions restore
+  the original text once.
+- JS undoes and redoes Tree edits and styles, with split reconciliation
+  (`reconcileTreeNodeID`, `reconcileTreeEdit`, split tickets).
+- JS has a `maxUndoDepth` document option, `clearHistory`, and refuses
+  undo/redo during an update and while minting is suspended (epoch
+  re-anchor). Its change events carry `source: OpSource.UndoRedo`.
 
 Gap:
 
-- There is no full document history manager.
-- Reverse operations are not yet exercised through a user-facing undo/redo API.
-- Array reverse operation behavior is only covered in small internal slices.
+- Undo reverses are positional, as JS was before identity-preserving restore:
+  an undone deletion is inserted again as new content. Two clients undoing
+  overlapping deletions converge on duplicated content. The two JS
+  correctness cases for this (`history_text_test.ts`, skipped upstream) are
+  ignored in `crates/yorkie/tests/integration_history.rs`. The
+  `restore_spans`/`restore_mode` proto fields stay at their defaults, and the
+  removal ledger is not ported (see the Text section).
+- **Interop: a Rust replica does not converge with a JS peer that undoes.**
+  This is the receive side of the gap above. JS sends an undo of a Text edit
+  with `restore_spans`, `retombstone_spans`, and `restore_mode`
+  (`packages/sdk/src/api/converter.ts`, `toOperation` Edit case, encoded by
+  `EditOperation.identityReverse` in `document/operation/edit_operation.ts`),
+  and an undo of a Tree edit with the same fields on `TreeEdit`
+  (`toOperation` TreeEdit case, `document/operation/tree_edit_operation.ts`).
+  A JS receiver revives or re-removes those nodes by identity
+  (`fromOperation` Edit and TreeEdit cases, then `EditOperation.execute` with
+  `restoreMode`). The Rust decoder
+  (`crates/yorkie-protocol/src/converter.rs`, the `Edit` and `TreeEdit` arms
+  of the operation decode) drops the three fields and runs only the
+  positional part. For a Text undo that part is an empty edit of the
+  original range, so the text a JS undo brings back never reappears on the
+  Rust replica. Mixed JS and Rust sessions therefore diverge after a JS undo
+  of a Text or Tree edit. A Rust undo goes out as a plain positional edit,
+  which JS applies the same way. Porting the receive side needs the removal
+  ledger and identity restore in `CrdtText` and `CrdtTree`.
+- Tree undo and redo are not ported. Tree edits and styles push no reverse
+  operation, so an undo never replays a tree change, and a change that mixes
+  tree and other edits is undone only for the other edits.
+- `maxUndoDepth`, `clearHistory`, and the minting-suspended refusal are not
+  ported. Rust change events do not carry the JS `source` field, so an
+  undo's `LocalChange` looks like any other local change.
+
+- JS `getUndoStackForTest`/`getRedoStackForTest` have no public Rust
+  counterpart: the stacks are readable only from yorkie-core unit tests.
+  The integration port of `doc_presence_test.ts:689` checks the stack depth
+  with `can_undo` and the entries through undo and redo results instead.
 
 Expected direction:
 
-- Port history behavior after public mutation methods produce correct
-  operation types.
-- Use JS history tests as the main source for expected grouping and reverse-op
-  behavior.
+- Port identity-preserving Text restore together with the removal ledger.
+- Port Tree undo and redo with the JS split and merge reverse machinery.
 
 ## Serialization and Protocol Conversion
 
@@ -712,14 +1008,19 @@ JS/Go behavior:
 
 Gap:
 
-- Presence changes are not converted yet.
+- Presence `Put`/`Clear` changes and snapshot presences are converted; each
+  value travels as its JSON encoding. As in JS `fromPresenceChange`, every
+  type decodes so a stored change cannot wedge sync: UNSPECIFIED and DELETE
+  decode as an empty `Put`, and PATCH decodes as the receive-only
+  `PresenceChange::Patch` (absent presence becomes `{}`), which merges onto the
+  actor's presence on apply and encodes back to PATCH.
 - Go has a nil-pack converter error case. Rust takes `&api::ChangePack`, so
   that exact nil case is excluded by the function signature; the missing
   checkpoint case is covered.
 - Snapshot bytes are carried in `ChangePack`, and the protocol converter
   decodes `Snapshot.root` into a core snapshot root for
-  `Document::apply_change_pack`. Snapshot presences are currently ignored
-  because presence is not implemented.
+  `Document::apply_change_pack`. Snapshot presences replace the document's
+  presences.
 - No cross-language binary compatibility tests. This is intentionally not the
   immediate focus while JS/Go in-repo converter scenarios are still being
   ported.
@@ -731,7 +1032,7 @@ Gap:
   merge-state root bytes at core wire level, tree protobuf payload round trips
   at protocol level, snapshot-root `ChangePack` protobuf round trips,
   simple and mixed change-pack replay, and a generated-protobuf snapshot apply
-  path. Presence remains blocked by the missing presence model.
+  path. Presence changes and snapshot presences are converted (see above).
 
 Expected direction:
 
@@ -746,91 +1047,258 @@ Expected direction:
 
 Current Rust behavior:
 
-- Client crates and facade are scaffolded.
 - `yorkie-client` is split into `client`, `options`, `attachment`,
-  `transport`, `protocol`, and `error` modules, with `lib.rs` kept as a
-  re-exporting crate entrypoint.
-- `ClientOptions` carries the JS/Go-shaped base options that do not require a
-  network runtime yet: RPC address, client key, API key, metadata, user agent,
-  sync-loop duration, retry delay, reconnect delay, and channel heartbeat
-  interval. Defaults match the JS/Go values where both implementations already
-  agree.
+  `transport`, `connect`, `protocol`, `sync_loop`, `watch`, and `error`
+  modules, with `lib.rs` kept as a re-exporting crate entrypoint.
+- `ClientOptions` carries the JS/Go-shaped base options: RPC address, client
+  key, API key, metadata, user agent, sync-loop duration, retry delay,
+  reconnect delay, channel heartbeat interval, and watch heartbeat interval
+  (JS `watchHeartbeatInterval`, default 20s). Defaults match the JS/Go values
+  where both implementations already agree.
 - `SyncMode`, `DeactivateOptions`, `AttachOptions`, `AttachChannelOptions`,
-  `DetachOptions`, and `SyncOptions` are defined as public client-surface
-  types.
-- `Client` stores a key, optional actor ID, deactivated status, sync/watch
-  condition flags, and document attachment metadata.
-- `ClientTransport` is an async, testable transport boundary for
-  activate/deactivate, document attach/detach/remove, and client-side push-pull
-  sync.
-  `Client::activate` sends client key, metadata, and shard key through this
-  boundary; `Client::deactivate` sends client ID and synchronous flag, clears
-  local attachment metadata, and marks sync/watch conditions inactive.
-- `Client::attach` sends client ID, local `ChangePack`, schema key, and shard
-  key through the transport boundary, stores returned max-size/schema-rule
-  metadata on the document, applies the returned change pack, records
-  attachment metadata, and marks the watch loop condition active for realtime
-  sync modes.
-- `Client::detach` sends client ID, attached document ID, local `ChangePack`,
-  `remove_if_not_attached`, and shard key through the transport boundary,
-  applies the returned change pack, updates document status, removes attachment
-  metadata, and refreshes the watch loop condition.
-- `Client::remove` sends client ID, attached document ID, local `ChangePack`
-  marked as removed, and shard key through the transport boundary, applies the
-  returned change pack, removes attachment metadata, and refreshes the watch
-  loop condition. The request/response shape follows the client-side remove
-  flow in JS, with Go client behavior used as a typed cross-check.
-- `Client::sync` and `Client::sync_with_options` send client ID, attached
-  document ID, local `ChangePack`, push-only mode, and shard key through the
-  transport boundary, apply the returned change pack, and remove attachment
-  metadata when the document is removed. The push-only response guard follows
-  the client-side JS behavior.
+  and `DetachOptions` are public client-surface types. `AttachOptions` has
+  `initial_root`, `initial_presence` (default empty), `sync_mode` (default
+  `Realtime`), `document_poll_interval`, and `schema`, as in JS.
+- `Client` is a cloneable handle over `Arc<ClientInner>`. It owns an
+  `Arc<dyn ClientTransport>`: `Client::new` builds a `ConnectTransport`, and
+  `Client::with_transport` takes any transport (tests use a mock or wrap
+  `ConnectTransport`). Its methods take `&self`. Because it spawns tokio
+  tasks, it must be used inside a tokio runtime.
+- Client calls (`activate`, `deactivate`, `attach`, `detach`, `sync`,
+  `remove`, `change_sync_mode`, and the channel calls) and each sync-loop
+  round run one at a time on an async task queue (JS `enqueueTask`). Watch
+  streams do not use it; each broadcast try does, but not the waits between
+  tries.
+- Documents are shared as `SharedDocument` (`Arc<std::sync::Mutex<Document>>`).
+  The client locks a document only for synchronous steps (build a pack, apply
+  a response, publish an event) and never across an `.await`, and it never
+  holds a document lock together with its own state lock. Event callbacks run
+  under the document lock, so a callback must not lock the same document
+  again.
+- A client created without a `key` (or with an empty one) gets a random
+  version 4 UUID from the OS CSPRNG, as JS `uuid()` does (`util/uuid`). It
+  panics if the OS has no random source, where JS throws
+  `ErrInvalidArgument`.
+- `Client::activate` sends client key, metadata, and shard key and starts the
+  sync loop. The actor stamped into changes is the response `actor_id`, or
+  `client_id` when it is empty (JS `res.actorId || res.clientId`); requests
+  keep sending `client_id`.
+- `Client::deactivate` sends client ID and synchronous flag, marks sync/watch
+  conditions inactive, stops the sync loop and every watch loop, drops every
+  attachment, and sets each attached document to `Detached` (JS
+  `deactivateInternal`).
+- `Client::attach` rejects an inactive client, a document that is not
+  `Detached`, and a key that is already attached or attaching
+  (`ClientError::AlreadyAttached`, JS `ErrAlreadyAttached`). It stamps the
+  actor, sets `initial_presence` in a local change, sends the attach request,
+  stores returned max-size/schema-rule metadata, and applies the returned
+  pack. It then re-checks that the client is still active in the same session
+  (otherwise the document goes back to `Detached` and the call fails with
+  `ClientNotActivated`), records the attachment, and in a realtime mode opens
+  the watch stream and waits until it is initialized or its first attempt
+  ends, as JS awaits `runWatchLoop`. Finally it applies `initial_root` for
+  missing keys and returns the same `SharedDocument`.
+- `Client::detach` clears the presence first (JS `p.clear()` before detach),
+  sends client ID, document ID, local `ChangePack`, `remove_if_not_attached`,
+  and shard key, applies the returned pack, updates document status, and
+  removes the attachment, which stops its watch loop (JS `detachInternal`).
+- `Client::remove` stamps the actor, sends a `ChangePack` marked as removed,
+  applies the returned pack, and removes the attachment.
+- `Client::sync(Some(doc))` pushes and pulls that document; `sync(None)` syncs
+  every attachment in its own sync mode, one after another (JS runs them in
+  parallel). The push-only response guard follows the client-side JS
+  behavior. A pulled removal drops the attachment. Every sync publishes
+  `SyncStatusChanged(Synced | SyncFailed)`.
+- `detach`, `sync`, `remove`, and `change_sync_mode` find the attachment by
+  key and require it to hold the same `SharedDocument`. Work that resumes
+  after an `.await` (a sync, a watch message) touches or removes an
+  attachment only if it still holds the document it started with, so a newer
+  attachment of the same key is never dropped.
+- The sync loop (`sync_loop.rs`, JS `runSyncLoop`) is one tokio task per
+  active client. Every `sync_loop_duration` it syncs, in parallel, each
+  attachment that needs it (JS `needRealtimeSync`): `Realtime` with local
+  changes or a pending remote-change notice, `RealtimePushOnly` with local
+  changes (push-only request), `Polling` once per poll interval, never
+  `RealtimeSyncOff` or `Manual`. The notice is cleared before the request and
+  restored if the sync fails. A failed round is handled after it leaves the
+  task queue, as in JS: after a retryable error it waits
+  `retry_sync_loop_delay` (up to 5s longer while the auth token refresh
+  backs off); any other error stops the loop. A document whose push is
+  refused for its size (`ErrDocumentSizeExceedsLimit`, `ErrChangeTooLarge`)
+  is parked instead, as JS `markWriteRejected` does: the loop skips it and
+  goes on with the rest until a sync of it succeeds, such as an explicit
+  `Client::sync`.
+- The watch loop (`watch.rs`, JS `runWatchLoop`/`runWatchStream`) is one
+  tokio task per attachment in `Realtime`, `RealtimePushOnly`, or
+  `RealtimeSyncOff`. It opens the unified `Watch` RPC with a document
+  descriptor, `actor_id`, and `heartbeat_interval_ms`, publishes
+  `ConnectionChanged(Connected)`, and marks a pull as needed. Initialization
+  sets the online clients and publishes `Initialized`
+  (`Document::apply_watch_init`); `DOCUMENT_CHANGED` marks a pull as needed;
+  `DOCUMENT_WATCHED`/`UNWATCHED` update the online set and publish
+  `Watched`/`Unwatched` (`Document::apply_watched`/`apply_unwatched`);
+  heartbeats are ignored. When the stream fails or ends it clears the online
+  clients, publishes `Initialized` and `ConnectionChanged(Disconnected)` (and
+  `AuthError` for `ErrUnauthenticated`), and reconnects after
+  `reconnect_stream_delay` (longer while the auth token refresh backs off);
+  a non-retryable error stops it.
+  Once the server reports a nonzero heartbeat interval, a stream silent for
+  three times that interval (1s to 24h) is treated as half-open and
+  reconnected (JS `watchIdleTimeout`).
+- `Client::change_sync_mode` follows JS `changeDocumentSyncMode`: switching to
+  `Manual` or `Polling` closes the watch stream (publishing the same
+  disconnect events), switching from those to a realtime mode opens it and
+  waits for it, and switching to `Realtime` marks a pull as needed. A switch
+  to `RealtimePushOnly` or `RealtimeSyncOff` is counted on the attachment
+  before it waits on the task queue (JS `pendingPullPauses`), so a sync
+  already in flight drops the remote state of its reply and marks a pull as
+  needed again. This check reads the attachment's mode when the reply
+  arrives and skips a `Manual` document. The pull is marked in `Polling`
+  too, as in JS; `Polling` ignores the mark and pulls on its interval.
+- Loops hold `Weak<ClientInner>`, and their handles live in the client state
+  and abort the loop when dropped, so dropping every `Client` handle stops
+  them as well. `Client::running_task_count` (hidden) lets tests check that.
 - `yorkie-client::protocol` converts activate/deactivate, attach/detach/remove,
-  and push-pull transport DTOs to and from generated protobuf request/response
-  messages. Shard keys remain on transport DTOs because JS/Go send them as
-  request metadata rather than protobuf fields.
-- `Client::has` and `change_sync_mode` cover local lifecycle bookkeeping and
-  precondition errors for documents.
-- Document local change packs can be created and applied in-memory.
+  push-pull, and watch transport DTOs to and from generated protobuf messages.
+  Shard keys remain on transport DTOs because JS/Go send them as request
+  metadata. Unknown watch bodies (channel events, unknown event types) are
+  skipped.
+- `ConnectTransport` implements the unary RPCs and the server-streaming
+  `Watch` RPC over the Connect protocol (reqwest, binary protobuf,
+  `application/connect+proto` envelopes, end-stream errors decoded into
+  `ClientError::Rpc`).
 - `Document` stores max-size and schema-rule metadata received during attach,
-  but update-time max-size/schema validation is not implemented yet.
-- `yorkie-protocol` converts schema rules between generated protobuf types and
-  Rust document metadata using the same field shape as JS/Go converters.
+  and `Document::update` checks each local change against them before
+  committing it, as JS `update` does: schema rules first, then the size. A
+  rejected change leaves the document untouched. Remote changes and undo/redo
+  are not checked, as in JS.
+- Server errors are handled as JS `handleConnectError` does
+  (`Client::handle_connect_error`), using the Yorkie code and reason from
+  the error's `ErrorInfo` metadata: size rejections are not retried,
+  transient Connect codes and `ErrTooManySubscribers` are retried,
+  `ErrUnauthenticated` refreshes the auth token and is retried, and
+  `ErrClientNotActivated`/`ErrClientNotFound` deactivate the client locally
+  (JS `deactivateInternal`). One-shot calls run it and return the error, as
+  JS does in their `catch`.
+- `ClientOptions::auth_token_injector` (JS `authTokenInjector`) gives the
+  token `ConnectTransport` sends as the `authorization` header (JS
+  `createAuthInterceptor`): at activation with no reason, and after each
+  `ErrUnauthenticated` with the auth webhook's reason. A failing injector
+  fails `activate` and one-shot calls with its error; the loops keep the old
+  token and back off their injector calls (1s doubling to 30s, jittered),
+  with the JS rules for overlapping calls (`refreshAuthToken`). `deactivate`
+  refused with a token that cannot be refreshed deactivates locally and
+  returns the injector's error. Documents publish `AuthError` for refused
+  syncs (`ErrUnauthenticated`, `ErrPermissionDenied`) and watch streams
+  (`ErrUnauthenticated`); channels publish it for refused broadcasts.
 
 JS/Go behavior:
 
 - Clients support activate/deactivate, attach/detach, sync, watch, presence,
   stream handling, retry/error behavior, and document status transitions.
+- JS `handleConnectError` refreshes auth tokens on `Unauthenticated`, parks
+  documents whose writes the server rejects for size, retries
+  `ErrTooManySubscribers`, and deactivates the client on
+  `ErrClientNotActivated`/`ErrClientNotFound`.
 
 Gap:
 
-- No concrete RPC transport.
-- Activate/deactivate/attach/detach/remove/push-pull sync use an async
-  transport trait and have protobuf conversion helpers, but there is no
-  Connect/gRPC-web implementation yet.
-- No watch stream.
-- No presence.
-- Schema rules and max-size limits are stored after attach but are not enforced
-  during `Document::update` yet.
-- Deactivation clears client attachment metadata but cannot yet update attached
-  document statuses because documents are not owned by the client.
-- Sync modes are represented in attachment metadata but not executed by a sync
-  loop.
-- Auth token refresh, gRPC-web/connect transport choice, Go TLS options, and
-  Go receive-size/logger options are not modeled yet.
+- `EpochMismatch` and `WriteRejected` events are not published: a parked
+  document only gets `SyncStatusChanged(SyncFailed)`, and an
+  `ErrEpochMismatch` stops the sync loop without telling the document.
+- JS's `deactivating` flag is not modeled: Rust `deactivate` holds the task
+  queue, so the sync loop cannot run during it. The auth webhook path is
+  covered by unit tests with a mock transport only; JS `webhook_test.ts`
+  needs a server configured with an auth webhook and is not ported.
+- `DOCUMENT_BROADCAST` watch events are ignored, as in JS: broadcasts travel
+  on channels.
+- Detach does not mark the attachment as detaching (JS `markDetaching`); the
+  task queue keeps the sync loop from running during a detach instead.
+- A push-only or sync-off reply is taken as a push acknowledgement only, as
+  in JS, and so is a reply that arrives while a pause is pending. For the
+  push-only and sync-off part, Rust takes the request's mode and the
+  attachment's mode when the sync started, where JS reads the attachment's
+  mode when the reply arrives. The pending-pause part reads the mode when
+  the reply arrives, as JS does.
+- Integration tests set schema rules and the size limit with
+  `Document::set_schema_rules` and `set_max_size_per_document` after
+  attaching. JS creates them through the admin API (`CreateSchema`,
+  `UpdateProject`) and attaches with a schema key; those cases, and the
+  `UpdateDocument` schema cases, are not ported.
+- When a tree text node carries several disallowed marks, the schema error
+  names the first by key; JS names the first set.
+- `DeactivateOptions::keepalive` exists but has no effect: in JS it keeps a
+  browser `fetch` alive during page unload, which has no Rust counterpart.
+  `disableGC`, gRPC-web/Connect transport choice, Go TLS options, and Go
+  receive-size/logger options are not modeled yet.
 
 Expected direction:
 
-- Add a concrete protocol transport that uses the existing client protocol
-  conversion helpers.
-- Keep Client state transitions aligned with document status and attachment
-  metadata as the network layer lands.
+- Publish `WriteRejected` and `EpochMismatch` when those events are ported.
+
+## Channels and Broadcast
+
+Current Rust behavior:
+
+- `Channel` (`yorkie-client/src/channel.rs`) ports JS `Channel`: key
+  validation, status, actor, session ID, session count with seq ordering
+  (`updateSessionCount`), subscriptions for all events or one broadcast
+  topic, and `broadcast`. It is shared as `SharedChannel`
+  (`Arc<std::sync::Mutex<Channel>>`), locked like `SharedDocument`.
+- Channels follow the JS RefreshChannel-only lifecycle. `attach_channel`
+  registers the channel and starts the sync loop; the client need not be
+  active. The first `RefreshChannel` (no session ID) carries the client key
+  and metadata, and its reply gives the session ID (the channel becomes
+  `Attached`) and, for a client without one, a client ID that activates the
+  client. Later refreshes run every heartbeat interval (default 5s, JS
+  `DefaultChannelHeartbeatMs`) and publish `PresenceChanged` when the count
+  changes. `ErrSessionNotFound` clears the session so the next round
+  creates one; any other failure publishes `SyncError` and goes through the
+  sync loop's retry rules.
+- `Realtime` channels open the unified `Watch` RPC with a channel descriptor
+  after their first refresh, and publish `Initialized`, `PresenceChanged`,
+  and `Broadcast`. `Polling` channels only refresh; `Manual` channels refresh
+  only through `sync_channel`. `change_channel_sync_mode` opens or closes the
+  stream and resets an unpinned heartbeat interval.
+- `detach_channel` is local, as in JS: the server expires the session by TTL
+  (15s, checked every 10s), so peers see the count fall up to ~25s later.
+  `deactivate` detaches channels too. `peek_channel` reads a count without
+  activation or a session.
+- `Channel::broadcast` publishes `LocalBroadcast`; the client that attached
+  the channel sends it in the background through the `Broadcast` RPC with
+  the JSON encoding of the payload, retrying retryable failures after 1s,
+  2s, 4s, ... (at most 20s) up to `BroadcastOptions::max_retries`, and passes
+  a final failure to `BroadcastOptions::error`. `Client::broadcast` sends one
+  and waits for it.
+
+Gap:
+
+- JS `ChannelStatus.Removed` is not ported.
+- Deliberate differences from JS: `detach_channel` clears the session ID (JS
+  keeps it, so a re-attached channel stays `Detached` until the old session
+  expires); every broadcast try checks the channel is still attached (JS
+  checks once); `Client::broadcast` waits for its retries (JS resolves after
+  the first failed try) and returns a non-retryable failure (JS swallows it);
+  `BroadcastOptions::error` gets any final failure of a `Channel::broadcast`
+  (JS calls it only when the first try fails and no retry is left, that is
+  with `maxRetries: 0`: a failure after retries and a non-retryable failure
+  never reach it). `attach_channel` rejects a key already attached as a
+  document or channel (JS overwrites the map entry).
+- JS "Should throw error when broadcasting unserializeable payload" has no
+  Rust case: a `serde_json::Value` payload always serializes.
+- Payload numbers are encoded by `serde_json`, which can differ from JS
+  `JSON.stringify` for edge cases (for example `1.0`).
 
 ## Error Behavior
 
 Current Rust behavior:
 
 - `YorkieError` is small and strongly typed for the current implementation.
+- `ErrorCode` has one variant per JS `Code`, with the JS strings
+  (`as_str`, `FromStr`). `YorkieError::code` maps every core variant to the
+  JS code thrown for the same failure, and `ClientError::code` gives the
+  server's Yorkie code for `Rpc`, the JS code for lifecycle errors, and the
+  core code for `Core`.
 
 JS/Go behavior:
 
@@ -839,14 +1307,20 @@ JS/Go behavior:
 
 Gap:
 
-- Rust error variants and messages are not yet aligned with JS error codes.
-- Some temporary errors use generic `MissingCrdtElement` or
-  `UnexpectedCrdtElement` where JS/Go may report more specific cases.
+- Rust variants are finer than JS codes, so several map to one code: missing
+  elements, keys, and execution times and invalid positions, indexes,
+  lamports, primitives, and counter operations are all
+  `ErrInvalidArgument`; `UnexpectedType`/`UnexpectedCrdtElement` are
+  `ErrInvalidType`. Messages other than the schema and size ones are not
+  the JS messages.
+- `ClientError::code` is `None` for `Transport` errors and for server codes
+  this SDK does not know; JS keeps the raw string.
+- JS `ChangeApplyError` (`ErrChangeApplyFailed` with change and operation
+  details) has no Rust counterpart.
 
 Expected direction:
 
-- Align public-facing errors with JS error codes before stabilizing the SDK
-  surface.
+- Align public-facing messages with JS before stabilizing the SDK surface.
 - Keep internal errors specific enough to debug CRDT state issues.
 
 ## Test Coverage
@@ -855,6 +1329,14 @@ Current Rust behavior:
 
 - Unit tests cover current CRDT primitives, object/RHT behavior, array/RGA
   basics, operations, change packs, and document JSON round trips.
+- Integration tests (`crates/yorkie/tests/integration_*.rs`) run against a
+  live server when `YORKIE_TEST_RPC_ADDR` is set and skip themselves
+  otherwise. They cover the client lifecycle, realtime sync and presence,
+  primitives, objects, arrays (including the concurrency table), counters,
+  text, tree (including split and merge matrices), history, schema and size
+  limits, channels with broadcast, documents, snapshots, and garbage
+  collection (including push-only and containment cases). CI runs them
+  against a pinned server image (`.github/workflows/ci.yml`).
 
 JS/Go behavior:
 
@@ -863,7 +1345,8 @@ JS/Go behavior:
 
 Gap:
 
-- Rust tests are hand-picked slices, not a systematic JS test port.
+- Rust tests are hand-picked slices, not a systematic JS test port, though
+  the integration suites port the JS cases of their areas by name.
 - No automated parity harness exists.
 - Array/RGA and operation tests now cover the JS/Go-style insert/move/set/remove
   matrix at CRDT and root-operation layers.
@@ -883,7 +1366,7 @@ Expected direction:
 
 - Treat current array CRDT behavior as semantically covered for the ported
   internal matrix, but not as a finished performance implementation.
-- Do not expose current operation event shapes as stable public API.
+- `OperationInfo` is public; keep new op infos in the JS `OpInfo` shape.
 - Route CRDT mutations through `CrdtRoot` to keep the copied root index fresh.
 - Prefer adding missing public JSON behavior before expanding network/client
   behavior.

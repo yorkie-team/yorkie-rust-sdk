@@ -16,7 +16,7 @@ pub(crate) enum PrimitiveType {
 }
 
 impl PrimitiveType {
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Null => "null",
             Self::Boolean => "boolean",
@@ -123,6 +123,10 @@ impl CrdtPrimitive {
 
     pub(crate) fn positioned_at(&self) -> &TimeTicket {
         self.meta.positioned_at()
+    }
+
+    pub(crate) fn set_created_at(&mut self, created_at: TimeTicket) {
+        self.meta.set_created_at(created_at);
     }
 
     pub(crate) fn set_moved_at(&mut self, moved_at: Option<TimeTicket>) -> bool {

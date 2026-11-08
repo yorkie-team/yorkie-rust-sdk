@@ -240,6 +240,14 @@ impl Rht {
         self.number_of_removed_elements -= 1;
     }
 
+    /// Returns whether a node with the given ID string is here, the node
+    /// `purge_by_id` would purge.
+    pub(crate) fn has_id(&self, child_id: &str) -> bool {
+        self.node_by_key
+            .values()
+            .any(|node| node.id_string() == child_id)
+    }
+
     pub(crate) fn purge_by_id(&mut self, child_id: &str) -> bool {
         let Some(key) = self
             .node_by_key
