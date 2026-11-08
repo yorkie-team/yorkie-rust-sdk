@@ -95,6 +95,11 @@ impl Document {
     }
 
     /// Assigns the actor for new local changes and pending local changes.
+    ///
+    /// Like JS `setActor` without `reissue`, it rewrites only each pending
+    /// change's ID and each operation's `executed_at`. Elements and nodes an
+    /// earlier edit created keep the actor they were created under: JS
+    /// pre-attach ticket re-issue (`reissueActor`) is not ported.
     pub fn set_actor(&mut self, actor_id: impl Into<ActorId>) {
         let actor_id = actor_id.into();
 

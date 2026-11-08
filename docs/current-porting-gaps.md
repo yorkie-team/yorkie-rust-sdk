@@ -31,6 +31,7 @@ section of the area they touch.
 | Revisions API | `packages/sdk/src/api/revision.ts`, `yorkie.ts`; `test/integration/revision_test.ts` | Admin-side document revisions. |
 | Epoch re-anchor | `packages/sdk/src/document/document.ts` (`EpochMismatch`, minting suspension), `client/client.ts` | `ErrEpochMismatch` stops the sync loop without telling the document. |
 | Identity-preserving undo restore spans and the removal ledger | `packages/sdk/src/document/crdt/rga_tree_split.ts` (`recordRemoval`, `isRemovedInView`), `document/crdt/text.ts`, `document/history.ts`; receive side `api/converter.ts` (`fromOperation` Edit and TreeEdit cases) | Rust sends `restore_spans`/`restore_mode` at their defaults, and drops them on receive, so a Rust replica diverges from a JS peer that undoes a Text or Tree edit. See Undo and Redo. |
+| Pre-attach ticket re-issue | `packages/sdk/src/document/document.ts` (`setActor` with `ReissueToken`, `reissueActor`, `neverSynced`), `api/reissue.ts` (`reissueOperations`, `reissueVersionVector`), `client/client.ts` (`claimReissue`, `markReissueClaim`); `docs/design/pre-attach-ticket-reissue.md` | Elements edited before `attach` keep the initial actor's tickets. See Document Editing Model. |
 | Disable-GC attach option | `packages/sdk/src/document/document.ts` (`disableGC`), `client/client.ts` | `AttachOptions` has no such field. |
 | Tree undo and redo | `packages/sdk/src/document/operation/tree_edit_operation.ts`, `tree_style_operation.ts`, `document/crdt/tree.ts`, `document/history.ts` | Split and merge reverse machinery. See Undo and Redo. |
 | Auth webhook integration test | `packages/sdk/test/integration/webhook_test.ts` | Needs a server with an auth webhook; the auth path is unit-tested with a mock transport. |
@@ -105,6 +106,25 @@ Gap:
 - Counter, Text, and Tree public editing methods are connected to the edit
   recorder. Text and Tree hold a copy of their CRDT value and apply each edit
   to it as the callback runs.
+- Pre-attach ticket re-issue is not ported. `Client::attach` calls
+  `Document::set_actor`, which, like JS `setActor` without `reissue`, rewrites
+  only each pending change's ID and each operation's `executed_at` (and moves
+  the self presence). Every other ticket an edit made before `attach` minted
+  keeps the initial actor: element `created_at`s in `crdt_root` and inside the
+  operations, Text and Tree node IDs, and positions. JS `Client.attach`
+  instead calls `setActor(actor, { reissue: ReissueToken })` when
+  `claimReissue` allows it (generated client key, actor has minted nothing in
+  that document key) and the document never synced (`neverSynced`).
+  `reissueActor` then rewrites every ticket of the previous actor in the
+  local changes (`api/reissue.ts`), rebuilds the root and presences by
+  replaying them on a fresh `CRDTRoot`, and clears the undo/redo stacks.
+  Without it, two clients that edit the same document key before attaching
+  push elements with the same `created_at`, so replicas can disagree on the
+  winner, and the local root names Text/Tree nodes by tickets the pushed
+  operations no longer carry. Documents edited only after `attach`, and
+  `AttachOptions::initial_root` (applied after the attach response), are not
+  affected. Porting it needs ticket rewriting for every operation and
+  element payload, the replay, and the per-client claim bookkeeping.
 
 Expected direction:
 
