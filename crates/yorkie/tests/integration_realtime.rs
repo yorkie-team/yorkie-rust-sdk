@@ -1,10 +1,10 @@
 //! Integration tests for the watch stream and the realtime sync loop.
 //!
-//! JS reference: `packages/sdk/test/integration/client_test.ts` ("Can recover
-//! from temporary disconnect (realtime sync)", "Can change sync
-//! mode(realtime <-> manual)") and `doc_presence_test.ts` ("Can receive
-//! 'unwatched' event when a client detaches", "Should receive
-//! presence-changed event for final presence ...").
+//! JS reference: `packages/sdk/test/integration/client_test.ts` ("Can change
+//! sync mode(realtime <-> manual)", and the watch stream side of "Can recover
+//! from temporary disconnect (realtime sync)"). The rest of `client_test.ts`
+//! is in `integration_client.rs`, and `doc_presence_test.ts` in
+//! `integration_doc_presence.rs`.
 //! Run with `YORKIE_TEST_RPC_ADDR=http://localhost:18080 cargo test -p yorkie`.
 
 mod integration_support;
@@ -16,15 +16,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use yorkie::{
-    ActivateClientRequest, ActivateClientResponse, ActorId, AttachDocumentRequest,
-    AttachDocumentResponse, AttachOptions, BroadcastRequest, BroadcastResponse, ChannelWatchStream,
-    Client, ClientError, ClientOptions, ClientResult, ClientTransport, ConnectTransport,
-    DeactivateClientRequest, DeactivateClientResponse, DeactivateOptions, DetachDocumentRequest,
-    DetachDocumentResponse, DetachOptions, DocEvent, Document, PeekChannelRequest,
-    PeekChannelResponse, Presence, PushPullChangesRequest, PushPullChangesResponse,
-    RefreshChannelRequest, RefreshChannelResponse, RemoveDocumentRequest, RemoveDocumentResponse,
-    SharedDocument, StreamConnectionStatus, SyncMode, WatchChannelRequest, WatchDocumentRequest,
-    WatchStream,
+    ActivateClientRequest, ActivateClientResponse, AttachDocumentRequest, AttachDocumentResponse,
+    AttachOptions, BroadcastRequest, BroadcastResponse, ChannelWatchStream, Client, ClientError,
+    ClientOptions, ClientResult, ClientTransport, ConnectTransport, DeactivateClientRequest,
+    DeactivateClientResponse, DeactivateOptions, DetachDocumentRequest, DetachDocumentResponse,
+    DocEvent, Document, PeekChannelRequest, PeekChannelResponse, PushPullChangesRequest,
+    PushPullChangesResponse, RefreshChannelRequest, RefreshChannelResponse, RemoveDocumentRequest,
+    RemoveDocumentResponse, SharedDocument, StreamConnectionStatus, SyncMode, WatchChannelRequest,
+    WatchDocumentRequest, WatchStream,
 };
 
 type Events = Arc<Mutex<Vec<DocEvent>>>;
@@ -55,19 +54,6 @@ fn set(doc: &SharedDocument, key: &str, value: &str) {
         .unwrap()
         .update(|root| root.set(key, value).map(|_| ()))
         .unwrap();
-}
-
-fn presence(name: &str) -> Presence {
-    let mut presence = Presence::new();
-    presence.insert("name".to_owned(), name.into());
-    presence
-}
-
-fn with_presence(name: &str) -> AttachOptions {
-    AttachOptions {
-        initial_presence: presence(name),
-        ..AttachOptions::default()
-    }
 }
 
 fn collect(doc: &SharedDocument) -> Events {
@@ -112,84 +98,6 @@ async fn realtime_clients_converge_without_manual_sync() {
     })
     .await;
     assert_eq!(sorted_json(&doc_a), sorted_json(&doc_b));
-
-    a.deactivate(DeactivateOptions::default()).await.unwrap();
-    b.deactivate(DeactivateOptions::default()).await.unwrap();
-}
-
-/// JS `doc_presence_test.ts` "Can receive 'unwatched' event when a client
-/// detaches".
-#[tokio::test]
-async fn watched_and_unwatched_events() {
-    let Some(addr) = rpc_addr() else { return };
-    let key = unique_key("watched-unwatched");
-    let a = active_client(&addr).await;
-    let b = active_client(&addr).await;
-    let actor_a = a.actor_id().unwrap();
-    let actor_b = b.actor_id().unwrap();
-
-    let doc_a = a.attach(shared(&key), with_presence("a")).await.unwrap();
-    let events = collect(&doc_a);
-    let doc_b = b.attach(shared(&key), with_presence("b")).await.unwrap();
-
-    let watched = DocEvent::Watched(actor_b.clone(), presence("b"));
-    eventually("a to see b watched", || has_event(&events, &watched)).await;
-
-    b.detach(&doc_b, DetachOptions).await.unwrap();
-    let unwatched = DocEvent::Unwatched(actor_b.clone(), presence("b"));
-    eventually("a to see b unwatched", || has_event(&events, &unwatched)).await;
-
-    assert_eq!(
-        vec![(actor_a, presence("a"))],
-        doc_a.lock().unwrap().presences()
-    );
-    assert_eq!(
-        vec![(ActorId::new("000000000000000000000000"), Presence::new())],
-        doc_b.lock().unwrap().presences()
-    );
-
-    a.deactivate(DeactivateOptions::default()).await.unwrap();
-    b.deactivate(DeactivateOptions::default()).await.unwrap();
-}
-
-/// JS `doc_presence_test.ts` "Should receive presence-changed event for
-/// final presence if there are multiple presence changes within doc.update".
-#[tokio::test]
-async fn presence_changed_event_in_realtime() {
-    let Some(addr) = rpc_addr() else { return };
-    let key = unique_key("presence-changed");
-    let a = active_client(&addr).await;
-    let b = active_client(&addr).await;
-    let actor_a = a.actor_id().unwrap();
-    let actor_b = b.actor_id().unwrap();
-
-    let doc_a = a.attach(shared(&key), with_presence("a")).await.unwrap();
-    let events_a = collect(&doc_a);
-    let doc_b = b.attach(shared(&key), with_presence("b")).await.unwrap();
-    let events_b = collect(&doc_b);
-    let watched = DocEvent::Watched(actor_b, presence("b"));
-    eventually("a to see b watched", || has_event(&events_a, &watched)).await;
-
-    doc_a
-        .lock()
-        .unwrap()
-        .update_with_presence(|_, p| {
-            p.set(presence("A"));
-            p.set(presence("X"));
-            Ok(())
-        })
-        .unwrap();
-
-    let changed = DocEvent::PresenceChanged(actor_a.clone(), presence("X"));
-    assert!(has_event(&events_a, &changed));
-    eventually("b to see a's presence change", || {
-        has_event(&events_b, &changed)
-    })
-    .await;
-    assert_eq!(
-        Some(presence("X")),
-        doc_b.lock().unwrap().presence(&actor_a)
-    );
 
     a.deactivate(DeactivateOptions::default()).await.unwrap();
     b.deactivate(DeactivateOptions::default()).await.unwrap();
