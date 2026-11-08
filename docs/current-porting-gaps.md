@@ -30,7 +30,7 @@ section of the area they touch.
 | Devtools | `packages/sdk/src/devtools/` | Browser-only inspector protocol. |
 | Revisions API | `packages/sdk/src/api/revision.ts`, `yorkie.ts`; `test/integration/revision_test.ts` | Admin-side document revisions. |
 | Epoch re-anchor | `packages/sdk/src/document/document.ts` (`EpochMismatch`, minting suspension), `client/client.ts` | `ErrEpochMismatch` stops the sync loop without telling the document. |
-| Identity-preserving undo restore spans and the removal ledger | `packages/sdk/src/document/crdt/rga_tree_split.ts` (`recordRemoval`, `isRemovedInView`), `document/crdt/text.ts`, `document/history.ts` | `restore_spans`/`restore_mode` stay at their defaults. See Undo and Redo and Text. |
+| Identity-preserving undo restore spans and the removal ledger | `packages/sdk/src/document/crdt/rga_tree_split.ts` (`recordRemoval`, `isRemovedInView`), `document/crdt/text.ts`, `document/history.ts`; receive side `api/converter.ts` (`fromOperation` Edit and TreeEdit cases) | Rust sends `restore_spans`/`restore_mode` at their defaults, and drops them on receive, so a Rust replica diverges from a JS peer that undoes a Text or Tree edit. See Undo and Redo. |
 | Disable-GC attach option | `packages/sdk/src/document/document.ts` (`disableGC`), `client/client.ts` | `AttachOptions` has no such field. |
 | Tree undo and redo | `packages/sdk/src/document/operation/tree_edit_operation.ts`, `tree_style_operation.ts`, `document/crdt/tree.ts`, `document/history.ts` | Split and merge reverse machinery. See Undo and Redo. |
 | Auth webhook integration test | `packages/sdk/test/integration/webhook_test.ts` | Needs a server with an auth webhook; the auth path is unit-tested with a mock transport. |
@@ -833,6 +833,24 @@ Gap:
   ignored in `crates/yorkie/tests/integration_history.rs`. The
   `restore_spans`/`restore_mode` proto fields stay at their defaults, and the
   removal ledger is not ported (see the Text section).
+- **Interop: a Rust replica does not converge with a JS peer that undoes.**
+  This is the receive side of the gap above. JS sends an undo of a Text edit
+  with `restore_spans`, `retombstone_spans`, and `restore_mode`
+  (`packages/sdk/src/api/converter.ts`, `toOperation` Edit case, encoded by
+  `EditOperation.identityReverse` in `document/operation/edit_operation.ts`),
+  and an undo of a Tree edit with the same fields on `TreeEdit`
+  (`toOperation` TreeEdit case, `document/operation/tree_edit_operation.ts`).
+  A JS receiver revives or re-removes those nodes by identity
+  (`fromOperation` Edit and TreeEdit cases, then `EditOperation.execute` with
+  `restoreMode`). The Rust decoder
+  (`crates/yorkie-protocol/src/converter.rs`, the `Edit` and `TreeEdit` arms
+  of the operation decode) drops the three fields and runs only the
+  positional part. For a Text undo that part is an empty edit of the
+  original range, so the text a JS undo brings back never reappears on the
+  Rust replica. Mixed JS and Rust sessions therefore diverge after a JS undo
+  of a Text or Tree edit. A Rust undo goes out as a plain positional edit,
+  which JS applies the same way. Porting the receive side needs the removal
+  ledger and identity restore in `CrdtText` and `CrdtTree`.
 - Tree undo and redo are not ported. Tree edits and styles push no reverse
   operation, so an undo never replays a tree change, and a change that mixes
   tree and other edits is undone only for the other edits.
