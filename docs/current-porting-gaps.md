@@ -1198,6 +1198,11 @@ Gap:
   `UpdateDocument` schema cases, are not ported.
 - When a tree text node carries several disallowed marks, the schema error
   names the first by key; JS names the first set.
+- A client created without a `key` gets `rust-<nanoseconds>-<counter>` in
+  hex. JS generates a random UUID from the runtime's CSPRNG (`util/uuid`),
+  because the server derives the actor from the key and a predictable key
+  lets another client of the project activate as the same actor. The JS
+  case that checks the 36-character key (`client_test.ts:45`) is ignored.
 - `DeactivateOptions::keepalive` exists but has no effect: in JS it keeps a
   browser `fetch` alive during page unload, which has no Rust counterpart.
   `disableGC`, gRPC-web/Connect transport choice, Go TLS options, and Go
