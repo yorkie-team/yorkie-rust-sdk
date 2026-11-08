@@ -229,6 +229,18 @@ impl TreeNode {
         self.removed_at = removed_at;
     }
 
+    /// Clears the split-sibling links on this node and every descendant,
+    /// removed ones included (JS `CRDTTreeNode.dropSplitLinks`). The merge
+    /// lineage stays: an element payload can be a copy of real document
+    /// state that underwent those merges.
+    pub(crate) fn drop_split_links(&mut self) {
+        self.ins_prev_id = None;
+        self.ins_next_id = None;
+        for child in &mut self.children {
+            child.drop_split_links();
+        }
+    }
+
     pub(crate) fn is_text(&self) -> bool {
         self.node_type == DEFAULT_TEXT_TYPE
     }
@@ -729,6 +741,13 @@ impl CrdtTree {
 
     pub(crate) fn root_mut(&mut self) -> &mut TreeNode {
         &mut self.root
+    }
+
+    /// Clears the split-sibling links on every node of this tree (JS
+    /// `getRoot().dropSplitLinks()`). Node ids do not change, so the node
+    /// map stays valid.
+    pub(crate) fn drop_split_links(&mut self) {
+        self.root.drop_split_links();
     }
 
     pub(crate) fn find_floor_node(&self, id: &TreeNodeId) -> Option<&TreeNode> {

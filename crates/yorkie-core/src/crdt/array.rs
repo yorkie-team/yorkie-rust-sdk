@@ -495,6 +495,17 @@ impl CrdtArray {
         None
     }
 
+    /// Clears the split-sibling links of every tree under this array,
+    /// removed elements included (the array half of JS
+    /// `dropSplitLinksInElement`).
+    pub(crate) fn drop_split_links(&mut self) {
+        for node in self.elements.iter_all_mut() {
+            if let Some(element) = node.element_mut() {
+                super::split_links::drop_split_links_in_element(element);
+            }
+        }
+    }
+
     pub(crate) fn purge_gc_pair_by_id(&mut self, child_id: &str) -> bool {
         if self.elements.purge_by_id(child_id) {
             return true;

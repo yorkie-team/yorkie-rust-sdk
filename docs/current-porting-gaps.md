@@ -680,6 +680,10 @@ Gap:
 - TreeEdit content decoded from the wire keeps the split links and merge
   lineage it carries; JS drops them (`dropEngineOnlyLinks`). Content created
   by JS, Go, or Rust editors never carries them.
+  A Set, Add or ArraySet element payload, by contrast, does drop the split
+  links of every tree it holds, removed members included, both on decode and
+  on the copy an undo restores (JS `dropSplitLinksInElement` in
+  `crdt/split_links.ts`); its merge lineage is kept, as in JS.
 - Rust style resolution does not port the JS §9.4 interloper guards
   (`mergedAnchorInterloperGuard`, `reversedFromAnchorRecovery`) or the
   declared-lineage checks of `styleTargets`. The ported style matrices,

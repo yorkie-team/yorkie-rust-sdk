@@ -8,6 +8,7 @@ use crate::crdt::object::CrdtObject;
 use crate::crdt::primitive::{CrdtPrimitive, PrimitiveValue};
 use crate::crdt::rga_tree_split::RgaTreeSplitPosRange;
 use crate::crdt::root::{CrdtRoot, DocSize};
+use crate::crdt::split_links::drop_split_links_in_element;
 use crate::crdt::text::CrdtText;
 use crate::crdt::tree::{CrdtTree, TreePos};
 use crate::event::{ChangeInfo, DocEvent, OperationInfo, Subscribers, SubscriptionId};
@@ -362,6 +363,20 @@ impl Document {
 
             let ticket = context.issue_time_ticket();
             operation.set_executed_at(ticket.clone());
+            // A Set, Add or ArraySet reverse carries a deep copy of the value
+            // it restores, with the split-sibling links of the tree it was
+            // taken from. Every other replica decodes this operation through
+            // `drop_split_links_in_element`, so drop them here too, or this
+            // replica alone keeps them and the two disagree from the next
+            // same-boundary split on (JS `executeUndoRedo`).
+            match &mut operation {
+                Operation::Set(operation) => drop_split_links_in_element(operation.value_mut()),
+                Operation::Add(operation) => drop_split_links_in_element(operation.value_mut()),
+                Operation::ArraySet(operation) => {
+                    drop_split_links_in_element(operation.value_mut())
+                }
+                _ => {}
+            }
             // An array set and an add that brings a removed element back both
             // put the element under a new creation time, and the rest of the
             // history may still name the old one.
@@ -1460,6 +1475,8 @@ fn crdt_element_to_json_value(element: &CrdtElement) -> Result<JsonValue> {
     Ok(value)
 }
 
+#[cfg(test)]
+mod split_link_tests;
 #[cfg(test)]
 mod update_tests;
 

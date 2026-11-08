@@ -10,6 +10,7 @@ use crate::crdt::rga_tree_split::{
     RgaTreeSplit, RgaTreeSplitNode, RgaTreeSplitNodeId, RgaTreeSplitPos,
 };
 use crate::crdt::rht::Rht;
+use crate::crdt::split_links::drop_split_links_in_element;
 use crate::crdt::text::{CrdtText, TextValue};
 use crate::crdt::tree::{CrdtTree, TreeNode, TreeNodeId, TreePos};
 use crate::operation::{
@@ -560,7 +561,7 @@ impl TryFrom<WireOperation> for Operation {
                 executed_at,
             } => Ok(Self::Set(SetOperation::create(
                 key,
-                CrdtElement::try_from(value)?,
+                element_payload_from_wire(value)?,
                 parent_created_at,
                 Some(executed_at),
             ))),
@@ -572,7 +573,7 @@ impl TryFrom<WireOperation> for Operation {
             } => Ok(Self::Add(AddOperation::create(
                 parent_created_at,
                 prev_created_at,
-                CrdtElement::try_from(value)?,
+                element_payload_from_wire(value)?,
                 Some(executed_at),
             ))),
             WireOperation::Move {
@@ -720,11 +721,20 @@ impl TryFrom<WireOperation> for Operation {
             } => Ok(Self::ArraySet(ArraySetOperation::create(
                 parent_created_at,
                 created_at,
-                CrdtElement::try_from(value)?,
+                element_payload_from_wire(value)?,
                 Some(executed_at),
             ))),
         }
     }
+}
+
+/// Decodes the element a Set, Add or ArraySet carries, without the
+/// split-sibling links of any tree in it (JS `fromElementSimple`). Snapshots
+/// keep theirs: they are the document's own state.
+fn element_payload_from_wire(element: WireJsonElementSimple) -> Result<CrdtElement> {
+    let mut element = CrdtElement::try_from(element)?;
+    drop_split_links_in_element(&mut element);
+    Ok(element)
 }
 
 impl TryFrom<&CrdtElement> for WireJsonElementSimple {
