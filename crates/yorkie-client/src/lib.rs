@@ -9,12 +9,13 @@ mod options;
 pub mod protocol;
 mod transport;
 
+pub use attachment::SharedDocument;
 pub use client::{Client, ClientCondition, ClientStatus};
 pub use connect::ConnectTransport;
 pub use error::{ClientError, ClientResult};
 pub use options::{
     AttachChannelOptions, AttachOptions, ClientOptions, DeactivateOptions, DetachOptions, SyncMode,
-    SyncOptions, DEFAULT_CHANNEL_HEARTBEAT_INTERVAL_MS, DEFAULT_POLLING_INTERVAL_MS,
+    DEFAULT_CHANNEL_HEARTBEAT_INTERVAL_MS, DEFAULT_POLLING_INTERVAL_MS,
     DEFAULT_RECONNECT_STREAM_DELAY_MS, DEFAULT_RETRY_SYNC_LOOP_DELAY_MS, DEFAULT_RPC_ADDR,
     DEFAULT_SYNC_LOOP_DURATION_MS,
 };
@@ -25,6 +26,6 @@ pub use transport::{
     RemoveDocumentResponse,
 };
 pub use yorkie_core::{
-    ActorId, DocStatus, Document, JsonArray, JsonObject, JsonValue, Result, SchemaRule,
+    ActorId, DocStatus, Document, JsonArray, JsonObject, JsonValue, Presence, Result, SchemaRule,
     TreeNodeRule, YorkieError,
 };

@@ -24,6 +24,7 @@ pub fn from_activate_client_response(
 ) -> ActivateClientResponse {
     ActivateClientResponse {
         client_id: ActorId::new(response.client_id.clone()),
+        actor_id: (!response.actor_id.is_empty()).then(|| ActorId::new(response.actor_id.clone())),
     }
 }
 
@@ -174,6 +175,17 @@ mod tests {
             ..Default::default()
         });
         assert_eq!("000000000000000000000001", response.client_id.as_str());
+        assert_eq!(None, response.actor_id);
+
+        let response = from_activate_client_response(&api::ActivateClientResponse {
+            client_id: "000000000000000000000001".to_owned(),
+            actor_id: "000000000000000000000002".to_owned(),
+        });
+        assert_eq!("000000000000000000000001", response.client_id.as_str());
+        assert_eq!(
+            Some("000000000000000000000002"),
+            response.actor_id.as_ref().map(ActorId::as_str)
+        );
     }
 
     #[test]

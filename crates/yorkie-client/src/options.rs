@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
-use yorkie_core::JsonObject;
+use yorkie_core::{JsonObject, Presence};
 
 pub const DEFAULT_RPC_ADDR: &str = "https://api.yorkie.dev";
 pub const DEFAULT_SYNC_LOOP_DURATION_MS: u64 = 50;
@@ -40,11 +40,15 @@ pub struct DeactivateOptions {
     pub synchronous: bool,
 }
 
-/// User-settable options for attaching documents.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// User-settable options for attaching documents (JS `AttachOptions`).
+///
+/// `sync_mode` defaults to [`SyncMode::Realtime`] and `initial_presence` to an
+/// empty presence, as in JS `attach`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct AttachOptions {
     pub initial_root: Option<JsonObject>,
-    pub sync_mode: Option<SyncMode>,
+    pub initial_presence: Presence,
+    pub sync_mode: SyncMode,
     pub document_poll_interval: Option<Duration>,
     pub schema: Option<String>,
 }
@@ -60,12 +64,6 @@ pub struct AttachChannelOptions {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DetachOptions;
 
-/// User-settable options for synchronizing documents.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct SyncOptions {
-    pub sync_mode: Option<SyncMode>,
-}
-
 impl Default for ClientOptions {
     fn default() -> Self {
         Self {
@@ -80,6 +78,18 @@ impl Default for ClientOptions {
                 DEFAULT_CHANNEL_HEARTBEAT_INTERVAL_MS,
             ),
             user_agent: None,
+        }
+    }
+}
+
+impl Default for AttachOptions {
+    fn default() -> Self {
+        Self {
+            initial_root: None,
+            initial_presence: Presence::new(),
+            sync_mode: SyncMode::Realtime,
+            document_poll_interval: None,
+            schema: None,
         }
     }
 }

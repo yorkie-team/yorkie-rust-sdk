@@ -1,15 +1,16 @@
 use async_trait::async_trait;
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use yorkie::{
     ActivateClientRequest, ActivateClientResponse, ActorId, AttachChannelOptions,
     AttachDocumentRequest, AttachDocumentResponse, AttachOptions, ChangePack, Checkpoint, Client,
     ClientCondition, ClientError, ClientStatus, ClientTransport, CounterType, CounterValue,
     DeactivateClientRequest, DeactivateClientResponse, DeactivateOptions, DetachDocumentRequest,
-    DetachDocumentResponse, DetachOptions, DocStatus, Document, JsonCounter,
+    DetachDocumentResponse, DetachOptions, DocStatus, Document, JsonCounter, Presence,
     PushPullChangesRequest, PushPullChangesResponse, RemoveDocumentRequest, RemoveDocumentResponse,
-    Result, SchemaRule, SyncMode, SyncOptions, TimeTicket, TimeTicketStruct, TreeNodeRule,
+    Result, SchemaRule, SharedDocument, SyncMode, TimeTicket, TimeTicketStruct, TreeNodeRule,
     VersionVector,
 };
 
@@ -31,6 +32,7 @@ impl ClientTransport for FacadeTransport {
         self.activate_requests.fetch_add(1, Ordering::SeqCst);
         Ok(ActivateClientResponse {
             client_id: ActorId::new("000000000000000000000001"),
+            actor_id: None,
         })
     }
 
@@ -154,11 +156,12 @@ fn facade_exports_time_api() {
 
 #[test]
 fn facade_exports_client_api() {
-    let mut client = Client::default();
-    let transport = FacadeTransport::default();
-    let mut doc = Document::new("doc-key");
+    let transport = Arc::new(FacadeTransport::default());
+    let client = Client::with_transport(Default::default(), transport.clone());
+    let doc: SharedDocument = Arc::new(Mutex::new(Document::new("doc-key")));
     let attach_options = AttachOptions {
-        sync_mode: Some(SyncMode::Polling),
+        sync_mode: SyncMode::Polling,
+        initial_presence: Presence::new(),
         ..AttachOptions::default()
     };
     let channel_options = AttachChannelOptions {
@@ -171,27 +174,28 @@ fn facade_exports_client_api() {
     assert!(!client.condition(ClientCondition::SyncLoop));
     assert_eq!(
         ClientError::ClientNotActivated(client.key().to_owned()),
-        block_on(client.attach(&transport, &mut doc, attach_options.clone())).unwrap_err()
+        block_on(client.attach(doc.clone(), attach_options.clone())).unwrap_err()
     );
-    block_on(client.activate(&transport)).unwrap();
+    block_on(client.activate()).unwrap();
     assert_eq!(ClientStatus::Activated, client.status());
     assert_eq!(1, transport.activate_requests.load(Ordering::SeqCst));
-    assert_eq!(Some(SyncMode::Polling), attach_options.sync_mode);
+    assert_eq!(SyncMode::Polling, attach_options.sync_mode);
     assert_eq!(Some(SyncMode::Realtime), channel_options.sync_mode);
-    block_on(client.attach(&transport, &mut doc, attach_options)).unwrap();
+    block_on(client.attach(doc.clone(), attach_options)).unwrap();
     assert!(client.has("doc-key"));
-    assert_eq!(1024, doc.max_size_per_document());
-    assert_eq!(1, doc.schema_rules().len());
+    assert_eq!(1024, doc.lock().unwrap().max_size_per_document());
+    assert_eq!(1, doc.lock().unwrap().schema_rules().len());
     assert_eq!(1, transport.attach_requests.load(Ordering::SeqCst));
-    doc.update(|root| root.set("title", "hello").map(|_| ()))
+    doc.lock()
+        .unwrap()
+        .update(|root| root.set("title", "hello").map(|_| ()))
         .unwrap();
-    block_on(client.sync(&transport, &mut doc)).unwrap();
-    assert!(!doc.has_local_changes());
+    block_on(client.sync(Some(&doc))).unwrap();
+    assert!(!doc.lock().unwrap().has_local_changes());
     assert_eq!(1, transport.push_pull_requests.load(Ordering::SeqCst));
-    assert_eq!(SyncOptions::default(), SyncOptions { sync_mode: None });
-    block_on(client.remove(&transport, &mut doc)).unwrap();
+    block_on(client.remove(&doc)).unwrap();
     assert!(!client.has("doc-key"));
-    assert_eq!(DocStatus::Removed, doc.status());
+    assert_eq!(DocStatus::Removed, doc.lock().unwrap().status());
     assert_eq!(1, transport.remove_requests.load(Ordering::SeqCst));
     assert_eq!(
         DeactivateOptions::default(),

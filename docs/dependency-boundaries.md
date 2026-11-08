@@ -101,7 +101,7 @@ Current `yorkie-client` module layout follows the same split:
 | --- | --- |
 | `client.rs` | Client orchestration, lifecycle state, and public client methods. |
 | `options.rs` | Client, attach, detach, channel, and sync mode option types. |
-| `attachment.rs` | Per-resource attachment metadata and sync interval helpers. |
+| `attachment.rs` | `SharedDocument`, per-resource attachment metadata, and sync interval helpers. |
 | `transport.rs` | Request/response DTOs and transport traits for RPC boundaries. |
 | `protocol.rs` | Conversion between client transport DTOs and generated protobuf request/response types. |
 | `error.rs` | Client-layer error and result types. |

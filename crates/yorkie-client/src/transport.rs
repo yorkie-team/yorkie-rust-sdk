@@ -12,9 +12,14 @@ pub struct ActivateClientRequest {
 }
 
 /// Response data for activating a client.
+///
+/// `client_id` is the per-session ID sent back in later requests. `actor_id`
+/// is the stable actor stamped into document changes; it is `None` when the
+/// server does not return one (JS `res.actorId || res.clientId`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivateClientResponse {
     pub client_id: ActorId,
+    pub actor_id: Option<ActorId>,
 }
 
 /// Request data for deactivating a client.

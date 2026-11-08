@@ -7,11 +7,11 @@ pub use yorkie_client::{
     ClientResult, ClientStatus, ClientTransport, ConnectTransport, DeactivateClientRequest,
     DeactivateClientResponse, DeactivateOptions, DetachDocumentRequest, DetachDocumentResponse,
     DetachOptions, PushPullChangesRequest, PushPullChangesResponse, RemoveDocumentRequest,
-    RemoveDocumentResponse, SyncMode, SyncOptions,
+    RemoveDocumentResponse, SharedDocument, SyncMode,
 };
 pub use yorkie_core::{
-    ActorId, ChangePack, Checkpoint, CounterType, CounterValue, DocStatus, Document, JsonArray,
-    JsonCounter, JsonObject, JsonValue, Result, SchemaRule, TimeTicket, TimeTicketStruct,
-    TreeNodeRule, VersionVector, YorkieError,
+    ActorId, ChangePack, Checkpoint, CounterType, CounterValue, DocEvent, DocStatus, Document,
+    JsonArray, JsonCounter, JsonObject, JsonValue, Presence, PresenceProxy, Result, SchemaRule,
+    TimeTicket, TimeTicketStruct, TreeNodeRule, VersionVector, YorkieError,
 };
 pub use yorkie_protocol::YORKIE_PROTO_PACKAGE;

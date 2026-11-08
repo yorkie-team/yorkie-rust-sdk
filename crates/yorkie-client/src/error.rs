@@ -7,6 +7,9 @@ use yorkie_core::YorkieError;
 pub enum ClientError {
     ClientNotActivated(String),
     NotAttached(String),
+    /// A resource with the same key is already attached or attaching
+    /// (JS `ErrAlreadyAttached`).
+    AlreadyAttached(String),
     NotDetached(String),
     InvalidArgument(String),
     Transport(String),
@@ -25,6 +28,7 @@ impl Display for ClientError {
         match self {
             Self::ClientNotActivated(key) => write!(f, "client {key:?} is not active"),
             Self::NotAttached(key) => write!(f, "resource {key:?} is not attached"),
+            Self::AlreadyAttached(key) => write!(f, "resource {key:?} is already attached"),
             Self::NotDetached(key) => write!(f, "resource {key:?} is not detached"),
             Self::InvalidArgument(message) => write!(f, "invalid client argument: {message}"),
             Self::Transport(message) => write!(f, "client transport error: {message}"),

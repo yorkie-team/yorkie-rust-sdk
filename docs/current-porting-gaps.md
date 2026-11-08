@@ -763,85 +763,82 @@ Expected direction:
 
 Current Rust behavior:
 
-- Client crates and facade are scaffolded.
 - `yorkie-client` is split into `client`, `options`, `attachment`,
-  `transport`, `protocol`, and `error` modules, with `lib.rs` kept as a
-  re-exporting crate entrypoint.
-- `ClientOptions` carries the JS/Go-shaped base options that do not require a
-  network runtime yet: RPC address, client key, API key, metadata, user agent,
-  sync-loop duration, retry delay, reconnect delay, and channel heartbeat
-  interval. Defaults match the JS/Go values where both implementations already
-  agree.
+  `transport`, `connect`, `protocol`, and `error` modules, with `lib.rs` kept
+  as a re-exporting crate entrypoint.
+- `ClientOptions` carries the JS/Go-shaped base options: RPC address, client
+  key, API key, metadata, user agent, sync-loop duration, retry delay,
+  reconnect delay, and channel heartbeat interval. Defaults match the JS/Go
+  values where both implementations already agree.
 - `SyncMode`, `DeactivateOptions`, `AttachOptions`, `AttachChannelOptions`,
-  `DetachOptions`, and `SyncOptions` are defined as public client-surface
-  types.
-- `Client` stores a key, optional actor ID, deactivated status, sync/watch
-  condition flags, and document attachment metadata.
-- `ClientTransport` is an async, testable transport boundary for
-  activate/deactivate, document attach/detach/remove, and client-side push-pull
-  sync.
-  `Client::activate` sends client key, metadata, and shard key through this
-  boundary; `Client::deactivate` sends client ID and synchronous flag, clears
-  local attachment metadata, and marks sync/watch conditions inactive.
-- `Client::attach` sends client ID, local `ChangePack`, schema key, and shard
-  key through the transport boundary, stores returned max-size/schema-rule
-  metadata on the document, applies the returned change pack, records
-  attachment metadata, and marks the watch loop condition active for realtime
-  sync modes.
-- `Client::detach` sends client ID, attached document ID, local `ChangePack`,
-  `remove_if_not_attached`, and shard key through the transport boundary,
-  applies the returned change pack, updates document status, removes attachment
-  metadata, and refreshes the watch loop condition.
-- `Client::remove` sends client ID, attached document ID, local `ChangePack`
-  marked as removed, and shard key through the transport boundary, applies the
-  returned change pack, removes attachment metadata, and refreshes the watch
-  loop condition. The request/response shape follows the client-side remove
-  flow in JS, with Go client behavior used as a typed cross-check.
-- `Client::sync` and `Client::sync_with_options` send client ID, attached
-  document ID, local `ChangePack`, push-only mode, and shard key through the
-  transport boundary, apply the returned change pack, and remove attachment
-  metadata when the document is removed. The push-only response guard follows
-  the client-side JS behavior.
+  and `DetachOptions` are public client-surface types. `AttachOptions` has
+  `initial_root`, `initial_presence` (default empty), `sync_mode` (default
+  `Realtime`), `document_poll_interval`, and `schema`, as in JS.
+- `Client` is a cloneable handle over `Arc<ClientInner>`. It owns an
+  `Arc<dyn ClientTransport>`: `Client::new` builds a `ConnectTransport`, and
+  `Client::with_transport` takes any transport (tests use a mock). Its methods
+  take `&self`.
+- Documents are shared as `SharedDocument` (`Arc<std::sync::Mutex<Document>>`).
+  The client locks a document only for synchronous steps (build a pack, apply
+  a response) and never across an `.await`, and it never holds a document
+  lock together with its own state lock. Event callbacks run under the
+  document lock, so a callback must not lock the same document again.
+- `Client::activate` sends client key, metadata, and shard key. The actor
+  stamped into changes is the response `actor_id`, or `client_id` when it is
+  empty (JS `res.actorId || res.clientId`); requests keep sending `client_id`.
+- `Client::deactivate` sends client ID and synchronous flag, marks sync/watch
+  conditions inactive, drops every attachment, and sets each attached
+  document to `Detached` (JS `deactivateInternal`).
+- `Client::attach` rejects an inactive client, a document that is not
+  `Detached`, and a key that is already attached or attaching
+  (`ClientError::AlreadyAttached`, JS `ErrAlreadyAttached`). It stamps the
+  actor, sets `initial_presence` in a local change, sends the attach request,
+  stores returned max-size/schema-rule metadata, applies the returned pack,
+  records the attachment, applies `initial_root` for missing keys, and returns
+  the same `SharedDocument`.
+- `Client::detach` clears the presence first (JS `p.clear()` before detach),
+  sends client ID, document ID, local `ChangePack`, `remove_if_not_attached`,
+  and shard key, applies the returned pack, updates document status, and
+  removes the attachment.
+- `Client::remove` stamps the actor, sends a `ChangePack` marked as removed,
+  applies the returned pack, and removes the attachment.
+- `Client::sync(Some(doc))` pushes and pulls that document; `sync(None)` syncs
+  every attachment in its own sync mode, one after another (JS runs them in
+  parallel). The push-only response guard follows the client-side JS
+  behavior. A pulled removal drops the attachment.
+- `Client::change_sync_mode` updates attachment bookkeeping and the watch loop
+  condition flag.
 - `yorkie-client::protocol` converts activate/deactivate, attach/detach/remove,
-  and push-pull transport DTOs to and from generated protobuf request/response
-  messages. Shard keys remain on transport DTOs because JS/Go send them as
-  request metadata rather than protobuf fields.
-- `Client::has` and `change_sync_mode` cover local lifecycle bookkeeping and
-  precondition errors for documents.
-- Document local change packs can be created and applied in-memory.
+  and push-pull transport DTOs to and from generated protobuf messages. Shard
+  keys remain on transport DTOs because JS/Go send them as request metadata.
+- `ConnectTransport` implements the unary RPCs over the Connect protocol
+  (reqwest, binary protobuf).
 - `Document` stores max-size and schema-rule metadata received during attach,
   but update-time max-size/schema validation is not implemented yet.
-- `yorkie-protocol` converts schema rules between generated protobuf types and
-  Rust document metadata using the same field shape as JS/Go converters.
 
 JS/Go behavior:
 
 - Clients support activate/deactivate, attach/detach, sync, watch, presence,
   stream handling, retry/error behavior, and document status transitions.
+- JS serializes client calls through a task queue and runs a sync loop and a
+  watch stream per realtime attachment.
 
 Gap:
 
-- `ConnectTransport` implements the unary RPCs over the Connect protocol
-  (reqwest, binary protobuf). Server-streaming (watch) is not implemented yet.
-- The `ClientTransport` trait is `async_trait` with `&self` methods so it can
-  later be held as `Arc<dyn ClientTransport>`.
-- No watch stream.
-- No presence.
+- No sync loop and no watch stream: sync modes are recorded but only manual
+  `sync` moves changes, and online clients are not tracked from the server.
+- Client calls are not serialized by a task queue; concurrent duplicate
+  attaches of one key are rejected, but other calls may interleave.
 - Schema rules and max-size limits are stored after attach but are not enforced
   during `Document::update` yet.
-- Deactivation clears client attachment metadata but cannot yet update attached
-  document statuses because documents are not owned by the client.
-- Sync modes are represented in attachment metadata but not executed by a sync
-  loop.
-- Auth token refresh, gRPC-web/connect transport choice, Go TLS options, and
-  Go receive-size/logger options are not modeled yet.
+- `DeactivateOptions::keepalive`, `disableGC`, auth token refresh,
+  gRPC-web/Connect transport choice, Go TLS options, and Go receive-size/logger
+  options are not modeled yet.
 
 Expected direction:
 
-- Add a concrete protocol transport that uses the existing client protocol
-  conversion helpers.
-- Keep Client state transitions aligned with document status and attachment
-  metadata as the network layer lands.
+- Add the watch stream and the realtime sync loop as tokio tasks spawned from
+  `Client`, with a task registry and cancellation on detach/deactivate.
 
 ## Error Behavior
 
