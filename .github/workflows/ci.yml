@@ -37,7 +37,7 @@ jobs:
     env:
       YORKIE_TEST_RPC_ADDR: http://localhost:8080
       # Tag without a "v" prefix, as published to Docker Hub by `make docker`.
-      YORKIE_IMAGE: yorkieteam/yorkie:0.7.24
+      YORKIE_IMAGE: yorkieteam/yorkie:0.7.26
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
