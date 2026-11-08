@@ -134,6 +134,13 @@ pub(crate) struct SyncTarget {
 #[derive(Debug)]
 pub(crate) struct TaskHandle(tokio::task::AbortHandle);
 
+impl TaskHandle {
+    /// Whether the loop has ended, by returning or being aborted.
+    pub(crate) fn is_finished(&self) -> bool {
+        self.0.is_finished()
+    }
+}
+
 impl Drop for TaskHandle {
     fn drop(&mut self) {
         self.0.abort();
@@ -664,7 +671,14 @@ impl Client {
                     heartbeat_interval_pinned,
                 ),
             );
-            if !state.conditions[&ClientCondition::SyncLoop] {
+            // The handle check backs up the condition: a loop that ended
+            // without clearing it must not leave the channel unrefreshed.
+            let loop_running = state.conditions[&ClientCondition::SyncLoop]
+                && state
+                    .sync_loop
+                    .as_ref()
+                    .is_some_and(|task| !task.is_finished());
+            if !loop_running {
                 state.conditions.insert(ClientCondition::SyncLoop, true);
                 state.sync_loop = Some(sync_loop::spawn(&self.inner));
             }
@@ -1428,6 +1442,8 @@ mod tests {
         refresh_requests: Mutex<Vec<RefreshChannelRequest>>,
         /// Errors for the next refreshes, in order; later refreshes succeed.
         refresh_errors: Mutex<Vec<ClientError>>,
+        /// When set, the next refresh waits for it before answering.
+        refresh_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
         peek_requests: Mutex<Vec<PeekChannelRequest>>,
         channel_watch_requests: Mutex<Vec<WatchChannelRequest>>,
         /// Messages for the next channel watch streams, one list per stream;
@@ -1453,6 +1469,7 @@ mod tests {
                 attach_schema_rules: Vec::new(),
                 refresh_requests: Mutex::new(Vec::new()),
                 refresh_errors: Mutex::new(Vec::new()),
+                refresh_gate: Mutex::new(None),
                 peek_requests: Mutex::new(Vec::new()),
                 channel_watch_requests: Mutex::new(Vec::new()),
                 channel_watch_scripts: Mutex::new(Vec::new()),
@@ -1545,8 +1562,12 @@ mod tests {
         ) -> ClientResult<RefreshChannelResponse> {
             let first_call = request.session_id.is_none();
             let needs_client_id = request.client_id.is_none();
-            let mut requests = self.refresh_requests.lock().unwrap();
-            requests.push(request);
+            self.refresh_requests.lock().unwrap().push(request);
+            let gate = self.refresh_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
+            let requests = self.refresh_requests.lock().unwrap();
             let mut errors = self.refresh_errors.lock().unwrap();
             if !errors.is_empty() {
                 return Err(errors.remove(0));
@@ -3147,6 +3168,78 @@ mod tests {
 
         client.detach_channel(&channel).await?;
         assert!(format!("{:?}", channel.lock().unwrap()).contains("subscribers: 0"));
+        Ok(())
+    }
+    /// Review rule (JS clears `SyncLoop` synchronously): a round that ends
+    /// the loop marks it stopped before releasing the task queue, so a call
+    /// queued behind the round sees it stopped. This pins the invariant; the
+    /// old window was too short for it to catch reliably, which
+    /// `attach_channel_restarts_an_ended_sync_loop` covers instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sync_loop_is_marked_stopped_before_the_queue_is_released() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        *transport.refresh_gate.lock().unwrap() = Some(gate.clone());
+        transport
+            .refresh_errors
+            .lock()
+            .unwrap()
+            .push(ClientError::Rpc {
+                code: "permission_denied".to_owned(),
+                message: "denied".to_owned(),
+                yorkie_code: None,
+            });
+        let client = mock_client(fast_loop_options(), &transport);
+        client
+            .attach_channel(shared_channel("first"), fast_channel(SyncMode::Polling))
+            .await?;
+        // The round is now inside the refresh, holding the task queue.
+        eventually(|| transport.refresh_requests.lock().unwrap().len() == 1).await;
+
+        let queued = tokio::spawn({
+            let client = client.clone();
+            async move {
+                let _queue = client.lock_task_queue().await;
+                client.condition(ClientCondition::SyncLoop)
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        gate.notify_one();
+
+        assert!(!queued.await.unwrap());
+        Ok(())
+    }
+
+    /// Review rule: `attach_channel` starts a new sync loop when the old one
+    /// has ended, even if the condition was left set, so the channel is
+    /// refreshed.
+    #[tokio::test]
+    async fn attach_channel_restarts_an_ended_sync_loop() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        transport
+            .refresh_errors
+            .lock()
+            .unwrap()
+            .push(ClientError::Rpc {
+                code: "permission_denied".to_owned(),
+                message: "denied".to_owned(),
+                yorkie_code: None,
+            });
+        let client = mock_client(fast_loop_options(), &transport);
+        client
+            .attach_channel(shared_channel("first"), fast_channel(SyncMode::Polling))
+            .await?;
+        eventually(|| !client.condition(ClientCondition::SyncLoop)).await;
+        eventually(|| client.running_task_count() == 0).await;
+
+        // The window the condition guards: set, but the loop is gone.
+        client.set_condition(ClientCondition::SyncLoop, true);
+        let second = shared_channel("second");
+        client
+            .attach_channel(second.clone(), fast_channel(SyncMode::Polling))
+            .await?;
+        eventually(|| second.lock().unwrap().is_attached()).await;
+        assert!(client.is_active());
         Ok(())
     }
 }

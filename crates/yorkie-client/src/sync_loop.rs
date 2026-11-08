@@ -26,12 +26,19 @@ async fn run(inner: Weak<ClientInner>) {
         let Some(client) = Client::upgrade(&inner) else {
             return;
         };
-        let delay = match sync_attachments(&client).await {
-            Ok(()) => client.options().sync_loop_duration,
-            Err(err) if err.is_retryable() => client.options().retry_sync_loop_delay,
-            Err(_) => {
-                client.set_condition(ClientCondition::SyncLoop, false);
-                return;
+        let delay = {
+            let _queue = client.lock_task_queue().await;
+            match sync_attachments(&client).await {
+                Ok(()) => client.options().sync_loop_duration,
+                Err(err) if err.is_retryable() => client.options().retry_sync_loop_delay,
+                Err(_) => {
+                    // Cleared before the queue is released, as JS clears it
+                    // synchronously: a call queued behind this round, such as
+                    // `attach_channel`, must see the loop as stopped and start
+                    // a new one.
+                    client.set_condition(ClientCondition::SyncLoop, false);
+                    return;
+                }
             }
         };
         drop(client);
@@ -39,7 +46,7 @@ async fn run(inner: Weak<ClientInner>) {
     }
 }
 
-/// Runs one round: syncs, in parallel, every document whose sync mode and
+/// Runs one round, on the task queue the caller holds: syncs, in parallel, every document whose sync mode and
 /// state call for it and refreshes every channel whose heartbeat is due, and
 /// returns the first error.
 ///
@@ -47,7 +54,6 @@ async fn run(inner: Weak<ClientInner>) {
 /// channels, whose first refresh activates it. With no channels either, the
 /// round fails with `ClientNotActivated`, which ends the loop.
 async fn sync_attachments(client: &Client) -> ClientResult<()> {
-    let _queue = client.lock_task_queue().await;
     let (session, channels) = {
         let state = client.state();
         let session = state.session(client.key());
