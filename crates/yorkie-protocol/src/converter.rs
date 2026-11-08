@@ -470,6 +470,7 @@ fn wire_operation_to_proto(operation: &WireOperation) -> Result<api::Operation> 
             contents,
             split_level,
             executed_at,
+            split_tickets,
         } => api::operation::Body::TreeEdit(api::operation::TreeEdit {
             parent_created_at: Some(to_time_ticket(parent_created_at)?),
             from: Some(wire_tree_pos_to_proto(from)?),
@@ -487,6 +488,10 @@ fn wire_operation_to_proto(operation: &WireOperation) -> Result<api::Operation> 
                 .unwrap_or_default(),
             split_level: i32_from_usize(*split_level, "tree_edit.split_level")?,
             executed_at: Some(to_time_ticket(executed_at)?),
+            split_tickets: split_tickets
+                .iter()
+                .map(to_time_ticket)
+                .collect::<Result<Vec<_>>>()?,
             ..Default::default()
         }),
         WireOperation::TreeStyle {
@@ -658,6 +663,13 @@ fn proto_operation_to_wire(operation: &api::Operation) -> Result<WireOperation> 
                 &operation.executed_at,
                 "operation.tree_edit.executed_at",
             )?,
+            // Read back as sent, as JS and Go read them: the server applies
+            // them verbatim.
+            split_tickets: operation
+                .split_tickets
+                .iter()
+                .map(from_time_ticket)
+                .collect(),
         }),
         api::operation::Body::TreeStyle(operation) => Ok(WireOperation::TreeStyle {
             parent_created_at: proto_required_time_ticket(
@@ -1321,10 +1333,10 @@ fn base64_value(byte: u8, original: &str) -> Result<u8> {
 mod tests {
     use super::{
         decode_change_pack, encode_change_pack, from_change_pack, from_schema_rules,
-        proto_change_pack_to_wire, proto_json_element_to_wire, proto_tree_nodes_to_wire,
-        to_change_pack, to_schema_rules, to_time_ticket, to_version_vector,
-        wire_change_pack_to_proto, wire_json_element_to_proto, wire_tree_nodes_to_proto,
-        ProtocolError,
+        proto_change_pack_to_wire, proto_json_element_to_wire, proto_operation_to_wire,
+        proto_tree_nodes_to_wire, to_change_pack, to_schema_rules, to_time_ticket,
+        to_version_vector, wire_change_pack_to_proto, wire_json_element_to_proto,
+        wire_operation_to_proto, wire_tree_nodes_to_proto, ProtocolError,
     };
     use crate::yorkie::v1::{self as api, json_element, operation::Body, ValueType};
     use prost::Message;
@@ -1333,7 +1345,8 @@ mod tests {
     use yorkie_core::wire::{
         WireChange, WireChangeId, WireChangePack, WireJsonElement, WireJsonElementSimple,
         WireNodeAttr, WireOperation, WirePresence, WirePresenceChange, WireRgaNode, WireRhtNode,
-        WireTextNode, WireTextNodeId, WireTextNodePos, WireTreeNode, WireTreeNodeId, WireValueType,
+        WireTextNode, WireTextNodeId, WireTextNodePos, WireTreeNode, WireTreeNodeId, WireTreePos,
+        WireValueType,
     };
     use yorkie_core::{Checkpoint, Document, SchemaRule, TimeTicket, TreeNodeRule, VersionVector};
 
@@ -1548,6 +1561,43 @@ mod tests {
 
         let decoded = proto_json_element_to_wire(&proto)?;
         assert_eq!(element, decoded);
+        Ok(())
+    }
+
+    // JS `converter.toOperation/fromOperation`: a tree edit carries the
+    // tickets its split issued as `split_tickets`, read back as sent.
+    #[test]
+    fn roundtrips_tree_edit_split_tickets() -> Result<(), Box<dyn Error>> {
+        let pos = WireTreePos {
+            parent_id: tree_node_id(1, 0),
+            left_sibling_id: tree_node_id(2, 1),
+        };
+        let operation = WireOperation::TreeEdit {
+            parent_created_at: ticket(1),
+            from: pos.clone(),
+            to: pos,
+            contents: None,
+            split_level: 2,
+            executed_at: ticket(10),
+            split_tickets: vec![
+                TimeTicket::new(10, 3, "000000000000000000000001"),
+                TimeTicket::new(10, 4, "000000000000000000000001"),
+            ],
+        };
+
+        let proto = wire_operation_to_proto(&operation)?;
+        let Some(Body::TreeEdit(tree_edit)) = &proto.body else {
+            panic!("expected a tree edit");
+        };
+        assert_eq!(
+            vec![3, 4],
+            tree_edit
+                .split_tickets
+                .iter()
+                .map(|ticket| ticket.delimiter)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(operation, proto_operation_to_wire(&proto)?);
         Ok(())
     }
 

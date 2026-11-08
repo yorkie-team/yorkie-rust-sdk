@@ -214,6 +214,9 @@ pub enum WireOperation {
         contents: Option<Vec<Vec<WireTreeNode>>>,
         split_level: usize,
         executed_at: TimeTicket,
+        /// The tickets issued for the elements the split created, in issue
+        /// order; empty when the sender wrote none.
+        split_tickets: Vec<TimeTicket>,
     },
     TreeStyle {
         parent_created_at: TimeTicket,
@@ -525,6 +528,7 @@ impl TryFrom<&Operation> for WireOperation {
                     .map(|contents| contents.iter().map(wire_tree_nodes_from_domain).collect()),
                 split_level: operation.split_level(),
                 executed_at: operation.executed_at()?.clone(),
+                split_tickets: operation.split_tickets().to_vec(),
             }),
             Operation::TreeStyle(operation) => Ok(Self::TreeStyle {
                 parent_created_at: operation.parent_created_at().clone(),
@@ -660,6 +664,7 @@ impl TryFrom<WireOperation> for Operation {
                 contents,
                 split_level,
                 executed_at,
+                split_tickets,
             } => {
                 let contents = contents
                     .map(|contents| {
@@ -669,14 +674,16 @@ impl TryFrom<WireOperation> for Operation {
                             .collect::<Result<Vec<_>>>()
                     })
                     .transpose()?;
-                Ok(Self::TreeEdit(TreeEditOperation::create(
+                let mut operation = TreeEditOperation::create(
                     parent_created_at,
                     TreePos::from(from),
                     TreePos::from(to),
                     contents,
                     split_level,
                     Some(executed_at),
-                )))
+                );
+                operation.set_split_tickets(split_tickets);
+                Ok(Self::TreeEdit(operation))
             }
             WireOperation::TreeStyle {
                 parent_created_at,
@@ -1527,6 +1534,30 @@ mod tests {
 
         assert_eq!(r#"["1","2","3"]"#, element.to_sorted_json());
         assert_eq!(r#"["1","2","3"]"#, roundtripped.to_sorted_json());
+        Ok(())
+    }
+
+    #[test]
+    fn carries_tree_edit_split_tickets_through_wire_shape() -> Result<()> {
+        let pos = TreePos::new(tree_node_id(1, 0), tree_node_id(2, 1));
+        let mut operation =
+            TreeEditOperation::create(ticket(1), pos.clone(), pos, None, 1, Some(ticket(10)));
+        let split_tickets = vec![TimeTicket::new(10, 4, "000000000000000000000001")];
+        operation.set_split_tickets(split_tickets.clone());
+
+        let wire = WireOperation::try_from(&Operation::TreeEdit(operation))?;
+        let WireOperation::TreeEdit {
+            split_tickets: wire_tickets,
+            ..
+        } = &wire
+        else {
+            panic!("expected a tree edit");
+        };
+        assert_eq!(&split_tickets, wire_tickets);
+        let Operation::TreeEdit(decoded) = Operation::try_from(wire)? else {
+            panic!("expected a tree edit");
+        };
+        assert_eq!(split_tickets, decoded.split_tickets());
         Ok(())
     }
 

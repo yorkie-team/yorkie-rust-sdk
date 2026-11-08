@@ -1,6 +1,8 @@
 use super::{ExecutionResult, OpInfo, OpSource, Operation, OperationMeta};
 use crate::crdt::root::CrdtRoot;
-use crate::crdt::tree::{TreeEditChange, TreeEditResult, TreeNode, TreeNodeId, TreePos};
+use crate::crdt::tree::{
+    fallback_split_tickets, TreeEditChange, TreeEditResult, TreeNode, TreeNodeId, TreePos,
+};
 use crate::time::ActorId;
 use crate::{Result, TimeTicket, VersionVector, YorkieError};
 
@@ -11,6 +13,11 @@ pub(crate) struct TreeEditOperation {
     to_pos: TreePos,
     contents: Option<Vec<TreeNode>>,
     split_level: usize,
+    /// The tickets the editing replica issued for the elements its split
+    /// created, in issue order (JS `splitTickets`). Empty for a change
+    /// written before the field existed, which falls back to rebuilding
+    /// them from `executed_at`.
+    split_tickets: Vec<TimeTicket>,
 }
 
 impl TreeEditOperation {
@@ -28,6 +35,7 @@ impl TreeEditOperation {
             to_pos,
             contents,
             split_level,
+            split_tickets: Vec::new(),
         }
     }
 
@@ -64,11 +72,18 @@ impl TreeEditOperation {
                 return Err(self.tree_parent_error(root));
             };
 
-            let result = tree.edit_by_range_with_changes(
+            // The split takes the carried tickets in order, then the ones a
+            // replica rebuilds from the edit and its top-level contents.
+            let mut split_tickets = self.split_tickets.iter().cloned();
+            let mut fallback =
+                fallback_split_tickets(&executed_at, self.contents.as_ref().map(Vec::len));
+            let mut issue_split_ticket = || split_tickets.next().unwrap_or_else(&mut fallback);
+            let result = tree.edit(
                 range,
                 self.contents.clone(),
                 self.split_level,
                 executed_at,
+                &mut issue_split_ticket,
                 version_vector,
             )?;
             let reverse_op = self.to_reverse_operation(tree, &result)?;
@@ -110,11 +125,29 @@ impl TreeEditOperation {
         self.split_level
     }
 
+    /// Returns the tickets issued for the elements the split created (JS
+    /// `getSplitTickets`).
+    pub(crate) fn split_tickets(&self) -> &[TimeTicket] {
+        &self.split_tickets
+    }
+
+    /// Records the tickets issued for the elements the split created (JS
+    /// `setSplitTickets`).
+    pub(crate) fn set_split_tickets(&mut self, split_tickets: Vec<TimeTicket>) {
+        self.split_tickets = split_tickets;
+    }
+
     pub(crate) fn set_executed_at(&mut self, executed_at: TimeTicket) {
         self.meta.set_executed_at(executed_at);
     }
 
+    /// Sets the actor of this operation and of the tickets its split issued,
+    /// which carry the actor of the change (JS `setActor`).
     pub(crate) fn set_actor(&mut self, actor_id: impl Into<ActorId>) {
+        let actor_id = actor_id.into();
+        for ticket in &mut self.split_tickets {
+            *ticket = ticket.set_actor(actor_id.clone());
+        }
         self.meta.set_actor(actor_id);
     }
 
@@ -555,6 +588,58 @@ mod tests {
             }
             other => panic!("unexpected op info: {other:?}"),
         }
+        Ok(())
+    }
+
+    /// JS `TreeEditOperation.execute`: the elements a split creates take the
+    /// tickets the operation carries, in order, then fall back to the
+    /// tickets that follow the edit and its top-level contents.
+    #[test]
+    fn splits_with_the_tickets_the_operation_carries() -> crate::Result<()> {
+        let tree_at = ticket(1, "a");
+        let product_ids = |split_tickets: Vec<TimeTicket>| -> crate::Result<Vec<String>> {
+            let mut root = seeded_nested_root(tree_at.clone());
+            let pos = root
+                .tree_by_created_at(&tree_at)
+                .unwrap()
+                .path_to_pos(&[0, 0, 0, 2])?;
+            let mut operation = TreeEditOperation::create(
+                tree_at.clone(),
+                pos.clone(),
+                pos,
+                None,
+                2,
+                Some(TimeTicket::new(20, 3, "b")),
+            );
+            operation.set_split_tickets(split_tickets);
+            operation.execute(&mut root, OpSource::Remote, None)?;
+
+            let tree = root.tree_by_created_at(&tree_at).unwrap();
+            assert_eq!(
+                r#"<doc><tc><p><tn>12</tn></p><p><tn>34</tn></p><p><tn>5678</tn></p></tc></doc>"#,
+                tree.to_xml()
+            );
+            Ok(tree
+                .nodes()
+                .filter(|node| node.id().created_at().lamport() == 20)
+                .map(|node| node.id().created_at().to_test_string())
+                .collect())
+        };
+
+        assert_eq!(
+            vec!["20:b:7", "20:b:9"],
+            product_ids(vec![
+                TimeTicket::new(20, 9, "b"),
+                TimeTicket::new(20, 7, "b")
+            ])?
+        );
+        // A change written before the field existed carries none.
+        assert_eq!(vec!["20:b:5", "20:b:4"], product_ids(Vec::new())?);
+        // The fallback starts past the edit, whatever was consumed.
+        assert_eq!(
+            vec!["20:b:4", "20:b:9"],
+            product_ids(vec![TimeTicket::new(20, 9, "b")])?
+        );
         Ok(())
     }
 
