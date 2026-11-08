@@ -1236,6 +1236,7 @@ Current Rust behavior:
 - Integration tests (`crates/yorkie/tests/integration_*.rs`) run against a
   live server when `YORKIE_TEST_RPC_ADDR` is set and skip themselves
   otherwise. They cover the client lifecycle, realtime sync and presence,
+  primitives, objects, arrays (including the concurrency table), counters,
   text, tree (including split and merge matrices), history, schema and size
   limits, and channels with broadcast. CI runs them against a pinned server
   image (`.github/workflows/ci.yml`).
