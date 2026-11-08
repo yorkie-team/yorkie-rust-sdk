@@ -1,7 +1,7 @@
 use super::element::{CrdtElementMeta, DataSize};
 use super::rht::{Rht, RhtNode};
 use crate::json::escape_json_string;
-use crate::{JsonValue, Result, TimeTicket, YorkieError, TIME_TICKET_SIZE};
+use crate::{Result, TimeTicket, TreeNodeInput, YorkieError, TIME_TICKET_SIZE};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -655,13 +655,13 @@ pub(crate) struct TreeStyleChange {
     pub(crate) attributes_to_remove: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TreeEditChange {
     pub(crate) from: usize,
     pub(crate) to: usize,
     pub(crate) from_path: Vec<usize>,
     pub(crate) to_path: Vec<usize>,
-    pub(crate) value: Option<Vec<String>>,
+    pub(crate) value: Option<Vec<TreeNodeInput>>,
     pub(crate) split_level: Option<usize>,
 }
 
@@ -1124,9 +1124,12 @@ impl CrdtTree {
         }
 
         let mut inserted_size = 0;
-        let mut inserted_value = contents
-            .as_ref()
-            .map(|nodes| nodes.iter().map(TreeNode::to_json).collect::<Vec<_>>());
+        let mut inserted_value = contents.as_ref().map(|nodes| {
+            nodes
+                .iter()
+                .map(TreeNodeInput::from_crdt)
+                .collect::<Vec<_>>()
+        });
         if let Some(contents) = contents {
             // Insert right after the left node, or first in the parent (JS
             // `CRDTTree.edit` step 05).
@@ -2226,7 +2229,7 @@ fn attach_insertion_change(
     mut changes: Vec<TreeEditChange>,
     from: usize,
     from_path: Vec<usize>,
-    value: Option<Vec<String>>,
+    value: Option<Vec<TreeNodeInput>>,
 ) -> Vec<TreeEditChange> {
     let Some(value) = value.filter(|value| !value.is_empty()) else {
         return changes;
@@ -2586,25 +2589,6 @@ fn attribute_value_to_json(value: &str) -> String {
         "true" | "false" | "null" => trimmed.to_owned(),
         _ if trimmed.parse::<f64>().is_ok() => trimmed.to_owned(),
         _ => format!("\"{}\"", escape_json_string(value)),
-    }
-}
-
-pub(crate) fn attribute_value_to_json_value(value: &str) -> JsonValue {
-    let trimmed = value.trim();
-    if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
-        return JsonValue::String(unescape_json_string(&trimmed[1..trimmed.len() - 1]));
-    }
-
-    match trimmed {
-        "true" => JsonValue::Bool(true),
-        "false" => JsonValue::Bool(false),
-        "null" => JsonValue::Null,
-        _ => trimmed
-            .parse::<i32>()
-            .map(JsonValue::Integer)
-            .or_else(|_| trimmed.parse::<i64>().map(JsonValue::Long))
-            .or_else(|_| trimmed.parse::<f64>().map(JsonValue::Double))
-            .unwrap_or_else(|_| JsonValue::String(value.to_owned())),
     }
 }
 
@@ -2972,9 +2956,10 @@ mod tests {
         assert_eq!(vec![0], result.changes[0].from_path);
         assert_eq!(vec![0], result.changes[0].to_path);
         assert_eq!(
-            Some(vec![
-                r#"{"type":"p","children":[{"type":"text","value":"hello"}]}"#.to_owned()
-            ]),
+            Some(vec![crate::TreeNodeInput::element(
+                "p",
+                vec![crate::TreeNodeInput::text("hello")]
+            )]),
             result.changes[0].value
         );
         Ok(())

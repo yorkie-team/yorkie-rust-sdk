@@ -1,14 +1,17 @@
 mod text;
+mod tree;
 
 use crate::crdt::counter::{CounterType, CounterValue, CrdtCounter};
 use crate::crdt::primitive::{CrdtPrimitive, PrimitiveValue};
 use crate::crdt::rga_tree_split::RgaTreeSplitPosRange;
+use crate::crdt::tree::{TreeNode, TreePos};
 use crate::{Result, TimeTicket, YorkieError};
 use std::collections::BTreeMap;
 use std::fmt::{self, Write};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 pub use text::{JsonText, TextChunk};
+pub use tree::{JsonTree, TreeNodeInput};
 
 pub(crate) type JsonEditRecorderRef = Arc<Mutex<dyn JsonEditRecorder + Send>>;
 
@@ -87,6 +90,38 @@ pub(crate) trait JsonEditRecorder {
         attributes: BTreeMap<String, String>,
         executed_at: TimeTicket,
     );
+
+    /// Returns the last ticket issued, which a tree edit runs at (JS
+    /// `ChangeContext.getLastTimeTicket`).
+    fn last_time_ticket(&self) -> TimeTicket;
+
+    fn record_tree_edit(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        from_pos: TreePos,
+        to_pos: TreePos,
+        contents: Option<Vec<TreeNode>>,
+        split_level: usize,
+        executed_at: TimeTicket,
+    );
+
+    fn record_tree_style(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        from_pos: TreePos,
+        to_pos: TreePos,
+        attributes: BTreeMap<String, String>,
+        executed_at: TimeTicket,
+    );
+
+    fn record_tree_remove_style(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        from_pos: TreePos,
+        to_pos: TreePos,
+        attributes_to_remove: Vec<String>,
+        executed_at: TimeTicket,
+    );
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -121,6 +156,7 @@ pub enum JsonValue {
     String(String),
     Counter(JsonCounter),
     Text(JsonText),
+    Tree(JsonTree),
     Object(JsonObject),
     Array(JsonArray),
 }
@@ -161,6 +197,7 @@ impl JsonValue {
             Self::String(value) => format!("\"{}\"", escape_json_string(value)),
             Self::Counter(value) => value.to_sorted_json(),
             Self::Text(value) => value.to_sorted_json(),
+            Self::Tree(value) => value.to_json_string(),
             Self::Object(value) => value.to_sorted_json(),
             Self::Array(value) => value.to_sorted_json(),
         }
@@ -395,15 +432,6 @@ impl JsonObject {
         Ok(self)
     }
 
-    pub(crate) fn set_unchecked(
-        &mut self,
-        key: impl Into<String>,
-        value: impl Into<JsonValue>,
-    ) -> &mut Self {
-        self.members.insert(key.into(), value.into());
-        self
-    }
-
     pub(crate) fn set_tracked_unchecked(
         &mut self,
         key: impl Into<String>,
@@ -477,6 +505,17 @@ impl JsonObject {
         }
     }
 
+    pub fn get_tree_mut(&mut self, key: &str) -> Result<&mut JsonTree> {
+        match self.members.get_mut(key) {
+            Some(JsonValue::Tree(value)) => Ok(value),
+            Some(_) => Err(YorkieError::UnexpectedType {
+                key: key.to_owned(),
+                expected: "tree",
+            }),
+            None => Err(YorkieError::MissingKey(key.to_owned())),
+        }
+    }
+
     pub fn get_object_mut(&mut self, key: &str) -> Result<&mut JsonObject> {
         match self.members.get_mut(key) {
             Some(JsonValue::Object(value)) => Ok(value),
@@ -516,6 +555,18 @@ impl JsonObject {
         let key = key.into();
         self.set(key.clone(), JsonText::new())?;
         self.get_text_mut(&key)
+    }
+
+    /// Sets a new tree built from `root` at `key` and returns it for editing
+    /// (JS `root[key] = new Tree(root)`).
+    pub fn set_tree(
+        &mut self,
+        key: impl Into<String>,
+        root: TreeNodeInput,
+    ) -> Result<&mut JsonTree> {
+        let key = key.into();
+        self.set(key.clone(), JsonTree::new(root))?;
+        self.get_tree_mut(&key)
     }
 
     pub fn to_sorted_json(&self) -> String {
@@ -1120,6 +1171,7 @@ impl JsonValue {
         match self {
             Self::Counter(value) => value.attach_recorder(recorder),
             Self::Text(value) => value.attach_recorder(recorder),
+            Self::Tree(value) => value.attach_recorder(recorder),
             Self::Object(value) => value.attach_recorder(recorder),
             Self::Array(value) => value.attach_recorder(recorder),
             Self::Null
@@ -1135,6 +1187,7 @@ impl JsonValue {
         match self {
             Self::Counter(value) => value.detach_recorder(),
             Self::Text(value) => value.detach_recorder(),
+            Self::Tree(value) => value.detach_recorder(),
             Self::Object(value) => value.detach_recorder(),
             Self::Array(value) => value.detach_recorder(),
             Self::Null
@@ -1278,6 +1331,12 @@ impl From<JsonCounter> for JsonValue {
 impl From<JsonText> for JsonValue {
     fn from(value: JsonText) -> Self {
         Self::Text(value)
+    }
+}
+
+impl From<JsonTree> for JsonValue {
+    fn from(value: JsonTree) -> Self {
+        Self::Tree(value)
     }
 }
 

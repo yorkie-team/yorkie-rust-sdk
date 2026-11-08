@@ -12,8 +12,8 @@ pub use yorkie_client::{
 };
 pub use yorkie_core::{
     ActorId, ChangePack, Checkpoint, CounterType, CounterValue, DocEvent, DocStatus, DocSyncStatus,
-    Document, JsonArray, JsonCounter, JsonObject, JsonText, JsonValue, Presence, PresenceProxy,
-    Result, SchemaRule, StreamConnectionStatus, TextChunk, TimeTicket, TimeTicketStruct,
-    TreeNodeRule, VersionVector, YorkieError,
+    Document, JsonArray, JsonCounter, JsonObject, JsonText, JsonTree, JsonValue, OperationInfo,
+    Presence, PresenceProxy, Result, SchemaRule, StreamConnectionStatus, TextChunk, TimeTicket,
+    TimeTicketStruct, TreeNodeInput, TreeNodeRule, TreeStyleOpValue, VersionVector, YorkieError,
 };
 pub use yorkie_protocol::YORKIE_PROTO_PACKAGE;

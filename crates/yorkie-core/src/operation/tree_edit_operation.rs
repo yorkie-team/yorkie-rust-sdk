@@ -284,9 +284,10 @@ mod tests {
                 to: 0,
                 from_path: vec![0],
                 to_path: vec![0],
-                value: Some(vec![
-                    r#"{"type":"p","children":[{"type":"text","value":"hello"}]}"#.to_owned()
-                ]),
+                value: Some(vec![crate::TreeNodeInput::element(
+                    "p",
+                    vec![crate::TreeNodeInput::text("hello")]
+                )]),
                 split_level: None,
             }],
             result.op_infos
@@ -374,10 +375,7 @@ mod tests {
                 assert_eq!("$.body", path);
                 assert_eq!(3, *from);
                 assert_eq!(3, *to);
-                assert_eq!(
-                    Some(vec![r#"{"type":"text","value":"X"}"#.to_owned()]),
-                    *value
-                );
+                assert_eq!(Some(vec![crate::TreeNodeInput::text("X")]), *value);
             }
             other => panic!("unexpected op info: {other:?}"),
         }

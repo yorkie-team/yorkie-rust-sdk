@@ -25,7 +25,7 @@ use crate::crdt::primitive::PrimitiveValue;
 use crate::crdt::root::CrdtRoot;
 use crate::event::{parse_attrs, EditOpValue, OperationInfo, StyleOpValue, TreeStyleOpValue};
 use crate::time::ActorId;
-use crate::{TimeTicket, VersionVector};
+use crate::{TimeTicket, TreeNodeInput, VersionVector};
 
 use crate::Result;
 use std::collections::BTreeMap;
@@ -96,7 +96,7 @@ pub(crate) enum OpInfo {
         to: usize,
         from_path: Vec<usize>,
         to_path: Vec<usize>,
-        value: Option<Vec<String>>,
+        value: Option<Vec<TreeNodeInput>>,
         split_level: Option<usize>,
     },
 }

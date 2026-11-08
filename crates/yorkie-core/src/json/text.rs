@@ -187,7 +187,9 @@ impl JsonText {
 /// string that is not itself a JSON document is stored as-is, which is what
 /// the Go SDK stores; any other value, including a string that is a JSON
 /// document, is stored JSON-encoded so it keeps its type.
-fn stringify_attributes(attributes: BTreeMap<String, Value>) -> BTreeMap<String, String> {
+pub(super) fn stringify_attributes(
+    attributes: BTreeMap<String, Value>,
+) -> BTreeMap<String, String> {
     attributes
         .into_iter()
         .map(|(key, value)| {

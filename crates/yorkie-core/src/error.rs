@@ -59,6 +59,13 @@ pub enum YorkieError {
     /// A JSON value was used before it belongs to a document update (JS
     /// `ErrNotInitialized`).
     NotInitialized(String),
+
+    /// An argument is not valid for the requested call (JS
+    /// `ErrInvalidArgument`).
+    InvalidArgument(String),
+
+    /// The requested feature is not implemented yet (JS `ErrUnimplemented`).
+    Unimplemented(String),
 }
 
 /// Convenient result alias for Yorkie core operations.
@@ -103,6 +110,8 @@ impl Display for YorkieError {
                 write!(f, "unsupported protocol conversion for {value}")
             }
             Self::NotInitialized(message) => write!(f, "not initialized: {message}"),
+            Self::InvalidArgument(message) => write!(f, "invalid argument: {message}"),
+            Self::Unimplemented(message) => write!(f, "unimplemented: {message}"),
         }
     }
 }

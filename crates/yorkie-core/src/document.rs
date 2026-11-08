@@ -7,12 +7,13 @@ use crate::crdt::primitive::{CrdtPrimitive, PrimitiveValue};
 use crate::crdt::rga_tree_split::RgaTreeSplitPosRange;
 use crate::crdt::root::CrdtRoot;
 use crate::crdt::text::CrdtText;
-use crate::crdt::tree::{attribute_value_to_json_value, TreeNode};
+use crate::crdt::tree::{CrdtTree, TreeNode, TreePos};
 use crate::event::{ChangeInfo, DocEvent, OperationInfo, Subscribers, SubscriptionId};
 use crate::json::{counter_operand, JsonEditRecorder, JsonEditRecorderRef, RecordedJsonValue};
 use crate::operation::{
     AddOperation, ArraySetOperation, EditOperation, IncreaseOperation, MoveOperation, OpSource,
-    Operation, RemoveOperation, SetOperation, StyleOperation,
+    Operation, RemoveOperation, SetOperation, StyleOperation, TreeEditOperation,
+    TreeStyleOperation,
 };
 use crate::presence::{Presence, PresenceChange, PresenceProxy};
 use crate::{
@@ -726,6 +727,67 @@ impl JsonEditRecorder for DocumentEditRecorder {
             Some(executed_at),
         )));
     }
+
+    fn last_time_ticket(&self) -> TimeTicket {
+        self.context.last_time_ticket()
+    }
+
+    fn record_tree_edit(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        from_pos: TreePos,
+        to_pos: TreePos,
+        contents: Option<Vec<TreeNode>>,
+        split_level: usize,
+        executed_at: TimeTicket,
+    ) {
+        self.context
+            .push(Operation::TreeEdit(TreeEditOperation::create(
+                parent_created_at.clone(),
+                from_pos,
+                to_pos,
+                contents,
+                split_level,
+                Some(executed_at),
+            )));
+    }
+
+    fn record_tree_style(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        from_pos: TreePos,
+        to_pos: TreePos,
+        attributes: BTreeMap<String, String>,
+        executed_at: TimeTicket,
+    ) {
+        self.context
+            .push(Operation::TreeStyle(TreeStyleOperation::create(
+                parent_created_at.clone(),
+                from_pos,
+                to_pos,
+                attributes,
+                Some(executed_at),
+            )));
+    }
+
+    fn record_tree_remove_style(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        from_pos: TreePos,
+        to_pos: TreePos,
+        attributes_to_remove: Vec<String>,
+        executed_at: TimeTicket,
+    ) {
+        self.context.push(Operation::TreeStyle(
+            TreeStyleOperation::create_tree_remove_style_operation(
+                parent_created_at.clone(),
+                from_pos,
+                to_pos,
+                attributes_to_remove,
+                Some(executed_at),
+            ),
+        ));
+    }
 }
 
 fn collect_object_changes(
@@ -1058,6 +1120,10 @@ fn json_value_to_crdt_element(
         JsonValue::Counter(value) => CrdtElement::counter(value.to_crdt_counter(created_at)),
         // As in JS, setting a text always creates an empty one.
         JsonValue::Text(_) => CrdtElement::text(CrdtText::create(created_at)),
+        JsonValue::Tree(value) => {
+            let root = value.build_root(&mut || context.issue_time_ticket())?;
+            CrdtElement::tree(CrdtTree::create(root, created_at))
+        }
         JsonValue::Object(value) => {
             let mut members = Vec::new();
             for (key, value) in value.iter() {
@@ -1135,39 +1201,10 @@ fn crdt_element_to_json_value(element: &CrdtElement) -> Result<JsonValue> {
             JsonValue::Array(array)
         }
         CrdtElement::Text(value) => JsonValue::Text(crate::JsonText::from_crdt(value)),
-        CrdtElement::Tree(value) => crdt_tree_node_to_json_value(value.root())?,
+        CrdtElement::Tree(value) => JsonValue::Tree(crate::JsonTree::from_crdt(value)),
     };
 
     Ok(value)
-}
-
-fn crdt_tree_node_to_json_value(node: &TreeNode) -> Result<JsonValue> {
-    let mut object = JsonObject::new();
-    object.set_unchecked("type", node.node_type().to_owned());
-
-    if node.is_text() {
-        object.set_unchecked("value", node.value().to_owned());
-        return Ok(JsonValue::Object(object));
-    }
-
-    let mut children = crate::JsonArray::new();
-    for child in node.children() {
-        children.push(crdt_tree_node_to_json_value(child)?)?;
-    }
-    object.set_unchecked("children", children);
-
-    if let Some(attrs) = node.attrs() {
-        let values = attrs.to_object();
-        if !values.is_empty() {
-            let mut attr_object = JsonObject::new();
-            for (key, value) in values {
-                attr_object.set_unchecked(key, attribute_value_to_json_value(&value));
-            }
-            object.set_unchecked("attributes", attr_object);
-        }
-    }
-
-    Ok(JsonValue::Object(object))
 }
 
 #[cfg(test)]
@@ -1295,7 +1332,7 @@ mod tests {
     }
 
     #[test]
-    fn converts_crdt_tree_to_public_json_object() -> Result<()> {
+    fn converts_crdt_tree_to_public_json_tree() -> Result<()> {
         let mut attrs = Rht::new();
         attrs.set("bold", "\"true\"", crate::TimeTicket::new(4, 0, "a"));
         let tree = CrdtTree::create(
@@ -1318,10 +1355,15 @@ mod tests {
 
         let value = crdt_element_to_json_value(&CrdtElement::tree(tree))?;
 
+        let JsonValue::Tree(tree) = &value else {
+            panic!("expected a tree, got {value:?}");
+        };
+        // The key order of JS `Tree.toJSON`.
         assert_eq!(
-            r#"{"children":[{"attributes":{"bold":"true"},"children":[{"type":"text","value":"Hi"}],"type":"p"}],"type":"root"}"#,
+            r#"{"type":"root","children":[{"type":"p","children":[{"type":"text","value":"Hi"}],"attributes":{"bold":"true"}}]}"#,
             value.to_sorted_json()
         );
+        assert_eq!(r#"<root><p bold="true">Hi</p></root>"#, tree.to_xml()?);
         Ok(())
     }
 

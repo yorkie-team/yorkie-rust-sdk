@@ -6,6 +6,7 @@ use crate::crdt::counter::CounterValue;
 use crate::document::DocStatus;
 use crate::presence::Presence;
 use crate::time::ActorId;
+use crate::TreeNodeInput;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -103,13 +104,12 @@ pub enum OperationInfo {
         to: usize,
         value: StyleOpValue,
     },
-    /// JS `TreeEditOpInfo`. `value` holds the inserted nodes as JSON-encoded
-    /// JS `TreeNode`s.
+    /// JS `TreeEditOpInfo`. `value` holds the inserted nodes, if any.
     TreeEdit {
         path: String,
         from: usize,
         to: usize,
-        value: Option<Vec<String>>,
+        value: Option<Vec<TreeNodeInput>>,
         split_level: Option<usize>,
         from_path: Vec<usize>,
         to_path: Vec<usize>,

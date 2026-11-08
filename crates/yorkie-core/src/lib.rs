@@ -28,7 +28,8 @@ pub use event::{
     StyleOpValue, SubscriptionId, TreeStyleOpValue,
 };
 pub use json::{
-    JsonArray, JsonArrayElement, JsonCounter, JsonObject, JsonText, JsonValue, TextChunk,
+    JsonArray, JsonArrayElement, JsonCounter, JsonObject, JsonText, JsonTree, JsonValue, TextChunk,
+    TreeNodeInput,
 };
 pub use presence::{Presence, PresenceChange, PresenceProxy};
 pub use schema::{SchemaRule, TreeNodeRule};

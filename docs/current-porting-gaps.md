@@ -97,7 +97,8 @@ Current Rust behavior:
 
 - `JsonObject` supports `set`, `get`, `get_mut`, `remove`,
   `get_object_mut`, `get_array_mut`, `get_counter_mut`, `get_text_mut`,
-  `set_counter`, `set_long_counter`, `set_dedup_counter`, and `set_text`.
+  `get_tree_mut`, `set_counter`, `set_long_counter`, `set_dedup_counter`,
+  `set_text`, and `set_tree`.
 - `JsonArray` supports `push`, index `get`/`get_mut`, `set`/`set_value`,
   `insert`, `insert_after_index`, `insert_integer_after`, `remove`/`delete`,
   element-ID lookup, `get_by_id`, `get_mut_by_id`, `get_element_by_index`,
@@ -110,15 +111,24 @@ Current Rust behavior:
   Mutation methods can return errors because they may create CRDT operations
   during `Document::update`.
 - `JsonValue` is a simple enum wrapper around primitive, counter, text,
-  object, and array values.
+  tree, object, and array values.
 - `JsonText` (JS `Text`) supports `edit`, `delete`, `empty`, `set_style`,
   `to_string`, `len`, `is_empty`, `values`, `id`, and `to_sorted_json`. It
   holds a copy of the CRDT text, applies each edit to it with a ticket from the
   update's change context, and records the matching `EditOperation` or
   `StyleOperation`, so later edits in the same update see earlier ones, as in
   JS.
-- During `Document::update`, public object, array, counter, and text values
-  are temporarily attached to a recorder and hidden CRDT identity metadata.
+- `JsonTree` (JS `Tree`) supports `edit` (JS `edit`/`editBulk`),
+  `edit_by_path` (JS `editByPath`/`editBulkByPath`), `style`, `remove_style`,
+  `to_xml`, `to_json`, `size`, `index_to_path`, and `path_to_index`. Like
+  `JsonText`, it holds a copy of the CRDT tree, applies each edit or style to
+  it, and records the matching `TreeEditOperation` or `TreeStyleOperation`.
+  Input nodes are `TreeNodeInput` values (JS `ElementNode`/`TextNode`),
+  validated like JS `validateTreeNodes`, and tree edit op infos report the
+  inserted nodes as `TreeNodeInput` values too.
+- During `Document::update`, public object, array, counter, text, and tree
+  values are temporarily attached to a recorder and hidden CRDT identity
+  metadata.
 
 JS/Go behavior:
 
@@ -142,7 +152,22 @@ Gap:
 - Rust value-based array search uses `JsonValue` equality. For non-primitive
   containers, JS compares wrapped element identity; Rust callers should use the
   explicit ID search methods when identity matters.
-- Tree does not have a public context-backed facade yet.
+- `JsonTree` does not accept `split_level > 0` yet; such an edit fails with
+  `YorkieError::Unimplemented`. Splits and merges through the facade are
+  Task 10 of the JS parity plan.
+- `JsonTree` does not port JS `splitByPath`, `mergeByPath`, `styleByPath`,
+  `removeStyleByPath`, `getNodeSize`, `getIndexTree`, `getRootTreeNode`, the
+  position-range conversions (`indexRangeToPosRange`, `posRangeToIndexRange`,
+  `pathRangeToPosRange`, `posRangeToPathRange`), or the test helpers. There is
+  no `JsonArray::push_tree` or `JsonArray::get_tree_mut` either.
+- JS ignores `TreeNodeInput` details a Rust enum cannot express the same way:
+  an element whose type is `"text"` and a text root are rejected with
+  `YorkieError::InvalidArgument`, since in JS the type alone makes a node a
+  text node. As in JS and Go, the attributes of the root given to
+  `JsonTree::new` are dropped.
+- Setting a `JsonTree` read from a document into another key copies its
+  current nodes. JS builds an empty tree in that case, because such a `Tree`
+  has no initial root.
 - `JsonText` does not port JS `indexRangeToPosRange`/`posRangeToIndexRange`
   (`TextPosStruct`), `toTestString`, `toJSForTest`, `createRangeForTest`, or
   the index/ID tree accessors.
@@ -526,10 +551,22 @@ Current Rust behavior:
   sizing, active attribute data size, and internal GC pair discovery.
 - `CrdtTree` can convert between linear tree indexes, paths, and CRDT tree
   positions using the JS/Go element padding and text-child path rules.
-- `CrdtTree` now resolves edit positions through parent/left sibling paths,
-  advances unknown split siblings via `insNextID`, narrows collection ranges
-  across split siblings, and falls back to floor-style text lookup when a text
-  node has moved under a concurrent split sibling.
+- `CrdtTree` resolves edit and style positions like JS
+  `findNodesAndSplitText`: it finds the parent and left sibling by node ID,
+  removed nodes included, follows `insPrevID` from the start of a split node,
+  splits the text node the position falls in, and moves the left sibling past
+  nodes inserted at the same position after the edit, as in RGA. It advances
+  unknown split siblings via `insNextID` and narrows collection ranges across
+  split siblings.
+- Edit ranges are walked over indexes that count removed nodes, as JS
+  `traverseInPosRange` walks tombstones, and content is inserted right after
+  the left sibling. Content inserted into a parent removed concurrently is
+  born removed and registered as garbage.
+- Tree edit changes follow JS `makeDeletionChanges`: one deletion change per
+  run of adjacent removed tokens, last run first, with the inserted nodes
+  attached to the change that starts at the insertion index. An edit that
+  changes nothing visible reports no change, and style changes skip removed
+  nodes and report the range of the node's start token.
 - `CrdtTree` can apply simple style/remove-style ranges to visible element
   tokens, split text nodes at style boundaries, ignore text-only ranges after
   applying the boundary splits, collect tree style operation info, and report
@@ -603,12 +640,24 @@ Gap:
 - Operation-time GC registration exists for split-free tree-node deletion,
   text-node split deletion, and visible-boundary merge source tombstones, but
   concurrent element split/merge deletion paths still need JS/Go parity.
-- Public Tree facade is missing. Wire conversion exists for full
+- The public `JsonTree` facade covers insert, delete, style, and remove-style
+  edits, but not splits and merges (Task 10). Wire conversion exists for full
   `JSONElement.Tree` payloads and tree edit/style operation bodies, but
   broader JS/Go protocol replay fixtures are still needed.
-- Tree attribute JSON/XML output follows the same scalar parsing helper as
-  Text, but object/array attribute values still need broader JS parity tests
-  before public style APIs expose them.
+- Concurrent edits converge in the ported JS `tree_concurrency_test.ts`
+  edit-edit, style-style, and edit-style matrices without merge and split
+  operations. The matrices with them are not ported yet.
+- Tree attribute JSON output still uses its own scalar parsing helper. JS
+  re-encodes every value through `JSON.parse`, emits `"attributes":{}` for a
+  node whose attributes were all removed, and does not escape text in
+  `toXML`, where Rust escapes `&`, `<`, and `>`; Rust XML attributes also do
+  not escape `'` as JS does.
+- Rust `TreeNode::can_style` still refuses a removed node unless the style is
+  later than the removal, where JS styles removed nodes too. Removed nodes
+  report no change either way, so only an undo restore could tell them apart.
+- Element splits (`split_element_at`) do not yet update the `insPrevID` of
+  the node after the split node, which text splits now do as in JS
+  `CRDTTreeNode.split`.
 
 Expected direction:
 
