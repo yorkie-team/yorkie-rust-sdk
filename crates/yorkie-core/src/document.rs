@@ -340,12 +340,11 @@ impl Document {
         let Some(entry) = entry else {
             return Ok(());
         };
-        // Building the change rewrites the entry's operations; a failed undo
-        // or redo puts back the entry as it was.
-        let popped = entry.clone();
+        // As in JS, a failed undo or redo drops the popped entry.
+        //
         // Applied to the stacks only once the change has run, so a failed
-        // undo or redo leaves them as they were. They name only the other
-        // entries, so deferring them changes nothing for this one.
+        // undo or redo leaves the other entries as they were. They name only
+        // the other entries, so deferring them changes nothing for this one.
         let mut reconciles = Vec::new();
 
         let actor_id = self.change_id.actor_id().clone();
@@ -387,18 +386,8 @@ impl Document {
         let mut change = context.to_change();
         change.mark_as_undo_redo();
         let prev = self.presence_state(&actor_id, self.status == DocStatus::Attached);
-        let staged = self.stage(&mut change, |change, root| change.execute_undo_redo(root));
-        let (staged, executed) = match staged {
-            Ok(staged) => staged,
-            Err(err) => {
-                if is_undo {
-                    self.history.push_undo(popped);
-                } else {
-                    self.history.push_redo(popped);
-                }
-                return Err(err);
-            }
-        };
+        let (staged, executed) =
+            self.stage(&mut change, |change, root| change.execute_undo_redo(root))?;
 
         // Nothing below fails: the change is committed from here on.
         self.commit_staged(staged);

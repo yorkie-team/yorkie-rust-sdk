@@ -1,4 +1,5 @@
-//! Tests that a rejected update or undo leaves the document untouched, and
+//! Tests that a rejected update or undo leaves the document untouched (a
+//! failed undo or redo only drops its entry, as in JS), and
 //! that local updates are checked against schema rules and the maximum
 //! document size.
 //!
@@ -8,13 +9,17 @@
 //! and drops the clone when that fails or is rejected, so the root never
 //! holds part of a change.
 
-use super::Document;
+use super::{DocStatus, Document};
 use crate::history::HistoryOperation;
 use crate::json::lock_recorder;
 use crate::operation::{Operation, RemoveOperation};
-use crate::{DataSize, DocSize, JsonText, Presence, Result, SchemaRule, TimeTicket, YorkieError};
+use crate::{
+    ActorId, DataSize, DocSize, JsonText, Presence, Result, SchemaRule, TimeTicket, YorkieError,
+};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
-/// Everything a rejected update or undo must leave as it was.
+/// Everything a rejected update must leave as it was.
 #[derive(Debug, PartialEq)]
 struct Observed {
     json: String,
@@ -24,6 +29,7 @@ struct Observed {
     redo_stack: Vec<Vec<HistoryOperation>>,
     doc_size: crate::crdt::root::DocSize,
     change_id: crate::change::ChangeId,
+    presences: BTreeMap<ActorId, Presence>,
 }
 
 fn observe(doc: &Document) -> Observed {
@@ -35,6 +41,7 @@ fn observe(doc: &Document) -> Observed {
         redo_stack: doc.redo_stack_for_test().to_vec(),
         doc_size: doc.crdt_root.doc_size(),
         change_id: doc.change_id.clone(),
+        presences: doc.presences.clone(),
     }
 }
 
@@ -104,10 +111,19 @@ fn operation_failing_partway_rolls_back_the_undo() -> Result<()> {
 
     let err = doc.history_mut().undo().unwrap_err();
 
+    // As in JS, the failed entry is dropped; nothing else changes.
     assert!(matches!(err, YorkieError::MissingCrdtElement(_)), "{err:?}");
-    assert_eq!(before, observe(&doc));
-    assert!(doc.history().can_undo());
+    let mut expected = before;
+    expected.undo_stack.pop();
+    assert_eq!(expected, observe(&doc));
+    assert_eq!(1, doc.undo_stack_for_test().len());
     Ok(())
+}
+
+fn presence_of(name: &str) -> Presence {
+    let mut presence = Presence::new();
+    presence.insert("name".to_owned(), serde_json::json!(name));
+    presence
 }
 
 fn string_title_rule() -> Vec<SchemaRule> {
@@ -172,6 +188,36 @@ fn rejected_update_rolls_back() -> Result<()> {
         before.change_id.next(false).lamport(),
         doc.local_changes.last().unwrap().id().lamport()
     );
+
+    // A failure in an update that also sets presence, watched by a
+    // subscriber: the presence stays and no event fires.
+    let mut doc = doc_with_history()?;
+    doc.set_actor("000000000000000000000001");
+    doc.apply_status(DocStatus::Attached);
+    doc.update_with_presence(|_, presence| {
+        presence.set(presence_of("before"));
+        Ok(())
+    })?;
+    doc.set_schema_rules(string_title_rule());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = events.clone();
+    doc.subscribe(move |event| sink.lock().unwrap().push(format!("{event:?}")));
+    let before_presence = observe(&doc);
+
+    let err = doc
+        .update_with_presence(|root, presence| {
+            presence.set(presence_of("after"));
+            root.set("title", 1).map(|_| ())
+        })
+        .unwrap_err();
+
+    assert!(
+        matches!(err, YorkieError::SchemaValidationFailed(_)),
+        "{err:?}"
+    );
+    assert_eq!(before_presence, observe(&doc));
+    assert_eq!(presence_of("before"), doc.my_presence());
+    assert!(events.lock().unwrap().is_empty(), "{events:?}");
     Ok(())
 }
 

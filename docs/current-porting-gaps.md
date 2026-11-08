@@ -783,9 +783,10 @@ Current Rust behavior:
 - A snapshot clears both stacks, as in JS `applySnapshot`.
 - An undo or redo runs on a copy of the CRDT root, like a local update (see
   Change, ChangeContext, and ChangePack). One that fails leaves the document
-  as it was, including the stacks: the entry goes back on its stack, and the
-  re-pointing of other entries (`reconcile_created_at`) waits until the change
-  has run. JS drops the popped entry and keeps the re-pointing.
+  as it was and queues nothing. As in JS, the popped entry is dropped. The
+  re-pointing of the other entries (`reconcile_created_at`) waits until the
+  change has run, so a failed one leaves them as they were; JS has already
+  re-pointed them to tickets the failed change never committed.
 
 JS/Go behavior:
 
