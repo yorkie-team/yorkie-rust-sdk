@@ -247,6 +247,12 @@ Gap:
 - The ownership model is not yet settled. Future code may need an arena,
   stable IDs with lookup back into the tree, or another explicit ownership
   strategy.
+- The copies cost time. Every pair holds a deep copy of its parent, so a root
+  with `n` members holds `n` copies of the root, and a local update, which
+  runs on a copy of `CrdtRoot`, costs time quadratic in `n`. 500 updates on
+  a root that grows to 500 members take about six minutes in a debug build.
+  The two JS snapshot integration cases that build such a root are ignored
+  for this (`integration_snapshot.rs`); both pass in a release build.
 
 Expected direction:
 
@@ -254,6 +260,48 @@ Expected direction:
   deliberately redesigned.
 - Add tests that mutate nested object/array descendants and immediately verify
   `create_path`, `find_by_created_at`, and visible JSON output.
+
+## Garbage Collection
+
+Current Rust behavior:
+
+- `Document::apply_change_pack` collects garbage with the pack's version
+  vector after the pack has applied and the checkpoint has moved, and not
+  for a snapshot pack, as JS `applyChangePack` does. The server's vector
+  covers only what this client pushed, so a pending local removal keeps its
+  tombstone.
+- A push-only or sync-off reply is taken as a push acknowledgement only
+  (`Document::acknowledge_pushed_changes`, JS `acknowledgePushedChanges`):
+  its remote state and its version vector never reach collection.
+- `CrdtRoot::garbage_collect` holds a purge back until the node behind the
+  tombstone is causally stable (the successor barrier of JS `dbff8892`, Go
+  `ba82ed91`) for array positions, text nodes, and tree siblings, and
+  repeats a pass that both purged and deferred.
+- `Document::garbage_collect`, `garbage_len`, and `version_vector` are
+  hidden public hooks, as JS exposes them for tests.
+
+JS/Go behavior:
+
+- JS skips collection for a document attached with `disableGC`.
+- Before collecting, JS prunes the Text removal ledgers and keeps a text
+  tombstone whose ledger still matters (`heldFromPurge`).
+- JS drops a GC pair whose child was revived without unregistering it.
+
+Gap:
+
+- `disableGC` is not ported (see Out-of-Scope Items).
+- The removal ledger is not ported (see Out-of-Scope Items), so neither is
+  the ledger pruning or `heldFromPurge`.
+- Rust has no step that drops a GC pair whose child was revived without
+  being unregistered; JS `collect` drops such a pair.
+- The running `doc_size` disagrees with a root rebuilt from the same content:
+  removing a text node does not move its size from `live` to `gc`, and a
+  moved element's ticket is not charged the way a rebuild charges it. This holds with or without
+  collection. The JS barrier tests check the running size against a rebuild;
+  the Rust ports check the garbage count only.
+- JS keeps a clone root and collects it too (`getGarbageLenFromClone`).
+  Rust has no clone to collect: a local change runs on a copy that replaces
+  the root.
 
 ## CRDT Array and RGA List
 
@@ -1122,8 +1170,10 @@ Gap:
   on channels.
 - Detach does not mark the attachment as detaching (JS `markDetaching`); the
   task queue keeps the sync loop from running during a detach instead.
-- A push-only or sync-off reply that carries changes is skipped whole; JS
-  still takes the push acknowledgement (`acknowledgePushedChanges`).
+- A push-only or sync-off reply is taken as a push acknowledgement only, as
+  in JS. JS also drops the reply while a pause to PushOnly or SyncOff is
+  queued but has not run yet (`pendingPullPauses`); Rust decides by the
+  request's mode and the attachment's mode when the sync started.
 - Integration tests set schema rules and the size limit with
   `Document::set_schema_rules` and `set_max_size_per_document` after
   attaching. JS creates them through the admin API (`CreateSchema`,
@@ -1238,7 +1288,8 @@ Current Rust behavior:
   otherwise. They cover the client lifecycle, realtime sync and presence,
   primitives, objects, arrays (including the concurrency table), counters,
   text, tree (including split and merge matrices), history, schema and size
-  limits, and channels with broadcast. CI runs them against a pinned server
+  limits, channels with broadcast, documents, snapshots, and garbage
+  collection (including push-only and containment cases). CI runs them against a pinned server
   image (`.github/workflows/ci.yml`).
 
 JS/Go behavior:
