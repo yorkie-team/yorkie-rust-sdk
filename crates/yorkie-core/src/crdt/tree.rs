@@ -1230,12 +1230,33 @@ impl CrdtTree {
         self.root.gc_pair_entries()
     }
 
+    /// Purges the removed node or attribute `child_id`. A purged node's split
+    /// siblings on either side are linked to each other, so the split chain
+    /// does not stop at it (JS `CRDTTree.purge`).
     pub(crate) fn purge_gc_pair_by_id(&mut self, child_id: &str) -> bool {
+        let links = self
+            .nodes()
+            .find(|node| node.id_string() == child_id)
+            .map(|node| (node.ins_prev_id().cloned(), node.ins_next_id().cloned()));
         let purged = self.root.purge_gc_pair_by_id(child_id);
-        if purged {
-            self.rebuild_node_map();
+        if !purged {
+            return false;
         }
-        purged
+        self.rebuild_node_map();
+
+        if let Some((prev_id, next_id)) = links {
+            if let Some(prev) = prev_id.as_ref().and_then(|id| self.floor_id(id)) {
+                if let Ok(prev) = self.node_mut(&prev) {
+                    prev.set_ins_next_id(next_id.clone());
+                }
+            }
+            if let Some(next) = next_id.as_ref().and_then(|id| self.floor_id(id)) {
+                if let Ok(next) = self.node_mut(&next) {
+                    next.set_ins_prev_id(prev_id);
+                }
+            }
+        }
+        true
     }
 
     pub(crate) fn nodes(&self) -> impl Iterator<Item = &TreeNode> {
@@ -4142,6 +4163,30 @@ mod tests {
         assert_eq!(Some(&node_id(2, 0)), node(&second).ins_prev_id());
         assert_eq!(Some(&first), node(&second).ins_next_id());
         assert_eq!(Some(&second), node(&first).ins_prev_id());
+        Ok(())
+    }
+
+    /// JS `CRDTTree.purge`: purging a split product links the split siblings
+    /// on either side of it, so walks of the split chain do not stop at it.
+    #[test]
+    fn links_the_split_chain_past_a_purged_split_product() -> crate::Result<()> {
+        let mut tree = text_tree("abc");
+        let pos = tree.find_pos(3, true)?;
+        tree.edit_by_range_with_changes((pos.clone(), pos), None, 1, ticket(10, "a"), None)?;
+        let pos = tree.find_pos(2, true)?;
+        tree.edit_by_range_with_changes((pos.clone(), pos), None, 1, ticket(11, "a"), None)?;
+        assert_eq!("<root><p>a</p><p>b</p><p>c</p></root>", tree.to_xml());
+
+        let range = (tree.find_pos(3, true)?, tree.find_pos(6, true)?);
+        tree.edit_by_range_with_changes(range, None, 0, ticket(12, "a"), None)?;
+        assert_eq!("<root><p>a</p><p>c</p></root>", tree.to_xml());
+        let middle = TreeNodeId::new(TimeTicket::new(11, 1, "a"), 0);
+        assert!(tree.purge_gc_pair_by_id(&middle.to_id_string()));
+
+        let last = TreeNodeId::new(TimeTicket::new(10, 1, "a"), 0);
+        let node = |id: &TreeNodeId| tree.find_floor_node(id).unwrap().clone();
+        assert_eq!(Some(&last), node(&node_id(2, 0)).ins_next_id());
+        assert_eq!(Some(&node_id(2, 0)), node(&last).ins_prev_id());
         Ok(())
     }
 
