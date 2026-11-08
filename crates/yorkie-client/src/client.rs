@@ -2513,6 +2513,38 @@ mod tests {
         Ok(())
     }
 
+    /// JS `syncInternal`: the reply to a push-only request carries the
+    /// server's minimum version vector, which must not reach garbage
+    /// collection. The mock echoes this document's own vector, which covers
+    /// its removal.
+    #[test]
+    fn push_only_sync_does_not_collect_garbage() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        let client = mock_client(keyed_options(), &transport);
+        let doc = shared("doc-key");
+
+        client.apply_activation("000000000000000000000001");
+        block_on(client.attach(
+            doc.clone(),
+            AttachOptions {
+                sync_mode: SyncMode::RealtimePushOnly,
+                ..AttachOptions::default()
+            },
+        ))?;
+        doc.lock().unwrap().update(|root| {
+            root.set("title", "hello")?;
+            root.remove("title");
+            Ok(())
+        })?;
+        assert_eq!(1, doc.lock().unwrap().garbage_len());
+
+        block_on(client.sync(None))?;
+
+        assert!(transport.push_pull_requests.lock().unwrap()[0].push_only);
+        assert_eq!(1, doc.lock().unwrap().garbage_len());
+        Ok(())
+    }
+
     #[test]
     fn rejects_attach_when_document_is_not_detached() {
         let transport = Arc::new(MockTransport::default());

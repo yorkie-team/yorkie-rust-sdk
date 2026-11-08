@@ -1,12 +1,17 @@
-//! Tests that garbage collection does not reorder what survives it: a
-//! tombstone is purged only once the node behind it is causally stable, so a
-//! replica that collected places a concurrent insert where a replica that did
-//! not would.
+//! Tests for garbage collection on a document.
 //!
-//! JS reference: `test/unit/document/gc_rga_barrier_test.ts` (`GC successor
-//! barrier`), a port of Go `gc_rga_barrier_test.go` (yorkie `ba82ed91`).
-//! Every vector that authorises a purge is one the server could compute: the
-//! element-wise min of the replicas' own vectors.
+//! The first group checks the wiring: `apply_change_pack` collects with the
+//! pack's version vector, as JS `Document.applyChangePack` does, and never
+//! touches a tombstone that vector does not cover, such as one a pending
+//! local change made.
+//!
+//! The second group checks that collection does not reorder what survives
+//! it: a tombstone is purged only once the node behind it is causally stable,
+//! so a replica that collected places a concurrent insert where a replica
+//! that did not would. JS reference: `test/unit/document/gc_rga_barrier_test.ts`
+//! (`GC successor barrier`), a port of Go `gc_rga_barrier_test.go` (yorkie
+//! `ba82ed91`). Every vector that authorises a purge is one the server could
+//! compute: the element-wise min of the replicas' own vectors.
 
 use super::Document;
 use crate::change::{Change, ChangePack, Checkpoint};
@@ -74,7 +79,7 @@ fn cross_sync(d1: &mut Document, d2: &mut Document) -> Result<()> {
 }
 
 fn version_vector(d: &Document) -> VersionVector {
-    d.change_id.version_vector().clone()
+    d.version_vector().clone()
 }
 
 /// Go `time.MinVersionVector`: the element-wise min, 0 for a missing actor.
@@ -100,7 +105,7 @@ fn max_vector_of(actors: &[&str]) -> VersionVector {
 }
 
 fn collect(d: &mut Document, vector: &VersionVector) -> Result<usize> {
-    d.crdt_root.garbage_collect(vector)
+    d.garbage_collect(vector)
 }
 
 /// Checks that holding a purge back is a delay, not a leak, and that the
@@ -112,11 +117,11 @@ fn collect(d: &mut Document, vector: &VersionVector) -> Result<usize> {
 /// (see the porting gaps).
 fn assert_drains(d: &mut Document, name: &str) -> Result<()> {
     collect(d, &max_vector_of(&[A1, A2]))?;
-    assert_eq!(0, d.crdt_root.get_garbage_len(), "{name} leaked garbage");
+    assert_eq!(0, d.garbage_len(), "{name} leaked garbage");
     let rebuilt = CrdtRoot::new(d.crdt_root.object().deepcopy());
     assert_eq!(
         rebuilt.get_garbage_len(),
-        d.crdt_root.get_garbage_len(),
+        d.garbage_len(),
         "{name}: garbage"
     );
     Ok(())
@@ -126,6 +131,106 @@ fn bump(d: &mut Document, prefix: &str, n: i32) -> Result<()> {
     for i in 0..n {
         d.update(|root| root.set(format!("{prefix}-{i}"), i).map(|_| ()))?;
     }
+    Ok(())
+}
+
+/// An ack whose vector covers what this document pushed.
+fn ack_with_vector(d: &Document, client_seq: u32, vector: VersionVector) -> ChangePack {
+    ChangePack::create(
+        d.key(),
+        Checkpoint::new(1, client_seq),
+        false,
+        Vec::new(),
+        Some(vector),
+        None,
+    )
+}
+
+/// JS `should collect garbage` (`test/unit/document/gc_test.ts`):
+/// `garbage_len` counts an element with its descendants, and
+/// `garbage_collect` returns how many it purged.
+#[test]
+fn counts_and_collects_removed_elements_with_their_descendants() -> Result<()> {
+    let (mut doc, _) = replicas();
+    doc.update(|root| {
+        root.set("1", 1)?;
+        root.set("2", JsonArray::new())?;
+        root.get_array_mut("2")?.push(1)?.push(2)?.push(3)?;
+        root.set("3", 3)?;
+        Ok(())
+    })?;
+    assert_eq!(r#"{"1":1,"2":[1,2,3],"3":3}"#, doc.to_sorted_json());
+
+    doc.update(|root| {
+        root.remove("2");
+        Ok(())
+    })?;
+    assert_eq!(r#"{"1":1,"3":3}"#, doc.to_sorted_json());
+    assert_eq!(4, doc.garbage_len());
+    assert_eq!(4, doc.garbage_collect(&max_vector_of(&[A1]))?);
+    assert_eq!(0, doc.garbage_len());
+    Ok(())
+}
+
+/// JS `Document.applyChangePack` step 03: a pack without a snapshot collects
+/// with its version vector once everything in it has been applied.
+#[test]
+fn collects_with_the_vector_of_an_applied_change_pack() -> Result<()> {
+    let (mut doc, _) = replicas();
+    doc.update(|root| root.set("k", 1).map(|_| ()))?;
+    doc.update(|root| {
+        root.remove("k");
+        Ok(())
+    })?;
+    assert_eq!(1, doc.garbage_len());
+
+    let vector = version_vector(&doc);
+    doc.apply_change_pack(&ack_with_vector(&doc, 2, vector))?;
+    assert_eq!(0, doc.garbage_len());
+    assert_eq!("{}", doc.to_sorted_json());
+    Ok(())
+}
+
+/// The server's vector covers only what this document pushed, so a removal
+/// made after that push, still pending, keeps its tombstone.
+#[test]
+fn keeps_a_tombstone_a_pending_local_change_made() -> Result<()> {
+    let (mut doc, _) = replicas();
+    doc.update(|root| root.set("k", 1).map(|_| ()))?;
+    let pushed = version_vector(&doc);
+
+    doc.update(|root| {
+        root.remove("k");
+        Ok(())
+    })?;
+    doc.apply_change_pack(&ack_with_vector(&doc, 1, pushed))?;
+
+    assert_eq!(1, doc.garbage_len());
+    assert!(doc.has_local_changes());
+    Ok(())
+}
+
+/// A text edit made after collection anchors on what survived it, and a
+/// replica that did not collect reaches the same text.
+#[test]
+fn edits_text_after_its_tombstones_were_collected() -> Result<()> {
+    let (mut doc, mut replica) = replicas();
+    doc.update(|root| root.set_text("t")?.edit(0, 0, "abc", None).map(|_| ()))?;
+    doc.update(|root| root.get_text_mut("t")?.edit(1, 2, "", None).map(|_| ()))?;
+    one_way_deliver(&mut doc, &mut replica)?;
+    assert_eq!(1, doc.garbage_len());
+
+    let vector = version_vector(&doc);
+    doc.apply_change_pack(&ack_with_vector(&doc, 2, vector))?;
+    assert_eq!(0, doc.garbage_len());
+
+    doc.update(|root| root.get_text_mut("t")?.edit(1, 1, "x", None).map(|_| ()))?;
+    doc.update(|root| root.get_text_mut("t")?.edit(2, 3, "", None).map(|_| ()))?;
+    assert_eq!("ax", text(&doc));
+
+    // The replica did not collect, and reaches the same text.
+    one_way_deliver(&mut doc, &mut replica)?;
+    assert_eq!(doc.to_sorted_json(), replica.to_sorted_json());
     Ok(())
 }
 

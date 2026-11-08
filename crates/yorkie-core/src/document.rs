@@ -22,8 +22,8 @@ use crate::operation::{
 use crate::presence::{Presence, PresenceChange, PresenceProxy};
 use crate::schema::validate_yorkie_ruleset;
 use crate::{
-    ActorId, JsonArray, JsonObject, JsonValue, Result, SchemaRule, TimeTicket, YorkieError,
-    INITIAL_ACTOR_ID,
+    ActorId, JsonArray, JsonObject, JsonValue, Result, SchemaRule, TimeTicket, VersionVector,
+    YorkieError, INITIAL_ACTOR_ID,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -472,6 +472,29 @@ impl Document {
         !self.local_changes.is_empty()
     }
 
+    /// Returns the version vector of this document: the latest lamport seen
+    /// from each actor (JS `getVersionVector`).
+    #[doc(hidden)]
+    pub fn version_vector(&self) -> &VersionVector {
+        self.change_id.version_vector()
+    }
+
+    /// Returns how many removed elements and nodes this document still
+    /// holds, an element counted with its descendants (JS `getGarbageLen`).
+    #[doc(hidden)]
+    pub fn garbage_len(&self) -> usize {
+        self.crdt_root.get_garbage_len()
+    }
+
+    /// Purges the tombstones `vector` covers and returns how many it purged
+    /// (JS `garbageCollect`). `apply_change_pack` runs it with the server's
+    /// minimum version vector; calling it with a vector the server did not
+    /// send can purge a tombstone a peer's change still anchors on.
+    #[doc(hidden)]
+    pub fn garbage_collect(&mut self, vector: &VersionVector) -> Result<usize> {
+        self.crdt_root.garbage_collect(vector)
+    }
+
     /// Returns the size of this document (JS `getDocSize`).
     pub fn doc_size(&self) -> DocSize {
         self.crdt_root.doc_size()
@@ -525,6 +548,16 @@ impl Document {
         }
 
         self.checkpoint = self.checkpoint.forward(pack.checkpoint());
+
+        // As in JS, collect with the server's minimum version vector once the
+        // pack has applied. A snapshot pack does not collect: its vector
+        // describes the snapshot, and the replayed local changes are newer.
+        if !pack.has_snapshot() {
+            if let Some(vector) = pack.version_vector() {
+                self.garbage_collect(vector)?;
+            }
+        }
+
         if pack.is_removed() {
             self.apply_status(DocStatus::Removed);
         }
