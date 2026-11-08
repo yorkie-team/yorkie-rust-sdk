@@ -643,6 +643,9 @@ pub(crate) struct CrdtTree {
     meta: CrdtElementMeta,
     root: TreeNode,
     node_by_id: BTreeMap<TreeNodeId, TreeNode>,
+    /// GC pairs of text pieces split off removed nodes, drained by the edit
+    /// or style that split them (JS `pendingGCPairs`).
+    pending_gc_pairs: Vec<(String, DataSize, TimeTicket)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -697,6 +700,7 @@ impl CrdtTree {
             meta: CrdtElementMeta::new(created_at),
             root,
             node_by_id: BTreeMap::new(),
+            pending_gc_pairs: Vec::new(),
         };
         tree.rebuild_node_map();
         tree.rebuild_merge_state();
@@ -1133,6 +1137,12 @@ impl CrdtTree {
         if let Some(contents) = contents {
             // Insert right after the left node, or first in the parent (JS
             // `CRDTTree.edit` step 05).
+            debug_assert!(
+                from_left_path == from_parent_path
+                    || split_parent_path(&from_left_path).map(|(path, _)| path)
+                        == Some(from_parent_path.clone()),
+                "the left sibling must be a child of the insertion parent"
+            );
             let first_index = if from_left_path == from_parent_path {
                 0
             } else {
@@ -1159,6 +1169,7 @@ impl CrdtTree {
 
         self.rebuild_node_map();
         self.rebuild_merge_state();
+        gc_pairs.extend(self.drain_pending_gc_pairs());
 
         let changes = if split_level > 0 {
             // Split changes keep their single-change shape until splits are
@@ -1219,6 +1230,7 @@ impl CrdtTree {
             meta: self.meta.clone(),
             root: self.root.clone(),
             node_by_id: BTreeMap::new(),
+            pending_gc_pairs: Vec::new(),
         };
         tree.rebuild_node_map();
         tree.rebuild_merge_state();
@@ -1305,10 +1317,22 @@ impl CrdtTree {
                 let split_diff = node_at_path_mut(&mut self.root, &text_parent_path)?
                     .split_text_child_at(index, pos.left_sibling_id().offset())?;
                 if split_diff != DataSize::default() {
-                    add_data_size(diff, split_diff);
-                    self.rebuild_node_map();
                     let mut split_path = text_parent_path;
                     split_path.push(index + 1);
+                    let split = node_at_path(&self.root, &split_path)?;
+                    // A piece split off a removed node is born removed: it
+                    // was never live, so it goes to GC with the size the
+                    // split added rather than to the live diff (JS
+                    // `CRDTTreeNode.split`).
+                    match split.removed_at() {
+                        Some(removed_at) => self.pending_gc_pairs.push((
+                            split.id_string(),
+                            split_diff,
+                            removed_at.clone(),
+                        )),
+                        None => add_data_size(diff, split_diff),
+                    }
+                    self.rebuild_node_map();
                     self.link_split_to_next(&split_path)?;
                 }
             }
@@ -1329,6 +1353,12 @@ impl CrdtTree {
         }
 
         Ok((real_parent_path, left_path))
+    }
+
+    /// Returns and clears the GC pairs buffered by text splits (JS
+    /// `drainPendingGCPairs`).
+    pub(crate) fn drain_pending_gc_pairs(&mut self) -> Vec<(String, DataSize, TimeTicket)> {
+        std::mem::take(&mut self.pending_gc_pairs)
     }
 
     /// Points the node after a newly split node back at it (JS
@@ -3501,9 +3531,15 @@ mod tests {
         assert_eq!("<root></root>", tree.to_xml());
         assert!(result.changes.is_empty());
         assert_eq!(0, result.inserted_size);
-        assert_eq!(1, result.gc_pairs.len());
-        // Only the split of the removed "ab" changes the size; "c" adds none.
-        assert_eq!(0, result.diff.data);
+        // As in JS: "c", and the "b" split off the removed "ab", which was
+        // never live either.
+        let ids = result
+            .gc_pairs
+            .iter()
+            .map(|(id, _, _)| id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(vec!["10:b:0:0", "3:a:0:1"], ids);
+        assert_eq!(super::DataSize::default(), result.diff);
         Ok(())
     }
 

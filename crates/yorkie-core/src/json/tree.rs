@@ -244,6 +244,8 @@ impl JsonTree {
             executed_at.clone(),
             None,
         )?;
+        // The recorded operation registers these with the document root.
+        tree.drain_pending_gc_pairs();
         recorder.record_tree_style(tree.created_at(), from_pos, to_pos, attributes, executed_at);
         Ok(())
     }
@@ -268,6 +270,7 @@ impl JsonTree {
             executed_at.clone(),
             None,
         )?;
+        tree.drain_pending_gc_pairs();
         recorder.record_tree_remove_style(tree.created_at(), from_pos, to_pos, keys, executed_at);
         Ok(())
     }
@@ -924,9 +927,10 @@ mod tests {
             );
 
             // JS: 'unacceptable path'.
-            assert!(tree
-                .edit_by_path(&[0, 0, 4], &[0, 0, 4], vec![element("tn", vec![])], 0)
-                .is_err());
+            assert!(matches!(
+                tree.edit_by_path(&[0, 0, 4], &[0, 0, 4], vec![element("tn", vec![])], 0),
+                Err(YorkieError::InvalidTreePosition(_))
+            ));
             Ok(())
         })
     }

@@ -77,12 +77,19 @@ impl TreeStyleOperation {
         let executed_at = self.executed_at()?.clone();
         let range = (self.from_pos.clone(), self.to_pos.clone());
 
-        let (changes, gc_nodes, diff, reverse_attributes, reverse_attributes_to_remove) = {
+        let (
+            changes,
+            gc_nodes,
+            diff,
+            reverse_attributes,
+            reverse_attributes_to_remove,
+            split_pairs,
+        ) = {
             let Some(tree) = root.tree_by_created_at_mut(self.parent_created_at()) else {
                 return Err(self.tree_parent_error(root));
             };
 
-            if !self.attributes_to_remove.is_empty() {
+            let result = if !self.attributes_to_remove.is_empty() {
                 let (removed_nodes, remove_diff, remove_changes, previous_attributes) = tree
                     .remove_style_by_range_with_changes(
                         range,
@@ -117,11 +124,23 @@ impl TreeStyleOperation {
                     previous_attributes,
                     attributes_to_remove,
                 )
-            }
+            };
+            let (changes, gc_nodes, diff, previous, to_remove) = result;
+            (
+                changes,
+                gc_nodes,
+                diff,
+                previous,
+                to_remove,
+                tree.drain_pending_gc_pairs(),
+            )
         };
 
         root.acc(diff);
         register_removed_attr_nodes(root, gc_nodes);
+        for (child_id, child_size, removed_at) in split_pairs {
+            root.register_gc_pair_by_id(child_id, child_size, removed_at);
+        }
 
         let reverse_op =
             self.to_reverse_operation(reverse_attributes, reverse_attributes_to_remove);
@@ -256,8 +275,8 @@ mod tests {
     use crate::crdt::object::CrdtObject;
     use crate::crdt::root::CrdtRoot;
     use crate::crdt::tree::{CrdtTree, TreeNode, TreeNodeId};
-    use crate::operation::{OpInfo, OpSource, Operation};
-    use crate::TimeTicket;
+    use crate::operation::{OpInfo, OpSource, Operation, TreeEditOperation};
+    use crate::{TimeTicket, VersionVector};
     use std::collections::BTreeMap;
 
     #[test]
@@ -372,6 +391,53 @@ mod tests {
             result.op_infos
         );
         assert!(matches!(result.reverse_op, Some(Operation::TreeStyle(_))));
+        Ok(())
+    }
+
+    /// JS `CRDTTreeNode.split`: a style concurrent with a deletion splits the
+    /// removed text at its boundaries, and the pieces it splits off go to GC
+    /// without being counted as live.
+    #[test]
+    fn registers_text_split_off_a_removed_node_for_gc() -> crate::Result<()> {
+        let tree_at = ticket(1, "a");
+        let mut root = seeded_root(tree_at.clone());
+        let (style_range, delete_range) = {
+            let tree = root.tree_by_created_at(&tree_at).unwrap();
+            (
+                (tree.find_pos(2, true)?, tree.find_pos(4, true)?),
+                (tree.find_pos(1, true)?, tree.find_pos(6, true)?),
+            )
+        };
+        TreeEditOperation::create(
+            tree_at.clone(),
+            delete_range.0,
+            delete_range.1,
+            None,
+            0,
+            Some(ticket(10, "a")),
+        )
+        .execute(&mut root, OpSource::Remote, None)?;
+        assert_eq!(1, root.get_garbage_len());
+        let live = root.doc_size().live;
+
+        let mut version_vector = VersionVector::new();
+        version_vector.set("a", 3);
+        TreeStyleOperation::create(
+            tree_at.clone(),
+            style_range.0,
+            style_range.1,
+            BTreeMap::from([("bold".to_owned(), "true".to_owned())]),
+            Some(ticket(10, "b")),
+        )
+        .execute(&mut root, OpSource::Remote, Some(&version_vector))?;
+
+        assert_eq!(
+            "<root><p></p></root>",
+            root.tree_by_created_at(&tree_at).unwrap().to_xml()
+        );
+        // "hello" split into "h", "el" and "lo": two new removed pieces.
+        assert_eq!(3, root.get_garbage_len());
+        assert_eq!(live, root.doc_size().live);
         Ok(())
     }
 
