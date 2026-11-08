@@ -611,6 +611,25 @@ where
         self.purge_by_id(&child.id_string());
     }
 
+    /// Looks up the node `child_id` that `purge_by_id` would purge. Returns
+    /// `None` when there is no such node, and otherwise `Some` of the
+    /// creation ticket of the node behind it: `find_node_with_split` skips
+    /// forward while the next node was created after the edit, so unlinking
+    /// a node hands that decision to its successor, which must be causally
+    /// stable first (JS `RGATreeSplit.purgeBarrierAt`).
+    pub(crate) fn purge_barrier_by_id(&self, child_id: &str) -> Option<Option<TimeTicket>> {
+        let index = self
+            .nodes
+            .iter()
+            .position(|node| node.id_string() == child_id)
+            .filter(|index| *index != 0)?;
+        Some(
+            self.nodes
+                .get(index + 1)
+                .map(|next| next.created_at().clone()),
+        )
+    }
+
     pub(crate) fn purge_by_id(&mut self, child_id: &str) -> bool {
         let Some(index) = self
             .nodes

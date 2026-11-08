@@ -699,6 +699,21 @@ impl CrdtText {
         pairs
     }
 
+    /// Looks up the GC pair child `child_id`, a removed text node or a
+    /// removed attribute, in the order `purge_gc_pair_by_id` purges (see
+    /// `CrdtElement::gc_pair_barrier_by_id`). Attributes are not ordered, so
+    /// nothing bars their purge.
+    pub(crate) fn gc_pair_barrier_by_id(&self, child_id: &str) -> Option<Option<TimeTicket>> {
+        self.rga_tree_split
+            .purge_barrier_by_id(child_id)
+            .or_else(|| {
+                self.rga_tree_split
+                    .iter()
+                    .any(|node| node.value().attributes().has_id(child_id))
+                    .then_some(None)
+            })
+    }
+
     pub(crate) fn purge_gc_pair_by_id(&mut self, child_id: &str) -> bool {
         if self.rga_tree_split.purge_by_id(child_id) {
             return true;

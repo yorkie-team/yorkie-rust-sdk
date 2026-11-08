@@ -506,6 +506,24 @@ impl CrdtArray {
         }
     }
 
+    /// Returns the ticket that must be covered before the removed element
+    /// `created_at` may be purged: purging it unlinks the position node
+    /// holding it, so the array's order decides when that is safe (JS
+    /// `CRDTArray.purgeBarrierAt`).
+    pub(crate) fn purge_barrier_at(&self, created_at: &TimeTicket) -> Option<TimeTicket> {
+        self.elements.purge_barrier_at(created_at)
+    }
+
+    /// Looks up the GC pair child `child_id` in this array's dead position
+    /// nodes and then under its elements (see
+    /// `CrdtElement::gc_pair_barrier_by_id`).
+    pub(crate) fn gc_pair_barrier_by_id(&self, child_id: &str) -> Option<Option<TimeTicket>> {
+        self.elements.purge_barrier_by_id(child_id).or_else(|| {
+            self.iter_all()
+                .find_map(|child| child.gc_pair_barrier_by_id(child_id))
+        })
+    }
+
     pub(crate) fn purge_gc_pair_by_id(&mut self, child_id: &str) -> bool {
         if self.elements.purge_by_id(child_id) {
             return true;

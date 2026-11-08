@@ -445,6 +445,14 @@ impl CrdtObject {
         }
     }
 
+    /// Looks up the GC pair child `child_id` under this object's members
+    /// (see `CrdtElement::gc_pair_barrier_by_id`).
+    pub(crate) fn gc_pair_barrier_by_id(&self, child_id: &str) -> Option<Option<TimeTicket>> {
+        self.member_nodes
+            .iter()
+            .find_map(|node| node.value().gc_pair_barrier_by_id(child_id))
+    }
+
     pub(crate) fn purge_gc_pair_by_id(&mut self, child_id: &str) -> bool {
         for node in self.member_nodes.iter_mut() {
             match node.value_mut() {

@@ -485,6 +485,38 @@ impl TreeNode {
         entries
     }
 
+    /// Looks up the GC pair child `child_id`, a removed attribute or a
+    /// removed descendant, in the order `purge_gc_pair_by_id` purges (see
+    /// `CrdtElement::gc_pair_barrier_by_id`). A node's barrier is the
+    /// creation ticket of its next sibling: `find_nodes_and_split_text` walks
+    /// the children, removed ones included, while the next sibling was
+    /// created after the edit, so purging a node hands that decision to the
+    /// sibling behind it (JS `CRDTTree.purgeBarrierAt`).
+    pub(crate) fn gc_pair_barrier_by_id(&self, child_id: &str) -> Option<Option<TimeTicket>> {
+        if self
+            .attrs
+            .as_ref()
+            .is_some_and(|attrs| attrs.has_id(child_id))
+        {
+            return Some(None);
+        }
+
+        if let Some(index) = self
+            .children
+            .iter()
+            .position(|child| child.id_string() == child_id)
+        {
+            return Some(
+                self.children
+                    .get(index + 1)
+                    .map(|next| next.id().created_at().clone()),
+            );
+        }
+
+        self.all_children()
+            .find_map(|child| child.gc_pair_barrier_by_id(child_id))
+    }
+
     pub(crate) fn purge_gc_pair_by_id(&mut self, child_id: &str) -> bool {
         if let Some(attrs) = &mut self.attrs {
             if attrs.purge_by_id(child_id) {
@@ -1297,6 +1329,12 @@ impl CrdtTree {
 
     pub(crate) fn gc_pair_entries(&self) -> Vec<(String, DataSize, TimeTicket)> {
         self.root.gc_pair_entries()
+    }
+
+    /// Looks up the GC pair child `child_id` in this tree (see
+    /// `TreeNode::gc_pair_barrier_by_id`).
+    pub(crate) fn gc_pair_barrier_by_id(&self, child_id: &str) -> Option<Option<TimeTicket>> {
+        self.root.gc_pair_barrier_by_id(child_id)
     }
 
     /// Purges the removed node or attribute `child_id`. A purged node's split

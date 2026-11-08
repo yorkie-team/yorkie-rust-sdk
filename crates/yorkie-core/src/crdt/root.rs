@@ -482,8 +482,39 @@ impl CrdtRoot {
         self.get_garbage_element_set_size() + self.gc_pair_by_child_id.len()
     }
 
+    /// Purges the tombstones `vector` covers and returns how many it purged
+    /// (JS `CRDTRoot.garbageCollect`).
+    ///
+    /// A pass can hold a purge back (see `collect`), and holding one back
+    /// can be the only reason another is held back: purging a node hands its
+    /// successor to the node in front of it, and that successor is one this
+    /// pass already found stable. So a pass that both purged and deferred may
+    /// have more to do, and the loop repeats until a pass purges nothing new
+    /// or defers nothing. Everything held back stays on the worklist for the
+    /// next vector that covers it.
     pub(crate) fn garbage_collect(&mut self, vector: &crate::VersionVector) -> Result<usize> {
         let mut count = 0;
+        loop {
+            let (purged, deferred) = self.collect(vector)?;
+            count += purged;
+            if purged == 0 || deferred == 0 {
+                return Ok(count);
+            }
+        }
+    }
+
+    /// Runs one collection pass and returns how much it purged and how much
+    /// it held back on a barrier (JS `CRDTRoot.collect`).
+    ///
+    /// A tombstone is not only a value that is gone, it is also a place in
+    /// its parent that other replicas may still be deciding against:
+    /// `removed_at` covers the value, and the barrier covers the place. An
+    /// RGA resolves a concurrent insert by walking forward past newer nodes,
+    /// tombstones included, so purging a node is safe only once the node
+    /// that would end that walk in its place is causally stable as well.
+    fn collect(&mut self, vector: &crate::VersionVector) -> Result<(usize, usize)> {
+        let mut count = 0;
+        let mut deferred = 0;
 
         let removed_element_ids = self
             .gc_element_set_by_created_at
@@ -494,6 +525,9 @@ impl CrdtRoot {
             let Some(pair) = self.element_pair_by_created_at.get(&created_id).cloned() else {
                 continue;
             };
+            let Some(parent) = pair.parent() else {
+                continue;
+            };
             let Some(removed_at) = pair.element().removed_at() else {
                 continue;
             };
@@ -501,12 +535,18 @@ impl CrdtRoot {
                 continue;
             }
 
-            if let Some(parent) = pair.parent() {
-                if let Some(object) = self.object_by_created_at_mut(parent.created_at()) {
-                    object.purge(pair.element())?;
-                } else if let Some(array) = self.array_by_created_at_mut(parent.created_at()) {
-                    array.purge(pair.element())?;
+            if let Some(array) = self.array_by_created_at(parent.created_at()) {
+                let barrier = array.purge_barrier_at(pair.element().created_at());
+                if barrier.is_some_and(|at| !vector.after_or_equal(&at)) {
+                    deferred += 1;
+                    continue;
                 }
+            }
+
+            if let Some(object) = self.object_by_created_at_mut(parent.created_at()) {
+                object.purge(pair.element())?;
+            } else if let Some(array) = self.array_by_created_at_mut(parent.created_at()) {
+                array.purge(pair.element())?;
             }
 
             count += self.deregister_element(pair.element());
@@ -522,6 +562,15 @@ impl CrdtRoot {
                 continue;
             }
 
+            let barrier = self
+                .root_object
+                .gc_pair_barrier_by_id(&pair.child_id)
+                .flatten();
+            if barrier.is_some_and(|at| !vector.after_or_equal(&at)) {
+                deferred += 1;
+                continue;
+            }
+
             if self.purge_gc_pair_by_child_id(&pair.child_id) {
                 if let Some(pair) = self.gc_pair_by_child_id.remove(&pair.child_id) {
                     sub_data_size(&mut self.doc_size.gc, pair.child_size);
@@ -530,7 +579,7 @@ impl CrdtRoot {
             }
         }
 
-        Ok(count)
+        Ok((count, deferred))
     }
 
     pub(crate) fn object(&self) -> &CrdtObject {
