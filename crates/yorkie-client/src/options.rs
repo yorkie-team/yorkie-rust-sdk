@@ -6,7 +6,9 @@ pub const DEFAULT_RPC_ADDR: &str = "https://api.yorkie.dev";
 pub const DEFAULT_SYNC_LOOP_DURATION_MS: u64 = 50;
 pub const DEFAULT_RETRY_SYNC_LOOP_DELAY_MS: u64 = 1000;
 pub const DEFAULT_RECONNECT_STREAM_DELAY_MS: u64 = 1000;
-pub const DEFAULT_CHANNEL_HEARTBEAT_INTERVAL_MS: u64 = 30000;
+/// How often a channel session is refreshed (JS `DefaultChannelHeartbeatMs`),
+/// a third of the server's 15s channel session TTL.
+pub const DEFAULT_CHANNEL_HEARTBEAT_INTERVAL_MS: u64 = 5000;
 pub const DEFAULT_POLLING_INTERVAL_MS: u64 = 3000;
 /// Heartbeat interval a client asks the server for on its watch streams
 /// (JS `DefaultWatchHeartbeatMs`).
@@ -61,7 +63,12 @@ pub struct AttachOptions {
     pub schema: Option<String>,
 }
 
-/// User-settable options for attaching channels.
+/// User-settable options for attaching channels (JS `AttachChannelOptions`).
+///
+/// `sync_mode` defaults to [`SyncMode::Realtime`]; channels take `Manual`,
+/// `Realtime`, and `Polling` only. `channel_heartbeat_interval` overrides the
+/// client's [`ClientOptions::channel_heartbeat_interval`] for this channel
+/// and must be greater than zero.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AttachChannelOptions {
     pub sync_mode: Option<SyncMode>,

@@ -8,8 +8,9 @@ use yorkie::{
     AttachDocumentRequest, AttachDocumentResponse, AttachOptions, ChangePack, Checkpoint, Client,
     ClientCondition, ClientError, ClientStatus, ClientTransport, CounterType, CounterValue,
     DeactivateClientRequest, DeactivateClientResponse, DeactivateOptions, DetachDocumentRequest,
-    DetachDocumentResponse, DetachOptions, DocStatus, Document, JsonCounter, Presence,
-    PushPullChangesRequest, PushPullChangesResponse, RemoveDocumentRequest, RemoveDocumentResponse,
+    DetachDocumentResponse, DetachOptions, DocStatus, Document, JsonCounter, PeekChannelRequest,
+    PeekChannelResponse, Presence, PushPullChangesRequest, PushPullChangesResponse,
+    RefreshChannelRequest, RefreshChannelResponse, RemoveDocumentRequest, RemoveDocumentResponse,
     Result, SchemaRule, SharedDocument, SyncMode, TimeTicket, TimeTicketStruct, TreeNodeRule,
     VersionVector, WatchDocumentRequest, WatchStream,
 };
@@ -97,6 +98,24 @@ impl ClientTransport for FacadeTransport {
         _request: WatchDocumentRequest,
     ) -> yorkie::ClientResult<WatchStream> {
         Ok(Box::pin(stream::pending()))
+    }
+
+    async fn refresh_channel(
+        &self,
+        _request: RefreshChannelRequest,
+    ) -> yorkie::ClientResult<RefreshChannelResponse> {
+        Err(ClientError::Transport(
+            "channels are not used here".to_owned(),
+        ))
+    }
+
+    async fn peek_channel(
+        &self,
+        _request: PeekChannelRequest,
+    ) -> yorkie::ClientResult<PeekChannelResponse> {
+        Err(ClientError::Transport(
+            "channels are not used here".to_owned(),
+        ))
     }
 }
 

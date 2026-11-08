@@ -1,3 +1,4 @@
+use crate::channel::SharedChannel;
 use crate::client::TaskHandle;
 use crate::error::{ClientError, ClientResult};
 use crate::options::{SyncMode, DEFAULT_POLLING_INTERVAL_MS};
@@ -76,6 +77,78 @@ impl Attachment {
     }
 }
 
+/// A channel attached to a client (JS `Attachment<Channel>`). Documents and
+/// channels share one key space, but sit in separate maps of the client
+/// state because they sync differently.
+///
+/// Dropping it stops its watch stream.
+#[derive(Debug)]
+pub(crate) struct ChannelAttachment {
+    pub(crate) channel: SharedChannel,
+    pub(crate) sync_mode: SyncMode,
+    /// How often the session is refreshed; zero falls back to the client's
+    /// `channel_heartbeat_interval` (JS `pollInterval`).
+    pub(crate) heartbeat_interval: Duration,
+    pub(crate) heartbeat_interval_pinned: bool,
+    /// When the session was last refreshed (JS `lastHeartbeatTime`, 0 before
+    /// the first refresh so it runs at once).
+    pub(crate) last_heartbeat_at: Option<Instant>,
+    /// The watch loop task, while the attachment watches the channel.
+    pub(crate) watch_task: Option<TaskHandle>,
+}
+
+impl ChannelAttachment {
+    pub(crate) fn new(
+        channel: SharedChannel,
+        sync_mode: SyncMode,
+        heartbeat_interval: Duration,
+        heartbeat_interval_pinned: bool,
+    ) -> Self {
+        Self {
+            channel,
+            sync_mode,
+            heartbeat_interval,
+            heartbeat_interval_pinned,
+            last_heartbeat_at: None,
+            watch_task: None,
+        }
+    }
+
+    /// Whether the sync loop should refresh the session now (JS `needSync`
+    /// for a channel): never in `Manual`, otherwise once per heartbeat
+    /// interval.
+    pub(crate) fn need_sync(&self, client_heartbeat_interval: Duration) -> bool {
+        if self.sync_mode == SyncMode::Manual {
+            return false;
+        }
+        let interval = if self.heartbeat_interval.is_zero() {
+            client_heartbeat_interval
+        } else {
+            self.heartbeat_interval
+        };
+        self.last_heartbeat_at
+            .is_none_or(|at| at.elapsed() >= interval)
+    }
+
+    /// Whether the channel is the one this attachment holds; see
+    /// [`Attachment::holds`].
+    pub(crate) fn holds(&self, channel: &SharedChannel) -> bool {
+        Arc::ptr_eq(&self.channel, channel)
+    }
+}
+
+/// Rejects the sync modes channels do not support (JS
+/// `assertValidChannelSyncMode`): the push-only and sync-off modes are for
+/// documents.
+pub(crate) fn validate_channel_sync_mode(sync_mode: SyncMode) -> ClientResult<()> {
+    match sync_mode {
+        SyncMode::Manual | SyncMode::Realtime | SyncMode::Polling => Ok(()),
+        SyncMode::RealtimePushOnly | SyncMode::RealtimeSyncOff => Err(
+            ClientError::InvalidArgument(format!("invalid channel sync mode: {sync_mode:?}")),
+        ),
+    }
+}
+
 /// Whether the sync mode keeps a watch stream open (JS: every mode but
 /// `Manual` and `Polling`).
 pub(crate) fn uses_watch_stream(sync_mode: SyncMode) -> bool {
@@ -115,6 +188,28 @@ mod tests {
         let doc = Arc::new(Mutex::new(Document::new("doc-key")));
         let (interval, pinned) = resolve_document_poll_interval(sync_mode, None).unwrap();
         Attachment::new(doc, "document-id", sync_mode, interval, pinned)
+    }
+
+    /// JS `Attachment.needSync` for a channel.
+    #[test]
+    fn channel_heartbeat_follows_the_interval() {
+        let channel = Arc::new(Mutex::new(crate::channel::Channel::new("room").unwrap()));
+        let client_interval = Duration::from_secs(5);
+        let mut realtime =
+            ChannelAttachment::new(channel.clone(), SyncMode::Realtime, Duration::ZERO, false);
+        assert!(realtime.need_sync(client_interval));
+        realtime.last_heartbeat_at = Some(Instant::now());
+        assert!(!realtime.need_sync(client_interval));
+        assert!(realtime.need_sync(Duration::ZERO));
+        realtime.heartbeat_interval = Duration::from_secs(60);
+        assert!(!realtime.need_sync(Duration::ZERO));
+
+        let manual = ChannelAttachment::new(channel, SyncMode::Manual, Duration::ZERO, false);
+        assert!(!manual.need_sync(Duration::ZERO));
+
+        for sync_mode in [SyncMode::RealtimePushOnly, SyncMode::RealtimeSyncOff] {
+            assert!(validate_channel_sync_mode(sync_mode).is_err());
+        }
     }
 
     /// JS `Attachment.needRealtimeSync`.

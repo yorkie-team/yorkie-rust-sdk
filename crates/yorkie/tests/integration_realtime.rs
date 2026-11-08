@@ -20,7 +20,8 @@ use yorkie::{
     AttachDocumentResponse, AttachOptions, Client, ClientError, ClientOptions, ClientResult,
     ClientTransport, ConnectTransport, DeactivateClientRequest, DeactivateClientResponse,
     DeactivateOptions, DetachDocumentRequest, DetachDocumentResponse, DetachOptions, DocEvent,
-    Document, Presence, PushPullChangesRequest, PushPullChangesResponse, RemoveDocumentRequest,
+    Document, PeekChannelRequest, PeekChannelResponse, Presence, PushPullChangesRequest,
+    PushPullChangesResponse, RefreshChannelRequest, RefreshChannelResponse, RemoveDocumentRequest,
     RemoveDocumentResponse, SharedDocument, StreamConnectionStatus, SyncMode, WatchDocumentRequest,
     WatchStream,
 };
@@ -253,6 +254,17 @@ impl ClientTransport for FlakyWatchTransport {
             "injected stream failure".to_owned(),
         ))]);
         Ok(Box::pin(stream.take(1).chain(failure)))
+    }
+
+    async fn refresh_channel(
+        &self,
+        request: RefreshChannelRequest,
+    ) -> ClientResult<RefreshChannelResponse> {
+        self.inner.refresh_channel(request).await
+    }
+
+    async fn peek_channel(&self, request: PeekChannelRequest) -> ClientResult<PeekChannelResponse> {
+        self.inner.peek_channel(request).await
     }
 }
 

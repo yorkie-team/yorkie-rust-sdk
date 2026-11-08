@@ -3,12 +3,14 @@
 
 pub use yorkie_client::{
     ActivateClientRequest, ActivateClientResponse, AttachChannelOptions, AttachDocumentRequest,
-    AttachDocumentResponse, AttachOptions, Client, ClientCondition, ClientError, ClientOptions,
-    ClientResult, ClientStatus, ClientTransport, ConnectTransport, DeactivateClientRequest,
+    AttachDocumentResponse, AttachOptions, Channel, ChannelEvent, ChannelStatus,
+    ChannelSubscriptionId, Client, ClientCondition, ClientError, ClientOptions, ClientResult,
+    ClientStatus, ClientTransport, ConnectTransport, DeactivateClientRequest,
     DeactivateClientResponse, DeactivateOptions, DetachDocumentRequest, DetachDocumentResponse,
-    DetachOptions, PushPullChangesRequest, PushPullChangesResponse, RemoveDocumentRequest,
-    RemoveDocumentResponse, SharedDocument, SyncMode, WatchDocEvent, WatchDocEventType,
-    WatchDocumentRequest, WatchDocumentResponse, WatchStream,
+    DetachOptions, PeekChannelRequest, PeekChannelResponse, PushPullChangesRequest,
+    PushPullChangesResponse, RefreshChannelRequest, RefreshChannelResponse, RemoveDocumentRequest,
+    RemoveDocumentResponse, SharedChannel, SharedDocument, SyncMode, WatchDocEvent,
+    WatchDocEventType, WatchDocumentRequest, WatchDocumentResponse, WatchStream,
 };
 pub use yorkie_core::{
     ActorId, ChangePack, Checkpoint, CounterType, CounterValue, DataSize, DocEvent, DocSize,

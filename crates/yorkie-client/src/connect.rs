@@ -13,7 +13,8 @@ use crate::protocol as conv;
 use crate::transport::{
     ActivateClientRequest, ActivateClientResponse, AttachDocumentRequest, AttachDocumentResponse,
     ClientTransport, DeactivateClientRequest, DeactivateClientResponse, DetachDocumentRequest,
-    DetachDocumentResponse, PushPullChangesRequest, PushPullChangesResponse, RemoveDocumentRequest,
+    DetachDocumentResponse, PeekChannelRequest, PeekChannelResponse, PushPullChangesRequest,
+    PushPullChangesResponse, RefreshChannelRequest, RefreshChannelResponse, RemoveDocumentRequest,
     RemoveDocumentResponse, WatchDocumentRequest, WatchStream,
 };
 use async_trait::async_trait;
@@ -234,7 +235,44 @@ pub(crate) fn decode_end_stream(payload: &[u8]) -> ClientResult<()> {
     Err(ClientError::Rpc {
         code: text("code").unwrap_or("unknown").to_owned(),
         message: text("message").unwrap_or_default().to_owned(),
+        yorkie_code: yorkie_code_of(error),
     })
+}
+
+/// `google.rpc.ErrorInfo`, the error detail Yorkie puts its error code in.
+#[derive(Clone, PartialEq, prost::Message)]
+struct ErrorInfo {
+    #[prost(string, tag = "1")]
+    reason: String,
+    #[prost(string, tag = "2")]
+    domain: String,
+    #[prost(map = "string, string", tag = "3")]
+    metadata: std::collections::HashMap<String, String>,
+}
+
+/// Returns the Yorkie error code from the `ErrorInfo` detail of a Connect
+/// JSON error (JS `errorCodeOf`), if it carries one. Connect sends each
+/// detail's protobuf bytes base64-encoded, with or without padding.
+fn yorkie_code_of(error: &serde_json::Value) -> Option<String> {
+    use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
+    use base64::engine::DecodePaddingMode;
+    use base64::Engine;
+
+    const BASE64: GeneralPurpose = GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
+    );
+
+    error
+        .get("details")?
+        .as_array()?
+        .iter()
+        .filter(|detail| {
+            detail.get("type").and_then(|value| value.as_str()) == Some("google.rpc.ErrorInfo")
+        })
+        .filter_map(|detail| BASE64.decode(detail.get("value")?.as_str()?).ok())
+        .filter_map(|bytes| ErrorInfo::decode(bytes.as_slice()).ok())
+        .find_map(|info| info.metadata.get("code").cloned())
 }
 
 fn protocol_error(err: impl ToString) -> ClientError {
@@ -250,6 +288,7 @@ pub(crate) fn decode_connect_error(status: u16, body: &[u8]) -> ClientError {
     struct Parsed {
         code: Option<String>,
         message: String,
+        yorkie_code: Option<String>,
     }
     let parsed = serde_json::from_slice::<serde_json::Value>(body)
         .ok()
@@ -262,6 +301,7 @@ pub(crate) fn decode_connect_error(status: u16, body: &[u8]) -> ClientError {
                     .and_then(|m| m.as_str())
                     .unwrap_or_default()
                     .to_owned(),
+                yorkie_code: yorkie_code_of(&value),
             })
         })
         .unwrap_or_default();
@@ -269,10 +309,12 @@ pub(crate) fn decode_connect_error(status: u16, body: &[u8]) -> ClientError {
         Some(code) => ClientError::Rpc {
             code,
             message: parsed.message,
+            yorkie_code: parsed.yorkie_code,
         },
         None => ClientError::Rpc {
             code: http_status_to_code(status).to_owned(),
             message: String::from_utf8_lossy(body).into_owned(),
+            yorkie_code: None,
         },
     }
 }
@@ -377,6 +419,31 @@ impl ClientTransport for ConnectTransport {
             }
         })))
     }
+
+    async fn refresh_channel(
+        &self,
+        request: RefreshChannelRequest,
+    ) -> ClientResult<RefreshChannelResponse> {
+        let response: api::RefreshChannelResponse = self
+            .unary(
+                "RefreshChannel",
+                &request.shard_key,
+                &conv::to_refresh_channel_request(&request),
+            )
+            .await?;
+        Ok(conv::from_refresh_channel_response(&response))
+    }
+
+    async fn peek_channel(&self, request: PeekChannelRequest) -> ClientResult<PeekChannelResponse> {
+        let response: api::PeekChannelResponse = self
+            .unary(
+                "PeekChannel",
+                &request.shard_key,
+                &conv::to_peek_channel_request(&request),
+            )
+            .await?;
+        Ok(conv::from_peek_channel_response(&response))
+    }
 }
 
 #[cfg(test)]
@@ -393,9 +460,30 @@ mod tests {
             ClientError::Rpc {
                 code: "not_found".to_owned(),
                 message: "document not found".to_owned(),
+                yorkie_code: None,
             },
             err
         );
+    }
+
+    /// JS `errorCodeOf`: the Yorkie code rides in an `ErrorInfo` detail.
+    /// The body is what the server answers a refresh of an unknown session.
+    #[test]
+    fn connect_error_details_carry_the_yorkie_code() {
+        let body = br#"{"code":"not_found","message":"refresh 000000000000000000000000: session not found","details":[{"type":"google.rpc.ErrorInfo","value":"Cglub3RfZm91bmQaGgoEY29kZRISRXJyU2Vzc2lvbk5vdEZvdW5k","debug":{"reason":"not_found","metadata":{"code":"ErrSessionNotFound"}}}]}"#;
+        let err = decode_connect_error(404, body);
+        assert!(matches!(
+            &err,
+            ClientError::Rpc { code, yorkie_code: Some(yorkie_code), .. }
+                if code == "not_found" && yorkie_code == "ErrSessionNotFound"
+        ));
+        assert!(err.has_yorkie_code("ErrSessionNotFound"));
+        assert!(!err.has_yorkie_code("ErrClientNotFound"));
+
+        let end_stream = br#"{"error":{"code":"not_found","message":"m","details":[{"type":"google.rpc.ErrorInfo","value":"Cglub3RfZm91bmQaGgoEY29kZRISRXJyU2Vzc2lvbk5vdEZvdW5k"}]}}"#;
+        assert!(decode_end_stream(end_stream)
+            .unwrap_err()
+            .has_yorkie_code("ErrSessionNotFound"));
     }
 
     #[test]
@@ -404,6 +492,7 @@ mod tests {
             ClientError::Rpc {
                 code: "unauthenticated".to_owned(),
                 message: "nope".to_owned(),
+                yorkie_code: None,
             },
             decode_connect_error(401, b"nope")
         );
@@ -455,6 +544,7 @@ mod tests {
             Err(ClientError::Rpc {
                 code: "unavailable".to_owned(),
                 message: "server stopped".to_owned(),
+                yorkie_code: None,
             }),
             decode_end_stream(payload)
         );

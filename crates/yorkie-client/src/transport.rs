@@ -101,6 +101,48 @@ pub struct PushPullChangesResponse {
     pub change_pack: ChangePack,
 }
 
+/// Request data for refreshing a channel session (JS `refreshChannel` in
+/// `syncInternal`).
+///
+/// The first refresh of a channel has no `session_id`: it sends the client
+/// key and metadata, and the server activates the client if `client_id` is
+/// `None`, attaches it to the channel, and refreshes the session in one round
+/// trip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshChannelRequest {
+    pub client_id: Option<ActorId>,
+    pub channel_key: String,
+    pub session_id: Option<String>,
+    /// Sent on the first refresh only; empty afterwards.
+    pub client_key: String,
+    /// Sent on the first refresh only; empty afterwards.
+    pub metadata: BTreeMap<String, String>,
+    pub shard_key: String,
+}
+
+/// Response data for refreshing a channel session. `client_id` and
+/// `session_id` are set only in reply to a first refresh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshChannelResponse {
+    pub session_count: u64,
+    pub client_id: Option<ActorId>,
+    pub session_id: Option<String>,
+}
+
+/// Request data for reading a channel's session count without joining it
+/// (JS `peekChannel`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeekChannelRequest {
+    pub channel_key: String,
+    pub shard_key: String,
+}
+
+/// Response data for peeking at a channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeekChannelResponse {
+    pub session_count: u64,
+}
+
 /// Request data for watching a document (JS `watch` with a document
 /// resource descriptor).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,4 +229,13 @@ pub trait ClientTransport: Send + Sync {
 
     /// Opens a server stream of events for one document (JS `watch`).
     async fn watch_document(&self, request: WatchDocumentRequest) -> ClientResult<WatchStream>;
+
+    /// Creates or refreshes a channel session (JS `refreshChannel`).
+    async fn refresh_channel(
+        &self,
+        request: RefreshChannelRequest,
+    ) -> ClientResult<RefreshChannelResponse>;
+
+    /// Reads a channel's session count (JS `peekChannel`).
+    async fn peek_channel(&self, request: PeekChannelRequest) -> ClientResult<PeekChannelResponse>;
 }

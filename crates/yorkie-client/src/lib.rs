@@ -2,6 +2,7 @@
 //! Network client layer for Yorkie.
 
 mod attachment;
+mod channel;
 mod client;
 mod connect;
 mod error;
@@ -12,6 +13,7 @@ mod transport;
 mod watch;
 
 pub use attachment::SharedDocument;
+pub use channel::{Channel, ChannelEvent, ChannelStatus, ChannelSubscriptionId, SharedChannel};
 pub use client::{Client, ClientCondition, ClientStatus};
 pub use connect::ConnectTransport;
 pub use error::{ClientError, ClientResult};
@@ -24,7 +26,8 @@ pub use options::{
 pub use transport::{
     ActivateClientRequest, ActivateClientResponse, AttachDocumentRequest, AttachDocumentResponse,
     ClientTransport, DeactivateClientRequest, DeactivateClientResponse, DetachDocumentRequest,
-    DetachDocumentResponse, PushPullChangesRequest, PushPullChangesResponse, RemoveDocumentRequest,
+    DetachDocumentResponse, PeekChannelRequest, PeekChannelResponse, PushPullChangesRequest,
+    PushPullChangesResponse, RefreshChannelRequest, RefreshChannelResponse, RemoveDocumentRequest,
     RemoveDocumentResponse, WatchDocEvent, WatchDocEventType, WatchDocumentRequest,
     WatchDocumentResponse, WatchStream,
 };

@@ -1,13 +1,16 @@
-//! Client lifecycle: activation, document attachment, manual sync, and the
-//! background loops that keep realtime documents in sync.
+//! Client lifecycle: activation, document and channel attachment, manual
+//! sync, and the background loops that keep realtime documents in sync and
+//! channel sessions alive.
 //!
 //! JS reference: `packages/sdk/src/client/client.ts` (`activate`,
 //! `deactivate`, `attach`, `detach`, `sync`, `remove`, `changeSyncMode`,
-//! `enqueueTask`, `syncInternal`, `detachInternal`).
+//! `attachChannel`, `detachChannel`, `peekChannel`, `enqueueTask`,
+//! `syncInternal`, `detachInternal`).
 //!
 //! Locking: the client keeps its own state behind one mutex, and each attached
-//! document sits behind its own [`SharedDocument`] mutex. Neither lock is held
-//! across an `.await`, and the client never holds both at once. Client calls
+//! document or channel sits behind its own [`SharedDocument`] or
+//! [`SharedChannel`] mutex. No lock is held across an `.await`, and the client
+//! never holds its state lock together with a document or channel lock. Client calls
 //! and sync-loop rounds additionally take the async task queue, which is held
 //! across `.await`s so that only one of them talks to the server at a time,
 //! as in JS `enqueueTask`. Watch streams do not take it.
@@ -19,15 +22,19 @@
 //! stops its loop. A `Client` must therefore be used inside a tokio runtime.
 
 use crate::attachment::{
-    default_document_poll_interval, resolve_document_poll_interval, uses_watch_stream, Attachment,
-    SharedDocument,
+    default_document_poll_interval, resolve_document_poll_interval, uses_watch_stream,
+    validate_channel_sync_mode, Attachment, ChannelAttachment, SharedDocument,
 };
+use crate::channel::{first_key_path, Channel, ChannelEvent, ChannelStatus, SharedChannel};
 use crate::connect::ConnectTransport;
 use crate::error::{ClientError, ClientResult};
-use crate::options::{AttachOptions, ClientOptions, DeactivateOptions, DetachOptions, SyncMode};
+use crate::options::{
+    AttachChannelOptions, AttachOptions, ClientOptions, DeactivateOptions, DetachOptions, SyncMode,
+};
 use crate::transport::{
     ActivateClientRequest, AttachDocumentRequest, ClientTransport, DeactivateClientRequest,
-    DetachDocumentRequest, PushPullChangesRequest, RemoveDocumentRequest,
+    DetachDocumentRequest, PeekChannelRequest, PushPullChangesRequest, RefreshChannelRequest,
+    RemoveDocumentRequest,
 };
 use crate::{sync_loop, watch};
 use std::collections::{BTreeMap, BTreeSet};
@@ -35,7 +42,7 @@ use std::fmt::{self, Debug, Formatter};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use yorkie_core::{ActorId, DocEvent, DocStatus, DocSyncStatus, Document};
 
 /// Client activation state.
@@ -44,6 +51,10 @@ pub enum ClientStatus {
     Deactivated,
     Activated,
 }
+
+/// The Yorkie error code of a refresh for a session the server no longer
+/// has (JS `Code.ErrSessionNotFound`).
+const ERR_SESSION_NOT_FOUND: &str = "ErrSessionNotFound";
 
 /// Client background loop condition keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -83,6 +94,9 @@ pub(crate) struct ClientState {
     status: ClientStatus,
     conditions: BTreeMap<ClientCondition, bool>,
     pub(crate) attachments: BTreeMap<String, Attachment>,
+    /// Attached channels. They share the key space of `attachments`, as in
+    /// the single JS `attachmentMap`.
+    pub(crate) channels: BTreeMap<String, ChannelAttachment>,
     /// Keys with an attach in flight (JS `attachingDocs`).
     attaching: BTreeSet<String>,
     /// The sync loop task while the client is active.
@@ -153,6 +167,7 @@ impl Client {
                 (ClientCondition::WatchLoop, false),
             ]),
             attachments: BTreeMap::new(),
+            channels: BTreeMap::new(),
             attaching: BTreeSet::new(),
             sync_loop: None,
         };
@@ -209,9 +224,11 @@ impl Client {
         &self.inner.options
     }
 
-    /// Returns whether a document with the given key is attached.
+    /// Returns whether a document or channel with the given key is attached
+    /// (JS `has`).
     pub fn has(&self, key: &str) -> bool {
-        self.state().attachments.contains_key(key)
+        let state = self.state();
+        state.attachments.contains_key(key) || state.channels.contains_key(key)
     }
 
     /// Returns how many background loops (the sync loop and watch loops) are
@@ -255,7 +272,8 @@ impl Client {
     }
 
     /// Deactivates this client, stops its loops, and detaches every attached
-    /// document locally (JS `deactivate` and `deactivateInternal`).
+    /// document and channel locally (JS `deactivate` and
+    /// `deactivateInternal`).
     pub async fn deactivate(&self, options: DeactivateOptions) -> ClientResult<()> {
         let _queue = self.lock_task_queue().await;
         let client_id = {
@@ -275,13 +293,14 @@ impl Client {
             })
             .await?;
 
-        let (attachments, sync_loop) = {
+        let (attachments, channels, sync_loop) = {
             let mut state = self.state();
             state.status = ClientStatus::Deactivated;
             state.conditions.insert(ClientCondition::SyncLoop, false);
             state.conditions.insert(ClientCondition::WatchLoop, false);
             (
                 std::mem::take(&mut state.attachments),
+                std::mem::take(&mut state.channels),
                 state.sync_loop.take(),
             )
         };
@@ -289,6 +308,9 @@ impl Client {
         for attachment in attachments.into_values() {
             let doc = release_attachment(attachment);
             lock_document(&doc).apply_status(DocStatus::Detached);
+        }
+        for attachment in channels.into_values() {
+            release_channel_attachment(attachment);
         }
         Ok(())
     }
@@ -586,6 +608,250 @@ impl Client {
         Ok(())
     }
 
+    /// Attaches the channel and returns it (JS `attachChannel`).
+    ///
+    /// As in JS, this only registers the channel and makes sure the sync loop
+    /// runs: the loop's next round sends the first refresh, which creates the
+    /// session on the server and marks the channel attached. The client does
+    /// not have to be active; if it is not, the first refresh activates it
+    /// with the client ID the server issues.
+    pub async fn attach_channel(
+        &self,
+        channel: SharedChannel,
+        options: AttachChannelOptions,
+    ) -> ClientResult<SharedChannel> {
+        let key = {
+            let channel = lock_channel(&channel);
+            if channel.status() != ChannelStatus::Detached {
+                return Err(ClientError::NotDetached(channel.key().to_owned()));
+            }
+            channel.key().to_owned()
+        };
+        let sync_mode = options.sync_mode.unwrap_or(SyncMode::Realtime);
+        validate_channel_sync_mode(sync_mode)?;
+        let (heartbeat_interval, heartbeat_interval_pinned) =
+            match options.channel_heartbeat_interval {
+                Some(interval) if interval.is_zero() => {
+                    return Err(ClientError::InvalidArgument(
+                        "channel_heartbeat_interval must be greater than 0".to_owned(),
+                    ));
+                }
+                Some(interval) => (interval, true),
+                None => (self.inner.options.channel_heartbeat_interval, false),
+            };
+
+        let _queue = self.lock_task_queue().await;
+        let client_id = {
+            let mut state = self.state();
+            if state.is_taken(&key) {
+                return Err(ClientError::AlreadyAttached(key));
+            }
+            state.channels.insert(
+                key,
+                ChannelAttachment::new(
+                    channel.clone(),
+                    sync_mode,
+                    heartbeat_interval,
+                    heartbeat_interval_pinned,
+                ),
+            );
+            if !state.conditions[&ClientCondition::SyncLoop] {
+                state.conditions.insert(ClientCondition::SyncLoop, true);
+                state.sync_loop = Some(sync_loop::spawn(&self.inner));
+            }
+            state.id.clone()
+        };
+        // JS: a client that is already active gives the channel its ID now;
+        // otherwise the first refresh does.
+        if let Some(client_id) = client_id {
+            lock_channel(&channel).set_actor(client_id);
+        }
+        Ok(channel)
+    }
+
+    /// Detaches the channel (JS `detachChannel`).
+    ///
+    /// As in JS this is local: the client stops refreshing the session, and
+    /// the server drops it when its TTL runs out, so peers see the session
+    /// count fall only then.
+    pub async fn detach_channel(&self, channel: &SharedChannel) -> ClientResult<()> {
+        let _queue = self.lock_task_queue().await;
+        let key = channel_key(channel);
+        if self.remove_channel_attachment(&key, channel) {
+            Ok(())
+        } else {
+            Err(ClientError::NotAttached(key))
+        }
+    }
+
+    /// Refreshes the session of an attached channel now (JS `sync(channel)`).
+    /// A `Manual` channel is refreshed only this way.
+    pub async fn sync_channel(&self, channel: &SharedChannel) -> ClientResult<()> {
+        let _queue = self.lock_task_queue().await;
+        let key = channel_key(channel);
+        if self
+            .with_channel_attachment(&key, channel, |_| ())
+            .is_none()
+        {
+            return Err(ClientError::NotAttached(key));
+        }
+        self.refresh_channel(key, channel.clone()).await
+    }
+
+    /// Changes the sync mode of an attached channel (JS
+    /// `changeChannelSyncMode`). Channels take `Manual`, `Realtime`, and
+    /// `Polling`; an unpinned heartbeat interval becomes zero in `Manual` and
+    /// the client's interval otherwise.
+    pub async fn change_channel_sync_mode(
+        &self,
+        channel: &SharedChannel,
+        sync_mode: SyncMode,
+    ) -> ClientResult<()> {
+        let _queue = self.lock_task_queue().await;
+        let key = channel_key(channel);
+        let mut state = self.state();
+        let Some(attachment) = state
+            .channels
+            .get_mut(&key)
+            .filter(|attachment| attachment.holds(channel))
+        else {
+            return Err(ClientError::NotAttached(key));
+        };
+        if attachment.sync_mode == sync_mode {
+            return Ok(());
+        }
+        validate_channel_sync_mode(sync_mode)?;
+
+        attachment.sync_mode = sync_mode;
+        if !attachment.heartbeat_interval_pinned {
+            attachment.heartbeat_interval = if sync_mode == SyncMode::Manual {
+                Duration::ZERO
+            } else {
+                self.inner.options.channel_heartbeat_interval
+            };
+        }
+        Ok(())
+    }
+
+    /// Returns a channel's session count without joining it (JS
+    /// `peekChannel`). It needs no activation, adds no session, and gets no
+    /// events; callers poll it themselves.
+    pub async fn peek_channel(&self, channel_key: &str) -> ClientResult<u64> {
+        let _queue = self.lock_task_queue().await;
+        let response = self
+            .inner
+            .transport
+            .peek_channel(PeekChannelRequest {
+                channel_key: channel_key.to_owned(),
+                shard_key: self.shard_key(first_key_path(channel_key)),
+            })
+            .await?;
+        Ok(response.session_count)
+    }
+
+    /// Creates or refreshes the session of an attached channel and takes the
+    /// session count the server reports (JS `syncInternal` for a channel).
+    ///
+    /// A channel without a session sends a first refresh with the client key
+    /// and metadata. Its reply carries the session ID, which marks the
+    /// channel attached, and a client ID, which the client adopts if it has
+    /// none yet, becoming active. A refresh of a session the server no longer
+    /// has (`ErrSessionNotFound`) clears the session, so the next round
+    /// creates a new one; any other failure is published as
+    /// `ChannelEvent::SyncError` and returned.
+    pub(crate) async fn refresh_channel(
+        &self,
+        key: String,
+        channel: SharedChannel,
+    ) -> ClientResult<()> {
+        let session_id = lock_channel(&channel).session_id().map(str::to_owned);
+        let first_call = session_id.is_none();
+        let client_id = self.state().id.clone();
+        let (client_key, metadata) = if first_call {
+            (self.inner.key.clone(), self.inner.options.metadata.clone())
+        } else {
+            (String::new(), BTreeMap::new())
+        };
+        let result = self
+            .inner
+            .transport
+            .refresh_channel(RefreshChannelRequest {
+                client_id,
+                channel_key: key.clone(),
+                session_id,
+                client_key,
+                metadata,
+                shard_key: self.shard_key(first_key_path(&key)),
+            })
+            .await;
+
+        let response = match result {
+            Ok(response) => response,
+            Err(err) => {
+                if self
+                    .with_channel_attachment(&key, &channel, |_| ())
+                    .is_none()
+                {
+                    return Err(err);
+                }
+                let mut channel = lock_channel(&channel);
+                if err.has_yorkie_code(ERR_SESSION_NOT_FOUND) {
+                    channel.set_session_id(None);
+                    return Ok(());
+                }
+                channel.publish(ChannelEvent::SyncError {
+                    error: err.clone(),
+                    method: "RefreshChannel".to_owned(),
+                });
+                return Err(err);
+            }
+        };
+
+        // The channel may have been detached, or the client deactivated,
+        // while the request was in flight.
+        let actor_id = {
+            let mut state = self.state();
+            let Some(attachment) = state
+                .channels
+                .get_mut(&key)
+                .filter(|attachment| attachment.holds(&channel))
+            else {
+                return Ok(());
+            };
+            attachment.last_heartbeat_at = Some(Instant::now());
+            if first_call && state.id.is_none() {
+                if let Some(client_id) = &response.client_id {
+                    state.id = Some(client_id.clone());
+                    // JS: channel activation carries no stable actor.
+                    state.actor_id = Some(client_id.clone());
+                    state.status = ClientStatus::Activated;
+                }
+            }
+            state.id.clone()
+        };
+
+        let mut channel = lock_channel(&channel);
+        if first_call {
+            if let Some(actor_id) = actor_id {
+                channel.set_actor(actor_id);
+            }
+            // JS: without a session ID the channel stays detached, and the
+            // next round tries the first refresh again.
+            if let Some(session_id) = response.session_id {
+                channel.set_session_id(Some(session_id));
+                channel.apply_status(ChannelStatus::Attached);
+            }
+        }
+        let prev_count = channel.session_count();
+        if channel.update_session_count(response.session_count, 0)
+            && channel.session_count() != prev_count
+        {
+            let count = channel.session_count();
+            channel.publish(ChannelEvent::PresenceChanged { count });
+        }
+        Ok(())
+    }
+
     /// Pushes and pulls one document and publishes the sync status (JS
     /// `syncInternal`).
     pub(crate) async fn sync_document(
@@ -677,6 +943,43 @@ impl Client {
         format!("{}/{}", self.inner.options.api_key, resource_key)
     }
 
+    /// Runs `f` on the channel attachment of `key` if it still holds
+    /// `channel`.
+    pub(crate) fn with_channel_attachment<R>(
+        &self,
+        key: &str,
+        channel: &SharedChannel,
+        f: impl FnOnce(&mut ChannelAttachment) -> R,
+    ) -> Option<R> {
+        self.state()
+            .channels
+            .get_mut(key)
+            .filter(|attachment| attachment.holds(channel))
+            .map(f)
+    }
+
+    /// Drops the channel attachment of `key` if it still holds `channel`
+    /// (JS `detachInternal`), and returns whether it did.
+    fn remove_channel_attachment(&self, key: &str, channel: &SharedChannel) -> bool {
+        let attachment = {
+            let mut state = self.state();
+            if !state
+                .channels
+                .get(key)
+                .is_some_and(|attachment| attachment.holds(channel))
+            {
+                return false;
+            }
+            let attachment = state.channels.remove(key);
+            state.refresh_watch_loop_condition();
+            attachment
+        };
+        if let Some(attachment) = attachment {
+            release_channel_attachment(attachment);
+        }
+        true
+    }
+
     fn attached_document_id(&self, key: &str, doc: &SharedDocument) -> ClientResult<String> {
         self.with_attachment(key, doc, |attachment| attachment.resource_id.clone())
             .ok_or_else(|| ClientError::NotAttached(key.to_owned()))
@@ -754,6 +1057,13 @@ impl ClientState {
         }
     }
 
+    /// Whether a document or channel with the key is attached or attaching.
+    fn is_taken(&self, key: &str) -> bool {
+        self.attachments.contains_key(key)
+            || self.channels.contains_key(key)
+            || self.attaching.contains(key)
+    }
+
     /// Whether the client is still active in the given session.
     fn is_current(&self, session: &Session) -> bool {
         self.status == ClientStatus::Activated && self.id.as_ref() == Some(&session.client_id)
@@ -791,9 +1101,10 @@ struct AttachingGuard<'a> {
 impl<'a> AttachingGuard<'a> {
     fn claim(inner: &'a ClientInner, key: &str) -> ClientResult<Self> {
         let mut state = inner.state();
-        if state.attachments.contains_key(key) || !state.attaching.insert(key.to_owned()) {
+        if state.is_taken(key) {
             return Err(ClientError::AlreadyAttached(key.to_owned()));
         }
+        state.attaching.insert(key.to_owned());
         Ok(Self {
             inner,
             key: key.to_owned(),
@@ -828,12 +1139,36 @@ fn release_attachment(attachment: Attachment) -> SharedDocument {
     doc
 }
 
+/// Drops a removed channel attachment, stopping its watch stream, and marks
+/// the channel detached (JS `detachInternal` and `applyStatus(Detached)`).
+/// The session ID is cleared too, so attaching the channel again starts a
+/// new session. Must be called without the client state lock.
+fn release_channel_attachment(attachment: ChannelAttachment) {
+    let ChannelAttachment {
+        channel,
+        watch_task,
+        ..
+    } = attachment;
+    drop(watch_task);
+    let mut channel = lock_channel(&channel);
+    channel.apply_status(ChannelStatus::Detached);
+    channel.set_session_id(None);
+}
+
 pub(crate) fn lock_document(doc: &SharedDocument) -> MutexGuard<'_, Document> {
     doc.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+pub(crate) fn lock_channel(channel: &SharedChannel) -> MutexGuard<'_, Channel> {
+    channel.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 fn document_key(doc: &SharedDocument) -> String {
     lock_document(doc).key().to_owned()
+}
+
+fn channel_key(channel: &SharedChannel) -> String {
+    lock_channel(channel).key().to_owned()
 }
 
 fn generate_client_key() -> String {
@@ -852,6 +1187,7 @@ fn generate_client_key() -> String {
 mod tests {
     use super::{Client, ClientCondition, ClientStatus};
     use crate::attachment::SharedDocument;
+    use crate::channel::{Channel, ChannelEvent, ChannelStatus, SharedChannel};
     use crate::error::{ClientError, ClientResult};
     use crate::options::{
         AttachChannelOptions, AttachOptions, ClientOptions, DeactivateOptions, DetachOptions,
@@ -862,8 +1198,9 @@ mod tests {
     use crate::transport::{
         ActivateClientRequest, ActivateClientResponse, AttachDocumentRequest,
         AttachDocumentResponse, ClientTransport, DeactivateClientRequest, DeactivateClientResponse,
-        DetachDocumentRequest, DetachDocumentResponse, PushPullChangesRequest,
-        PushPullChangesResponse, RemoveDocumentRequest, RemoveDocumentResponse,
+        DetachDocumentRequest, DetachDocumentResponse, PeekChannelRequest, PeekChannelResponse,
+        PushPullChangesRequest, PushPullChangesResponse, RefreshChannelRequest,
+        RefreshChannelResponse, RemoveDocumentRequest, RemoveDocumentResponse,
         WatchDocumentRequest, WatchDocumentResponse, WatchStream,
     };
     use async_trait::async_trait;
@@ -897,6 +1234,10 @@ mod tests {
         watch_scripts: Mutex<Vec<Vec<ClientResult<WatchDocumentResponse>>>>,
         attach_max_size_per_document: usize,
         attach_schema_rules: Vec<SchemaRule>,
+        refresh_requests: Mutex<Vec<RefreshChannelRequest>>,
+        /// Errors for the next refreshes, in order; later refreshes succeed.
+        refresh_errors: Mutex<Vec<ClientError>>,
+        peek_requests: Mutex<Vec<PeekChannelRequest>>,
     }
 
     impl Default for MockTransport {
@@ -914,6 +1255,9 @@ mod tests {
                 watch_scripts: Mutex::new(Vec::new()),
                 attach_max_size_per_document: 0,
                 attach_schema_rules: Vec::new(),
+                refresh_requests: Mutex::new(Vec::new()),
+                refresh_errors: Mutex::new(Vec::new()),
+                peek_requests: Mutex::new(Vec::new()),
             }
         }
     }
@@ -992,6 +1336,39 @@ mod tests {
                 scripts.remove(0)
             };
             Ok(Box::pin(stream::iter(messages).chain(stream::pending())))
+        }
+
+        /// Issues `session-<n>` on the n-th first refresh, and this
+        /// transport's client ID to a client that has none.
+        async fn refresh_channel(
+            &self,
+            request: RefreshChannelRequest,
+        ) -> ClientResult<RefreshChannelResponse> {
+            let first_call = request.session_id.is_none();
+            let needs_client_id = request.client_id.is_none();
+            let mut requests = self.refresh_requests.lock().unwrap();
+            requests.push(request);
+            let mut errors = self.refresh_errors.lock().unwrap();
+            if !errors.is_empty() {
+                return Err(errors.remove(0));
+            }
+            let sessions = requests
+                .iter()
+                .filter(|request| request.session_id.is_none())
+                .count();
+            Ok(RefreshChannelResponse {
+                session_count: 1,
+                client_id: (first_call && needs_client_id).then(|| self.client_id.clone()),
+                session_id: first_call.then(|| format!("session-{sessions}")),
+            })
+        }
+
+        async fn peek_channel(
+            &self,
+            request: PeekChannelRequest,
+        ) -> ClientResult<PeekChannelResponse> {
+            self.peek_requests.lock().unwrap().push(request);
+            Ok(PeekChannelResponse { session_count: 2 })
         }
     }
 
@@ -1850,6 +2227,7 @@ mod tests {
         *transport.watch_scripts.lock().unwrap() = vec![vec![Err(ClientError::Rpc {
             code: "permission_denied".to_owned(),
             message: "denied".to_owned(),
+            yorkie_code: None,
         })]];
         let client = mock_client(fast_loop_options(), &transport);
         let doc = shared("doc-key");
@@ -1991,6 +2369,20 @@ mod tests {
             ) -> ClientResult<WatchStream> {
                 self.mock.watch_document(request).await
             }
+
+            async fn refresh_channel(
+                &self,
+                request: RefreshChannelRequest,
+            ) -> ClientResult<RefreshChannelResponse> {
+                self.mock.refresh_channel(request).await
+            }
+
+            async fn peek_channel(
+                &self,
+                request: PeekChannelRequest,
+            ) -> ClientResult<PeekChannelResponse> {
+                self.mock.peek_channel(request).await
+            }
         }
 
         let transport = Arc::new(DeactivatingTransport {
@@ -2037,6 +2429,324 @@ mod tests {
         );
         client.remove_attachment("doc-key", &doc);
         assert!(!client.has("doc-key"));
+        Ok(())
+    }
+
+    fn shared_channel(key: &str) -> SharedChannel {
+        Arc::new(Mutex::new(Channel::new(key).unwrap()))
+    }
+
+    fn collect_channel_events(channel: &SharedChannel) -> Arc<Mutex<Vec<ChannelEvent>>> {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        channel.lock().unwrap().subscribe({
+            let events = events.clone();
+            move |event| events.lock().unwrap().push(event.clone())
+        });
+        events
+    }
+
+    /// Channel options with a 10ms heartbeat, so tests see several refreshes.
+    fn fast_channel(sync_mode: SyncMode) -> AttachChannelOptions {
+        AttachChannelOptions {
+            sync_mode: Some(sync_mode),
+            channel_heartbeat_interval: Some(Duration::from_millis(10)),
+        }
+    }
+
+    /// JS "can attach a channel without activating the client": the first
+    /// refresh carries the client key and no IDs, and its reply activates the
+    /// client and attaches the channel. Later heartbeats carry both IDs.
+    #[tokio::test]
+    async fn first_channel_refresh_activates_the_client() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        let options = ClientOptions {
+            metadata: BTreeMap::from([("name".to_owned(), "a".to_owned())]),
+            ..fast_loop_options()
+        };
+        let client = mock_client(options, &transport);
+        let channel = shared_channel("room.1");
+        let events = collect_channel_events(&channel);
+
+        client
+            .attach_channel(channel.clone(), fast_channel(SyncMode::Polling))
+            .await?;
+        assert!(client.has("room.1"));
+        eventually(|| transport.refresh_requests.lock().unwrap().len() >= 2).await;
+
+        assert!(client.is_active());
+        let client_id = ActorId::new("000000000000000000000001");
+        assert_eq!(Some(client_id.clone()), client.id());
+        assert_eq!(Some(client_id.clone()), client.actor_id());
+        {
+            let channel = channel.lock().unwrap();
+            assert_eq!(ChannelStatus::Attached, channel.status());
+            assert_eq!(Some("session-1"), channel.session_id());
+            assert_eq!(Some(&client_id), channel.actor_id());
+            assert_eq!(1, channel.session_count());
+        }
+        assert_eq!(
+            vec![ChannelEvent::PresenceChanged { count: 1 }],
+            *events.lock().unwrap()
+        );
+
+        let requests = transport.refresh_requests.lock().unwrap().clone();
+        assert_eq!(None, requests[0].client_id);
+        assert_eq!(None, requests[0].session_id);
+        assert_eq!("client-key", requests[0].client_key);
+        assert_eq!(
+            Some("a"),
+            requests[0].metadata.get("name").map(String::as_str)
+        );
+        assert_eq!("api-key/room", requests[0].shard_key);
+        assert_eq!(Some(client_id), requests[1].client_id);
+        assert_eq!(Some("session-1"), requests[1].session_id.as_deref());
+        assert_eq!("", requests[1].client_key);
+        assert!(requests[1].metadata.is_empty());
+        assert!(transport.activate_requests.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    /// JS "recovers transparently when the server forgets the session": an
+    /// `ErrSessionNotFound` refresh clears the session, and the next refresh
+    /// starts a new one under the same client.
+    #[tokio::test]
+    async fn lost_channel_session_is_created_again() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        let client = mock_client(fast_loop_options(), &transport);
+        client.activate().await?;
+        let channel = shared_channel("room");
+        let events = collect_channel_events(&channel);
+        client
+            .attach_channel(channel.clone(), fast_channel(SyncMode::Polling))
+            .await?;
+        eventually(|| channel.lock().unwrap().is_attached()).await;
+
+        transport
+            .refresh_errors
+            .lock()
+            .unwrap()
+            .push(ClientError::Rpc {
+                code: "not_found".to_owned(),
+                message: "session not found".to_owned(),
+                yorkie_code: Some("ErrSessionNotFound".to_owned()),
+            });
+        eventually(|| channel.lock().unwrap().session_id() == Some("session-2")).await;
+
+        let requests = transport.refresh_requests.lock().unwrap().clone();
+        let restart = requests
+            .iter()
+            .rposition(|request| request.session_id.is_none())
+            .unwrap();
+        assert!(restart > 0);
+        assert_eq!(client.id(), requests[restart].client_id);
+        assert_eq!("client-key", requests[restart].client_key);
+        assert!(client.condition(ClientCondition::SyncLoop));
+        assert!(!events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, ChannelEvent::SyncError { .. })));
+        Ok(())
+    }
+
+    /// JS `SyncError`: a refresh failure is published on the channel, and
+    /// one that is not retryable stops the sync loop.
+    #[tokio::test]
+    async fn failed_channel_refresh_publishes_a_sync_error() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        let error = ClientError::Rpc {
+            code: "permission_denied".to_owned(),
+            message: "denied".to_owned(),
+            yorkie_code: None,
+        };
+        transport.refresh_errors.lock().unwrap().push(error.clone());
+        let client = mock_client(fast_loop_options(), &transport);
+        let channel = shared_channel("room");
+        let events = collect_channel_events(&channel);
+
+        client
+            .attach_channel(channel.clone(), fast_channel(SyncMode::Polling))
+            .await?;
+        eventually(|| !client.condition(ClientCondition::SyncLoop)).await;
+
+        assert_eq!(
+            vec![ChannelEvent::SyncError {
+                error,
+                method: "RefreshChannel".to_owned(),
+            }],
+            *events.lock().unwrap()
+        );
+        assert!(!channel.lock().unwrap().is_attached());
+        assert!(!client.is_active());
+        Ok(())
+    }
+
+    /// JS `needSync`: a `Manual` channel is refreshed only by
+    /// `sync(channel)`.
+    #[tokio::test]
+    async fn manual_channel_refreshes_only_when_synced() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        let client = mock_client(fast_loop_options(), &transport);
+        client.activate().await?;
+        let channel = shared_channel("room");
+        client
+            .attach_channel(channel.clone(), fast_channel(SyncMode::Manual))
+            .await?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(transport.refresh_requests.lock().unwrap().is_empty());
+
+        client.sync_channel(&channel).await?;
+        assert_eq!(1, transport.refresh_requests.lock().unwrap().len());
+        assert!(channel.lock().unwrap().is_attached());
+
+        client.detach_channel(&channel).await?;
+        assert_eq!(
+            ClientError::NotAttached("room".to_owned()),
+            client.sync_channel(&channel).await.unwrap_err()
+        );
+        Ok(())
+    }
+
+    /// JS `attachChannel` and `assertValidChannelSyncMode`.
+    #[tokio::test]
+    async fn attach_channel_rejects_invalid_options_and_taken_keys() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        let client = mock_client(fast_loop_options(), &transport);
+        client.activate().await?;
+
+        for sync_mode in [SyncMode::RealtimePushOnly, SyncMode::RealtimeSyncOff] {
+            let options = AttachChannelOptions {
+                sync_mode: Some(sync_mode),
+                ..AttachChannelOptions::default()
+            };
+            assert!(matches!(
+                client.attach_channel(shared_channel("room"), options).await,
+                Err(ClientError::InvalidArgument(message))
+                    if message.starts_with("invalid channel sync mode")
+            ));
+        }
+        let zero = AttachChannelOptions {
+            channel_heartbeat_interval: Some(Duration::ZERO),
+            ..AttachChannelOptions::default()
+        };
+        assert_eq!(
+            ClientError::InvalidArgument(
+                "channel_heartbeat_interval must be greater than 0".to_owned()
+            ),
+            client
+                .attach_channel(shared_channel("room"), zero)
+                .await
+                .unwrap_err()
+        );
+        assert!(!client.has("room"));
+
+        client
+            .attach(shared("taken"), AttachOptions::default())
+            .await?;
+        assert_eq!(
+            ClientError::AlreadyAttached("taken".to_owned()),
+            client
+                .attach_channel(shared_channel("taken"), AttachChannelOptions::default())
+                .await
+                .unwrap_err()
+        );
+        let channel = client
+            .attach_channel(shared_channel("room"), fast_channel(SyncMode::Polling))
+            .await?;
+        assert_eq!(
+            ClientError::AlreadyAttached("room".to_owned()),
+            client
+                .attach(shared("room"), AttachOptions::default())
+                .await
+                .unwrap_err()
+        );
+        eventually(|| channel.lock().unwrap().is_attached()).await;
+        assert_eq!(
+            ClientError::NotDetached("room".to_owned()),
+            client
+                .attach_channel(channel.clone(), AttachChannelOptions::default())
+                .await
+                .unwrap_err()
+        );
+        Ok(())
+    }
+
+    /// JS `changeChannelSyncMode`: an unpinned heartbeat interval follows the
+    /// mode, a pinned one stays, and document-only modes are rejected.
+    #[tokio::test]
+    async fn change_channel_sync_mode_resets_an_unpinned_interval() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        let client = mock_client(fast_loop_options(), &transport);
+        client.activate().await?;
+        let unpinned = shared_channel("unpinned");
+        let pinned = shared_channel("pinned");
+        let polling = AttachChannelOptions {
+            sync_mode: Some(SyncMode::Polling),
+            ..AttachChannelOptions::default()
+        };
+        client.attach_channel(unpinned.clone(), polling).await?;
+        client
+            .attach_channel(pinned.clone(), fast_channel(SyncMode::Polling))
+            .await?;
+        let interval = |key: &str| client.state().channels[key].heartbeat_interval;
+
+        client
+            .change_channel_sync_mode(&unpinned, SyncMode::Manual)
+            .await?;
+        client
+            .change_channel_sync_mode(&pinned, SyncMode::Manual)
+            .await?;
+        assert_eq!(Duration::ZERO, interval("unpinned"));
+        assert_eq!(Duration::from_millis(10), interval("pinned"));
+
+        client
+            .change_channel_sync_mode(&unpinned, SyncMode::Polling)
+            .await?;
+        assert_eq!(
+            Duration::from_millis(DEFAULT_CHANNEL_HEARTBEAT_INTERVAL_MS),
+            interval("unpinned")
+        );
+        assert!(matches!(
+            client
+                .change_channel_sync_mode(&unpinned, SyncMode::RealtimePushOnly)
+                .await,
+            Err(ClientError::InvalidArgument(_))
+        ));
+        Ok(())
+    }
+
+    /// JS `deactivateInternal`: channels are detached too.
+    #[tokio::test]
+    async fn deactivate_detaches_channels() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        let client = mock_client(fast_loop_options(), &transport);
+        client.activate().await?;
+        let channel = shared_channel("room");
+        client
+            .attach_channel(channel.clone(), fast_channel(SyncMode::Polling))
+            .await?;
+        eventually(|| channel.lock().unwrap().is_attached()).await;
+
+        client.deactivate(DeactivateOptions::default()).await?;
+
+        assert!(!client.has("room"));
+        let channel = channel.lock().unwrap();
+        assert_eq!(ChannelStatus::Detached, channel.status());
+        assert_eq!(None, channel.session_id());
+        Ok(())
+    }
+
+    /// JS `peekChannel`: no activation, and the shard key is the first key
+    /// path.
+    #[tokio::test]
+    async fn peek_channel_needs_no_activation() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        let client = mock_client(keyed_options(), &transport);
+        assert_eq!(2, client.peek_channel("room.1").await?);
+        let requests = transport.peek_requests.lock().unwrap();
+        assert_eq!("room.1", requests[0].channel_key);
+        assert_eq!("api-key/room", requests[0].shard_key);
+        assert!(!client.is_active());
         Ok(())
     }
 }

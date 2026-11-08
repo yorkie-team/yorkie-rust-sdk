@@ -13,10 +13,13 @@ pub enum ClientError {
     NotDetached(String),
     InvalidArgument(String),
     Transport(String),
-    /// Error reply from the server, with its Connect error code.
+    /// Error reply from the server, with its Connect error code and, when
+    /// the server sent one, the Yorkie error code from the error details
+    /// (JS `errorCodeOf`, such as `ErrSessionNotFound`).
     Rpc {
         code: String,
         message: String,
+        yorkie_code: Option<String>,
     },
     Core(YorkieError),
 }
@@ -40,6 +43,12 @@ impl ClientError {
             _ => false,
         }
     }
+
+    /// Whether the server replied with the given Yorkie error code (JS
+    /// `isErrorCode(err, code)`).
+    pub(crate) fn has_yorkie_code(&self, expected: &str) -> bool {
+        matches!(self, Self::Rpc { yorkie_code: Some(code), .. } if code == expected)
+    }
 }
 
 impl Display for ClientError {
@@ -51,7 +60,7 @@ impl Display for ClientError {
             Self::NotDetached(key) => write!(f, "resource {key:?} is not detached"),
             Self::InvalidArgument(message) => write!(f, "invalid client argument: {message}"),
             Self::Transport(message) => write!(f, "client transport error: {message}"),
-            Self::Rpc { code, message } => write!(f, "rpc error {code}: {message}"),
+            Self::Rpc { code, message, .. } => write!(f, "rpc error {code}: {message}"),
             Self::Core(err) => Display::fmt(err, f),
         }
     }
@@ -75,6 +84,7 @@ mod tests {
         let rpc = |code: &str| ClientError::Rpc {
             code: code.to_owned(),
             message: String::new(),
+            yorkie_code: None,
         };
         assert!(ClientError::Transport("connection reset".to_owned()).is_retryable());
         for code in [

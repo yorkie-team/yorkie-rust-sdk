@@ -3,7 +3,8 @@
 use crate::transport::{
     ActivateClientRequest, ActivateClientResponse, AttachDocumentRequest, AttachDocumentResponse,
     DeactivateClientRequest, DeactivateClientResponse, DetachDocumentRequest,
-    DetachDocumentResponse, PushPullChangesRequest, PushPullChangesResponse, RemoveDocumentRequest,
+    DetachDocumentResponse, PeekChannelRequest, PeekChannelResponse, PushPullChangesRequest,
+    PushPullChangesResponse, RefreshChannelRequest, RefreshChannelResponse, RemoveDocumentRequest,
     RemoveDocumentResponse, WatchDocEvent, WatchDocEventType, WatchDocumentRequest,
     WatchDocumentResponse,
 };
@@ -138,6 +139,43 @@ pub fn from_push_pull_changes_response(
     })
 }
 
+pub fn to_refresh_channel_request(request: &RefreshChannelRequest) -> api::RefreshChannelRequest {
+    api::RefreshChannelRequest {
+        client_id: request
+            .client_id
+            .as_ref()
+            .map(ActorId::to_string)
+            .unwrap_or_default(),
+        channel_key: request.channel_key.clone(),
+        session_id: request.session_id.clone().unwrap_or_default(),
+        client_key: request.client_key.clone(),
+        metadata: request.metadata.clone().into_iter().collect(),
+    }
+}
+
+pub fn from_refresh_channel_response(
+    response: &api::RefreshChannelResponse,
+) -> RefreshChannelResponse {
+    RefreshChannelResponse {
+        session_count: count_from_i64(response.session_count),
+        client_id: (!response.client_id.is_empty())
+            .then(|| ActorId::new(response.client_id.clone())),
+        session_id: (!response.session_id.is_empty()).then(|| response.session_id.clone()),
+    }
+}
+
+pub fn to_peek_channel_request(request: &PeekChannelRequest) -> api::PeekChannelRequest {
+    api::PeekChannelRequest {
+        channel_key: request.channel_key.clone(),
+    }
+}
+
+pub fn from_peek_channel_response(response: &api::PeekChannelResponse) -> PeekChannelResponse {
+    PeekChannelResponse {
+        session_count: count_from_i64(response.session_count),
+    }
+}
+
 /// Builds the unified `Watch` request for one document, as JS
 /// `createDocumentWatchStream` does.
 pub fn to_watch_document_request(request: &WatchDocumentRequest) -> api::WatchRequest {
@@ -193,6 +231,12 @@ pub fn from_watch_response(response: &api::WatchResponse) -> Option<WatchDocumen
         }
         Body::Heartbeat(_) => Some(WatchDocumentResponse::Heartbeat),
     }
+}
+
+/// Session counts and sequence numbers are `int64` on the wire; a negative
+/// one is never sent, and reads as 0.
+fn count_from_i64(value: i64) -> u64 {
+    u64::try_from(value).unwrap_or(0)
 }
 
 fn required<'a, T>(value: &'a Option<T>, field: &'static str) -> Result<&'a T> {
@@ -404,6 +448,75 @@ mod tests {
                 value: -1,
             },
             from_attach_document_response(&response).unwrap_err()
+        );
+    }
+
+    /// JS `syncInternal` for a channel and `peekChannel`.
+    #[test]
+    fn converts_channel_session_messages() {
+        let first = to_refresh_channel_request(&RefreshChannelRequest {
+            client_id: None,
+            channel_key: "room.1".to_owned(),
+            session_id: None,
+            client_key: "client-key".to_owned(),
+            metadata: BTreeMap::from([("region".to_owned(), "local".to_owned())]),
+            shard_key: "api-key/room".to_owned(),
+        });
+        assert_eq!("", first.client_id);
+        assert_eq!("room.1", first.channel_key);
+        assert_eq!("", first.session_id);
+        assert_eq!("client-key", first.client_key);
+        assert_eq!(
+            Some("local"),
+            first.metadata.get("region").map(String::as_str)
+        );
+
+        let heartbeat = to_refresh_channel_request(&RefreshChannelRequest {
+            client_id: Some(ActorId::new("000000000000000000000001")),
+            channel_key: "room.1".to_owned(),
+            session_id: Some("session".to_owned()),
+            client_key: String::new(),
+            metadata: BTreeMap::new(),
+            shard_key: "api-key/room".to_owned(),
+        });
+        assert_eq!("000000000000000000000001", heartbeat.client_id);
+        assert_eq!("session", heartbeat.session_id);
+
+        assert_eq!(
+            RefreshChannelResponse {
+                session_count: 2,
+                client_id: Some(ActorId::new("000000000000000000000001")),
+                session_id: Some("session".to_owned()),
+            },
+            from_refresh_channel_response(&api::RefreshChannelResponse {
+                session_count: 2,
+                client_id: "000000000000000000000001".to_owned(),
+                session_id: "session".to_owned(),
+            })
+        );
+        assert_eq!(
+            RefreshChannelResponse {
+                session_count: 0,
+                client_id: None,
+                session_id: None,
+            },
+            from_refresh_channel_response(&api::RefreshChannelResponse {
+                session_count: -1,
+                ..Default::default()
+            })
+        );
+
+        assert_eq!(
+            "room.1",
+            to_peek_channel_request(&PeekChannelRequest {
+                channel_key: "room.1".to_owned(),
+                shard_key: "api-key/room".to_owned(),
+            })
+            .channel_key
+        );
+        assert_eq!(
+            PeekChannelResponse { session_count: 3 },
+            from_peek_channel_response(&api::PeekChannelResponse { session_count: 3 })
         );
     }
 
