@@ -9,8 +9,8 @@
 
 mod integration_support;
 
-use integration_support::rpc_addr;
 use integration_support::two_clients::TwoClients;
+use integration_support::{max_vector_of, rpc_addr};
 use yorkie::{Document, JsonArray, JsonObject, JsonValue, SharedDocument, TimeTicket};
 
 fn sorted_json(doc: &SharedDocument) -> String {
@@ -728,12 +728,8 @@ async fn converges_after_complex_concurrent_insert_befores_and_deletes() {
 }
 
 /// JS "Returns undefined when looking up an element that doesnt exist after
-/// GC" (array_test.ts:725). JS collects the garbage with
-/// `doc.garbageCollect(maxVectorOf([actor]))` before the lookup; the Rust
-/// `Document` has no public garbage collection, and without it the lookup
-/// passes trivially.
+/// GC" (array_test.ts:725).
 #[test]
-#[ignore = "Document::garbage_collect (JS garbageCollect) is not public"]
 fn finds_nothing_for_a_garbage_collected_id() {
     let mut doc = Document::new("test-doc");
     let mut target = None;
@@ -754,7 +750,8 @@ fn finds_nothing_for_a_garbage_collected_id() {
 
     assert_eq!(r#"{"list":[0,1]}"#, doc.to_sorted_json());
 
-    // JS: doc.garbageCollect(maxVectorOf([doc.getChangeID().getActorID()]))
+    let actor = doc.actor_id().clone();
+    doc.garbage_collect(&max_vector_of(&[&actor])).unwrap();
     doc.update(|root| {
         assert!(root
             .get_array_mut("list")?

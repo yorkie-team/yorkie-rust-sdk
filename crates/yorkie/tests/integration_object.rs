@@ -828,9 +828,7 @@ async fn skips_an_undo_of_a_garbage_collected_object() {
 }
 
 /// JS "Should clean up the references to a previously deleted node when the
-/// deleted node is restored through undo" (object_test.ts:979). JS ends by
-/// checking `getGarbageLen() == 2` on doc2, which the Rust public API does
-/// not expose; that assertion is left out.
+/// deleted node is restored through undo" (object_test.ts:979).
 #[tokio::test]
 async fn restores_a_replaced_object_through_undo() {
     let Some(addr) = rpc_addr() else { return };
@@ -857,6 +855,10 @@ async fn restores_a_replaced_object_through_undo() {
     client1.sync(None).await.unwrap();
     assert_eq!(r#"{"shape":{"color":"black"}}"#, sorted_json(&doc1));
     assert_eq!(r#"{"shape":{"color":"black"}}"#, sorted_json(&doc2));
+
+    // JS NOTE(chacha912): the removed set should only retain the entry for
+    // `{shape: {color: 'yellow'}}`.
+    assert_eq!(2, doc2.lock().unwrap().garbage_len());
 
     deactivate([client1, client2]).await;
 }

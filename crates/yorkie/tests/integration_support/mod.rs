@@ -57,6 +57,29 @@ pub fn assert_undo_redo(doc: &mut yorkie::Document, states: &[String]) {
     }
 }
 
+/// A version vector that covers every ticket of the given actors, or of the
+/// initial actor when none is given (JS `maxVectorOf` in
+/// `test/helper/helper.ts`).
+pub fn max_vector_of(actors: &[&yorkie::ActorId]) -> yorkie::VersionVector {
+    let mut vector = yorkie::VersionVector::new();
+    if actors.is_empty() {
+        vector.set("000000000000000000000000", i64::MAX);
+    }
+    for actor in actors {
+        vector.set((*actor).clone(), i64::MAX);
+    }
+    vector
+}
+
+/// A version vector of the given actor and lamport pairs (JS `vectorOf`).
+pub fn vector_of(entries: &[(&yorkie::ActorId, i64)]) -> yorkie::VersionVector {
+    let mut vector = yorkie::VersionVector::new();
+    for (actor, lamport) in entries {
+        vector.set((*actor).clone(), *lamport);
+    }
+    vector
+}
+
 /// Builds a document value from a JSON literal, the way a JS test assigns an
 /// object or array literal: numbers that fit an `i32` become Integers, other
 /// integers Longs, and the rest Doubles.
