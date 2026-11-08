@@ -439,7 +439,7 @@ async fn overlapping_merge_and_merge() {
 #[tokio::test]
 async fn overlapping_merge_and_delete_element_node() {
     run_case(
-        "overlapping-merge-and-delete-element-nod",
+        "overlapping-merge-and-delete-element-node",
         element(
             "r",
             vec![element("p", vec![text("a")]), element("p", vec![text("b")])],
@@ -498,7 +498,7 @@ async fn overlapping_merge_and_delete_text_nodes() {
 #[tokio::test]
 async fn can_converge_an_unwrap_with_a_concurrent_delete_of_the_same_paragraph() {
     run_case(
-        "can-converge-an-unwrap-with-a-concurrent",
+        "can-converge-an-unwrap-with-a-concurrent-delete-of-the-same-paragraph",
         element(
             "r",
             vec![
@@ -527,7 +527,7 @@ async fn can_converge_an_unwrap_with_a_concurrent_delete_of_the_same_paragraph()
 #[tokio::test]
 async fn contained_split_and_split_at_the_same_position() {
     run_case(
-        "contained-split-and-split-at-the-same-po",
+        "contained-split-and-split-at-the-same-position",
         element("r", vec![element("p", vec![text("ab")])]),
         vec![
             Sync(C1),
@@ -552,7 +552,7 @@ async fn contained_split_and_split_at_the_same_position() {
 #[tokio::test]
 async fn contained_split_and_split_at_diffrent_positions_on_the_same_node() {
     run_case(
-        "contained-split-and-split-at-diffrent-po",
+        "contained-split-and-split-at-diffrent-positions-on-the-same-node",
         element("r", vec![element("p", vec![text("abc")])]),
         vec![
             Sync(C1),
@@ -577,7 +577,7 @@ async fn contained_split_and_split_at_diffrent_positions_on_the_same_node() {
 #[tokio::test]
 async fn contained_split_and_split_at_different_levels() {
     run_case(
-        "contained-split-and-split-at-different-l",
+        "contained-split-and-split-at-different-levels",
         element(
             "r",
             vec![element(
@@ -611,7 +611,7 @@ async fn contained_split_and_split_at_different_levels() {
 #[tokio::test]
 async fn contained_split_and_insert_into_the_split_position() {
     run_case(
-        "contained-split-and-insert-into-the-spli",
+        "contained-split-and-insert-into-the-split-position",
         element("r", vec![element("p", vec![text("ab")])]),
         vec![
             Sync(C1),
@@ -636,7 +636,7 @@ async fn contained_split_and_insert_into_the_split_position() {
 #[tokio::test]
 async fn contained_split_and_insert_into_original_node() {
     run_case(
-        "contained-split-and-insert-into-original",
+        "contained-split-and-insert-into-original-node",
         element("r", vec![element("p", vec![text("ab")])]),
         vec![
             Sync(C1),
@@ -661,7 +661,7 @@ async fn contained_split_and_insert_into_original_node() {
 #[tokio::test]
 async fn contained_split_and_insert_into_split_node() {
     run_case(
-        "contained-split-and-insert-into-split-no",
+        "contained-split-and-insert-into-split-node",
         element("r", vec![element("p", vec![text("ab")])]),
         vec![
             Sync(C1),
@@ -686,7 +686,7 @@ async fn contained_split_and_insert_into_split_node() {
 #[tokio::test]
 async fn contained_split_and_delete_contents_in_split_node() {
     run_case(
-        "contained-split-and-delete-contents-in-s",
+        "contained-split-and-delete-contents-in-split-node",
         element("r", vec![element("p", vec![text("ab")])]),
         vec![
             Sync(C1),
@@ -711,7 +711,7 @@ async fn contained_split_and_delete_contents_in_split_node() {
 #[tokio::test]
 async fn contained_split_and_delete_the_whole_original_and_split_nodes() {
     run_case(
-        "contained-split-and-delete-the-whole-ori",
+        "contained-split-and-delete-the-whole-original-and-split-nodes",
         element("r", vec![element("p", vec![text("ab")])]),
         vec![
             Sync(C1),
@@ -736,7 +736,7 @@ async fn contained_split_and_delete_the_whole_original_and_split_nodes() {
 #[tokio::test]
 async fn contained_merge_and_merge_at_different_levels() {
     run_case(
-        "contained-merge-and-merge-at-different-l",
+        "contained-merge-and-merge-at-different-levels",
         element(
             "r",
             vec![
@@ -770,7 +770,7 @@ async fn contained_merge_and_merge_at_different_levels() {
 #[tokio::test]
 async fn contained_merge_and_merge_at_the_same_level() {
     run_case(
-        "contained-merge-and-merge-at-the-same-le",
+        "contained-merge-and-merge-at-the-same-level",
         element(
             "r",
             vec![
@@ -858,7 +858,7 @@ async fn contained_merge_and_delete_the_whole() {
 #[tokio::test]
 async fn contained_merge_and_delete_contents_in_merged_node() {
     run_case(
-        "contained-merge-and-delete-contents-in-m",
+        "contained-merge-and-delete-contents-in-merged-node",
         element(
             "r",
             vec![
@@ -889,7 +889,7 @@ async fn contained_merge_and_delete_contents_in_merged_node() {
 #[tokio::test]
 async fn contained_merge_and_delete_sub_range_in_merged_range() {
     run_case(
-        "contained-merge-and-delete-sub-range-in-",
+        "contained-merge-and-delete-sub-range-in-merged-range",
         element(
             "r",
             vec![
@@ -952,7 +952,7 @@ async fn contained_merge_and_split_merged_node() {
 #[tokio::test]
 async fn contained_merge_and_split_at_multi_levels() {
     run_case(
-        "contained-merge-and-split-at-multi-level",
+        "contained-merge-and-split-at-multi-levels",
         element(
             "r",
             vec![element(
@@ -1070,7 +1070,7 @@ async fn side_by_side_split_and_delete() {
 #[tokio::test]
 async fn cascade_delete_across_parent_after_multi_level_split() {
     run_case(
-        "cascade-delete-across-parent-after-multi",
+        "cascade-delete-across-parent-after-multi-level-split",
         element(
             "r",
             vec![element(
@@ -1134,7 +1134,7 @@ async fn sequential_merge_then_split() {
 #[tokio::test]
 async fn multi_level_split_with_concurrent_merge_and_text_split() {
     run_case(
-        "multi-level-split-with-concurrent-merge-",
+        "multi-level-split-with-concurrent-merge-and-text-split",
         element(
             "r",
             vec![element(
@@ -1163,7 +1163,7 @@ async fn multi_level_split_with_concurrent_merge_and_text_split() {
 #[tokio::test]
 async fn split_with_concurrent_delete_overlapping_content() {
     run_case(
-        "split-with-concurrent-delete-overlapping",
+        "split-with-concurrent-delete-overlapping-content",
         element("r", vec![element("p", vec![text("abcd")])]),
         vec![
             Sync(C1),
@@ -1216,7 +1216,7 @@ async fn merge_with_concurrent_content_delete() {
 #[tokio::test]
 async fn merge_with_concurrent_full_content_delete_in_source() {
     run_case(
-        "merge-with-concurrent-full-content-delet",
+        "merge-with-concurrent-full-content-delete-in-source",
         element(
             "r",
             vec![
@@ -1399,7 +1399,7 @@ async fn side_by_side_merge_and_split() {
 #[tokio::test]
 async fn concurrent_delete_after_merge_with_nested_content() {
     run_case(
-        "concurrent-delete-after-merge-with-neste",
+        "concurrent-delete-after-merge-with-nested-content",
         element(
             "r",
             vec![
@@ -1461,7 +1461,7 @@ async fn delete_starting_inside_merge_target() {
 #[tokio::test]
 async fn can_split_link_can_transmitted_through_rpc() {
     run_case(
-        "can-split-link-can-transmitted-through-r",
+        "can-split-link-can-transmitted-through-rpc",
         element("doc", vec![element("p", vec![text("ab")])]),
         vec![
             Edit(D1, 2, 2, vec![text("1")], 0),
@@ -1485,7 +1485,7 @@ async fn can_split_link_can_transmitted_through_rpc() {
 #[tokio::test]
 async fn can_split_and_merge_with_empty_paragraph_left() {
     run_case(
-        "can-split-and-merge-with-empty-paragraph",
+        "can-split-and-merge-with-empty-paragraph-left",
         element("doc", vec![element("p", vec![text("a"), text("b")])]),
         vec![
             Expect(D1, "<doc><p>ab</p></doc>"),
@@ -1505,7 +1505,7 @@ async fn can_split_and_merge_with_empty_paragraph_left() {
 #[tokio::test]
 async fn can_split_and_merge_with_empty_paragraph_right() {
     run_case(
-        "can-split-and-merge-with-empty-paragraph",
+        "can-split-and-merge-with-empty-paragraph-right",
         element("doc", vec![element("p", vec![text("a"), text("b")])]),
         vec![
             Expect(D1, "<doc><p>ab</p></doc>"),
@@ -1525,7 +1525,7 @@ async fn can_split_and_merge_with_empty_paragraph_right() {
 #[tokio::test]
 async fn can_split_and_merge_with_empty_paragraph_and_multiple_split_level_left() {
     run_case(
-        "can-split-and-merge-with-empty-paragraph",
+        "can-split-and-merge-with-empty-paragraph-and-multiple-split-level-left",
         element(
             "doc",
             vec![element("p", vec![element("p", vec![text("a"), text("b")])])],
@@ -1548,7 +1548,7 @@ async fn can_split_and_merge_with_empty_paragraph_and_multiple_split_level_left(
 #[tokio::test]
 async fn can_split_at_the_same_offset_multiple_times() {
     run_case(
-        "can-split-at-the-same-offset-multiple-ti",
+        "can-split-at-the-same-offset-multiple-times",
         element("doc", vec![element("p", vec![text("a"), text("b")])]),
         vec![
             Expect(D1, "<doc><p>ab</p></doc>"),
@@ -1572,7 +1572,7 @@ async fn can_split_at_the_same_offset_multiple_times() {
 #[tokio::test]
 async fn can_sync_editbypath_split_with_other_clients() {
     run_case(
-        "can-sync-editbypath-split-with-other-cli",
+        "can-sync-editbypath-split-with-other-clients",
         element(
             "doc",
             vec![element(
@@ -1625,7 +1625,7 @@ async fn can_sync_editbypath_split_with_other_clients() {
 #[tokio::test]
 async fn can_sync_editbypath_merge_with_other_clients() {
     run_case(
-        "can-sync-editbypath-merge-with-other-cli",
+        "can-sync-editbypath-merge-with-other-clients",
         element(
             "doc",
             vec![element(
