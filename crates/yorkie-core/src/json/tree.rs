@@ -177,8 +177,8 @@ impl JsonTree {
     /// `Tree.edit` for one or no node). `contents` must be all text nodes or
     /// all element nodes.
     ///
-    /// A `split_level` above zero first splits that many elements at `from`,
-    /// innermost first, and inserts `contents` where the split opened. Two
+    /// A `split_level` above zero also splits that many elements at `from`,
+    /// innermost first; `contents` then go at `from`, in the left half. Two
     /// elements merge when the range deletes the boundary between them.
     pub fn edit(
         &mut self,
