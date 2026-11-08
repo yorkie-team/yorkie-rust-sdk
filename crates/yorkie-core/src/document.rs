@@ -531,6 +531,33 @@ impl Document {
         Ok(())
     }
 
+    /// Takes the given pack as a push acknowledgement only (JS
+    /// `acknowledgePushedChanges`): it drops the local changes the server
+    /// confirmed and forwards the client seq of the checkpoint, leaving the
+    /// server seq where it was so a later pull fetches what this pack did not
+    /// carry. It is for a reply whose remote state the client must not take,
+    /// such as the reply to a push-only request.
+    ///
+    /// That reply still carries the server's minimum version vector, and it
+    /// must not reach garbage collection: the client has not pulled the
+    /// remote changes the vector already accounts for, so collecting with it
+    /// purges tombstones those changes anchor on.
+    ///
+    /// The removal flag is taken: it describes the document, not the skipped
+    /// content.
+    #[doc(hidden)]
+    pub fn acknowledge_pushed_changes(&mut self, pack: &ChangePack) {
+        let client_seq = pack.checkpoint().client_seq();
+        self.remove_pushed_local_changes(client_seq);
+        self.checkpoint = self
+            .checkpoint
+            .forward(Checkpoint::new(self.checkpoint.server_seq(), client_seq));
+
+        if pack.is_removed() {
+            self.apply_status(DocStatus::Removed);
+        }
+    }
+
     /// Returns the presence of the current client. Empty unless attached,
     /// as in JS `getMyPresence`.
     pub fn my_presence(&self) -> Presence {
@@ -2424,6 +2451,49 @@ mod tests {
 
         assert_eq!(Checkpoint::new(4, 2), doc.checkpoint());
         assert!(!doc.has_local_changes());
+        Ok(())
+    }
+
+    /// JS `acknowledgePushedChanges`: the confirmed changes go, the server
+    /// seq stays, the remote changes are not applied, and a removal is taken.
+    #[test]
+    fn acknowledges_pushed_changes_without_taking_remote_state() -> Result<()> {
+        let mut source = Document::new("doc-key");
+        source.update(|root| root.set("remote", 1).map(|_| ()))?;
+        let remote_changes = source.create_change_pack().changes().to_vec();
+
+        let mut doc = Document::new("doc-key");
+        doc.update(|root| root.set("title", "hello").map(|_| ()))?;
+        doc.update(|root| root.set("done", false).map(|_| ()))?;
+
+        let pack = ChangePack::create(
+            "doc-key",
+            Checkpoint::new(7, 1),
+            false,
+            remote_changes,
+            Some(VersionVector::new()),
+            None,
+        );
+        doc.acknowledge_pushed_changes(&pack);
+
+        assert_eq!(Checkpoint::new(0, 1), doc.checkpoint());
+        assert_eq!(1, doc.local_changes.len());
+        assert_eq!(2, doc.local_changes[0].id().client_seq());
+        assert_eq!(r#"{"done":false,"title":"hello"}"#, doc.to_sorted_json());
+
+        let pack = ChangePack::create(
+            "doc-key",
+            Checkpoint::new(8, 2),
+            true,
+            Vec::new(),
+            Some(VersionVector::new()),
+            None,
+        );
+        doc.acknowledge_pushed_changes(&pack);
+
+        assert_eq!(Checkpoint::new(0, 2), doc.checkpoint());
+        assert!(!doc.has_local_changes());
+        assert_eq!(DocStatus::Removed, doc.status());
         Ok(())
     }
 

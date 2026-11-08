@@ -1112,17 +1112,26 @@ impl Client {
             })
             .await?;
 
-        if response.change_pack.has_changes()
-            && matches!(
+        // As in JS `syncInternal`: while the document is in PushOnly or
+        // SyncOff, or the request was sent push-only, the reply is taken as
+        // a push acknowledgement only. Its remote state, a snapshot included,
+        // is dropped and pulled again once realtime sync resumes. The content
+        // does not enter the decision: even a reply without changes carries
+        // the server's minimum version vector, and collecting garbage with it
+        // purges tombstones that the changes this document has not pulled yet
+        // anchor on.
+        let drops_remote_state = target.request_mode == SyncMode::RealtimePushOnly
+            || matches!(
                 target.attachment_mode,
                 SyncMode::RealtimePushOnly | SyncMode::RealtimeSyncOff
-            )
-        {
-            return Ok(false);
-        }
+            );
 
         let mut doc = lock_document(&target.doc);
-        doc.apply_change_pack(&response.change_pack)?;
+        if drops_remote_state {
+            doc.acknowledge_pushed_changes(&response.change_pack);
+        } else {
+            doc.apply_change_pack(&response.change_pack)?;
+        }
         Ok(doc.status() == DocStatus::Removed)
     }
 
@@ -2469,7 +2478,7 @@ mod tests {
     }
 
     #[test]
-    fn push_only_sync_ignores_response_changes_for_push_only_attachment() -> ClientResult<()> {
+    fn push_only_sync_takes_only_the_push_ack_for_push_only_attachment() -> ClientResult<()> {
         let transport = Arc::new(MockTransport::default());
         let client = mock_client(keyed_options(), &transport);
         let doc = shared("doc-key");
@@ -2488,10 +2497,19 @@ mod tests {
 
         block_on(client.sync(None))?;
 
-        assert!(doc.lock().unwrap().has_local_changes());
+        // The mock echoes the pushed change back. As in JS, the push is
+        // acknowledged, so the change is not pushed again, but the echoed
+        // change is not applied a second time.
+        let doc = doc.lock().unwrap();
         let requests = transport.push_pull_requests.lock().unwrap();
         assert_eq!(1, requests.len());
         assert!(requests[0].push_only);
+        assert!(!doc.has_local_changes());
+        assert_eq!(
+            requests[0].change_pack.checkpoint().client_seq(),
+            doc.checkpoint().client_seq()
+        );
+        assert_eq!(r#"{"title":"hello"}"#, doc.to_sorted_json());
         Ok(())
     }
 
