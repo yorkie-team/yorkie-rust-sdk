@@ -11,7 +11,7 @@
 mod integration_support;
 
 use integration_support::rpc_addr;
-use integration_support::tree::TwoClients;
+use integration_support::two_clients::TwoClients;
 use yorkie::{DataSize, JsonText, SharedDocument, YorkieError};
 
 const SIZE_LIMIT: usize = 100;

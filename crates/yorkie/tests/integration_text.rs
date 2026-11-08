@@ -6,73 +6,11 @@
 
 mod integration_support;
 
-use integration_support::{rpc_addr, unique_key};
+use integration_support::rpc_addr;
+use integration_support::two_clients::TwoClients;
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
-use yorkie::{
-    AttachOptions, Client, ClientOptions, DeactivateOptions, Document, JsonText, SharedDocument,
-    SyncMode,
-};
-
-struct TwoClients {
-    c1: Client,
-    d1: SharedDocument,
-    c2: Client,
-    d2: SharedDocument,
-}
-
-impl TwoClients {
-    /// Attaches one document to two clients in manual sync mode (JS
-    /// `withTwoClientsAndDocuments`).
-    async fn attach(addr: &str, name: &str) -> Self {
-        let key = unique_key(name);
-        let c1 = active_client(addr).await;
-        let c2 = active_client(addr).await;
-        let d1 = c1.attach(shared(&key), manual_attach()).await.unwrap();
-        let d2 = c2.attach(shared(&key), manual_attach()).await.unwrap();
-        Self { c1, d1, c2, d2 }
-    }
-
-    /// Syncs c1, c2, then c1 again, so both have every change.
-    async fn sync_all(&self) {
-        self.c1.sync(None).await.unwrap();
-        self.c2.sync(None).await.unwrap();
-        self.c1.sync(None).await.unwrap();
-    }
-
-    async fn deactivate(self) {
-        self.c1
-            .deactivate(DeactivateOptions::default())
-            .await
-            .unwrap();
-        self.c2
-            .deactivate(DeactivateOptions::default())
-            .await
-            .unwrap();
-    }
-}
-
-fn manual_attach() -> AttachOptions {
-    AttachOptions {
-        sync_mode: SyncMode::Manual,
-        ..AttachOptions::default()
-    }
-}
-
-async fn active_client(addr: &str) -> Client {
-    let client = Client::new(ClientOptions {
-        rpc_addr: addr.to_owned(),
-        ..ClientOptions::default()
-    })
-    .unwrap();
-    client.activate().await.unwrap();
-    client
-}
-
-fn shared(key: &str) -> SharedDocument {
-    Arc::new(Mutex::new(Document::new(key)))
-}
+use yorkie::{JsonText, SharedDocument};
 
 fn sorted_json(doc: &SharedDocument) -> String {
     doc.lock().unwrap().to_sorted_json()

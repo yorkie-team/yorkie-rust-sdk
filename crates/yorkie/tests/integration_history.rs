@@ -15,7 +15,7 @@
 mod integration_support;
 
 use integration_support::rpc_addr;
-use integration_support::tree::TwoClients;
+use integration_support::two_clients::TwoClients;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use yorkie::{JsonArray, JsonText, JsonValue, SharedDocument};

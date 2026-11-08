@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 pub mod tree;
+pub mod two_clients;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

@@ -11,9 +11,9 @@
 mod integration_support;
 
 use integration_support::tree::{
-    active_client, attach_pair, attributes, collect_ops, edit_tree, element, element_with,
-    set_tree, text, xml, TwoClients,
+    attributes, collect_ops, edit_tree, element, element_with, set_tree, text, xml,
 };
+use integration_support::two_clients::{active_client, attach_pair, TwoClients};
 use integration_support::{rpc_addr, unique_key};
 use serde_json::json;
 use std::sync::Mutex;

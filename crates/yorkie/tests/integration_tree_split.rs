@@ -19,9 +19,9 @@
 mod integration_support;
 
 use integration_support::tree::{
-    active_client, collect_ops, edit_tree, element, element_with, manual_attach, set_tree, shared,
-    text, xml, TwoClients,
+    collect_ops, edit_tree, element, element_with, set_tree, text, xml,
 };
+use integration_support::two_clients::{active_client, manual_attach, shared, TwoClients};
 use integration_support::{rpc_addr, unique_key};
 use serde_json::json;
 use yorkie::{

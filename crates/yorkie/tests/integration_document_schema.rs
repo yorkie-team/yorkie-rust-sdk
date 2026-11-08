@@ -11,7 +11,8 @@
 mod integration_support;
 
 use integration_support::rpc_addr;
-use integration_support::tree::{element, text, TwoClients};
+use integration_support::tree::{element, text};
+use integration_support::two_clients::TwoClients;
 use yorkie::{JsonTree, SchemaRule, SharedDocument, TreeNodeRule, YorkieError};
 
 fn sorted_json(doc: &SharedDocument) -> String {
