@@ -155,6 +155,87 @@ impl EditOperation {
         self.meta.set_executed_at(executed_at);
     }
 
+    /// Remaps an undo edit's positions onto the text's current split chain.
+    ///
+    /// JS does this inside `execute` and keeps the result on the operation, so
+    /// the change that carries an undo sends the refined positions to other
+    /// replicas. `execute` takes `&self` here, so `Change` calls this first.
+    pub(crate) fn refine_undo_positions(&mut self, root: &CrdtRoot) -> Result<()> {
+        if !self.is_undo_op {
+            return Ok(());
+        }
+        let text = root
+            .text_by_created_at(self.parent_created_at())
+            .ok_or_else(|| self.text_parent_error(root))?;
+        self.from_pos = text.refine_pos(&self.from_pos)?;
+        self.to_pos = text.refine_pos(&self.to_pos)?;
+        Ok(())
+    }
+
+    /// Returns the UTF-16 indexes of this edit's range on the text as it is
+    /// now (JS `normalizePos`).
+    pub(crate) fn normalize_pos(&self, root: &CrdtRoot) -> Result<(usize, usize)> {
+        let text = root
+            .text_by_created_at(self.parent_created_at())
+            .ok_or_else(|| self.text_parent_error(root))?;
+        Ok((
+            text.normalize_pos(&self.from_pos)?.relative_offset(),
+            text.normalize_pos(&self.to_pos)?.relative_offset(),
+        ))
+    }
+
+    /// Returns the length of the inserted content in UTF-16 code units, the
+    /// unit of text indexes (JS `content.length`).
+    pub(crate) fn content_len(&self) -> usize {
+        self.content.encode_utf16().count()
+    }
+
+    /// Shifts an undo edit's range past a remote edit that replaced
+    /// `remote_from..remote_to` with `content_len` code units (JS
+    /// `reconcileOperation`). Only the relative offsets change: an undo edit's
+    /// positions are normalized to the head of the text.
+    pub(crate) fn reconcile_operation(
+        &mut self,
+        remote_from: usize,
+        remote_to: usize,
+        content_len: usize,
+    ) {
+        if !self.is_undo_op || remote_from > remote_to {
+            return;
+        }
+
+        let remote_len = remote_to - remote_from;
+        let local_from = self.from_pos.relative_offset();
+        let local_to = self.to_pos.relative_offset();
+        // JS clamps a negative result to zero.
+        let shift = |offset: usize| (offset + content_len).saturating_sub(remote_len);
+
+        let (from, to) = if remote_to <= local_from {
+            // The remote edit is left of the range.
+            (shift(local_from), shift(local_to))
+        } else if local_to <= remote_from {
+            // The remote edit is right of the range.
+            return;
+        } else if remote_from <= local_from && local_to <= remote_to && remote_from != remote_to {
+            // The range lies inside the remote edit.
+            (remote_from, remote_from)
+        } else if local_from <= remote_from && remote_to <= local_to && local_from != local_to {
+            // The remote edit lies inside the range.
+            (local_from, shift(local_to))
+        } else if remote_from < local_from && local_from < remote_to && remote_to < local_to {
+            // The remote edit overlaps the start of the range.
+            (remote_from, remote_from + (local_to - remote_to))
+        } else if local_from < remote_from && remote_from < local_to && local_to < remote_to {
+            // The remote edit overlaps the end of the range.
+            (local_from, remote_from)
+        } else {
+            return;
+        };
+
+        self.from_pos = RgaTreeSplitPos::new(self.from_pos.id().clone(), from);
+        self.to_pos = RgaTreeSplitPos::new(self.to_pos.id().clone(), to);
+    }
+
     pub(crate) fn set_actor(&mut self, actor_id: impl Into<ActorId>) {
         self.meta.set_actor(actor_id);
     }

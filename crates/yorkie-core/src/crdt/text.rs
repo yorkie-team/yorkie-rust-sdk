@@ -214,6 +214,10 @@ impl CrdtText {
         self.meta.positioned_at()
     }
 
+    pub(crate) fn set_created_at(&mut self, created_at: TimeTicket) {
+        self.meta.set_created_at(created_at);
+    }
+
     pub(crate) fn set_moved_at(&mut self, moved_at: Option<TimeTicket>) -> bool {
         self.meta.set_moved_at(moved_at)
     }

@@ -271,6 +271,21 @@ impl Operation {
         }
     }
 
+    pub(crate) fn set_executed_at(&mut self, executed_at: TimeTicket) {
+        match self {
+            Self::Set(operation) => operation.set_executed_at(executed_at),
+            Self::Remove(operation) => operation.set_executed_at(executed_at),
+            Self::Add(operation) => operation.set_executed_at(executed_at),
+            Self::Increase(operation) => operation.set_executed_at(executed_at),
+            Self::Move(operation) => operation.set_executed_at(executed_at),
+            Self::ArraySet(operation) => operation.set_executed_at(executed_at),
+            Self::Edit(operation) => operation.set_executed_at(executed_at),
+            Self::Style(operation) => operation.set_executed_at(executed_at),
+            Self::TreeEdit(operation) => operation.set_executed_at(executed_at),
+            Self::TreeStyle(operation) => operation.set_executed_at(executed_at),
+        }
+    }
+
     pub(crate) fn set_actor(&mut self, actor_id: impl Into<ActorId>) {
         let actor_id = actor_id.into();
         match self {

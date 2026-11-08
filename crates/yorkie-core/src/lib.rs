@@ -8,6 +8,7 @@ mod crdt;
 mod document;
 mod error;
 mod event;
+mod history;
 mod json;
 #[allow(dead_code)]
 mod operation;
@@ -27,6 +28,7 @@ pub use event::{
     ChangeInfo, DocEvent, DocSyncStatus, EditOpValue, OperationInfo, StreamConnectionStatus,
     StyleOpValue, SubscriptionId, TreeStyleOpValue,
 };
+pub use history::{HistoryMut, HistoryRef};
 pub use json::{
     JsonArray, JsonArrayElement, JsonCounter, JsonObject, JsonText, JsonTree, JsonValue, TextChunk,
     TreeNodeInput,

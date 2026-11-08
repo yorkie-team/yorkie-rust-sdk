@@ -91,6 +91,12 @@ impl TreeEditOperation {
             // outside the tree. Tree undo is not ported yet, so a reverse
             // that cannot be built is dropped rather than failing the edit,
             // which JS applies.
+            //
+            // NOTE: this drops every error, local edits included, and
+            // `HistoryOperation::entry` drops the reverse that is built:
+            // nothing reaches the undo stack today. A Tree undo port has to
+            // keep the errors of local edits, or an undo entry goes missing
+            // without notice.
             let reverse_op = self.to_reverse_operation(tree, &result).ok().flatten();
             (result, reverse_op)
         };

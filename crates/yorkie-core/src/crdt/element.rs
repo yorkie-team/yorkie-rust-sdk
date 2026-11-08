@@ -200,6 +200,17 @@ impl CrdtElement {
         }
     }
 
+    pub(crate) fn set_created_at(&mut self, created_at: TimeTicket) {
+        match self {
+            Self::Primitive(value) => value.set_created_at(created_at),
+            Self::Counter(value) => value.set_created_at(created_at),
+            Self::Object(value) => value.set_created_at(created_at),
+            Self::Array(value) => value.set_created_at(created_at),
+            Self::Text(value) => value.set_created_at(created_at),
+            Self::Tree(value) => value.set_created_at(created_at),
+        }
+    }
+
     pub(crate) fn set_moved_at(&mut self, moved_at: Option<TimeTicket>) -> bool {
         match self {
             Self::Primitive(value) => value.set_moved_at(moved_at),

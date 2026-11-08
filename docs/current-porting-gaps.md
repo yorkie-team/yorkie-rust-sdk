@@ -366,8 +366,9 @@ Gap:
   `yorkie_protocol::converter`. Binary `ChangePack` round-trip tests cover
   counter replay, and full `JSONElement.Counter` conversion carries HLL
   register payloads for dedup counters.
-- Change-level concurrent counter tests are still missing because the public
-  editing path does not yet include client sync/history.
+- Concurrent counter undo/redo is covered by
+  `crates/yorkie/tests/integration_history.rs`; other change-level concurrent
+  counter tests are still missing.
 
 Expected direction:
 
@@ -642,7 +643,8 @@ Gap:
   style to direct unknown split siblings in the JS/Go shape, but the broader
   concurrent style matrices and range-narrowing edge cases are not yet ported.
 - Tree undo and redo are not ported. Reverse tree edit operations are still
-  built for insert/delete, pure split and merge edits, but a reverse that
+  built for insert/delete, pure split and merge edits, but the document
+  history drops them (see Undo and Redo), and a reverse that
   does not fit the tree after a concurrent merge is dropped rather than
   failing the edit, and the JS reverse machinery (restore spans, split
   reconciliation, `mergeSourceOf`, `redoSplitLevel`, `dropDuplicateContents`
@@ -717,7 +719,8 @@ Gap:
 - Presence is implemented for `Put`/`Clear`: `Document::update_with_presence`,
   presence-only changes, remote presence application, snapshot presences, and
   online-client tracking. Rust never emits JS `Patch` changes (it decodes them);
-  `disablePresence` and presence undo/redo are not ported.
+  `disablePresence` is not ported. Presence undo/redo is ported (see Undo
+  and Redo).
 - Document events follow JS `reconcilePresence`: local presence updates,
   remote presence changes, and status transitions publish
   `PresenceChanged`/`Watched`/`Unwatched`. A remote `Clear` takes the actor
@@ -748,26 +751,64 @@ Expected direction:
 
 Current Rust behavior:
 
-- Some operations create reverse operations.
-- Undo/redo source handling exists as an enum and has narrow operation tests.
+- `Document::history()` returns a `HistoryRef` with `can_undo`/`can_redo`;
+  `Document::history_mut()` returns a `HistoryMut` that also has
+  `undo`/`redo` (JS `doc.history`). The stacks keep 50 entries each (JS
+  `MaxUndoRedoStackDepth`).
+- A local change pushes its reverse operations, newest first, and the
+  previous values of the presence keys set with
+  `PresenceProxy::set_with_history` (JS `addToHistory: true`). A change with
+  operation info clears the redo stack; a presence-only change does not.
+- Object set/remove, array add/remove/move/set, counter increase, text
+  edit/style, and presence are undoable. An undo or redo is a new local
+  change: it is queued for the server, publishes `LocalChange`, and replays
+  with `OpSource::UndoRedo` after a snapshot (JS `replaySourceOf`). An empty
+  stack makes `undo`/`redo` a no-op, as in JS.
+- An array set and an undo that adds an element back re-point the stacks to
+  the element's new creation time (JS `reconcileCreatedAt`). A remote or
+  replayed text edit shifts the undo text edits of the same text (JS
+  `reconcileTextEdit`/`reconcileOperation`).
+- An undo text edit is refined against the current split chain when it runs,
+  and the change keeps the refined positions for other replicas. JS does this
+  by mutating the operation inside `execute`; Rust refines in
+  `Change::execute_undo_redo` before each edit runs.
+- A snapshot clears both stacks, as in JS `applySnapshot`.
 
 JS/Go behavior:
 
-- Undo/redo is integrated with history, operation grouping, and array/object
-  operation semantics.
+- JS reverses Text edits by identity (`RestoreSpan`, `restoreMode`,
+  `retombstoneSpans`, and the removal ledger `recordRemoval`/
+  `isRemovedInView`), so overlapping undos of concurrent deletions restore
+  the original text once.
+- JS undoes and redoes Tree edits and styles, with split reconciliation
+  (`reconcileTreeNodeID`, `reconcileTreeEdit`, split tickets).
+- JS has a `maxUndoDepth` document option, `clearHistory`, and refuses
+  undo/redo during an update and while minting is suspended (epoch
+  re-anchor). Its change events carry `source: OpSource.UndoRedo`.
 
 Gap:
 
-- There is no full document history manager.
-- Reverse operations are not yet exercised through a user-facing undo/redo API.
-- Array reverse operation behavior is only covered in small internal slices.
+- Undo reverses are positional, as JS was before identity-preserving restore:
+  an undone deletion is inserted again as new content. Two clients undoing
+  overlapping deletions converge on duplicated content. The two JS
+  correctness cases for this (`history_text_test.ts`, skipped upstream) are
+  ignored in `crates/yorkie/tests/integration_history.rs`. The
+  `restore_spans`/`restore_mode` proto fields stay at their defaults, and the
+  removal ledger is not ported (see the Text section).
+- Tree undo and redo are not ported. Tree edits and styles push no reverse
+  operation, so an undo never replays a tree change, and a change that mixes
+  tree and other edits is undone only for the other edits.
+- `maxUndoDepth`, `clearHistory`, and the minting-suspended refusal are not
+  ported. Rust change events do not carry the JS `source` field, so an
+  undo's `LocalChange` looks like any other local change.
+- An undo whose operation fails partway leaves the CRDT root holding the
+  operations that ran, as a failing `Document::update` does; JS also burns
+  the change's lamport in that case.
 
 Expected direction:
 
-- Port history behavior after public mutation methods produce correct
-  operation types.
-- Use JS history tests as the main source for expected grouping and reverse-op
-  behavior.
+- Port identity-preserving Text restore together with the removal ledger.
+- Port Tree undo and redo with the JS split and merge reverse machinery.
 
 ## Serialization and Protocol Conversion
 

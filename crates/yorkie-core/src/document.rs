@@ -9,6 +9,7 @@ use crate::crdt::root::CrdtRoot;
 use crate::crdt::text::CrdtText;
 use crate::crdt::tree::{CrdtTree, TreePos};
 use crate::event::{ChangeInfo, DocEvent, OperationInfo, Subscribers, SubscriptionId};
+use crate::history::{History, HistoryMut, HistoryOperation, HistoryRef};
 use crate::json::{counter_operand, JsonEditRecorder, JsonEditRecorderRef, RecordedJsonValue};
 use crate::operation::{
     AddOperation, ArraySetOperation, EditOperation, IncreaseOperation, MoveOperation, OpSource,
@@ -38,6 +39,7 @@ pub struct Document {
     presences: BTreeMap<ActorId, Presence>,
     online_clients: BTreeSet<ActorId>,
     subscribers: Subscribers,
+    history: History,
 }
 
 /// Document attachment state.
@@ -64,6 +66,7 @@ impl Document {
             presences: BTreeMap::new(),
             online_clients: BTreeSet::new(),
             subscribers: Subscribers::default(),
+            history: History::default(),
         }
     }
 
@@ -168,7 +171,8 @@ impl Document {
             .unwrap_or_else(PoisonError::into_inner)
             .context
             .clone();
-        context.set_presence_change(proxy.into_change());
+        let (presence_change, reverse_presence) = proxy.into_parts();
+        context.set_presence_change(presence_change);
         if context.operations().is_empty() {
             collect_object_changes(
                 &mut context,
@@ -185,6 +189,26 @@ impl Document {
             let prev = self.presence_state(&actor_id, self.status == DocStatus::Attached);
             let executed = change.execute(&mut self.crdt_root, OpSource::Local)?;
             change.apply_presence_change(&mut self.presences);
+
+            // An array set replaces the element under a new creation time, and
+            // the history may still name the old one.
+            for operation in change.operations() {
+                if let Operation::ArraySet(operation) = operation {
+                    self.history.reconcile_created_at(
+                        operation.created_at(),
+                        operation.value().created_at(),
+                    );
+                }
+            }
+            let entry = HistoryOperation::entry(executed.reverse_ops, reverse_presence);
+            if !entry.is_empty() {
+                self.history.push_undo(entry);
+            }
+            // As in JS, a new local edit clears the redo stack; a change of
+            // presence alone does not.
+            if !executed.op_infos.is_empty() {
+                self.history.clear_redo();
+            }
 
             // As in JS, the change event is gated on the operations that ran,
             // not on the op infos they produced.
@@ -204,6 +228,129 @@ impl Document {
         }
 
         Ok(())
+    }
+
+    /// Returns a read-only view of this document's undo and redo history
+    /// (JS `doc.history.canUndo`/`canRedo`).
+    pub fn history(&self) -> HistoryRef<'_> {
+        HistoryRef::new(self)
+    }
+
+    /// Returns the handle that undoes and redoes local changes (JS
+    /// `doc.history`).
+    ///
+    /// JS refuses an undo or a redo called from inside an `update` callback.
+    /// Here the callback cannot reach the document at all: it holds
+    /// `&mut Document` only through `update`, so the borrow checker rejects
+    /// the call.
+    ///
+    /// ```compile_fail,E0499
+    /// let mut doc = yorkie_core::Document::new("doc");
+    /// let handle = &mut doc;
+    /// handle.update(|_root| doc.history_mut().undo()).unwrap();
+    /// ```
+    pub fn history_mut(&mut self) -> HistoryMut<'_> {
+        HistoryMut::new(self)
+    }
+
+    pub(crate) fn history_stacks(&self) -> &History {
+        &self.history
+    }
+
+    /// Pops the latest undo (or redo) entry and applies it as a new local
+    /// change (JS `executeUndoRedo`).
+    pub(crate) fn execute_undo_redo(&mut self, is_undo: bool) -> Result<()> {
+        let entry = if is_undo {
+            self.history.pop_undo()
+        } else {
+            self.history.pop_redo()
+        };
+        let Some(entry) = entry else {
+            return Ok(());
+        };
+
+        let actor_id = self.change_id.actor_id().clone();
+        let mut context = ChangeContext::create(self.change_id.clone(), None);
+        let mut proxy =
+            PresenceProxy::new(self.presences.get(&actor_id).cloned().unwrap_or_default());
+        for history_op in entry {
+            let mut operation = match history_op {
+                HistoryOperation::Presence(values) => {
+                    proxy.restore(values);
+                    continue;
+                }
+                HistoryOperation::Operation(operation) => *operation,
+            };
+
+            let ticket = context.issue_time_ticket();
+            operation.set_executed_at(ticket.clone());
+            // An array set and an add that brings a removed element back both
+            // put the element under a new creation time, and the rest of the
+            // history may still name the old one.
+            match &mut operation {
+                Operation::ArraySet(operation) => {
+                    let prev = operation.created_at().clone();
+                    operation.value_mut().set_created_at(ticket.clone());
+                    self.history.reconcile_created_at(&prev, &ticket);
+                }
+                Operation::Add(operation) => {
+                    let prev = operation.value().created_at().clone();
+                    operation.value_mut().set_created_at(ticket.clone());
+                    self.history.reconcile_created_at(&prev, &ticket);
+                }
+                _ => {}
+            }
+            context.push(operation);
+        }
+
+        let (presence_change, reverse_presence) = proxy.into_parts();
+        context.set_presence_change(presence_change);
+        let mut change = context.to_change();
+        change.mark_as_undo_redo();
+        let prev = self.presence_state(&actor_id, self.status == DocStatus::Attached);
+        let executed = change.execute_undo_redo(&mut self.crdt_root)?;
+        change.apply_presence_change(&mut self.presences);
+
+        let entry = HistoryOperation::entry(executed.reverse_ops, reverse_presence);
+        if !entry.is_empty() {
+            if is_undo {
+                self.history.push_redo(entry);
+            } else {
+                self.history.push_undo(entry);
+            }
+        }
+
+        // As in JS, an undo whose operations all skipped (their target was
+        // removed meanwhile) and that restores no presence is not sent.
+        if change.presence_change().is_none() && executed.operations.is_empty() {
+            return Ok(());
+        }
+
+        let change_event = (!executed.operations.is_empty())
+            .then(|| DocEvent::LocalChange(change_info(&change, executed.op_infos)));
+        let presence_event = change
+            .presence_change()
+            .and_then(|_| self.reconcile_presence(&actor_id, prev));
+
+        self.local_changes.push(change);
+        self.change_id = context.next_id();
+        self.root = crdt_object_to_json_object(self.crdt_root.object())?;
+        for event in change_event.into_iter().chain(presence_event) {
+            self.publish(event);
+        }
+        Ok(())
+    }
+
+    /// Returns the undo stack (JS `getUndoStackForTest`).
+    #[cfg(test)]
+    pub(crate) fn undo_stack_for_test(&self) -> &[Vec<HistoryOperation>] {
+        self.history.undo_stack()
+    }
+
+    /// Returns the redo stack (JS `getRedoStackForTest`).
+    #[cfg(test)]
+    pub(crate) fn redo_stack_for_test(&self) -> &[Vec<HistoryOperation>] {
+        self.history.redo_stack()
     }
 
     /// Returns an immutable view of the document root.
@@ -480,9 +627,27 @@ impl Document {
             let prev = change
                 .presence_change()
                 .map(|_| self.presence_state(&actor_id, self.online_clients.contains(&actor_id)));
-            let executed = change.execute(&mut self.crdt_root, source)?;
+            // A replayed local change runs with the source it first ran with.
+            let execute_source = match source {
+                OpSource::Local => change.replay_source(),
+                source => source,
+            };
+            let executed = change.execute(&mut self.crdt_root, execute_source)?;
             change.apply_presence_change(&mut self.presences);
             self.change_id = self.change_id.sync_clocks(change.id());
+            // Undo text edits recorded before this change still name the
+            // positions they had then; move them past what this edit changed.
+            for operation in &executed.operations {
+                if let Operation::Edit(operation) = operation {
+                    let (from, to) = operation.normalize_pos(&self.crdt_root)?;
+                    self.history.reconcile_text_edit(
+                        operation.parent_created_at(),
+                        from,
+                        to,
+                        operation.content_len(),
+                    );
+                }
+            }
 
             if !executed.operations.is_empty() {
                 let info = change_info(change, executed.op_infos);
@@ -525,6 +690,10 @@ impl Document {
         self.remove_pushed_local_changes(pack.checkpoint().client_seq());
         let local_changes = self.local_changes.clone();
         self.apply_changes(&local_changes, OpSource::Local)?;
+        // The history names elements and positions of the root the snapshot
+        // replaced, as in JS `applySnapshot`.
+        self.history.clear_undo();
+        self.history.clear_redo();
         self.publish(DocEvent::Snapshot);
         Ok(())
     }
@@ -2263,6 +2432,32 @@ mod tests {
 
         assert_eq!(r#"{"uv":2}"#, target.to_sorted_json());
         assert_eq!(target.crdt_root.to_sorted_json(), target.to_sorted_json());
+        Ok(())
+    }
+
+    /// JS `applySnapshot` clears the history: it names elements and positions
+    /// of the root the snapshot replaced.
+    #[test]
+    fn clears_the_history_when_a_snapshot_replaces_the_root() -> Result<()> {
+        let mut doc = Document::new("test-doc");
+        doc.update(|root| root.set("a", 1).map(|_| ()))?;
+        doc.update(|root| root.set("a", 2).map(|_| ()))?;
+        doc.history_mut().undo()?;
+        assert!(doc.history().can_undo() && doc.history().can_redo());
+
+        let snapshot = ChangePack::create_with_snapshot_root(
+            "test-doc",
+            Checkpoint::new(7, 3),
+            false,
+            Vec::new(),
+            Some(doc.change_id.version_vector().clone()),
+            Some(vec![1]),
+            Some(doc.crdt_root.object().clone()),
+        );
+        doc.apply_change_pack(&snapshot)?;
+
+        assert!(!doc.history().can_undo());
+        assert!(!doc.history().can_redo());
         Ok(())
     }
 

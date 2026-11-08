@@ -94,8 +94,16 @@ impl ArraySetOperation {
         &self.created_at
     }
 
+    pub(crate) fn set_created_at(&mut self, created_at: TimeTicket) {
+        self.created_at = created_at;
+    }
+
     pub(crate) fn value(&self) -> &CrdtElement {
         &self.value
+    }
+
+    pub(crate) fn value_mut(&mut self) -> &mut CrdtElement {
+        &mut self.value
     }
 
     pub(crate) fn to_test_string(&self) -> String {
