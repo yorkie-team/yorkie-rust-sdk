@@ -7,7 +7,7 @@ use crate::crdt::element::CrdtElement;
 use crate::crdt::object::CrdtObject;
 use crate::crdt::primitive::{CrdtPrimitive, PrimitiveValue};
 use crate::crdt::rga_tree_split::RgaTreeSplitPosRange;
-use crate::crdt::root::CrdtRoot;
+use crate::crdt::root::{CrdtRoot, DocSize};
 use crate::crdt::text::CrdtText;
 use crate::crdt::tree::{CrdtTree, TreePos};
 use crate::event::{ChangeInfo, DocEvent, OperationInfo, Subscribers, SubscriptionId};
@@ -19,6 +19,7 @@ use crate::operation::{
     TreeStyleOperation,
 };
 use crate::presence::{Presence, PresenceChange, PresenceProxy};
+use crate::schema::validate_yorkie_ruleset;
 use crate::{
     ActorId, JsonArray, JsonObject, JsonValue, Result, SchemaRule, TimeTicket, YorkieError,
     INITIAL_ACTOR_ID,
@@ -190,7 +191,9 @@ impl Document {
             let actor_id = self.change_id.actor_id().clone();
             let prev = self.presence_state(&actor_id, self.status == DocStatus::Attached);
             let (staged, executed) = self.stage(&mut change, |change, root| {
-                change.execute(root, OpSource::Local)
+                let executed = change.execute(root, OpSource::Local)?;
+                self.validate_local_change(root)?;
+                Ok(executed)
             })?;
 
             // Nothing below fails: the change is committed from here on.
@@ -240,11 +243,13 @@ impl Document {
     /// returns the copy, with its public JSON view, for `commit_staged`.
     ///
     /// JS runs a local change on its clone root first and drops the clone if
-    /// that fails, so the root never holds part of a change. Here the copy
-    /// plays the clone's part: a change that fails partway is dropped with
-    /// it, and this document is left as it was. Nothing reached the root, so
-    /// unlike a failure of the JS root pass there are no issued tickets to
-    /// burn: the change ID is not advanced, and the next change reuses it.
+    /// that fails or validation rejects it, so the root never holds part of
+    /// a change. Here the copy plays the clone's part: a change that fails
+    /// partway, or that `execute` rejects after running it, is dropped with
+    /// the copy, and this document is left as it was. Nothing reached the
+    /// root, so unlike a failure of the JS root pass there are no issued
+    /// tickets to burn: the change ID is not advanced, and the next change
+    /// reuses it.
     ///
     /// A change without operations touches no CRDT element and is run
     /// without a copy.
@@ -261,6 +266,32 @@ impl Document {
         let executed = execute(change, &mut crdt_root)?;
         let root = crdt_object_to_json_object(crdt_root.object())?;
         Ok((Some(StagedRoot { crdt_root, root }), executed))
+    }
+
+    /// Checks a root a local change ran on against this document's schema
+    /// rules and then its maximum size, as JS `update` checks its clone
+    /// root before committing the change.
+    ///
+    /// Only local updates are checked, as in JS: a remote change and an undo
+    /// or redo are applied even when they break a rule or the limit.
+    fn validate_local_change(&self, root: &CrdtRoot) -> Result<()> {
+        if !self.schema_rules.is_empty() {
+            let errors = validate_yorkie_ruleset(root.object(), &self.schema_rules)?;
+            if !errors.is_empty() {
+                return Err(YorkieError::SchemaValidationFailed(
+                    errors.into_iter().map(|error| error.message).collect(),
+                ));
+            }
+        }
+
+        let size = root.doc_size().total();
+        if self.max_size_per_document > 0 && self.max_size_per_document < size {
+            return Err(YorkieError::DocumentSizeExceedsLimit {
+                size,
+                limit: self.max_size_per_document,
+            });
+        }
+        Ok(())
     }
 
     /// Replaces the root with one `stage` produced.
@@ -432,12 +463,19 @@ impl Document {
         !self.local_changes.is_empty()
     }
 
+    /// Returns the size of this document (JS `getDocSize`).
+    pub fn doc_size(&self) -> DocSize {
+        self.crdt_root.doc_size()
+    }
+
     /// Returns the maximum size limit of this document in bytes.
     pub fn max_size_per_document(&self) -> usize {
         self.max_size_per_document
     }
 
-    /// Sets the maximum size limit of this document in bytes.
+    /// Sets the maximum size limit of this document in bytes. A local update
+    /// that leaves the document larger fails with
+    /// `YorkieError::DocumentSizeExceedsLimit`; zero means no limit.
     pub fn set_max_size_per_document(&mut self, size: usize) {
         self.max_size_per_document = size;
     }
@@ -447,7 +485,9 @@ impl Document {
         &self.schema_rules
     }
 
-    /// Sets the schema rules associated with this document.
+    /// Sets the schema rules associated with this document. A local update
+    /// that leaves the document breaking them fails with
+    /// `YorkieError::SchemaValidationFailed`.
     pub fn set_schema_rules(&mut self, rules: Vec<SchemaRule>) {
         self.schema_rules = rules;
     }

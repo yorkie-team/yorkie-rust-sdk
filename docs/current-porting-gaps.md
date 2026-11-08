@@ -1004,7 +1004,10 @@ Current Rust behavior:
   `application/connect+proto` envelopes, end-stream errors decoded into
   `ClientError::Rpc`).
 - `Document` stores max-size and schema-rule metadata received during attach,
-  but update-time max-size/schema validation is not implemented yet.
+  and `Document::update` checks each local change against them before
+  committing it, as JS `update` does: schema rules first, then the size. A
+  rejected change leaves the document untouched. Remote changes and undo/redo
+  are not checked, as in JS.
 
 JS/Go behavior:
 
@@ -1028,8 +1031,13 @@ Gap:
   task queue keeps the sync loop from running during a detach instead.
 - A push-only or sync-off reply that carries changes is skipped whole; JS
   still takes the push acknowledgement (`acknowledgePushedChanges`).
-- Schema rules and max-size limits are stored after attach but are not enforced
-  during `Document::update` yet.
+- Integration tests set schema rules and the size limit with
+  `Document::set_schema_rules` and `set_max_size_per_document` after
+  attaching. JS creates them through the admin API (`CreateSchema`,
+  `UpdateProject`) and attaches with a schema key; those cases, and the
+  `UpdateDocument` schema cases, are not ported.
+- When a tree text node carries several disallowed marks, the schema error
+  names the first by key; JS names the first set.
 - `DeactivateOptions::keepalive`, `disableGC`, auth token refresh,
   gRPC-web/Connect transport choice, Go TLS options, and Go receive-size/logger
   options are not modeled yet.
@@ -1054,6 +1062,9 @@ JS/Go behavior:
 Gap:
 
 - Rust error variants and messages are not yet aligned with JS error codes.
+  `SchemaValidationFailed` and `DocumentSizeExceedsLimit` carry the JS
+  messages and name their JS codes in their docs, but `YorkieError` has no
+  code accessor.
 - Some temporary errors use generic `MissingCrdtElement` or
   `UnexpectedCrdtElement` where JS/Go may report more specific cases.
 

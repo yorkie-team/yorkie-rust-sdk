@@ -6,10 +6,20 @@ use super::text::CrdtText;
 use super::tree::CrdtTree;
 use crate::{TimeTicket, TIME_TICKET_SIZE};
 
+/// The size of a resource in bytes (JS `DataSize`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct DataSize {
-    pub(crate) data: usize,
-    pub(crate) meta: usize,
+pub struct DataSize {
+    /// The size of the data itself.
+    pub data: usize,
+    /// The size of the metadata, such as time tickets.
+    pub meta: usize,
+}
+
+impl DataSize {
+    /// Returns `data + meta` (JS `totalDataSize`).
+    pub fn total(&self) -> usize {
+        self.data + self.meta
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

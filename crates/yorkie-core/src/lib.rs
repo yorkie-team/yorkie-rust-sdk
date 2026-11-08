@@ -22,6 +22,8 @@ pub use change::{
     MAX_CHECKPOINT, MAX_CLIENT_SEQ, MAX_SERVER_SEQ,
 };
 pub use crdt::counter::{CounterType, CounterValue};
+pub use crdt::element::DataSize;
+pub use crdt::root::DocSize;
 pub use document::{DocStatus, Document};
 pub use error::{Result, YorkieError};
 pub use event::{

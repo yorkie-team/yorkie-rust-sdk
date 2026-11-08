@@ -52,9 +52,11 @@ impl ClientTransport for FacadeTransport {
             document_id: "document-id".to_owned(),
             change_pack: request.change_pack,
             max_size_per_document: 1024,
+            // Updates are checked against these rules: the test sets a
+            // string title. Tree node rules apply to `yorkie.Tree` rules only.
             schema_rules: vec![SchemaRule::new(
-                "$.profile",
-                "object",
+                "$.title",
+                "string",
                 vec![TreeNodeRule::new("paragraph", "text*", "bold", "block")],
             )],
         })

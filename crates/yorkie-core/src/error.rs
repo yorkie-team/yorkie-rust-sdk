@@ -66,6 +66,15 @@ pub enum YorkieError {
 
     /// The requested feature is not implemented yet (JS `ErrUnimplemented`).
     Unimplemented(String),
+
+    /// A local update leaves the document violating its schema rules (JS
+    /// code `ErrDocumentSchemaValidationFailed`). Holds one message per
+    /// violation.
+    SchemaValidationFailed(Vec<String>),
+
+    /// A local update makes the document larger than its maximum size (JS
+    /// code `ErrDocumentSizeExceedsLimit`). Sizes are in bytes.
+    DocumentSizeExceedsLimit { size: usize, limit: usize },
 }
 
 /// Convenient result alias for Yorkie core operations.
@@ -112,6 +121,12 @@ impl Display for YorkieError {
             Self::NotInitialized(message) => write!(f, "not initialized: {message}"),
             Self::InvalidArgument(message) => write!(f, "invalid argument: {message}"),
             Self::Unimplemented(message) => write!(f, "unimplemented: {message}"),
+            Self::SchemaValidationFailed(errors) => {
+                write!(f, "schema validation failed: {}", errors.join(", "))
+            }
+            Self::DocumentSizeExceedsLimit { size, limit } => {
+                write!(f, "document size exceeded: {size} > {limit}")
+            }
         }
     }
 }

@@ -11,10 +11,10 @@ pub use yorkie_client::{
     WatchDocumentRequest, WatchDocumentResponse, WatchStream,
 };
 pub use yorkie_core::{
-    ActorId, ChangePack, Checkpoint, CounterType, CounterValue, DocEvent, DocStatus, DocSyncStatus,
-    Document, HistoryMut, HistoryRef, JsonArray, JsonCounter, JsonObject, JsonText, JsonTree,
-    JsonValue, OperationInfo, Presence, PresenceProxy, Result, SchemaRule, StreamConnectionStatus,
-    TextChunk, TimeTicket, TimeTicketStruct, TreeNodeInput, TreeNodeRule, TreeStyleOpValue,
-    VersionVector, YorkieError,
+    ActorId, ChangePack, Checkpoint, CounterType, CounterValue, DataSize, DocEvent, DocSize,
+    DocStatus, DocSyncStatus, Document, HistoryMut, HistoryRef, JsonArray, JsonCounter, JsonObject,
+    JsonText, JsonTree, JsonValue, OperationInfo, Presence, PresenceProxy, Result, SchemaRule,
+    StreamConnectionStatus, TextChunk, TimeTicket, TimeTicketStruct, TreeNodeInput, TreeNodeRule,
+    TreeStyleOpValue, VersionVector, YorkieError,
 };
 pub use yorkie_protocol::YORKIE_PROTO_PACKAGE;

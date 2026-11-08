@@ -45,10 +45,21 @@ impl CrdtGcPair {
     }
 }
 
+/// The size of a document in bytes (JS `DocSize`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct DocSize {
-    pub(crate) live: DataSize,
-    pub(crate) gc: DataSize,
+pub struct DocSize {
+    /// The size of the elements and nodes still in the document.
+    pub live: DataSize,
+    /// The size of the removed ones waiting for garbage collection.
+    pub gc: DataSize,
+}
+
+impl DocSize {
+    /// Returns the live and garbage sizes added up, the size a document's
+    /// maximum size is checked against (JS `totalDocSize`).
+    pub fn total(&self) -> usize {
+        self.live.total() + self.gc.total()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
