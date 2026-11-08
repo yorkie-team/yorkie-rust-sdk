@@ -1146,12 +1146,17 @@ impl CrdtTree {
             } else {
                 from_left_path.last().map_or(0, |index| index + 1)
             };
+            let intended = self.intended_merge_parent(&range.0, &from_parent)?;
             let parent = node_at_path_mut(&mut self.root, &from_parent_path)?;
             // Content inserted into a parent removed concurrently is born
             // removed: it never counts as live and shows in no change.
             let parent_removed = parent.is_removed();
             for (insert_index, mut content) in (first_index..).zip(contents) {
                 content.clear_removed_recursively();
+                if let Some((merged_from, merged_at)) = &intended {
+                    content.merged_from = Some(merged_from.clone());
+                    content.merged_at = merged_at.clone();
+                }
                 if parent_removed {
                     content.remove_recursively(edited_at.clone(), &mut gc_pairs, &mut Vec::new());
                 } else {
@@ -1336,6 +1341,39 @@ impl CrdtTree {
         }
 
         Ok((real_parent_path, left_path))
+    }
+
+    /// Returns the parent an insert at `from` was declared in when a merge
+    /// removed it and the content lands in its merge target `parent`
+    /// instead, with the merge ticket (JS `CRDTTree.edit` step 05, §9.4).
+    /// The content is stamped as merged from that parent, so it stays apart
+    /// from nodes that were never inside it. The ticket comes from a sibling
+    /// the merge moved: the parent's own removal may have been overwritten
+    /// by a later deletion.
+    fn intended_merge_parent(
+        &self,
+        from: &TreePos,
+        parent: &TreeNodeId,
+    ) -> Result<Option<(TreeNodeId, Option<TimeTicket>)>> {
+        let Some(declared) = self.floor_id(from.parent_id()) else {
+            return Ok(None);
+        };
+        let declared_node = self.node(&declared)?;
+        if &declared == parent
+            || !declared_node.is_removed()
+            || declared_node.merged_into().is_none()
+            || &self.resolve_merge_target(&declared)? != parent
+        {
+            return Ok(None);
+        }
+
+        let merged_at = self
+            .node(parent)?
+            .all_children()
+            .find(|child| child.merged_from() == Some(&declared) && child.merged_at().is_some())
+            .and_then(|child| child.merged_at().cloned())
+            .or_else(|| declared_node.removed_at().cloned());
+        Ok(Some((declared, merged_at)))
     }
 
     /// Returns and clears the GC pairs buffered by text splits (JS
@@ -4365,6 +4403,42 @@ mod tests {
         };
         assert_eq!(3, index_of(false)?);
         assert_eq!(6, index_of(true)?);
+        Ok(())
+    }
+
+    /// JS "stamps an insert declared inside a merged-away parent" (§9.4):
+    /// content declared in a paragraph a merge removed lands in the merge
+    /// target, stamped as merged from the paragraph with the merge ticket of
+    /// a moved sibling, not the later removal of the paragraph.
+    #[test]
+    fn stamps_an_insert_declared_inside_a_merged_away_parent() -> crate::Result<()> {
+        let mut tree = paragraphs(&["ab", "cd"]);
+        let pos = tree.find_pos(5, true)?;
+        let declared_parent = node_id(4, 0);
+        let merge_ticket = ticket(10, "a");
+        let range = (tree.find_pos(3, true)?, tree.find_pos(5, true)?);
+        tree.edit_by_range_with_changes(range, None, 0, merge_ticket.clone(), None)?;
+        tree.node_mut(&declared_parent)?.remove(ticket(11, "a"));
+
+        let content = TreeNodeId::new(ticket(12, "a"), 0);
+        tree.edit_by_range_with_changes(
+            (pos.clone(), pos),
+            Some(vec![TreeNode::create_element(
+                content.clone(),
+                "b",
+                None,
+                Vec::new(),
+            )]),
+            0,
+            ticket(12, "a"),
+            None,
+        )?;
+
+        assert_eq!("<root><p>ab<b></b>cd</p></root>", tree.to_xml());
+        assert_eq!(Some(node_id(2, 0)), tree.parent_id(&content));
+        let inserted = tree.node(&content)?;
+        assert_eq!(Some(&declared_parent), inserted.merged_from());
+        assert_eq!(Some(&merge_ticket), inserted.merged_at());
         Ok(())
     }
 
