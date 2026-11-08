@@ -27,7 +27,9 @@ pub use event::{
     ChangeInfo, DocEvent, DocSyncStatus, EditOpValue, OperationInfo, StreamConnectionStatus,
     StyleOpValue, SubscriptionId, TreeStyleOpValue,
 };
-pub use json::{JsonArray, JsonArrayElement, JsonCounter, JsonObject, JsonValue};
+pub use json::{
+    JsonArray, JsonArrayElement, JsonCounter, JsonObject, JsonText, JsonValue, TextChunk,
+};
 pub use presence::{Presence, PresenceChange, PresenceProxy};
 pub use schema::{SchemaRule, TreeNodeRule};
 pub use time::{

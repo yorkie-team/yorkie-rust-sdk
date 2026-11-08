@@ -118,9 +118,36 @@ impl RgaTreeSplitPos {
 
 pub(crate) type RgaTreeSplitPosRange = (RgaTreeSplitPos, RgaTreeSplitPos);
 
-/// Result of `RgaTreeSplit::edit`: the caret position, the removed nodes, the
-/// data size diff and the removed values.
-type SplitEditResult<V> = (RgaTreeSplitPos, Vec<RgaTreeSplitNode<V>>, DataSize, Vec<V>);
+/// A change to the visible values made by `RgaTreeSplit::edit` (JS
+/// `ValueChange`): the indexes `from..to` before the change were replaced by
+/// `value`, or removed when `value` is `None`. JS also carries the editing
+/// actor; no caller here reads it, so it is left out.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ValueChange<V> {
+    pub(crate) from: usize,
+    pub(crate) to: usize,
+    pub(crate) value: Option<V>,
+}
+
+/// Result of `RgaTreeSplit::delete_nodes`: the value changes and the nodes
+/// it tombstoned.
+type DeleteResult<V> = (Vec<ValueChange<V>>, Vec<RgaTreeSplitNode<V>>);
+
+/// Result of `RgaTreeSplit::edit`.
+#[derive(Debug, Clone)]
+pub(crate) struct SplitEditResult<V>
+where
+    V: RgaTreeSplitValue,
+{
+    /// Where the caret sits after the edit.
+    pub(crate) caret_pos: RgaTreeSplitPos,
+    /// Nodes this edit tombstoned.
+    pub(crate) removed_nodes: Vec<RgaTreeSplitNode<V>>,
+    pub(crate) diff: DataSize,
+    /// One change per affected range, in the order JS reports them.
+    pub(crate) changes: Vec<ValueChange<V>>,
+    pub(crate) removed_values: Vec<V>,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RgaTreeSplitNode<V>
@@ -421,7 +448,8 @@ where
         add_data_size(&mut diff, diff_from);
 
         let nodes_to_delete = self.find_between(from_right, to_right);
-        let removed_nodes = self.delete_nodes(nodes_to_delete, edited_at.clone(), version_vector);
+        let (mut changes, removed_nodes) =
+            self.delete_nodes(nodes_to_delete, edited_at.clone(), version_vector)?;
 
         let caret_id = to_right
             .and_then(|index| self.nodes.get(index))
@@ -430,6 +458,16 @@ where
         let mut caret_pos = RgaTreeSplitPos::new(caret_id, 0);
 
         if let Some(value) = value.filter(|value| value.len() > 0) {
+            let index = self.pos_to_index(&self.nodes[from_left].create_pos_range().1, true)?;
+            match changes.last_mut() {
+                Some(last) if last.from == index => last.value = Some(value.clone()),
+                _ => changes.push(ValueChange {
+                    from: index,
+                    to: index,
+                    value: Some(value.clone()),
+                }),
+            }
+
             let inserted = self.insert_after_index(
                 from_left,
                 RgaTreeSplitNode::new(RgaTreeSplitNodeId::new(edited_at, 0), value),
@@ -446,7 +484,13 @@ where
             .map(|node| node.value().clone())
             .collect::<Vec<_>>();
 
-        Ok((caret_pos, removed_nodes, diff, removed_values))
+        Ok(SplitEditResult {
+            caret_pos,
+            removed_nodes,
+            diff,
+            changes,
+            removed_values,
+        })
     }
 
     pub(crate) fn find_node_with_split(
@@ -524,6 +568,11 @@ where
         let inserted_id = node.id().clone();
         self.insert_after_index(prev_index, node);
         Ok(inserted_id)
+    }
+
+    /// Returns the node holding `id` (JS `findNode`).
+    pub(crate) fn find_node(&self, id: &RgaTreeSplitNodeId) -> Option<&RgaTreeSplitNode<V>> {
+        self.find_floor_node(id).map(|index| &self.nodes[index])
     }
 
     pub(crate) fn find_node_mut_by_id(
@@ -737,47 +786,89 @@ where
         insert_index
     }
 
+    /// Tombstones the removable `candidates` and returns the value changes
+    /// (JS `deleteNodes`). The changes are computed from the indexes before
+    /// the deletion, one per run of removed nodes between the kept ones.
     fn delete_nodes(
         &mut self,
         candidates: Vec<usize>,
         edited_at: TimeTicket,
         vector: Option<&VersionVector>,
-    ) -> Vec<RgaTreeSplitNode<V>> {
+    ) -> Result<DeleteResult<V>> {
+        let (Some(&first), Some(&last)) = (candidates.first(), candidates.last()) else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+
         let is_local = vector.map(VersionVector::is_empty).unwrap_or(true);
-        let mut removed_nodes = Vec::new();
+        let known = |ticket: &TimeTicket| {
+            is_local
+                || vector
+                    .and_then(|vector| vector.get(ticket.actor_id().as_str()))
+                    .is_some_and(|lamport| lamport >= ticket.lamport())
+        };
 
+        // 01. Split the candidates into the nodes to remove and the nodes to
+        // keep. The edges outside the candidates are kept; `None` on the
+        // right means the candidates reach the end of the text.
+        let mut nodes_to_remove = Vec::new();
+        let mut nodes_to_keep = vec![Some(first - 1)];
         for index in candidates {
-            let creation_known = if is_local {
-                true
-            } else {
-                vector
-                    .and_then(|vector| {
-                        vector.get(self.nodes[index].created_at().actor_id().as_str())
-                    })
-                    .map(|lamport| lamport >= self.nodes[index].created_at().lamport())
-                    .unwrap_or(false)
-            };
+            let node = &self.nodes[index];
+            let creation_known = known(node.created_at());
+            let tombstone_known = node.removed_at().is_some_and(known);
+            nodes_to_remove.push((index, creation_known, tombstone_known));
+            // `RgaTreeSplitNode::remove` tombstones exactly these nodes.
+            if !(creation_known && !node.is_removed()) {
+                nodes_to_keep.push(Some(index));
+            }
+        }
+        nodes_to_keep.push(self.next_index(last));
 
-            let tombstone_known = if let Some(removed_at) = self.nodes[index].removed_at() {
-                if is_local {
-                    true
-                } else {
-                    vector
-                        .and_then(|vector| vector.get(removed_at.actor_id().as_str()))
-                        .map(|lamport| lamport >= removed_at.lamport())
-                        .unwrap_or(false)
-                }
-            } else {
-                false
-            };
+        // 02. Make the value changes with the indexes before the deletion.
+        let changes = self.make_changes(&nodes_to_keep)?;
 
+        // 03. Mark the tombstones.
+        let mut removed_nodes = Vec::new();
+        for (index, creation_known, tombstone_known) in nodes_to_remove {
             if self.nodes[index].remove(edited_at.clone(), creation_known, tombstone_known) {
                 removed_nodes.push(self.nodes[index].clone());
             }
         }
 
         self.rebuild_indexes();
-        removed_nodes
+        Ok((changes, removed_nodes))
+    }
+
+    /// Returns one change for each run of nodes between two kept boundaries,
+    /// last run first (JS `makeChanges`).
+    fn make_changes(&self, boundaries: &[Option<usize>]) -> Result<Vec<ValueChange<V>>> {
+        let mut changes = Vec::new();
+        for pair in boundaries.windows(2) {
+            let left = pair[0].expect("only the right edge can be missing");
+            let right = pair[1];
+            if self.next_index(left) == right {
+                continue;
+            }
+
+            let from = self.pos_to_index(&self.nodes[left + 1].create_pos_range().0, false)?;
+            let to = match right {
+                Some(right) => {
+                    self.pos_to_index(&self.nodes[right - 1].create_pos_range().1, true)?
+                }
+                None => self.len(),
+            };
+
+            if from < to {
+                changes.push(ValueChange {
+                    from,
+                    to,
+                    value: None,
+                });
+            }
+        }
+
+        changes.reverse();
+        Ok(changes)
     }
 
     fn next_index(&self, index: usize) -> Option<usize> {

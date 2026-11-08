@@ -1,9 +1,14 @@
+mod text;
+
 use crate::crdt::counter::{CounterType, CounterValue, CrdtCounter};
 use crate::crdt::primitive::{CrdtPrimitive, PrimitiveValue};
+use crate::crdt::rga_tree_split::RgaTreeSplitPosRange;
 use crate::{Result, TimeTicket, YorkieError};
 use std::collections::BTreeMap;
 use std::fmt::{self, Write};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+pub use text::{JsonText, TextChunk};
 
 pub(crate) type JsonEditRecorderRef = Arc<Mutex<dyn JsonEditRecorder + Send>>;
 
@@ -61,6 +66,27 @@ pub(crate) trait JsonEditRecorder {
         value: CounterValue,
         actor: Option<&str>,
     ) -> Result<()>;
+
+    /// Issues the ticket for a text edit or style, which the text applies
+    /// locally before recording it.
+    fn issue_time_ticket(&mut self) -> TimeTicket;
+
+    fn record_text_edit(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        range: RgaTreeSplitPosRange,
+        content: &str,
+        attributes: BTreeMap<String, String>,
+        executed_at: TimeTicket,
+    );
+
+    fn record_text_style(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        range: RgaTreeSplitPosRange,
+        attributes: BTreeMap<String, String>,
+        executed_at: TimeTicket,
+    );
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -94,6 +120,7 @@ pub enum JsonValue {
     Double(f64),
     String(String),
     Counter(JsonCounter),
+    Text(JsonText),
     Object(JsonObject),
     Array(JsonArray),
 }
@@ -133,6 +160,7 @@ impl JsonValue {
             Self::Double(_) => "null".to_owned(),
             Self::String(value) => format!("\"{}\"", escape_json_string(value)),
             Self::Counter(value) => value.to_sorted_json(),
+            Self::Text(value) => value.to_sorted_json(),
             Self::Object(value) => value.to_sorted_json(),
             Self::Array(value) => value.to_sorted_json(),
         }
@@ -438,6 +466,17 @@ impl JsonObject {
         }
     }
 
+    pub fn get_text_mut(&mut self, key: &str) -> Result<&mut JsonText> {
+        match self.members.get_mut(key) {
+            Some(JsonValue::Text(value)) => Ok(value),
+            Some(_) => Err(YorkieError::UnexpectedType {
+                key: key.to_owned(),
+                expected: "text",
+            }),
+            None => Err(YorkieError::MissingKey(key.to_owned())),
+        }
+    }
+
     pub fn get_object_mut(&mut self, key: &str) -> Result<&mut JsonObject> {
         match self.members.get_mut(key) {
             Some(JsonValue::Object(value)) => Ok(value),
@@ -469,6 +508,14 @@ impl JsonObject {
         let key = key.into();
         self.set(key.clone(), JsonCounter::dedup())?;
         self.get_counter_mut(&key)
+    }
+
+    /// Sets a new empty text at `key` and returns it for editing (JS
+    /// `root[key] = new Text()`).
+    pub fn set_text(&mut self, key: impl Into<String>) -> Result<&mut JsonText> {
+        let key = key.into();
+        self.set(key.clone(), JsonText::new())?;
+        self.get_text_mut(&key)
     }
 
     pub fn to_sorted_json(&self) -> String {
@@ -557,6 +604,13 @@ impl JsonArray {
     pub fn push_dedup_counter(&mut self) -> Result<&mut JsonCounter> {
         self.push(JsonCounter::dedup())?;
         self.get_counter_mut(self.elements.len() - 1)
+    }
+
+    /// Appends a new empty text and returns it for editing (JS
+    /// `array.push(new Text())`).
+    pub fn push_text(&mut self) -> Result<&mut JsonText> {
+        self.push(JsonText::new())?;
+        self.get_text_mut(self.elements.len() - 1)
     }
 
     pub fn len(&self) -> usize {
@@ -918,6 +972,20 @@ impl JsonArray {
         }
     }
 
+    pub fn get_text_mut(&mut self, index: usize) -> Result<&mut JsonText> {
+        let len = self.elements.len();
+        match self.elements.get_mut(index) {
+            Some(JsonValue::Text(value)) => Ok(value),
+            Some(_) => Err(YorkieError::UnexpectedType {
+                key: index.to_string(),
+                expected: "text",
+            }),
+            None => Err(YorkieError::InvalidIndex(format!(
+                "array index {index} out of bounds for length {len}"
+            ))),
+        }
+    }
+
     pub fn get_object_mut(&mut self, index: usize) -> Result<&mut JsonObject> {
         let len = self.elements.len();
         match self.elements.get_mut(index) {
@@ -1051,6 +1119,7 @@ impl JsonValue {
     pub(crate) fn attach_recorder(&mut self, recorder: JsonEditRecorderRef) {
         match self {
             Self::Counter(value) => value.attach_recorder(recorder),
+            Self::Text(value) => value.attach_recorder(recorder),
             Self::Object(value) => value.attach_recorder(recorder),
             Self::Array(value) => value.attach_recorder(recorder),
             Self::Null
@@ -1065,6 +1134,7 @@ impl JsonValue {
     fn detach_recorder(&mut self) {
         match self {
             Self::Counter(value) => value.detach_recorder(),
+            Self::Text(value) => value.detach_recorder(),
             Self::Object(value) => value.detach_recorder(),
             Self::Array(value) => value.detach_recorder(),
             Self::Null
@@ -1202,6 +1272,12 @@ impl From<JsonArray> for JsonValue {
 impl From<JsonCounter> for JsonValue {
     fn from(value: JsonCounter) -> Self {
         Self::Counter(value)
+    }
+}
+
+impl From<JsonText> for JsonValue {
+    fn from(value: JsonText) -> Self {
+        Self::Text(value)
     }
 }
 

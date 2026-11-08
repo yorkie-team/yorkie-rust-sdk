@@ -96,23 +96,29 @@ Expected direction:
 Current Rust behavior:
 
 - `JsonObject` supports `set`, `get`, `get_mut`, `remove`,
-  `get_object_mut`, `get_array_mut`, `get_counter_mut`, `set_counter`,
-  `set_long_counter`, and `set_dedup_counter`.
+  `get_object_mut`, `get_array_mut`, `get_counter_mut`, `get_text_mut`,
+  `set_counter`, `set_long_counter`, `set_dedup_counter`, and `set_text`.
 - `JsonArray` supports `push`, index `get`/`get_mut`, `set`/`set_value`,
   `insert`, `insert_after_index`, `insert_integer_after`, `remove`/`delete`,
   element-ID lookup, `get_by_id`, `get_mut_by_id`, `get_element_by_index`,
   `get_element_by_id`, `get_last`, `insert_after`, `insert_before`,
   `delete_by_id`, `move_after`, `move_before`, `move_front`, `move_last`,
   `move_after_by_index`, `splice`, nested `get_object_mut`/`get_array_mut`,
-  `get_counter_mut`, `push_counter`, `push_long_counter`,
-  `push_dedup_counter`, value search, ID search, `len`, `is_empty`, `iter`,
-  and `as_slice`.
+  `get_counter_mut`, `get_text_mut`, `push_counter`, `push_long_counter`,
+  `push_dedup_counter`, `push_text`, value search, ID search, `len`,
+  `is_empty`, `iter`, and `as_slice`.
   Mutation methods can return errors because they may create CRDT operations
   during `Document::update`.
-- `JsonValue` is a simple enum wrapper around primitive, counter, object, and
-  array values.
-- During `Document::update`, public object, array, and counter values are
-  temporarily attached to a recorder and hidden CRDT identity metadata.
+- `JsonValue` is a simple enum wrapper around primitive, counter, text,
+  object, and array values.
+- `JsonText` (JS `Text`) supports `edit`, `delete`, `empty`, `set_style`,
+  `to_string`, `len`, `is_empty`, `values`, `id`, and `to_sorted_json`. It
+  holds a copy of the CRDT text, applies each edit to it with a ticket from the
+  update's change context, and records the matching `EditOperation` or
+  `StyleOperation`, so later edits in the same update see earlier ones, as in
+  JS.
+- During `Document::update`, public object, array, counter, and text values
+  are temporarily attached to a recorder and hidden CRDT identity metadata.
 
 JS/Go behavior:
 
@@ -125,7 +131,8 @@ JS/Go behavior:
 
 Gap:
 
-- Rust public object, array, and counter values are only partially CRDT-aware.
+- Rust public object, array, counter, and text values are only partially
+  CRDT-aware.
   The existing method calls record operations, but the values are still not
   stable live wrappers around CRDT elements.
 - Rust public arrays now expose element-ID access and lightweight
@@ -135,7 +142,12 @@ Gap:
 - Rust value-based array search uses `JsonValue` equality. For non-primitive
   containers, JS compares wrapped element identity; Rust callers should use the
   explicit ID search methods when identity matters.
-- Text and Tree do not have public context-backed facades yet.
+- Tree does not have a public context-backed facade yet.
+- `JsonText` does not port JS `indexRangeToPosRange`/`posRangeToIndexRange`
+  (`TextPosStruct`), `toTestString`, `toJSForTest`, `createRangeForTest`, or
+  the index/ID tree accessors.
+- Setting a `JsonText` that already has content creates an empty text, as JS
+  does for `root.k = new Text()`; there is no API to copy a text's content.
 
 Expected direction:
 
@@ -430,7 +442,17 @@ Current Rust behavior:
   helpers.
 - `CrdtText` is now a `CrdtElement` variant, participates in root path lookup,
   can be found through root text lookup helpers, and converts to public
-  `JsonValue::Array` for internal document-root materialization.
+  `JsonValue::Text` for document-root materialization.
+- The public `JsonText` facade edits through `ChangeContext` (see Public JSON
+  API). Local edits and styles reject an index inside a UTF-16 surrogate pair,
+  like JS `CRDTText.createRange`.
+- `RgaTreeSplit::edit` returns the JS value-change list: one change per run of
+  removed nodes between the kept ones, last run first, with the inserted value
+  on the change at the insertion index (JS `deleteNodes`/`makeChanges`).
+  `EditOperation` turns each change into one `OpInfo::Edit`, so edit events
+  match JS `EditOpInfo`s.
+- `CRDTTextValue.toJSON` attribute output follows JS: a stored value that
+  parses as JSON is re-encoded, and one that does not is emitted as a string.
 - `CrdtRoot` can rebuild GC pair indexes for removed text nodes and removed
   text attribute nodes when it is created from an existing CRDT tree.
 - Root garbage collection can physically purge removed text nodes and removed
@@ -464,28 +486,27 @@ Gap:
   mutations instead of using JS/Go-style linked nodes with stable per-node index
   handles. Read lookup now follows the same splay/ID-map route, but write-side
   index maintenance is still conservative.
-- Rust `CrdtText` is not yet exposed through a public Text facade. Wire
-  conversion exists for full `JSONElement.Text` snapshots and text
-  edit/style operation bodies, but replay coverage is still narrower than
-  JS/Go integration tests.
-- `StyleOperation` emits per-block style operation info from the text helper,
-  but `EditOperation` still emits a single requested range instead of the full
-  value-change list produced by JS `RGATreeSplit.edit`.
-- Text operation info is converted to the public `OperationInfo::{Edit,
-  Style}` shape, but `EditOperation` still reports one range per edit (see
-  above), so edit events are not yet the JS value-change list.
+- Integration tests cover concurrent insertion at one position, insertion
+  against deletion, overlapping deletions, style against insertion, and
+  overlapping styles (`crates/yorkie/tests/integration_text.rs`). The JS
+  Peritext cases ex4-ex9 and the LWW tombstone-ticket checks are not ported;
+  the latter read CRDT internals the public API does not expose.
+- JS `deleteNodes` keeps a node the deleter saw live but someone else removed
+  and records the deletion on it (`recordRemoval`, the removal ledger used by
+  identity-preserving undo). Rust keeps the earlier rule: a node is removed
+  when its creation is known and it is not yet tombstoned.
+- Re-encoded numeric attribute values can differ in form from JS:
+  `serde_json` writes the stored `1.0` as `1.0` where JS writes `1`.
 - Version-vector-aware edit/style conflict behavior is modeled at the internal
   helper level and is passed through `Change`, but it still needs broader
   multi-change replay coverage at the operation layer.
-- Rust strings cannot represent invalid standalone UTF-16 surrogate halves, so
-  splitting inside a surrogate pair currently uses lossy UTF-16 decoding. Exact
-  JS string parity for that edge case needs a deliberate representation choice.
+- Rust strings cannot represent invalid standalone UTF-16 surrogate halves.
+  Local edits refuse a mid-pair index, but a remote position inside a pair
+  (which only an SDK without that check can send) still splits the node with
+  lossy UTF-16 decoding, as Go does.
 
 Expected direction:
 
-- Connect public Text methods through `ChangeContext`.
-- Align edit operation info with the JS value-change list (Task 8 public
-  Text facade).
 - Continue porting JS history and multi-client text scenarios at the operation
   layer.
 - Replace rebuild-on-mutation indexing with stable node handles to align the

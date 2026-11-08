@@ -55,6 +55,10 @@ pub enum YorkieError {
 
     /// A core value does not have protocol conversion support yet.
     UnsupportedProtocolConversion(&'static str),
+
+    /// A JSON value was used before it belongs to a document update (JS
+    /// `ErrNotInitialized`).
+    NotInitialized(String),
 }
 
 /// Convenient result alias for Yorkie core operations.
@@ -98,6 +102,7 @@ impl Display for YorkieError {
             Self::UnsupportedProtocolConversion(value) => {
                 write!(f, "unsupported protocol conversion for {value}")
             }
+            Self::NotInitialized(message) => write!(f, "not initialized: {message}"),
         }
     }
 }

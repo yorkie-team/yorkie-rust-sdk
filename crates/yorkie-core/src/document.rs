@@ -4,13 +4,15 @@ use crate::crdt::counter::CounterValue;
 use crate::crdt::element::CrdtElement;
 use crate::crdt::object::CrdtObject;
 use crate::crdt::primitive::{CrdtPrimitive, PrimitiveValue};
+use crate::crdt::rga_tree_split::RgaTreeSplitPosRange;
 use crate::crdt::root::CrdtRoot;
+use crate::crdt::text::CrdtText;
 use crate::crdt::tree::{attribute_value_to_json_value, TreeNode};
 use crate::event::{ChangeInfo, DocEvent, OperationInfo, Subscribers, SubscriptionId};
 use crate::json::{counter_operand, JsonEditRecorder, JsonEditRecorderRef, RecordedJsonValue};
 use crate::operation::{
-    AddOperation, ArraySetOperation, IncreaseOperation, MoveOperation, OpSource, Operation,
-    RemoveOperation, SetOperation,
+    AddOperation, ArraySetOperation, EditOperation, IncreaseOperation, MoveOperation, OpSource,
+    Operation, RemoveOperation, SetOperation, StyleOperation,
 };
 use crate::presence::{Presence, PresenceChange, PresenceProxy};
 use crate::{
@@ -686,6 +688,44 @@ impl JsonEditRecorder for DocumentEditRecorder {
         self.context.push(Operation::Increase(operation));
         Ok(())
     }
+
+    fn issue_time_ticket(&mut self) -> TimeTicket {
+        self.context.issue_time_ticket()
+    }
+
+    fn record_text_edit(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        range: RgaTreeSplitPosRange,
+        content: &str,
+        attributes: BTreeMap<String, String>,
+        executed_at: TimeTicket,
+    ) {
+        self.context.push(Operation::Edit(EditOperation::create(
+            parent_created_at.clone(),
+            range.0,
+            range.1,
+            content,
+            attributes,
+            Some(executed_at),
+        )));
+    }
+
+    fn record_text_style(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        range: RgaTreeSplitPosRange,
+        attributes: BTreeMap<String, String>,
+        executed_at: TimeTicket,
+    ) {
+        self.context.push(Operation::Style(StyleOperation::create(
+            parent_created_at.clone(),
+            range.0,
+            range.1,
+            attributes,
+            Some(executed_at),
+        )));
+    }
 }
 
 fn collect_object_changes(
@@ -1016,6 +1056,8 @@ fn json_value_to_crdt_element(
         JsonValue::Double(value) => primitive(PrimitiveValue::Double(*value), created_at),
         JsonValue::String(value) => primitive(PrimitiveValue::String(value.clone()), created_at),
         JsonValue::Counter(value) => CrdtElement::counter(value.to_crdt_counter(created_at)),
+        // As in JS, setting a text always creates an empty one.
+        JsonValue::Text(_) => CrdtElement::text(CrdtText::create(created_at)),
         JsonValue::Object(value) => {
             let mut members = Vec::new();
             for (key, value) in value.iter() {
@@ -1092,7 +1134,7 @@ fn crdt_element_to_json_value(element: &CrdtElement) -> Result<JsonValue> {
             }
             JsonValue::Array(array)
         }
-        CrdtElement::Text(value) => JsonValue::Array(value.to_json_array()?),
+        CrdtElement::Text(value) => JsonValue::Text(crate::JsonText::from_crdt(value)),
         CrdtElement::Tree(value) => crdt_tree_node_to_json_value(value.root())?,
     };
 
@@ -1216,12 +1258,17 @@ mod tests {
     }
 
     #[test]
-    fn converts_crdt_text_to_public_json_array() -> Result<()> {
+    fn converts_crdt_text_to_public_json_text() -> Result<()> {
         let mut text = CrdtText::create(crate::TimeTicket::new(1, 0, "a"));
         text.edit_by_index(0, 0, "Hi", None, crate::TimeTicket::new(2, 0, "a"), None)?;
 
         let value = crdt_element_to_json_value(&CrdtElement::text(text))?;
 
+        let JsonValue::Text(text) = &value else {
+            panic!("expected text, got {value:?}");
+        };
+        assert_eq!(&crate::TimeTicket::new(1, 0, "a"), text.id());
+        assert_eq!("Hi", text.to_string());
         assert_eq!(r#"[{"val":"Hi"}]"#, value.to_sorted_json());
         Ok(())
     }

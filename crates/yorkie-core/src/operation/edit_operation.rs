@@ -64,7 +64,7 @@ impl EditOperation {
         let path = root.create_path(self.parent_created_at())?;
         let executed_at = self.executed_at()?.clone();
 
-        let (range, normalized_from, from_idx, to_idx) = {
+        let (range, normalized_from) = {
             let text = root
                 .text_by_created_at(self.parent_created_at())
                 .ok_or_else(|| self.text_parent_error(root))?;
@@ -80,13 +80,12 @@ impl EditOperation {
             };
             let range = (from_pos, to_pos);
             let normalized_from = text.normalize_pos(&range.0)?;
-            let (from_idx, to_idx) = text.find_indexes_from_range(&range)?;
 
-            (range, normalized_from, from_idx, to_idx)
+            (range, normalized_from)
         };
 
         let attributes = (!self.attributes.is_empty()).then_some(self.attributes.clone());
-        let (removed_nodes, diff, removed_values) = {
+        let result = {
             let Some(text) = root.text_by_created_at_mut(self.parent_created_at()) else {
                 return Err(self.text_parent_error(root));
             };
@@ -99,18 +98,32 @@ impl EditOperation {
             )?
         };
 
-        root.acc(diff);
-        register_removed_text_nodes(root, removed_nodes);
+        root.acc(result.diff);
+        register_removed_text_nodes(root, result.removed_nodes);
+
+        // As in JS, one op info per range the edit changed: a removal reports
+        // empty content, an insertion its value and attributes.
+        let op_infos = result
+            .changes
+            .into_iter()
+            .map(|change| {
+                let (content, attributes) = change
+                    .value
+                    .map(|value| (value.content().to_owned(), value.get_attributes()))
+                    .unwrap_or_default();
+                OpInfo::Edit {
+                    path: path.clone(),
+                    from: change.from,
+                    to: change.to,
+                    content,
+                    attributes,
+                }
+            })
+            .collect();
 
         Ok(Some(ExecutionResult {
-            op_infos: vec![OpInfo::Edit {
-                path,
-                from: from_idx,
-                to: to_idx,
-                content: self.content.clone(),
-                attributes: self.attributes.clone(),
-            }],
-            reverse_op: Some(self.to_reverse_operation(removed_values, normalized_from)),
+            op_infos,
+            reverse_op: Some(self.to_reverse_operation(result.removed_values, normalized_from)),
         }))
     }
 
