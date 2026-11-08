@@ -45,7 +45,8 @@ Current Rust behavior:
 
 - `Document::update` clones the public `JsonObject`, attaches an edit recorder
   to that clone, lets the callback mutate it, then executes the recorded
-  operations against `CrdtRoot` after the callback succeeds.
+  operations against a copy of `CrdtRoot` after the callback succeeds, and
+  replaces the root with the copy once every operation has run.
 - `Document` tracks `Detached`, `Attached`, and `Removed` status, exposes the
   current actor ID, applies actor assignment to pending local changes, and
   rejects edits after removal.
@@ -698,6 +699,13 @@ Current Rust behavior:
 - `Document::update` uses an update-time recorder backed by `ChangeContext` for
   current public object and array mutation methods.
 - `Change` executes operations and stacks reverse operations.
+- `Document::update` runs the change on a copy of the CRDT root and keeps the
+  copy only when every operation succeeds, as JS runs a change on its clone
+  root first. A change that fails partway leaves the document as it was:
+  JSON, CRDT root, pending changes, history, and change ID. Nothing reached
+  the root, so no lamport is burned; JS burns it only when its second pass,
+  on the root, fails after the clone pass succeeded, which cannot happen
+  here. A presence-only change runs without a copy.
 - `ChangePack` carries document key, checkpoint, changes, version vector,
   removal flag, and optional snapshot bytes.
 - `Document::apply_change_pack` applies changes or decoded snapshot roots,
@@ -773,6 +781,11 @@ Current Rust behavior:
   by mutating the operation inside `execute`; Rust refines in
   `Change::execute_undo_redo` before each edit runs.
 - A snapshot clears both stacks, as in JS `applySnapshot`.
+- An undo or redo runs on a copy of the CRDT root, like a local update (see
+  Change, ChangeContext, and ChangePack). One that fails leaves the document
+  as it was, including the stacks: the entry goes back on its stack, and the
+  re-pointing of other entries (`reconcile_created_at`) waits until the change
+  has run. JS drops the popped entry and keeps the re-pointing.
 
 JS/Go behavior:
 
@@ -801,9 +814,6 @@ Gap:
 - `maxUndoDepth`, `clearHistory`, and the minting-suspended refusal are not
   ported. Rust change events do not carry the JS `source` field, so an
   undo's `LocalChange` looks like any other local change.
-- An undo whose operation fails partway leaves the CRDT root holding the
-  operations that ran, as a failing `Document::update` does; JS also burns
-  the change's lamport in that case.
 
 Expected direction:
 

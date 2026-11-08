@@ -1,4 +1,6 @@
-use crate::change::{Change, ChangeContext, ChangeId, ChangePack, Checkpoint};
+use crate::change::{
+    Change, ChangeContext, ChangeExecutionResult, ChangeId, ChangePack, Checkpoint,
+};
 use crate::crdt::array::CrdtArray;
 use crate::crdt::counter::CounterValue;
 use crate::crdt::element::CrdtElement;
@@ -184,10 +186,15 @@ impl Document {
         }
 
         if context.has_change() {
-            let change = context.to_change();
+            let mut change = context.to_change();
             let actor_id = self.change_id.actor_id().clone();
             let prev = self.presence_state(&actor_id, self.status == DocStatus::Attached);
-            let executed = change.execute(&mut self.crdt_root, OpSource::Local)?;
+            let (staged, executed) = self.stage(&mut change, |change, root| {
+                change.execute(root, OpSource::Local)
+            })?;
+
+            // Nothing below fails: the change is committed from here on.
+            self.commit_staged(staged);
             change.apply_presence_change(&mut self.presences);
 
             // An array set replaces the element under a new creation time, and
@@ -220,7 +227,6 @@ impl Document {
 
             self.local_changes.push(change);
             self.change_id = context.next_id();
-            self.root = crdt_object_to_json_object(self.crdt_root.object())?;
             for event in change_event.into_iter().chain(presence_event) {
                 self.publish(event);
             }
@@ -228,6 +234,41 @@ impl Document {
         }
 
         Ok(())
+    }
+
+    /// Runs `execute` for a local change against a copy of the CRDT root and
+    /// returns the copy, with its public JSON view, for `commit_staged`.
+    ///
+    /// JS runs a local change on its clone root first and drops the clone if
+    /// that fails, so the root never holds part of a change. Here the copy
+    /// plays the clone's part: a change that fails partway is dropped with
+    /// it, and this document is left as it was. Nothing reached the root, so
+    /// unlike a failure of the JS root pass there are no issued tickets to
+    /// burn: the change ID is not advanced, and the next change reuses it.
+    ///
+    /// A change without operations touches no CRDT element and is run
+    /// without a copy.
+    fn stage(
+        &self,
+        change: &mut Change,
+        execute: impl FnOnce(&mut Change, &mut CrdtRoot) -> Result<ChangeExecutionResult>,
+    ) -> Result<(Option<StagedRoot>, ChangeExecutionResult)> {
+        if !change.has_operations() {
+            return Ok((None, ChangeExecutionResult::default()));
+        }
+
+        let mut crdt_root = self.crdt_root.clone();
+        let executed = execute(change, &mut crdt_root)?;
+        let root = crdt_object_to_json_object(crdt_root.object())?;
+        Ok((Some(StagedRoot { crdt_root, root }), executed))
+    }
+
+    /// Replaces the root with one `stage` produced.
+    fn commit_staged(&mut self, staged: Option<StagedRoot>) {
+        if let Some(StagedRoot { crdt_root, root }) = staged {
+            self.crdt_root = crdt_root;
+            self.root = root;
+        }
     }
 
     /// Returns a read-only view of this document's undo and redo history
@@ -268,6 +309,13 @@ impl Document {
         let Some(entry) = entry else {
             return Ok(());
         };
+        // Building the change rewrites the entry's operations; a failed undo
+        // or redo puts back the entry as it was.
+        let popped = entry.clone();
+        // Applied to the stacks only once the change has run, so a failed
+        // undo or redo leaves them as they were. They name only the other
+        // entries, so deferring them changes nothing for this one.
+        let mut reconciles = Vec::new();
 
         let actor_id = self.change_id.actor_id().clone();
         let mut context = ChangeContext::create(self.change_id.clone(), None);
@@ -291,12 +339,12 @@ impl Document {
                 Operation::ArraySet(operation) => {
                     let prev = operation.created_at().clone();
                     operation.value_mut().set_created_at(ticket.clone());
-                    self.history.reconcile_created_at(&prev, &ticket);
+                    reconciles.push((prev, ticket.clone()));
                 }
                 Operation::Add(operation) => {
                     let prev = operation.value().created_at().clone();
                     operation.value_mut().set_created_at(ticket.clone());
-                    self.history.reconcile_created_at(&prev, &ticket);
+                    reconciles.push((prev, ticket.clone()));
                 }
                 _ => {}
             }
@@ -308,7 +356,24 @@ impl Document {
         let mut change = context.to_change();
         change.mark_as_undo_redo();
         let prev = self.presence_state(&actor_id, self.status == DocStatus::Attached);
-        let executed = change.execute_undo_redo(&mut self.crdt_root)?;
+        let staged = self.stage(&mut change, |change, root| change.execute_undo_redo(root));
+        let (staged, executed) = match staged {
+            Ok(staged) => staged,
+            Err(err) => {
+                if is_undo {
+                    self.history.push_undo(popped);
+                } else {
+                    self.history.push_redo(popped);
+                }
+                return Err(err);
+            }
+        };
+
+        // Nothing below fails: the change is committed from here on.
+        self.commit_staged(staged);
+        for (prev, curr) in &reconciles {
+            self.history.reconcile_created_at(prev, curr);
+        }
         change.apply_presence_change(&mut self.presences);
 
         let entry = HistoryOperation::entry(executed.reverse_ops, reverse_presence);
@@ -334,7 +399,6 @@ impl Document {
 
         self.local_changes.push(change);
         self.change_id = context.next_id();
-        self.root = crdt_object_to_json_object(self.crdt_root.object())?;
         for event in change_event.into_iter().chain(presence_event) {
             self.publish(event);
         }
@@ -715,6 +779,13 @@ impl Document {
 struct PresenceState {
     presence: Option<Presence>,
     was_online: bool,
+}
+
+/// A copy of the CRDT root a local change ran on, and its public JSON view,
+/// waiting to replace the document's (see `Document::stage`).
+struct StagedRoot {
+    crdt_root: CrdtRoot,
+    root: JsonObject,
 }
 
 fn change_info(change: &Change, op_infos: Vec<crate::operation::OpInfo>) -> ChangeInfo {
@@ -1359,6 +1430,9 @@ fn crdt_element_to_json_value(element: &CrdtElement) -> Result<JsonValue> {
 
     Ok(value)
 }
+
+#[cfg(test)]
+mod update_tests;
 
 #[cfg(test)]
 mod tests {

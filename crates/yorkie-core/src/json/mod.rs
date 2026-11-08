@@ -439,6 +439,13 @@ impl JsonObject {
         self
     }
 
+    /// Returns the recorder of the update this object belongs to, so a test
+    /// can record an operation the public API cannot produce.
+    #[cfg(test)]
+    pub(crate) fn recorder_for_test(&self) -> Option<JsonEditRecorderRef> {
+        self.recorder.clone()
+    }
+
     pub fn get(&self, key: &str) -> Option<&JsonValue> {
         self.members.get(key)
     }
