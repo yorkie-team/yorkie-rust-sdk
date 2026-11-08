@@ -38,6 +38,33 @@ pub async fn eventually(what: &str, mut condition: impl FnMut() -> bool) {
     }
 }
 
+/// Collects values from a document subscription and waits for them (JS
+/// `EventCollector` in `test/helper/helper.ts`).
+pub struct EventCollector<T>(std::sync::Arc<std::sync::Mutex<Vec<T>>>);
+
+impl<T: Clone + PartialEq + std::fmt::Debug + Send + 'static> EventCollector<T> {
+    pub fn new() -> Self {
+        Self(Default::default())
+    }
+
+    /// Returns a closure that records each value it is given.
+    pub fn sink(&self) -> impl FnMut(T) + Send + 'static {
+        let events = self.0.clone();
+        move |value| events.lock().unwrap().push(value)
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.lock().unwrap().len()
+    }
+
+    /// Waits until `n` values have arrived and checks the `n`-th (JS
+    /// `waitAndVerifyNthEvent`).
+    pub async fn wait_and_verify_nth(&self, n: usize, expected: T) {
+        eventually(&format!("event {n}"), || self.len() >= n).await;
+        assert_eq!(expected, self.0.lock().unwrap()[n - 1], "event {n}");
+    }
+}
+
 /// Undoes back to the first of `states`, redoes to the last, then undoes
 /// again, checking the document against each state on the way (JS
 /// `assertUndoRedo` in `integration_helper.ts`).
