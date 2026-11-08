@@ -6,6 +6,7 @@ use super::{escape_json_string, lock_recorder, JsonEditRecorderRef};
 use crate::crdt::rht::Rht;
 use crate::crdt::tree::{CrdtTree, TreeNode, TreeNodeId, TreePos};
 use crate::event::parse_attr_value;
+use crate::operation::TreeEditOperation;
 use crate::{Result, TimeTicket, YorkieError};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -176,8 +177,9 @@ impl JsonTree {
     /// `Tree.edit` for one or no node). `contents` must be all text nodes or
     /// all element nodes.
     ///
-    /// `split_level` above zero is not supported yet and fails with
-    /// `YorkieError::Unimplemented`.
+    /// A `split_level` above zero first splits that many elements at `from`,
+    /// innermost first, and inserts `contents` where the split opened. Two
+    /// elements merge when the range deletes the boundary between them.
     pub fn edit(
         &mut self,
         from: usize,
@@ -221,6 +223,44 @@ impl JsonTree {
         let from_pos = tree.path_to_pos(from_path)?;
         let to_pos = tree.path_to_pos(to_path)?;
         self.edit_internal(&recorder, from_pos, to_pos, contents, split_level)
+    }
+
+    /// Splits the element holding the position at `path` in two (JS
+    /// `Tree.splitByPath`): a text position splits the element holding the
+    /// text, a child position the element holding the children.
+    pub fn split_by_path(&mut self, path: &[usize]) -> Result<()> {
+        let recorder = self.recorder()?;
+        if path.is_empty() {
+            return Err(YorkieError::InvalidArgument(
+                "path should not be empty".to_owned(),
+            ));
+        }
+        // A split needs a parent to hold the two halves.
+        let tree = self.tree()?;
+        if tree.split_target_is_root(path)? {
+            return Err(YorkieError::InvalidArgument(
+                "the root node cannot be split".to_owned(),
+            ));
+        }
+        let pos = tree.path_to_pos(path)?;
+        self.edit_internal(&recorder, pos.clone(), pos, Vec::new(), 1)
+    }
+
+    /// Merges the element at `path` into its previous sibling (JS
+    /// `Tree.mergeByPath`) by deleting the boundary between them, so two
+    /// replicas merging the same boundary merge it once.
+    pub fn merge_by_path(&mut self, path: &[usize]) -> Result<()> {
+        let recorder = self.recorder()?;
+        if path.is_empty() {
+            return Err(YorkieError::InvalidArgument(
+                "path should not be empty".to_owned(),
+            ));
+        }
+        let tree = self.tree()?;
+        let (from_path, to_path) = tree.merge_boundary_paths(path)?;
+        let from_pos = tree.path_to_pos(&from_path)?;
+        let to_pos = tree.path_to_pos(&to_path)?;
+        self.edit_internal(&recorder, from_pos, to_pos, Vec::new(), 0)
     }
 
     /// Sets `attributes` on the elements in `from..to` (JS `Tree.style`).
@@ -377,11 +417,6 @@ impl JsonTree {
         contents: Vec<TreeNodeInput>,
         split_level: usize,
     ) -> Result<()> {
-        if split_level > 0 {
-            return Err(YorkieError::Unimplemented(
-                "tree edits with split_level > 0 are not supported yet".to_owned(),
-            ));
-        }
         validate_tree_nodes(&contents)?;
         if contents.first().is_some_and(|content| !content.is_text()) {
             for content in &contents {
@@ -399,22 +434,32 @@ impl JsonTree {
         let nodes = create_content_nodes(&contents, &mut issue_time_ticket)?;
         let nodes = (!nodes.is_empty()).then_some(nodes);
 
+        // The elements a split creates take tickets of their own. They are
+        // recorded so every replica uses them rather than rebuilding them.
+        let mut split_tickets = Vec::new();
         let tree = self.tree_mut()?;
-        tree.edit_by_range_with_changes(
+        tree.edit(
             (from_pos.clone(), to_pos.clone()),
             nodes.clone(),
             split_level,
             executed_at.clone(),
+            &mut || {
+                let ticket = recorder.issue_time_ticket();
+                split_tickets.push(ticket.clone());
+                ticket
+            },
             None,
         )?;
-        recorder.record_tree_edit(
-            tree.created_at(),
+        let mut operation = TreeEditOperation::create(
+            tree.created_at().clone(),
             from_pos,
             to_pos,
             nodes,
             split_level,
-            executed_at,
+            Some(executed_at),
         );
+        operation.set_split_tickets(split_tickets);
+        recorder.record_tree_edit(operation);
         Ok(())
     }
 
@@ -597,9 +642,9 @@ fn validate_element_type(node_type: &str) -> Result<()> {
 }
 
 // Cases follow the single-document tests of JS
-// `test/integration/tree_test.ts`: "Tree", "Tree.edit", "Tree.style" and
-// "Tree(edge cases)", leaving out split and merge (Task 10), styleByPath, and
-// the position-range conversions.
+// `test/integration/tree_test.ts`: "Tree", "Tree.edit", "Tree.style",
+// "Tree.splitByPath/mergeByPath" and "Tree(edge cases)", leaving out
+// styleByPath and the position-range conversions.
 #[cfg(test)]
 mod tests {
     use super::{JsonTree, TreeNodeInput};
@@ -1142,14 +1187,270 @@ mod tests {
         })
     }
 
+    fn doc_with(root: TreeNodeInput) -> Result<Document> {
+        let mut doc = Document::new("test-doc");
+        doc.update(|r| r.set_tree("t", root).map(|_| ()))?;
+        Ok(doc)
+    }
+
+    fn edit_tree(doc: &mut Document, edit: impl FnOnce(&mut JsonTree) -> Result<()>) -> Result<()> {
+        doc.update(|root| edit(root.get_tree_mut("t")?))
+    }
+
+    /// `<doc><tc><p><tn>1234</tn></p><p><tn>5678</tn></p></tc></doc>`.
+    fn table_cell() -> TreeNodeInput {
+        let paragraph = |value| element("p", vec![element("tn", vec![text(value)])]);
+        element(
+            "doc",
+            vec![element("tc", vec![paragraph("1234"), paragraph("5678")])],
+        )
+    }
+
+    /// JS "Can split content using editByPath with splitLevel".
     #[test]
-    fn rejects_split_edits_until_they_are_supported() -> Result<()> {
+    fn can_split_content_using_edit_by_path_with_split_level() -> Result<()> {
+        let mut doc = doc_with(table_cell())?;
+        for (path, expected) in [
+            (
+                vec![0, 0, 0, 2],
+                "<doc><tc><p><tn>12</tn><tn>34</tn></p><p><tn>5678</tn></p></tc></doc>",
+            ),
+            (
+                vec![0, 0, 1],
+                "<doc><tc><p><tn>12</tn></p><p><tn>34</tn></p><p><tn>5678</tn></p></tc></doc>",
+            ),
+            (
+                vec![0, 2, 0, 4],
+                "<doc><tc><p><tn>12</tn></p><p><tn>34</tn></p><p><tn>5678</tn><tn></tn></p></tc></doc>",
+            ),
+            (
+                vec![0, 2, 1],
+                "<doc><tc><p><tn>12</tn></p><p><tn>34</tn></p><p><tn>5678</tn></p><p><tn></tn></p></tc></doc>",
+            ),
+        ] {
+            edit_tree(&mut doc, |tree| tree.edit_by_path(&path, &path, vec![], 1))?;
+            assert_eq!(expected, xml(&doc));
+        }
+        Ok(())
+    }
+
+    /// JS "Can merge content using editByPath".
+    #[test]
+    fn can_merge_content_using_edit_by_path() -> Result<()> {
+        let mut doc = doc_with(table_cell())?;
+        edit_tree(&mut doc, |tree| {
+            tree.edit_by_path(&[0, 0, 1], &[0, 1, 0], vec![], 0)
+        })?;
+        assert_eq!(
+            "<doc><tc><p><tn>1234</tn><tn>5678</tn></p></tc></doc>",
+            xml(&doc)
+        );
+        edit_tree(&mut doc, |tree| {
+            tree.edit_by_path(&[0, 0, 0, 4], &[0, 0, 1, 0], vec![], 0)
+        })?;
+        assert_eq!("<doc><tc><p><tn>12345678</tn></p></tc></doc>", xml(&doc));
+        Ok(())
+    }
+
+    /// JS "Can merge blocks using editByPath (wafflebase pattern)" and "Can
+    /// split then merge blocks using editByPath (wafflebase backspace bug)".
+    #[test]
+    fn can_split_and_merge_blocks_using_edit_by_path() -> Result<()> {
+        let block = |value| element("block", vec![element("inline", vec![text(value)])]);
+        let mut doc = doc_with(element("doc", vec![block("as"), block("df")]))?;
+        edit_tree(&mut doc, |tree| {
+            tree.edit_by_path(&[0, 1], &[1, 0], vec![], 0)
+        })?;
+        assert_eq!(
+            "<doc><block><inline>as</inline><inline>df</inline></block></doc>",
+            xml(&doc)
+        );
+
+        let mut doc = doc_with(element("doc", vec![block("asdf")]))?;
+        edit_tree(&mut doc, |tree| {
+            tree.edit_by_path(&[0, 0, 2], &[0, 0, 2], vec![], 2)
+        })?;
+        assert_eq!(
+            "<doc><block><inline>as</inline></block><block><inline>df</inline></block></doc>",
+            xml(&doc)
+        );
+        edit_tree(&mut doc, |tree| {
+            tree.edit_by_path(&[0, 1], &[1, 0], vec![], 0)
+        })?;
+        assert_eq!(
+            "<doc><block><inline>as</inline><inline>df</inline></block></doc>",
+            xml(&doc)
+        );
+        Ok(())
+    }
+
+    /// JS "Can delete nodes in a multi-level range".
+    #[test]
+    fn can_delete_nodes_in_a_multi_level_range() -> Result<()> {
+        let mut doc = doc_with(element(
+            "doc",
+            vec![
+                element("p", vec![text("ab"), element("p", vec![text("x")])]),
+                element("p", vec![element("p", vec![text("cd")])]),
+                element("p", vec![element("p", vec![text("y")]), text("ef")]),
+            ],
+        ))?;
+        assert_eq!(
+            "<doc><p>ab<p>x</p></p><p><p>cd</p></p><p><p>y</p>ef</p></doc>",
+            xml(&doc)
+        );
+        edit_tree(&mut doc, |tree| tree.edit(2, 18, vec![], 0))?;
+        assert_eq!("<doc><p>af</p></doc>", xml(&doc));
+        Ok(())
+    }
+
+    /// `<doc><p><span>abc</span><span>de</span></p></doc>`, the tree of the
+    /// JS "Tree.splitByPath/mergeByPath" cases.
+    fn doc_with_two_spans() -> Result<Document> {
+        doc_with_span(vec![
+            element("span", vec![text("abc")]),
+            element("span", vec![text("de")]),
+        ])
+    }
+
+    /// JS "Can split a text position and a child position".
+    #[test]
+    fn can_split_a_text_position_and_a_child_position() -> Result<()> {
+        let mut doc = doc_with_two_spans()?;
+        edit_tree(&mut doc, |tree| tree.split_by_path(&[0, 0, 1]))?;
+        assert_eq!(
+            "<doc><p><span>a</span><span>bc</span><span>de</span></p></doc>",
+            xml(&doc)
+        );
+        edit_tree(&mut doc, |tree| tree.split_by_path(&[0, 1]))?;
+        assert_eq!(
+            "<doc><p><span>a</span></p><p><span>bc</span><span>de</span></p></doc>",
+            xml(&doc)
+        );
+        Ok(())
+    }
+
+    /// JS "Can merge a boundary back together".
+    #[test]
+    fn can_merge_a_boundary_back_together() -> Result<()> {
+        let mut doc = doc_with_two_spans()?;
+        edit_tree(&mut doc, |tree| tree.merge_by_path(&[0, 1]))?;
+        assert_eq!("<doc><p><span>abcde</span></p></doc>", xml(&doc));
+        Ok(())
+    }
+
+    /// JS "Should throw on empty paths for splitByPath and mergeByPath",
+    /// "...when splitByPath targets the root", "...targets text held by the
+    /// root", "...when mergeByPath targets a first child" and "...targets a
+    /// text position". A rejected call changes nothing.
+    #[test]
+    fn rejects_split_and_merge_paths_js_rejects() -> Result<()> {
+        let invalid = |message: &str| Err(YorkieError::InvalidArgument(message.to_owned()));
+        let mut doc = doc_with_two_spans()?;
+        assert_eq!(
+            invalid("path should not be empty"),
+            edit_tree(&mut doc, |tree| tree.split_by_path(&[]))
+        );
+        assert_eq!(
+            invalid("path should not be empty"),
+            edit_tree(&mut doc, |tree| tree.merge_by_path(&[]))
+        );
+        for path in [[0], [1]] {
+            assert_eq!(
+                invalid("the root node cannot be split"),
+                edit_tree(&mut doc, |tree| tree.split_by_path(&path))
+            );
+        }
+        for path in [&[0, 0][..], &[0]] {
+            assert_eq!(
+                invalid("the first child cannot be merged"),
+                edit_tree(&mut doc, |tree| tree.merge_by_path(path))
+            );
+        }
+        assert_eq!(
+            invalid("text node cannot be merged"),
+            edit_tree(&mut doc, |tree| tree.merge_by_path(&[0, 0, 1]))
+        );
+        assert_eq!(
+            "<doc><p><span>abc</span><span>de</span></p></doc>",
+            xml(&doc)
+        );
+
+        let mut doc = doc_with(element("doc", vec![text("abcde")]))?;
+        assert_eq!(
+            invalid("the root node cannot be split"),
+            edit_tree(&mut doc, |tree| tree.split_by_path(&[2]))
+        );
+        assert_eq!("<doc>abcde</doc>", xml(&doc));
+        Ok(())
+    }
+
+    /// JS "Can edit with splitLevel walking past root without throwing": the
+    /// split stops at the root and the content is still inserted.
+    #[test]
+    fn splits_no_further_than_the_root() -> Result<()> {
+        let seeds = [
+            element("doc", vec![element("p", vec![text("x")])]),
+            element(
+                "doc",
+                vec![element("p", vec![text("x")]), element("p", vec![text("y")])],
+            ),
+            element(
+                "doc",
+                vec![element("p", vec![element("b", vec![text("x")])])],
+            ),
+            element("doc", vec![element("p", vec![])]),
+        ];
+        for seed in seeds {
+            let size = tree_of(&doc_with(seed.clone())?).size()?;
+            for pos in 0..=size {
+                for split_level in [1, 2] {
+                    let mut doc = doc_with(seed.clone())?;
+                    edit_tree(&mut doc, |tree| {
+                        tree.edit(pos, pos, vec![text("a")], split_level)
+                    })?;
+                    let label = format!("{seed:?} pos={pos} split_level={split_level}");
+                    assert!(tree_of(&doc).size()? > size, "{label}");
+                    assert!(xml(&doc).contains('a'), "{label}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// JS reports a local split as one empty change where it opened, with no
+    /// split level, and the content inserted with it on the same change.
+    #[test]
+    fn reports_a_split_as_an_empty_change_where_it_opened() -> Result<()> {
         let mut doc = doc_with_p_ab()?;
-        let err = doc
-            .update(|root| root.get_tree_mut("t")?.edit(2, 2, vec![], 1))
-            .expect_err("a split edit should be rejected");
-        assert!(matches!(err, YorkieError::Unimplemented(_)));
-        assert_eq!("<doc><p>ab</p></doc>", xml(&doc));
+        let ops = collect_local_ops(&mut doc);
+        edit_tree(&mut doc, |tree| tree.edit(2, 2, vec![], 1))?;
+        edit_tree(&mut doc, |tree| tree.edit(1, 1, vec![text("c")], 1))?;
+        // The content goes where the edit asked for it: the left half.
+        assert_eq!("<doc><p>c</p><p>a</p><p>b</p></doc>", xml(&doc));
+        assert_eq!(
+            vec![
+                OperationInfo::TreeEdit {
+                    path: "$.t".to_owned(),
+                    from: 2,
+                    to: 2,
+                    from_path: vec![0, 1],
+                    to_path: vec![0, 1],
+                    value: None,
+                    split_level: None,
+                },
+                OperationInfo::TreeEdit {
+                    path: "$.t".to_owned(),
+                    from: 1,
+                    to: 1,
+                    from_path: vec![0, 0],
+                    to_path: vec![0, 0],
+                    value: Some(vec![text("c")]),
+                    split_level: None,
+                },
+            ],
+            *ops.lock().unwrap()
+        );
         Ok(())
     }
 

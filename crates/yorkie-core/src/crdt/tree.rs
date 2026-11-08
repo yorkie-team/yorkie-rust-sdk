@@ -757,6 +757,52 @@ impl CrdtTree {
         tree_pos_to_crdt_pos(&self.root, &tree_pos)
     }
 
+    /// Reports whether a split at `path` would split the root, which has no
+    /// parent to hold the halves (JS `Tree.splitByPath`).
+    pub(crate) fn split_target_is_root(&self, path: &[usize]) -> Result<bool> {
+        let tree_pos = path_to_tree_pos(&self.root, path)?;
+        let node = node_at_visible_path(&self.root, &tree_pos.path)?;
+        Ok(if node.is_text() {
+            tree_pos.path.len() <= 1
+        } else {
+            tree_pos.path.is_empty()
+        })
+    }
+
+    /// Returns the paths around the boundary between the element at `path`
+    /// and its previous sibling: the end of the sibling's content and the
+    /// start of the element's (JS `Tree.mergeByPath`).
+    pub(crate) fn merge_boundary_paths(&self, path: &[usize]) -> Result<(Vec<usize>, Vec<usize>)> {
+        let tree_pos = path_to_tree_pos(&self.root, path)?;
+        let node = node_at_visible_path(&self.root, &tree_pos.path)?;
+        if node.is_text() {
+            return Err(YorkieError::InvalidArgument(
+                "text node cannot be merged".to_owned(),
+            ));
+        }
+        let left = tree_pos
+            .offset
+            .checked_sub(1)
+            .and_then(|offset| visible_child(node, offset))
+            .ok_or_else(|| {
+                YorkieError::InvalidArgument("the first child cannot be merged".to_owned())
+            })?;
+
+        let left_end = if left.has_text_child() {
+            left.children()
+                .filter(|child| child.is_text())
+                .map(TreeNode::len)
+                .sum()
+        } else {
+            left.children().count()
+        };
+        let mut from_path = path[..path.len() - 1].to_vec();
+        from_path.extend([tree_pos.offset - 1, left_end]);
+        let mut to_path = path.to_vec();
+        to_path.push(0);
+        Ok((from_path, to_path))
+    }
+
     pub(crate) fn path_to_pos_range(&self, path: &[usize]) -> Result<(TreePos, TreePos)> {
         let from_index = self.path_to_index(path)?;
         Ok((
@@ -4132,6 +4178,9 @@ mod tests {
             vec![(3, 3, vec![0, 2], vec![0, 2], false)],
             change_paths(&result)
         );
+        // JS "Should not leave garbage content behind": a split removes
+        // nothing, and a merge removes only boundaries, which hold no data.
+        assert!(result.gc_pairs.is_empty());
 
         let range = (tree.find_pos(3, true)?, tree.find_pos(5, true)?);
         let result = tree.edit_by_range_with_changes(range, None, 0, ticket(11, "a"), None)?;
@@ -4141,6 +4190,8 @@ mod tests {
             vec![(3, 5, vec![0, 2], vec![1, 0], false)],
             change_paths(&result)
         );
+        assert_eq!(1, result.gc_pairs.len());
+        assert!(result.gc_pairs.iter().all(|(_, size, _)| size.data == 0));
         Ok(())
     }
 
@@ -4331,6 +4382,91 @@ mod tests {
             change_paths(&result)
         );
         assert_eq!("<root><p>@ad</p></root>", tree.to_xml());
+        Ok(())
+    }
+
+    /// JS `CRDTTree.Merge` "Can merge different levels with edit", skipped
+    /// upstream (`test/unit/document/crdt/tree_test.ts:1700`, `it.skip` with a
+    /// TODO to fix the test). See `docs/crdt-parity/upstream-skipped-tests.md`.
+    #[test]
+    #[ignore = "skipped upstream: JS tree_test.ts:1700 it.skip"]
+    fn merges_different_levels_with_edit() -> crate::Result<()> {
+        let nested = || {
+            CrdtTree::create(
+                TreeNode::create_element(
+                    node_id(1, 0),
+                    "root",
+                    None,
+                    vec![TreeNode::create_element(
+                        node_id(2, 0),
+                        "p",
+                        None,
+                        vec![TreeNode::create_element(
+                            node_id(3, 0),
+                            "b",
+                            None,
+                            vec![TreeNode::create_element(
+                                node_id(4, 0),
+                                "i",
+                                None,
+                                vec![TreeNode::create_text(node_id(5, 0), "ab")],
+                            )],
+                        )],
+                    )],
+                ),
+                ticket(1, "a"),
+            )
+        };
+        for (from, to, expected) in [
+            (5, 6, "<root><p><b>ab</b></p></root>"),
+            (6, 7, "<root><p><i>ab</i></p></root>"),
+            (4, 6, "<root><p><b>a</b></p></root>"),
+            (5, 7, "<root><p>ab</p></root>"),
+            (4, 7, "<root><p>a</p></root>"),
+            (3, 7, "<root><p></p></root>"),
+        ] {
+            let mut tree = nested();
+            let range = (tree.find_pos(from, true)?, tree.find_pos(to, true)?);
+            tree.edit_by_range_with_changes(range, None, 0, ticket(10, "a"), None)?;
+            assert_eq!(expected, tree.to_xml(), "edit({from}, {to})");
+        }
+
+        let mut tree = CrdtTree::create(
+            TreeNode::create_element(
+                node_id(1, 0),
+                "root",
+                None,
+                vec![
+                    TreeNode::create_element(
+                        node_id(2, 0),
+                        "p",
+                        None,
+                        vec![TreeNode::create_text(node_id(3, 0), "ab")],
+                    ),
+                    TreeNode::create_element(
+                        node_id(4, 0),
+                        "p",
+                        None,
+                        vec![TreeNode::create_element(
+                            node_id(5, 0),
+                            "b",
+                            None,
+                            vec![TreeNode::create_text(node_id(6, 0), "cd")],
+                        )],
+                    ),
+                    TreeNode::create_element(
+                        node_id(7, 0),
+                        "p",
+                        None,
+                        vec![TreeNode::create_text(node_id(8, 0), "ef")],
+                    ),
+                ],
+            ),
+            ticket(1, "a"),
+        );
+        let range = (tree.find_pos(9, true)?, tree.find_pos(10, true)?);
+        tree.edit_by_range_with_changes(range, None, 0, ticket(10, "a"), None)?;
+        assert_eq!("<root><p>ab</p><b>cd</b><p>ef</p></root>", tree.to_xml());
         Ok(())
     }
 

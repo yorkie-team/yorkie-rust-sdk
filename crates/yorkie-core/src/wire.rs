@@ -1687,6 +1687,93 @@ mod tests {
     }
 
     #[test]
+    fn rebuilds_a_chained_merge_from_a_snapshot() -> Result<()> {
+        // JS `tree_merge_anchor_test.ts` "converges when insert is anchored
+        // in a chained merge", its snapshot round trip: a replica loading the
+        // tree after the chained merge rebuilds the same nodes, tombstones
+        // included, and the same forwarding pointers.
+        let tree_at = ticket(1);
+        let paragraph = |lamport: i64, value: &str| {
+            TreeNode::create_element(
+                tree_node_id(lamport, 0),
+                "p",
+                None,
+                vec![TreeNode::create_text(tree_node_id(lamport + 1, 0), value)],
+            )
+        };
+        let mut tree = CrdtTree::create(
+            TreeNode::create_element(
+                tree_node_id(2, 0),
+                "r",
+                None,
+                vec![paragraph(3, "ab"), paragraph(5, "cd"), paragraph(7, "ef")],
+            ),
+            tree_at.clone(),
+        );
+        let merge_p1 = (tree.find_pos(2, true)?, tree.find_pos(6, true)?);
+        let merge_p2 = (tree.find_pos(6, true)?, tree.find_pos(10, true)?);
+        let insert = tree.find_pos(9, true)?;
+        let actor = |actor: &str| TimeTicket::new(20, 0, actor);
+        let known = |actor_id: &str| {
+            let mut version_vector = VersionVector::new();
+            version_vector.set("000000000000000000000001", 9);
+            version_vector.set(actor_id, 20);
+            version_vector
+        };
+        tree.edit_by_range_with_changes(
+            merge_p2,
+            None,
+            0,
+            actor("000000000000000000000003"),
+            Some(&known("000000000000000000000003")),
+        )?;
+        tree.edit_by_range_with_changes(
+            merge_p1,
+            None,
+            0,
+            actor("000000000000000000000002"),
+            Some(&known("000000000000000000000002")),
+        )?;
+        tree.edit_by_range_with_changes(
+            (insert.clone(), insert),
+            Some(vec![TreeNode::create_element(
+                TreeNodeId::new(actor("000000000000000000000004"), 0),
+                "x",
+                None,
+                Vec::new(),
+            )]),
+            0,
+            actor("000000000000000000000004"),
+            Some(&known("000000000000000000000004")),
+        )?;
+        assert_eq!("<r><p>a<x></x>f</p></r>", tree.to_xml());
+
+        let nodes = |tree: &CrdtTree| {
+            tree.nodes()
+                .map(|node| {
+                    (
+                        node.to_xml(),
+                        node.len(),
+                        node.is_removed(),
+                        node.merged_into().cloned(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let runtime = nodes(&tree);
+        let root = CrdtRoot::new(CrdtObject::create_with_members(
+            TimeTicket::initial(),
+            [("t", CrdtElement::tree(tree))],
+        ));
+        let roundtripped = roundtrip_root_json_element(&root)?;
+        assert_eq!(
+            runtime,
+            nodes(roundtripped.tree_by_created_at(&tree_at).unwrap())
+        );
+        Ok(())
+    }
+
+    #[test]
     fn preserves_tree_merge_state_across_root_roundtrip() -> Result<()> {
         let tree_at = ticket(1);
         let mut tree = CrdtTree::create(

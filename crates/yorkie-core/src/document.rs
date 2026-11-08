@@ -7,7 +7,7 @@ use crate::crdt::primitive::{CrdtPrimitive, PrimitiveValue};
 use crate::crdt::rga_tree_split::RgaTreeSplitPosRange;
 use crate::crdt::root::CrdtRoot;
 use crate::crdt::text::CrdtText;
-use crate::crdt::tree::{CrdtTree, TreeNode, TreePos};
+use crate::crdt::tree::{CrdtTree, TreePos};
 use crate::event::{ChangeInfo, DocEvent, OperationInfo, Subscribers, SubscriptionId};
 use crate::json::{counter_operand, JsonEditRecorder, JsonEditRecorderRef, RecordedJsonValue};
 use crate::operation::{
@@ -732,24 +732,8 @@ impl JsonEditRecorder for DocumentEditRecorder {
         self.context.last_time_ticket()
     }
 
-    fn record_tree_edit(
-        &mut self,
-        parent_created_at: &TimeTicket,
-        from_pos: TreePos,
-        to_pos: TreePos,
-        contents: Option<Vec<TreeNode>>,
-        split_level: usize,
-        executed_at: TimeTicket,
-    ) {
-        self.context
-            .push(Operation::TreeEdit(TreeEditOperation::create(
-                parent_created_at.clone(),
-                from_pos,
-                to_pos,
-                contents,
-                split_level,
-                Some(executed_at),
-            )));
+    fn record_tree_edit(&mut self, operation: TreeEditOperation) {
+        self.context.push(Operation::TreeEdit(operation));
     }
 
     fn record_tree_style(

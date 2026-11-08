@@ -4,7 +4,8 @@ mod tree;
 use crate::crdt::counter::{CounterType, CounterValue, CrdtCounter};
 use crate::crdt::primitive::{CrdtPrimitive, PrimitiveValue};
 use crate::crdt::rga_tree_split::RgaTreeSplitPosRange;
-use crate::crdt::tree::{TreeNode, TreePos};
+use crate::crdt::tree::TreePos;
+use crate::operation::TreeEditOperation;
 use crate::{Result, TimeTicket, YorkieError};
 use std::collections::BTreeMap;
 use std::fmt::{self, Write};
@@ -95,15 +96,9 @@ pub(crate) trait JsonEditRecorder {
     /// `ChangeContext.getLastTimeTicket`).
     fn last_time_ticket(&self) -> TimeTicket;
 
-    fn record_tree_edit(
-        &mut self,
-        parent_created_at: &TimeTicket,
-        from_pos: TreePos,
-        to_pos: TreePos,
-        contents: Option<Vec<TreeNode>>,
-        split_level: usize,
-        executed_at: TimeTicket,
-    );
+    /// Records a tree edit the facade built, as JS `Tree.editInternal`
+    /// pushes its operation to the change context.
+    fn record_tree_edit(&mut self, operation: TreeEditOperation);
 
     fn record_tree_style(
         &mut self,
