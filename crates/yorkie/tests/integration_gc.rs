@@ -120,14 +120,8 @@ async fn garbage_len_matches_what_garbage_collect_purges() {
 
     // Actual garbage-collected nodes
     let max = max_vector_of(&[&actor(&c1), &actor(&c2)]);
-    assert_eq!(
-        gc_node_len,
-        d1.lock().unwrap().garbage_collect(&max).unwrap()
-    );
-    assert_eq!(
-        gc_node_len,
-        d2.lock().unwrap().garbage_collect(&max).unwrap()
-    );
+    assert_eq!(gc_node_len, d1.lock().unwrap().garbage_collect(&max));
+    assert_eq!(gc_node_len, d2.lock().unwrap().garbage_collect(&max));
 
     for client in [c1, c2] {
         client
@@ -539,7 +533,7 @@ fn collects_a_nested_object() {
     assert_eq!(4, doc.garbage_len()); // shape, point, x, y
     let actor = doc.actor_id().clone();
     // The number of GC nodes must also be 4.
-    assert_eq!(4, doc.garbage_collect(&max_vector_of(&[&actor])).unwrap());
+    assert_eq!(4, doc.garbage_collect(&max_vector_of(&[&actor])));
 }
 
 fn text_of(doc: &SharedDocument) -> String {

@@ -492,13 +492,13 @@ impl CrdtRoot {
     /// have more to do, and the loop repeats until a pass purges nothing new
     /// or defers nothing. Everything held back stays on the worklist for the
     /// next vector that covers it.
-    pub(crate) fn garbage_collect(&mut self, vector: &crate::VersionVector) -> Result<usize> {
+    pub(crate) fn garbage_collect(&mut self, vector: &crate::VersionVector) -> usize {
         let mut count = 0;
         loop {
-            let (purged, deferred) = self.collect(vector)?;
+            let (purged, deferred) = self.collect(vector);
             count += purged;
             if purged == 0 || deferred == 0 {
-                return Ok(count);
+                return count;
             }
         }
     }
@@ -512,7 +512,7 @@ impl CrdtRoot {
     /// RGA resolves a concurrent insert by walking forward past newer nodes,
     /// tombstones included, so purging a node is safe only once the node
     /// that would end that walk in its place is causally stable as well.
-    fn collect(&mut self, vector: &crate::VersionVector) -> Result<(usize, usize)> {
+    fn collect(&mut self, vector: &crate::VersionVector) -> (usize, usize) {
         let mut count = 0;
         let mut deferred = 0;
 
@@ -522,34 +522,52 @@ impl CrdtRoot {
             .cloned()
             .collect::<Vec<_>>();
         for created_id in removed_element_ids {
-            let Some(pair) = self.element_pair_by_created_at.get(&created_id).cloned() else {
+            // The indexed copy may be stale: purging another element of this
+            // pass can have removed this one, or a descendant of it, from the
+            // live tree. Skip what is gone, and purge and deregister what the
+            // live tree holds, as JS does with its live references.
+            let Some(pair) = self.element_pair_by_created_at.get(&created_id) else {
                 continue;
             };
-            let Some(parent) = pair.parent() else {
+            let Some(parent_created_at) = pair.parent().map(|p| p.created_at().clone()) else {
                 continue;
             };
-            let Some(removed_at) = pair.element().removed_at() else {
+            let created_at = pair.element().created_at().clone();
+            let Some(element) = self.actual_element_by_created_at(&created_at) else {
+                continue;
+            };
+            let Some(removed_at) = element.removed_at() else {
                 continue;
             };
             if !vector.after_or_equal(removed_at) {
                 continue;
             }
 
-            if let Some(array) = self.array_by_created_at(parent.created_at()) {
-                let barrier = array.purge_barrier_at(pair.element().created_at());
+            if let Some(array) = self.array_by_created_at(&parent_created_at) {
+                let barrier = array.purge_barrier_at(&created_at);
                 if barrier.is_some_and(|at| !vector.after_or_equal(&at)) {
                     deferred += 1;
                     continue;
                 }
             }
 
-            if let Some(object) = self.object_by_created_at_mut(parent.created_at()) {
-                object.purge(pair.element())?;
-            } else if let Some(array) = self.array_by_created_at_mut(parent.created_at()) {
-                array.purge(pair.element())?;
+            // As in JS, a member that cannot be purged is skipped, not
+            // reported: collection runs inside every change pack apply, and
+            // failing there would stop the document from syncing for good.
+            // It stays on the worklist, charged to gc.
+            let purged = if let Some(object) = self.object_by_created_at_mut(&parent_created_at) {
+                object.purge(&element)
+            } else if let Some(array) = self.array_by_created_at_mut(&parent_created_at) {
+                array.purge(&element)
+            } else {
+                Ok(())
+            };
+            if purged.is_err() {
+                continue;
             }
 
-            count += self.deregister_element(pair.element());
+            count += self.deregister_element(&element);
+            self.refresh_element_pair_and_ancestors(&parent_created_at);
         }
 
         let gc_pairs = self
@@ -562,11 +580,10 @@ impl CrdtRoot {
                 continue;
             }
 
-            let barrier = self
-                .root_object
-                .gc_pair_barrier_by_id(&pair.child_id)
-                .flatten();
-            if barrier.is_some_and(|at| !vector.after_or_equal(&at)) {
+            let Some(site) = self.root_object.locate_gc_pair(&pair.child_id) else {
+                continue;
+            };
+            if site.barrier.is_some_and(|at| !vector.after_or_equal(&at)) {
                 deferred += 1;
                 continue;
             }
@@ -576,10 +593,11 @@ impl CrdtRoot {
                     sub_data_size(&mut self.doc_size.gc, pair.child_size);
                 }
                 count += 1;
+                self.refresh_element_pair_and_ancestors(&site.container);
             }
         }
 
-        Ok((count, deferred))
+        (count, deferred)
     }
 
     pub(crate) fn object(&self) -> &CrdtObject {
@@ -1215,11 +1233,11 @@ mod tests {
 
         let mut vector = VersionVector::new();
         vector.set("a", 3);
-        assert_eq!(0, root.garbage_collect(&vector)?);
+        assert_eq!(0, root.garbage_collect(&vector));
         assert_eq!(1, root.get_garbage_len());
 
         vector.set("a", 4);
-        assert_eq!(1, root.garbage_collect(&vector)?);
+        assert_eq!(1, root.garbage_collect(&vector));
         assert_eq!(0, root.get_garbage_len());
         assert_eq!(0, root.stats().gc_pairs);
         assert_eq!(r#"{"items":["two","one"]}"#, root.to_json());
@@ -1310,14 +1328,14 @@ mod tests {
 
         let mut vector = VersionVector::new();
         vector.set("a", 5);
-        assert_eq!(1, rebuilt.garbage_collect(&vector)?);
+        assert_eq!(1, rebuilt.garbage_collect(&vector));
         assert_eq!(1, rebuilt.stats().gc_elements);
         assert_eq!(0, rebuilt.stats().gc_pairs);
         assert_eq!(1, rebuilt.get_garbage_len());
         assert_eq!(r#"{"items":[2,0]}"#, rebuilt.to_json());
 
         vector.set("a", 6);
-        assert_eq!(1, rebuilt.garbage_collect(&vector)?);
+        assert_eq!(1, rebuilt.garbage_collect(&vector));
         assert_eq!(0, rebuilt.get_garbage_len());
         assert!(rebuilt.find_by_created_at(&one_at).is_none());
         assert_eq!(r#"{"items":[2,0]}"#, rebuilt.to_json());
@@ -1381,7 +1399,7 @@ mod tests {
 
         let mut vector = VersionVector::new();
         vector.set("a", 5);
-        assert_eq!(3, root.garbage_collect(&vector)?);
+        assert_eq!(3, root.garbage_collect(&vector));
 
         assert_eq!(0, root.get_garbage_len());
         assert_eq!(r#"{"message":[{"val":"Yorkie"}]}"#, root.to_json());
@@ -1465,11 +1483,11 @@ mod tests {
 
         let mut vector = VersionVector::new();
         vector.set("a", 6);
-        assert_eq!(1, root.garbage_collect(&vector)?);
+        assert_eq!(1, root.garbage_collect(&vector));
         assert_eq!(1, root.stats().gc_pairs);
 
         vector.set("a", 7);
-        assert_eq!(1, root.garbage_collect(&vector)?);
+        assert_eq!(1, root.garbage_collect(&vector));
         assert_eq!(0, root.get_garbage_len());
         assert_eq!(
             r#"{"body":{"type":"root","children":[{"type":"p","children":[{"type":"text","value":"Hi"}]}]}}"#,

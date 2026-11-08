@@ -751,7 +751,7 @@ fn finds_nothing_for_a_garbage_collected_id() {
     assert_eq!(r#"{"list":[0,1]}"#, doc.to_sorted_json());
 
     let actor = doc.actor_id().clone();
-    doc.garbage_collect(&max_vector_of(&[&actor])).unwrap();
+    doc.garbage_collect(&max_vector_of(&[&actor]));
     doc.update(|root| {
         assert!(root
             .get_array_mut("list")?

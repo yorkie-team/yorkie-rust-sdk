@@ -130,21 +130,38 @@ pub(crate) enum CrdtElement {
     Tree(Box<CrdtTree>),
 }
 
+/// Where a GC pair child lives: the element that holds it, and the ticket
+/// that must be covered before it may be purged (JS `purgeBarrierAt`), if
+/// anything bars the purge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GcPairSite {
+    pub(crate) container: TimeTicket,
+    pub(crate) barrier: Option<TimeTicket>,
+}
+
+impl GcPairSite {
+    pub(crate) fn new(container: &TimeTicket, barrier: Option<TimeTicket>) -> Self {
+        Self {
+            container: container.clone(),
+            barrier,
+        }
+    }
+}
+
 impl CrdtElement {
     pub(crate) fn primitive(value: CrdtPrimitive) -> Self {
         Self::Primitive(value)
     }
 
     /// Looks up the GC pair child `child_id` under this element, searching
-    /// in the order `purge_gc_pair_by_id` purges, and returns `Some` of the
-    /// ticket that must be covered before it may be purged (`None` inside
-    /// when nothing bars it), or `None` when no such child is here.
-    pub(crate) fn gc_pair_barrier_by_id(&self, child_id: &str) -> Option<Option<TimeTicket>> {
+    /// in the order `purge_gc_pair_by_id` purges, or `None` when no such
+    /// child is here.
+    pub(crate) fn locate_gc_pair(&self, child_id: &str) -> Option<GcPairSite> {
         match self {
-            Self::Object(object) => object.gc_pair_barrier_by_id(child_id),
-            Self::Array(array) => array.gc_pair_barrier_by_id(child_id),
-            Self::Text(text) => text.gc_pair_barrier_by_id(child_id),
-            Self::Tree(tree) => tree.gc_pair_barrier_by_id(child_id),
+            Self::Object(object) => object.locate_gc_pair(child_id),
+            Self::Array(array) => array.locate_gc_pair(child_id),
+            Self::Text(text) => text.locate_gc_pair(child_id),
+            Self::Tree(tree) => tree.locate_gc_pair(child_id),
             Self::Primitive(_) | Self::Counter(_) => None,
         }
     }

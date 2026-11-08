@@ -491,7 +491,7 @@ impl Document {
     /// minimum version vector; calling it with a vector the server did not
     /// send can purge a tombstone a peer's change still anchors on.
     #[doc(hidden)]
-    pub fn garbage_collect(&mut self, vector: &VersionVector) -> Result<usize> {
+    pub fn garbage_collect(&mut self, vector: &VersionVector) -> usize {
         self.crdt_root.garbage_collect(vector)
     }
 
@@ -554,7 +554,7 @@ impl Document {
         // describes the snapshot, and the replayed local changes are newer.
         if !pack.has_snapshot() {
             if let Some(vector) = pack.version_vector() {
-                self.garbage_collect(vector)?;
+                self.garbage_collect(vector);
             }
         }
 

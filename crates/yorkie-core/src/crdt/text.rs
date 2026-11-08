@@ -1,4 +1,4 @@
-use super::element::{CrdtElementMeta, DataSize};
+use super::element::{CrdtElementMeta, DataSize, GcPairSite};
 use super::rga_tree_split::{
     RgaTreeSplit, RgaTreeSplitNode, RgaTreeSplitNodeId, RgaTreeSplitPos, RgaTreeSplitPosRange,
     RgaTreeSplitValue, SplitEditResult,
@@ -701,9 +701,9 @@ impl CrdtText {
 
     /// Looks up the GC pair child `child_id`, a removed text node or a
     /// removed attribute, in the order `purge_gc_pair_by_id` purges (see
-    /// `CrdtElement::gc_pair_barrier_by_id`). Attributes are not ordered, so
+    /// `CrdtElement::locate_gc_pair`). Attributes are not ordered, so
     /// nothing bars their purge.
-    pub(crate) fn gc_pair_barrier_by_id(&self, child_id: &str) -> Option<Option<TimeTicket>> {
+    pub(crate) fn locate_gc_pair(&self, child_id: &str) -> Option<GcPairSite> {
         self.rga_tree_split
             .purge_barrier_by_id(child_id)
             .or_else(|| {
@@ -712,6 +712,7 @@ impl CrdtText {
                     .any(|node| node.value().attributes().has_id(child_id))
                     .then_some(None)
             })
+            .map(|barrier| GcPairSite::new(self.created_at(), barrier))
     }
 
     pub(crate) fn purge_gc_pair_by_id(&mut self, child_id: &str) -> bool {

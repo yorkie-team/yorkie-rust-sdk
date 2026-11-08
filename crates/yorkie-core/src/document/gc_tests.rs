@@ -104,7 +104,7 @@ fn max_vector_of(actors: &[&str]) -> VersionVector {
     out
 }
 
-fn collect(d: &mut Document, vector: &VersionVector) -> Result<usize> {
+fn collect(d: &mut Document, vector: &VersionVector) -> usize {
     d.garbage_collect(vector)
 }
 
@@ -116,7 +116,7 @@ fn collect(d: &mut Document, vector: &VersionVector) -> Result<usize> {
 /// move's ticket the way a rebuild counts them, with or without collection
 /// (see the porting gaps).
 fn assert_drains(d: &mut Document, name: &str) -> Result<()> {
-    collect(d, &max_vector_of(&[A1, A2]))?;
+    collect(d, &max_vector_of(&[A1, A2]));
     assert_eq!(0, d.garbage_len(), "{name} leaked garbage");
     let rebuilt = CrdtRoot::new(d.crdt_root.object().deepcopy());
     assert_eq!(
@@ -167,7 +167,7 @@ fn counts_and_collects_removed_elements_with_their_descendants() -> Result<()> {
     })?;
     assert_eq!(r#"{"1":1,"3":3}"#, doc.to_sorted_json());
     assert_eq!(4, doc.garbage_len());
-    assert_eq!(4, doc.garbage_collect(&max_vector_of(&[A1]))?);
+    assert_eq!(4, doc.garbage_collect(&max_vector_of(&[A1])));
     assert_eq!(0, doc.garbage_len());
     Ok(())
 }
@@ -207,6 +207,49 @@ fn keeps_a_tombstone_a_pending_local_change_made() -> Result<()> {
 
     assert_eq!(1, doc.garbage_len());
     assert!(doc.has_local_changes());
+    Ok(())
+}
+
+/// A removed array and a removed element inside it are purged once each,
+/// whichever of the two collection visits first. The child's ID sorts
+/// before its parent's ("10:..." before "9:..."), so the child is visited
+/// first. A later removal the vector does not cover stays, and the gc size
+/// left over matches a root rebuilt from the same content.
+#[test]
+fn purges_a_removed_child_and_its_removed_parent_once() -> Result<()> {
+    let (mut doc, _) = replicas();
+    bump(&mut doc, "pad", 8)?;
+    doc.update(|root| root.set("p", JsonArray::new()).map(|_| ()))?; // lamport 9
+    doc.update(|root| root.get_array_mut("p")?.push(1).map(|_| ()))?; // 10
+    doc.update(|root| {
+        root.get_array_mut("p")?.delete(0);
+        Ok(())
+    })?; // 11
+    doc.update(|root| {
+        root.remove("p");
+        Ok(())
+    })?; // 12
+    let mut covered = VersionVector::new();
+    covered.set(A1, 12);
+
+    // Garbage the vector does not cover, so an undercount would show.
+    doc.update(|root| {
+        root.remove("pad-0");
+        Ok(())
+    })?;
+    let before = doc.garbage_len();
+    assert_eq!(3, before);
+
+    assert_eq!(2, doc.garbage_collect(&covered));
+    assert_eq!(1, doc.garbage_len());
+    let rebuilt = CrdtRoot::new(doc.crdt_root.object().deepcopy());
+    assert_ne!(crate::crdt::element::DataSize::default(), doc.doc_size().gc);
+    assert_eq!(rebuilt.doc_size().gc, doc.doc_size().gc);
+    assert_eq!(rebuilt.get_garbage_len(), doc.garbage_len());
+
+    assert_eq!(1, doc.garbage_collect(&max_vector_of(&[A1])));
+    assert_eq!(0, doc.garbage_len());
+    assert_eq!(crate::crdt::element::DataSize::default(), doc.doc_size().gc);
     Ok(())
 }
 
@@ -286,7 +329,7 @@ fn keeps_insert_order_when_a_removed_element_was_concurrently_moved() -> Result<
     assert_eq!(r#"["w","x"]"#, arr(&remover));
 
     // The mover collects with that vector: the only difference between them.
-    collect(&mut mover, &vv)?;
+    collect(&mut mover, &vv);
 
     one_way_deliver(&mut remover, &mut mover)?;
     cross_sync(&mut remover, &mut mover)?;
@@ -329,7 +372,7 @@ fn keeps_text_order_after_collecting_a_concurrently_deleted_node() -> Result<()>
     remover.update(|root| root.get_text_mut("t")?.edit(1, 1, "X", None).map(|_| ()))?;
     assert_eq!("WX", text(&remover));
 
-    collect(&mut mover, &vv)?;
+    collect(&mut mover, &vv);
     one_way_deliver(&mut remover, &mut mover)?;
     cross_sync(&mut remover, &mut mover)?;
     assert_eq!(remover.to_sorted_json(), mover.to_sorted_json());
@@ -375,7 +418,7 @@ fn keeps_tree_order_after_collecting_a_concurrently_deleted_node() -> Result<()>
     })?;
     assert_eq!("<doc><p>WX</p></doc>", xml(&remover)?);
 
-    collect(&mut mover, &vv)?;
+    collect(&mut mover, &vv);
     one_way_deliver(&mut remover, &mut mover)?;
     cross_sync(&mut remover, &mut mover)?;
     assert_eq!(xml(&remover)?, xml(&mover)?);

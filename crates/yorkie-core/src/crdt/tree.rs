@@ -1,4 +1,4 @@
-use super::element::{CrdtElementMeta, DataSize};
+use super::element::{CrdtElementMeta, DataSize, GcPairSite};
 use super::rht::{Rht, RhtNode};
 use crate::json::escape_json_string;
 use crate::{Result, TimeTicket, TreeNodeInput, YorkieError, TIME_TICKET_SIZE};
@@ -487,7 +487,7 @@ impl TreeNode {
 
     /// Looks up the GC pair child `child_id`, a removed attribute or a
     /// removed descendant, in the order `purge_gc_pair_by_id` purges (see
-    /// `CrdtElement::gc_pair_barrier_by_id`). A node's barrier is the
+    /// `CrdtElement::locate_gc_pair`). A node's barrier is the
     /// creation ticket of its next sibling: `find_nodes_and_split_text` walks
     /// the children, removed ones included, while the next sibling was
     /// created after the edit, so purging a node hands that decision to the
@@ -1333,8 +1333,10 @@ impl CrdtTree {
 
     /// Looks up the GC pair child `child_id` in this tree (see
     /// `TreeNode::gc_pair_barrier_by_id`).
-    pub(crate) fn gc_pair_barrier_by_id(&self, child_id: &str) -> Option<Option<TimeTicket>> {
-        self.root.gc_pair_barrier_by_id(child_id)
+    pub(crate) fn locate_gc_pair(&self, child_id: &str) -> Option<GcPairSite> {
+        self.root
+            .gc_pair_barrier_by_id(child_id)
+            .map(|barrier| GcPairSite::new(self.created_at(), barrier))
     }
 
     /// Purges the removed node or attribute `child_id`. A purged node's split

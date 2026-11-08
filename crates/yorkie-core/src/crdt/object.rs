@@ -1,6 +1,6 @@
 use super::array::CrdtArray;
 use super::counter::CrdtCounter;
-use super::element::{CrdtElement, CrdtElementMeta, DataSize};
+use super::element::{CrdtElement, CrdtElementMeta, DataSize, GcPairSite};
 use super::element_rht::ElementRht;
 use super::text::CrdtText;
 use super::tree::CrdtTree;
@@ -446,11 +446,11 @@ impl CrdtObject {
     }
 
     /// Looks up the GC pair child `child_id` under this object's members
-    /// (see `CrdtElement::gc_pair_barrier_by_id`).
-    pub(crate) fn gc_pair_barrier_by_id(&self, child_id: &str) -> Option<Option<TimeTicket>> {
+    /// (see `CrdtElement::locate_gc_pair`).
+    pub(crate) fn locate_gc_pair(&self, child_id: &str) -> Option<GcPairSite> {
         self.member_nodes
             .iter()
-            .find_map(|node| node.value().gc_pair_barrier_by_id(child_id))
+            .find_map(|node| node.value().locate_gc_pair(child_id))
     }
 
     pub(crate) fn purge_gc_pair_by_id(&mut self, child_id: &str) -> bool {
