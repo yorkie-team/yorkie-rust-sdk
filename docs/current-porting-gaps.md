@@ -256,8 +256,19 @@ Gap:
 - Collection is slow in the same way. For each GC pair it walks the whole
   document twice, once to find the pair's barrier and container
   (`locate_gc_pair`) and once to purge it, so a pass costs time in GC pairs
-  times nodes. Each purge also refreshes the copied pairs of the container
-  and its ancestors.
+  times nodes. Each purge then refreshes the copied pairs of the container
+  and of every ancestor up to the root, and refreshing the root re-copies
+  every pair in the document, so each purge alone costs time in the size of
+  the whole document.
+- `actual_element_by_created_at` resolves a createdAt to the first match in
+  the tree, and `deregister_element` drops the index entries and the gc
+  charge (`size_in_gc`) by createdAt. JS `deregisterElement` drops an entry
+  only if it names the element being collected, and keys `sizeInGC` by
+  element, because undo restores a copy of a removed container whose
+  members keep their createdAts while the tombstones are still there.
+  Collecting such a tombstone in Rust could evict the live copy's entry, so
+  a later remote change addressed at it would fail inside
+  `apply_change_pack`. Not verified that Rust undo aliases members this way.
 
 Expected direction:
 
@@ -265,6 +276,9 @@ Expected direction:
   deliberately redesigned.
 - Add tests that mutate nested object/array descendants and immediately verify
   `create_path`, `find_by_created_at`, and visible JSON output.
+- Add a test that undoes an array removal, collects the tombstone, and then
+  edits a restored member from a remote change; key the index and the gc
+  charge by element identity if it fails.
 
 ## Garbage Collection
 
@@ -300,10 +314,12 @@ Gap:
 - Rust has no step that drops a GC pair whose child was revived without
   being unregistered; JS `collect` drops such a pair.
 - The running `doc_size` disagrees with a root rebuilt from the same content:
-  removing a text node does not move its size from `live` to `gc`, and a
-  moved element's ticket is not charged the way a rebuild charges it. This
-  holds with or without collection. The JS barrier tests check the running
-  size against a rebuild; the Rust ports check the garbage count only.
+  removing a text or tree node does not move its size from `live` to `gc`,
+  and a moved element's ticket is not charged the way a rebuild charges it
+  (JS `accMovedElement`). This holds with or without collection. The JS
+  barrier tests check the running size against a rebuild; the Rust ports
+  check the garbage count only. Removed elements and their descendants do
+  match a rebuild (JS `sizeInGC`), before and after collection.
 - JS keeps a clone root and collects it too (`getGarbageLenFromClone`).
   Rust has no clone to collect: a local change runs on a copy that replaces
   the root.
