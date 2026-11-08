@@ -75,6 +75,14 @@ pub(crate) struct CrdtRoot {
     element_pair_by_created_at: BTreeMap<String, CrdtElementPair>,
     gc_element_set_by_created_at: BTreeSet<String>,
     gc_pair_by_child_id: BTreeMap<String, CrdtGcPair>,
+    /// The exact size charged to `doc_size.gc` for every registered element
+    /// whose size counts toward gc rather than live (JS `sizeInGC`). An
+    /// element gets there by its own removal or by a removed ancestor, and
+    /// recording the amount, not a flag, keeps both sides balanced although
+    /// `data_size` grows by a ticket once `removed_at` is set. JS keys this
+    /// by element identity, since an undo copy can share a tombstone's
+    /// createdAt; Rust keys it by createdAt (see the porting gaps).
+    size_in_gc: BTreeMap<String, DataSize>,
     doc_size: DocSize,
 }
 
@@ -85,6 +93,7 @@ impl CrdtRoot {
             element_pair_by_created_at: BTreeMap::new(),
             gc_element_set_by_created_at: BTreeSet::new(),
             gc_pair_by_child_id: BTreeMap::new(),
+            size_in_gc: BTreeMap::new(),
             doc_size: DocSize::default(),
         };
         let root_element = root.root_element();
@@ -149,16 +158,82 @@ impl CrdtRoot {
         count
     }
 
+    /// Registers a removed element for collection and moves its size, with
+    /// its descendants', from live to gc (JS `registerRemovedElement`).
     pub(crate) fn register_removed_element(&mut self, element: &CrdtElement) {
+        let moved = self.book_removed_element(element);
+
+        // The removal set `removed_at` after the element was registered, so
+        // the size just moved holds a ticket live was never charged. Live
+        // gets it back, but only on the move that carried it: a size already
+        // in gc did not take it from live.
+        if moved && element.removed_at().is_some() {
+            self.doc_size.live.meta += TIME_TICKET_SIZE;
+        }
+    }
+
+    /// Registers an element that already carried its `removed_at` when it
+    /// was registered, such as the losing value of a concurrent set (JS
+    /// `adoptRemovedElement`). It is `register_removed_element` without the
+    /// ticket refund: the size registered in live already held the ticket.
+    fn adopt_removed_element(&mut self, element: &CrdtElement) {
+        self.book_removed_element(element);
+    }
+
+    /// Puts `element` on the collection worklist and moves its size, with
+    /// its descendants', to gc. Reports whether its own size left live.
+    fn book_removed_element(&mut self, element: &CrdtElement) -> bool {
         let created_at = element.created_at().to_id_string();
         if let Some(pair) = self.element_pair_by_created_at.get_mut(&created_at) {
             pair.element = element.deepcopy();
         }
 
-        add_data_size(&mut self.doc_size.gc, element.data_size());
-        sub_data_size(&mut self.doc_size.live, element.data_size());
-        self.doc_size.live.meta += TIME_TICKET_SIZE;
+        let moved = self.move_size_to_gc(element);
+        self.move_descendants_to_gc(element);
         self.gc_element_set_by_created_at.insert(created_at);
+        moved
+    }
+
+    /// Moves the size of every descendant of `element` from live to gc (JS
+    /// `moveDescendantsToGC`). A container's own size is its metadata only,
+    /// so moving the container alone would strand its members in live.
+    fn move_descendants_to_gc(&mut self, element: &CrdtElement) {
+        match element {
+            CrdtElement::Object(object) => {
+                for (_, child) in object.iter_all() {
+                    self.move_size_to_gc(child);
+                    self.move_descendants_to_gc(child);
+                }
+            }
+            CrdtElement::Array(array) => {
+                for child in array.iter_all() {
+                    self.move_size_to_gc(child);
+                    self.move_descendants_to_gc(child);
+                }
+            }
+            CrdtElement::Primitive(_)
+            | CrdtElement::Counter(_)
+            | CrdtElement::Text(_)
+            | CrdtElement::Tree(_) => {}
+        }
+    }
+
+    /// Moves the size of `element` from live to gc and reports whether it
+    /// moved a size live was holding (JS `moveSizeToGC`). A size already in
+    /// gc, because the element or a container above it was removed before,
+    /// only has its charge topped up to the current size.
+    fn move_size_to_gc(&mut self, element: &CrdtElement) -> bool {
+        let size = element.data_size();
+        let created_at = element.created_at().to_id_string();
+
+        if let Some(charged) = self.size_in_gc.insert(created_at, size) {
+            adjust_data_size(&mut self.doc_size.gc, charged, size);
+            return false;
+        }
+
+        add_data_size(&mut self.doc_size.gc, size);
+        sub_data_size(&mut self.doc_size.live, size);
+        true
     }
 
     pub(crate) fn register_gc_pair(&mut self, child: &RgaTreeListNode) {
@@ -266,7 +341,7 @@ impl CrdtRoot {
             self.register_removed_element(removed);
         }
         if inserted.removed_at().is_some() {
-            self.register_removed_element(&inserted);
+            self.adopt_removed_element(&inserted);
         }
 
         Ok((inserted, removed))
@@ -347,7 +422,7 @@ impl CrdtRoot {
 
         self.register_element(&inserted, Some(&parent));
         if inserted.removed_at().is_some() {
-            self.register_removed_element(&inserted);
+            self.adopt_removed_element(&inserted);
         }
 
         Ok(inserted)
@@ -438,7 +513,7 @@ impl CrdtRoot {
         self.register_element(&inserted, Some(&parent));
         self.register_removed_element(&removed);
         if inserted.removed_at().is_some() {
-            self.register_removed_element(&inserted);
+            self.adopt_removed_element(&inserted);
         }
 
         Ok((inserted, removed))
@@ -895,7 +970,14 @@ impl CrdtRoot {
 
     fn deregister_element_internal(&mut self, element: &CrdtElement, count: &mut usize) {
         let created_at = element.created_at().to_id_string();
-        sub_data_size(&mut self.doc_size.gc, element.data_size());
+        // Take the size out of the side that holds it, by the amount charged
+        // there (JS `deregisterElement`). A member a peer set into a container
+        // already removed here never went through a removal, so it is still
+        // in live.
+        match self.size_in_gc.remove(&created_at) {
+            Some(charged) => sub_data_size(&mut self.doc_size.gc, charged),
+            None => sub_data_size(&mut self.doc_size.live, element.data_size()),
+        }
         self.element_pair_by_created_at.remove(&created_at);
         self.gc_element_set_by_created_at.remove(&created_at);
         *count += 1;
@@ -929,20 +1011,27 @@ impl CrdtRoot {
             CrdtElementPair::new(element.deepcopy(), parent.map(|parent| parent.deepcopy())),
         );
 
-        if !ancestor_removed && !element.is_removed() {
+        // A removed element and everything under it count toward gc, as
+        // JS charges them when it adopts the tombstones it registers.
+        let in_removed_subtree = ancestor_removed || element.is_removed();
+        if in_removed_subtree {
+            let size = element.data_size();
+            add_data_size(&mut self.doc_size.gc, size);
+            self.size_in_gc
+                .insert(element.created_at().to_id_string(), size);
+        } else {
             add_data_size(&mut self.doc_size.live, element.data_size());
         }
 
-        let descendant_removed = ancestor_removed || element.is_removed();
         match element {
             CrdtElement::Object(object) => {
                 for (_, child) in object.iter_all() {
-                    self.register_element_for_rebuild(child, Some(element), descendant_removed);
+                    self.register_element_for_rebuild(child, Some(element), in_removed_subtree);
                 }
             }
             CrdtElement::Array(array) => {
                 for child in array.iter_all() {
-                    self.register_element_for_rebuild(child, Some(element), descendant_removed);
+                    self.register_element_for_rebuild(child, Some(element), in_removed_subtree);
                 }
             }
             CrdtElement::Primitive(_)
@@ -959,7 +1048,6 @@ impl CrdtRoot {
                 pair.element = element.deepcopy();
             }
 
-            add_data_size(&mut self.doc_size.gc, element.data_size());
             self.gc_element_set_by_created_at.insert(created_at);
         }
 

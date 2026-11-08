@@ -327,12 +327,16 @@ fn rejects_local_update_that_exceeds_document_size_limit() -> Result<()> {
 }
 
 /// JS checks the limit only for local updates: undo and redo are not
-/// checked.
+/// checked. The replaced title is collected first: while its tombstone is
+/// still charged to gc, the undo only swaps the two titles between live and
+/// gc and the total does not grow.
 #[test]
 fn undo_is_not_checked_against_the_limit() -> Result<()> {
     let mut doc = Document::new("doc");
     doc.update(|root| root.set("title", "a long title to restore").map(|_| ()))?;
     doc.update(|root| root.set("title", "x").map(|_| ()))?;
+    let vector = doc.version_vector().clone();
+    assert_eq!(1, doc.garbage_collect(&vector));
     doc.set_max_size_per_document(doc.doc_size().total());
 
     doc.history_mut().undo()?;

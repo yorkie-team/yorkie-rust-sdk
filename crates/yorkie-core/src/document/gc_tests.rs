@@ -327,6 +327,143 @@ fn drops_the_gc_pairs_of_a_text_in_a_purged_object() -> Result<()> {
     Ok(())
 }
 
+/// Checks that the running document size matches a root rebuilt from the
+/// same content, for documents with no text or tree node removals.
+fn assert_doc_size_matches_rebuilt(d: &Document, name: &str) {
+    let rebuilt = CrdtRoot::new(d.crdt_root.object().deepcopy());
+    assert_eq!(rebuilt.doc_size(), d.doc_size(), "{name}: doc_size");
+}
+
+/// Removing a container moves its descendants' size to gc with it, and
+/// collecting it takes them out of gc, as JS `moveDescendantsToGC` and
+/// `deregisterElement` do. A container's own size is only its metadata, so
+/// moving the container alone left the members charged to live for good.
+/// The inner object is removed first, so the outer removal must not move
+/// the members under it a second time.
+#[test]
+fn moves_the_descendants_of_a_removed_container_to_gc() -> Result<()> {
+    let (mut doc, _) = replicas();
+    doc.update(|root| {
+        root.set("o", crate::JsonObject::new())?;
+        let o = root.get_object_mut("o")?;
+        o.set("a", "x".repeat(10))?.set("b", "y".repeat(10))?;
+        o.set("p", crate::JsonObject::new())?;
+        o.get_object_mut("p")?.set("c", "z".repeat(10))?;
+        root.set("keep", 1)?;
+        Ok(())
+    })?;
+    assert_doc_size_matches_rebuilt(&doc, "created");
+
+    doc.update(|root| {
+        root.get_object_mut("o")?.remove("p");
+        Ok(())
+    })?;
+    assert_doc_size_matches_rebuilt(&doc, "inner removed");
+    let inner_removed = version_vector(&doc);
+
+    doc.update(|root| {
+        root.remove("o");
+        Ok(())
+    })?;
+    assert_eq!(r#"{"keep":1}"#, doc.to_sorted_json());
+    assert_doc_size_matches_rebuilt(&doc, "outer removed");
+
+    collect(&mut doc, &inner_removed);
+    assert_doc_size_matches_rebuilt(&doc, "inner collected");
+
+    collect(&mut doc, &max_vector_of(&[A1]));
+    assert_eq!(0, doc.garbage_len());
+    assert_eq!(crate::crdt::element::DataSize::default(), doc.doc_size().gc);
+    assert_doc_size_matches_rebuilt(&doc, "outer collected");
+    Ok(())
+}
+
+/// The value that loses a concurrent set arrives already removed, and the
+/// size registered for it held its removal ticket, so moving it to gc gives
+/// live nothing back (JS `adoptRemovedElement`). A2 wins the tie, so the
+/// loser is A1's value, which reaches d2 already removed.
+#[test]
+fn adopts_the_value_that_lost_a_concurrent_set() -> Result<()> {
+    let (mut d1, mut d2) = replicas();
+    d1.update(|root| root.set("k", 1).map(|_| ()))?;
+    d2.update(|root| root.set("k", 2).map(|_| ()))?;
+    cross_sync(&mut d1, &mut d2)?;
+    assert_eq!(r#"{"k":2}"#, d1.to_sorted_json());
+    assert_eq!(r#"{"k":2}"#, d2.to_sorted_json());
+
+    for (doc, name) in [(&mut d1, "d1"), (&mut d2, "d2")] {
+        assert_doc_size_matches_rebuilt(doc, name);
+        collect(doc, &max_vector_of(&[A1, A2]));
+        assert_eq!(0, doc.garbage_len(), "{name}: garbage");
+        assert_doc_size_matches_rebuilt(doc, name);
+    }
+    Ok(())
+}
+
+/// A member a peer set into a container this replica had already removed
+/// never went through a removal, so it is charged to live; collecting the
+/// container takes it out of live, not gc, as JS `deregisterElement` takes
+/// out of each side what that side was charged.
+#[test]
+fn collects_a_member_set_into_an_already_removed_container() -> Result<()> {
+    let (mut d1, mut d2) = replicas();
+    d1.update(|root| {
+        root.set("o", crate::JsonObject::new())?;
+        root.get_object_mut("o")?.set("a", "x".repeat(10))?;
+        Ok(())
+    })?;
+    cross_sync(&mut d1, &mut d2)?;
+
+    d1.update(|root| {
+        root.remove("o");
+        Ok(())
+    })?;
+    d2.update(|root| {
+        root.get_object_mut("o")?
+            .set("b", "y".repeat(10))
+            .map(|_| ())
+    })?;
+    cross_sync(&mut d1, &mut d2)?;
+    assert_eq!("{}", d1.to_sorted_json());
+    assert_eq!(d1.to_sorted_json(), d2.to_sorted_json());
+
+    for (doc, name) in [(&mut d1, "d1"), (&mut d2, "d2")] {
+        collect(doc, &max_vector_of(&[A1, A2]));
+        assert_eq!(0, doc.garbage_len(), "{name}: garbage");
+        assert_doc_size_matches_rebuilt(doc, name);
+    }
+    Ok(())
+}
+
+/// JS checks the size limit against live plus gc, and collection takes a
+/// removed container out of both, so content replacing it that fits the
+/// limit is accepted once the container is collected.
+#[test]
+fn accepts_an_update_within_the_limit_after_collecting_a_container() -> Result<()> {
+    let (mut doc, _) = replicas();
+    let content = |root: &mut crate::JsonObject, key: &str| -> Result<()> {
+        root.set(key, crate::JsonObject::new())?;
+        root.get_object_mut(key)?
+            .set("a", "x".repeat(100))?
+            .set("b", "y".repeat(100))?;
+        Ok(())
+    };
+    doc.update(|root| content(root, "o"))?;
+    let limit = doc.doc_size().total();
+
+    doc.update(|root| {
+        root.remove("o");
+        Ok(())
+    })?;
+    collect(&mut doc, &max_vector_of(&[A1]));
+    assert_eq!("{}", doc.to_sorted_json());
+
+    doc.set_max_size_per_document(limit);
+    doc.update(|root| content(root, "n"))?;
+    assert_eq!(limit, doc.doc_size().total());
+    Ok(())
+}
+
 /// A text edit made after collection anchors on what survived it, and a
 /// replica that did not collect reaches the same text.
 #[test]
