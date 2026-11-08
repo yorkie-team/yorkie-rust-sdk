@@ -114,7 +114,7 @@ impl ConnectTransport {
         if status != 200 {
             return Err(decode_connect_error(status, &body));
         }
-        Res::decode(body.as_ref()).map_err(|err| ClientError::Transport(err.to_string()))
+        decode_message(body.as_ref())
     }
 
     /// Calls a server-streaming RPC. The request is sent as one enveloped
@@ -153,8 +153,7 @@ impl ConnectTransport {
                 loop {
                     match decoder.next_envelope() {
                         Ok(Some(Envelope::Message(payload))) => {
-                            let message = Res::decode(payload.as_slice())
-                                .map_err(|err| ClientError::Transport(err.to_string()));
+                            let message = decode_message(payload.as_slice());
                             return Some((message, Some((body, decoder))));
                         }
                         Ok(Some(Envelope::EndStream(payload))) => {
@@ -180,6 +179,24 @@ impl ConnectTransport {
                 }
             },
         ))
+    }
+}
+
+/// Decodes a response message. A message that does not decode is an
+/// `internal` error, as connect-es raises it (`parse binary`), so it is not
+/// retried: the same bytes would fail again.
+fn decode_message<Res: Message + Default>(bytes: &[u8]) -> ClientResult<Res> {
+    Res::decode(bytes).map_err(|err| internal_error(format!("parse binary: {err}")))
+}
+
+/// A response the client cannot read (connect-es `Code.Internal`), which
+/// JS `handleConnectError` does not retry.
+fn internal_error(message: String) -> ClientError {
+    ClientError::Rpc {
+        code: "internal".to_owned(),
+        message,
+        yorkie_code: None,
+        reason: None,
     }
 }
 
@@ -222,7 +239,7 @@ impl EnvelopeDecoder {
             return Ok(None);
         }
         if flags & FLAG_COMPRESSED != 0 {
-            return Err(ClientError::Transport(
+            return Err(internal_error(
                 "received a compressed Connect message without asking for one".to_owned(),
             ));
         }
@@ -514,6 +531,7 @@ impl ClientTransport for ConnectTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ErrorHandling;
     use base64::Engine;
     use yorkie_core::ErrorCode;
 
@@ -737,12 +755,29 @@ mod tests {
             decode_end_stream(b"not json"),
             Err(ClientError::Transport(_))
         ));
+    }
+
+    /// connect-es raises a response it cannot read, a message that does not
+    /// decode or a compressed envelope nobody asked for, as a
+    /// `ConnectError` with code `internal` (`serialization.ts`
+    /// `parse binary`, `envelope.ts`), which JS `handleConnectError` does
+    /// not retry. Retrying would only read the same bytes again.
+    #[test]
+    fn unreadable_responses_are_internal_errors_that_stop() {
+        let undecodable = decode_message::<api::WatchResponse>(&[0xff, 0xff, 0xff]).unwrap_err();
+        assert!(
+            matches!(&undecodable, ClientError::Rpc { code, .. } if code == "internal"),
+            "{undecodable:?}"
+        );
+        assert_eq!(ErrorHandling::Stop, undecodable.handling());
 
         let mut decoder = EnvelopeDecoder::default();
         decoder.push(&encode_envelope(FLAG_COMPRESSED, b"x"));
-        assert!(matches!(
-            decoder.next_envelope(),
-            Err(ClientError::Transport(_))
-        ));
+        let compressed = decoder.next_envelope().unwrap_err();
+        assert!(
+            matches!(&compressed, ClientError::Rpc { code, .. } if code == "internal"),
+            "{compressed:?}"
+        );
+        assert_eq!(ErrorHandling::Stop, compressed.handling());
     }
 }
