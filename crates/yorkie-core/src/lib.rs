@@ -15,6 +15,9 @@ mod operation;
 mod presence;
 mod schema;
 mod time;
+/// Protocol-shaped projections for `yorkie-protocol`. Public only so that
+/// crate can reach them; not part of the supported API.
+#[doc(hidden)]
 pub mod wire;
 
 pub use change::{

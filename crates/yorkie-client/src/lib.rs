@@ -8,6 +8,10 @@ mod client;
 mod connect;
 mod error;
 mod options;
+/// Transport DTO to protobuf conversion used by `ConnectTransport`. Not part
+/// of the supported API; implement `ClientTransport` with the re-exported
+/// request and response types instead.
+#[doc(hidden)]
 pub mod protocol;
 mod sync_loop;
 mod transport;
