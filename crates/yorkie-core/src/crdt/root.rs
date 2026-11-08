@@ -635,6 +635,14 @@ impl CrdtRoot {
             } else if let Some(array) = self.array_by_created_at_mut(&parent_created_at) {
                 array.purge(&element)
             } else {
+                // Unreachable: `element` was just found in the live tree, and
+                // only objects and arrays hold elements. Were the indexed
+                // parent stale, deregistering without a purge would still
+                // match JS, which purges from the detached parent it holds.
+                debug_assert!(
+                    false,
+                    "removed element {created_id} has no container parent"
+                );
                 Ok(())
             };
             if purged.is_err() {
