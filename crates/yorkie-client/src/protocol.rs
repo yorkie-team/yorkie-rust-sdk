@@ -595,6 +595,116 @@ mod tests {
         );
     }
 
+    /// JS `createChannelWatchStream`, `handleWatchChannelResponse`, and the
+    /// `broadcast` request.
+    #[test]
+    fn converts_channel_watch_and_broadcast_messages() {
+        let request = to_watch_channel_request(&WatchChannelRequest {
+            client_id: ActorId::new("000000000000000000000001"),
+            channel_key: "room.1".to_owned(),
+            heartbeat_interval_ms: 20000,
+            shard_key: "api-key/room".to_owned(),
+        });
+        assert_eq!("000000000000000000000001", request.client_id);
+        assert_eq!("", request.actor_id);
+        assert_eq!(20000, request.heartbeat_interval_ms);
+        assert_eq!(
+            vec![api::ResourceDescriptor {
+                resource: Some(api::resource_descriptor::Resource::Channel(
+                    api::ChannelDescriptor {
+                        channel_key: "room.1".to_owned(),
+                    }
+                )),
+            }],
+            request.resources
+        );
+
+        let init = api::WatchResponse {
+            body: Some(api::watch_response::Body::Initialization(
+                api::WatchInitialization {
+                    resource_inits: vec![api::ResourceInit {
+                        init: Some(api::resource_init::Init::ChannelInit(api::ChannelInit {
+                            channel_key: "room.1".to_owned(),
+                            session_count: 2,
+                            seq: 7,
+                        })),
+                    }],
+                    heartbeat_interval_ms: 15000,
+                },
+            )),
+        };
+        assert_eq!(
+            Some(WatchChannelResponse::Initialization {
+                session_count: 2,
+                seq: 7,
+                heartbeat_interval_ms: 15000,
+            }),
+            from_watch_channel_response(&init)
+        );
+
+        let event = |r#type: i32| api::WatchResponse {
+            body: Some(api::watch_response::Body::Event(api::WatchEvent {
+                event: Some(api::watch_event::Event::ChannelEvent(
+                    api::ChannelWatchEvent {
+                        channel_key: "room.1".to_owned(),
+                        event: Some(api::ChannelEvent {
+                            r#type,
+                            publisher: "000000000000000000000002".to_owned(),
+                            session_count: 3,
+                            seq: 8,
+                            topic: "chat".to_owned(),
+                            payload: b"{}".to_vec(),
+                        }),
+                    },
+                )),
+            })),
+        };
+        let expected = |event_type| {
+            Some(WatchChannelResponse::Event(WatchChannelEvent {
+                event_type,
+                publisher: ActorId::new("000000000000000000000002"),
+                session_count: 3,
+                seq: 8,
+                topic: "chat".to_owned(),
+                payload: b"{}".to_vec(),
+            }))
+        };
+        assert_eq!(
+            expected(WatchChannelEventType::Broadcast),
+            from_watch_channel_response(&event(api::channel_event::Type::Broadcast as i32))
+        );
+        // JS treats every type but BROADCAST as a count change.
+        for r#type in [
+            api::channel_event::Type::Presence as i32,
+            api::channel_event::Type::Unspecified as i32,
+        ] {
+            assert_eq!(
+                expected(WatchChannelEventType::Presence),
+                from_watch_channel_response(&event(r#type))
+            );
+        }
+        let document_event = api::WatchResponse {
+            body: Some(api::watch_response::Body::Event(api::WatchEvent {
+                event: Some(api::watch_event::Event::DocEvent(
+                    api::DocWatchEvent::default(),
+                )),
+            })),
+        };
+        assert_eq!(None, from_watch_channel_response(&document_event));
+
+        let broadcast = to_broadcast_request(&BroadcastRequest {
+            client_id: ActorId::new("000000000000000000000001"),
+            channel_key: "room.1".to_owned(),
+            topic: "chat".to_owned(),
+            payload: br#"{"a":1}"#.to_vec(),
+            shard_key: "api-key/room".to_owned(),
+        });
+        assert_eq!("000000000000000000000001", broadcast.client_id);
+        assert_eq!("room.1", broadcast.channel_key);
+        assert_eq!("chat", broadcast.topic);
+        assert_eq!(br#"{"a":1}"#.to_vec(), broadcast.payload);
+    }
+
     /// JS `createDocumentWatchStream` and `handleWatchDocumentResponse`.
     #[test]
     fn converts_watch_messages() {
