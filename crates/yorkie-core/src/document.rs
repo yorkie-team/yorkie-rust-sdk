@@ -343,6 +343,53 @@ impl Document {
         self.presences.contains_key(actor_id)
     }
 
+    /// Clears the set of online clients (JS `resetOnlineClients`).
+    #[doc(hidden)]
+    pub fn reset_online_clients(&mut self) {
+        self.online_clients.clear();
+    }
+
+    /// Replaces the online clients with the ones a watch stream reported when
+    /// it opened, skipping this client, and publishes `Initialized` (JS
+    /// `applyWatchInit`).
+    ///
+    /// Presences of clients that are no longer online are kept, as in JS: a
+    /// peer whose watch stream reconnects is then reported as watched again.
+    #[doc(hidden)]
+    pub fn apply_watch_init(&mut self, client_ids: impl IntoIterator<Item = ActorId>) {
+        let me = self.change_id.actor_id().clone();
+        self.online_clients = client_ids.into_iter().filter(|id| *id != me).collect();
+        let presences = self.presences();
+        self.publish(DocEvent::Initialized(presences));
+    }
+
+    /// Marks a client that started watching as online and publishes `Watched`
+    /// once its presence is known (JS `applyDocEvent(DOCUMENT_WATCHED)`).
+    #[doc(hidden)]
+    pub fn apply_watched(&mut self, publisher: ActorId) {
+        let was_online = self.online_clients.contains(&publisher);
+        if was_online && self.has_presence(&publisher) {
+            return;
+        }
+        let prev = self.presence_state(&publisher, was_online);
+        self.online_clients.insert(publisher.clone());
+        if let Some(event) = self.reconcile_presence(&publisher, prev) {
+            self.publish(event);
+        }
+    }
+
+    /// Marks a client that stopped watching as offline and publishes
+    /// `Unwatched` if it was visible (JS `applyDocEvent(DOCUMENT_UNWATCHED)`).
+    /// Its presence is kept, for the same reason as in `apply_watch_init`.
+    #[doc(hidden)]
+    pub fn apply_unwatched(&mut self, publisher: &ActorId) {
+        let prev = self.presence_state(publisher, self.online_clients.contains(publisher));
+        self.online_clients.remove(publisher);
+        if let Some(event) = self.reconcile_presence(publisher, prev) {
+            self.publish(event);
+        }
+    }
+
     /// Serializes the document root with object keys sorted lexicographically.
     pub fn to_sorted_json(&self) -> String {
         self.root.to_sorted_json()

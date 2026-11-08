@@ -708,6 +708,89 @@ mod tests {
         Ok(())
     }
 
+    /// JS `applyWatchInit`: self is skipped, `Initialized` lists the online
+    /// presences, and stale presences survive for a later reconnect.
+    #[test]
+    fn watch_init_sets_online_clients_and_publishes_initialized() -> Result<()> {
+        let mut source = attached_doc(2);
+        set_presence(&mut source, json!({"name": "b"}))?;
+        let mut target = attached_doc(1);
+        set_presence(&mut target, json!({"name": "a"}))?;
+        deliver(&mut source, &mut 0, &mut target)?;
+        let (_, events) = collect(&mut target);
+
+        target.apply_watch_init([actor(1), actor(2), actor(3)]);
+        assert_eq!(
+            vec![DocEvent::Initialized(vec![
+                (actor(1), presence_of(json!({"name": "a"}))),
+                (actor(2), presence_of(json!({"name": "b"}))),
+            ])],
+            take(&events)
+        );
+        assert_eq!(None, target.presence(&actor(3)));
+
+        target.apply_watch_init([]);
+        assert_eq!(
+            vec![DocEvent::Initialized(vec![(
+                actor(1),
+                presence_of(json!({"name": "a"}))
+            )])],
+            take(&events)
+        );
+        assert!(target.has_presence(&actor(2)));
+        Ok(())
+    }
+
+    /// JS `applyDocEvent(DOCUMENT_WATCHED | DOCUMENT_UNWATCHED)`.
+    #[test]
+    fn watched_and_unwatched_follow_the_online_set() -> Result<()> {
+        let mut source = attached_doc(2);
+        set_presence(&mut source, json!({"name": "b"}))?;
+        let mut target = attached_doc(1);
+        let (_, events) = collect(&mut target);
+
+        // Watched before the presence arrives is silent; the presence then
+        // makes the client watched.
+        target.apply_watched(actor(2));
+        assert!(take(&events).is_empty());
+        deliver(&mut source, &mut 0, &mut target)?;
+        assert_eq!(
+            vec![DocEvent::Watched(
+                actor(2),
+                presence_of(json!({"name": "b"}))
+            )],
+            take(&events)
+        );
+
+        // A duplicate watched event is ignored.
+        target.apply_watched(actor(2));
+        assert!(take(&events).is_empty());
+
+        target.apply_unwatched(&actor(2));
+        assert_eq!(
+            vec![DocEvent::Unwatched(
+                actor(2),
+                presence_of(json!({"name": "b"}))
+            )],
+            take(&events)
+        );
+        assert!(target.has_presence(&actor(2)));
+
+        // The kept presence makes a reconnect visible again.
+        target.apply_watched(actor(2));
+        assert_eq!(
+            vec![DocEvent::Watched(
+                actor(2),
+                presence_of(json!({"name": "b"}))
+            )],
+            take(&events)
+        );
+
+        target.reset_online_clients();
+        assert!(target.others_presences().is_empty());
+        Ok(())
+    }
+
     #[test]
     fn publish_delivers_client_events() {
         let mut doc = Document::new("doc-key");
