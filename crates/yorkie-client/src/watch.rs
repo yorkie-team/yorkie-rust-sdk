@@ -254,7 +254,7 @@ fn handle_response(
                 WatchDocEventType::DocumentUnwatched => {
                     lock_document(doc).apply_unwatched(&publisher)
                 }
-                // Broadcast delivery is not ported yet.
+                // JS ignores it too: broadcasts travel on channels.
                 WatchDocEventType::DocumentBroadcast => {}
             }
             Handled::Continue

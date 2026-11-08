@@ -49,12 +49,6 @@ pub enum DocEvent {
     Unwatched(ActorId, Presence),
     /// A client's presence changed (JS `presence-changed`).
     PresenceChanged(ActorId, Presence),
-    /// A broadcast message arrived (JS `broadcast`).
-    Broadcast {
-        actor: ActorId,
-        topic: String,
-        payload: Value,
-    },
 }
 
 /// The operations made by one change and its message (JS `ChangeInfo`).

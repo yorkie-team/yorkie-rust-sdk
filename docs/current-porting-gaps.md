@@ -733,9 +733,9 @@ Gap:
   remote presence changes, and status transitions publish
   `PresenceChanged`/`Watched`/`Unwatched`. A remote `Clear` takes the actor
   offline. The client publishes `Initialized`, watch-driven
-  `Watched`/`Unwatched`, `ConnectionChanged`, and `SyncStatusChanged`;
-  `Broadcast` is defined but not published yet. JS `AuthError`,
-  `EpochMismatch`, `WriteRejected`, `LocalChangesDropped`, and
+  `Watched`/`Unwatched`, `ConnectionChanged`, and `SyncStatusChanged`.
+  Broadcast is a channel event, not a document event, as in JS. JS
+  `AuthError`, `EpochMismatch`, `WriteRejected`, `LocalChangesDropped`, and
   `PersistDisabled` events are not ported. `ChangeInfo` omits JS
   `clientSeq`/`serverSeq`/`rawChange`.
 - Change packs can be projected to generated protobuf payloads and
