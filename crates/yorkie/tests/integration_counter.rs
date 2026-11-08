@@ -102,6 +102,7 @@ async fn syncs_an_increase() {
 /// JS "Can handle concurrent increase operation" (counter_test.ts:87). JS
 /// resets `width` with `new Counter(2.5)`, an Integer counter of 2.
 #[tokio::test]
+#[allow(clippy::approx_constant)] // JS increases by the literal 3.14.
 async fn converges_after_concurrent_increases() {
     let Some(addr) = rpc_addr() else { return };
     let t = TwoClients::attach(&addr, "counter-concurrent-increase").await;
