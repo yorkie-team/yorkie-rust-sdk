@@ -251,9 +251,10 @@ struct ErrorInfo {
     metadata: std::collections::HashMap<String, String>,
 }
 
-/// Returns the Yorkie error code from the `ErrorInfo` detail of a Connect
-/// JSON error (JS `errorCodeOf`), if it carries one. Connect sends each
-/// detail's protobuf bytes base64-encoded, with or without padding.
+/// Returns the Yorkie error code from the first `ErrorInfo` detail of a
+/// Connect JSON error (JS `errorCodeOf`, which reads only that detail), if it
+/// carries one. Connect sends each detail's protobuf bytes base64-encoded,
+/// with or without padding.
 fn yorkie_code_of(error: &serde_json::Value) -> Option<String> {
     use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
     use base64::engine::DecodePaddingMode;
@@ -272,8 +273,9 @@ fn yorkie_code_of(error: &serde_json::Value) -> Option<String> {
             detail.get("type").and_then(|value| value.as_str()) == Some("google.rpc.ErrorInfo")
         })
         .filter_map(|detail| BASE64.decode(detail.get("value")?.as_str()?).ok())
-        .filter_map(|bytes| ErrorInfo::decode(bytes.as_slice()).ok())
-        .find_map(|info| info.metadata.get("code").cloned())
+        .find_map(|bytes| ErrorInfo::decode(bytes.as_slice()).ok())?
+        .metadata
+        .remove("code")
 }
 
 fn protocol_error(err: impl ToString) -> ClientError {
@@ -510,6 +512,17 @@ mod tests {
         ));
         assert!(err.has_yorkie_code("ErrSessionNotFound"));
         assert!(!err.has_yorkie_code("ErrClientNotFound"));
+
+        // Only the first ErrorInfo counts, even without a code (JS
+        // `errorMetadataOf`). "CgFy" is an ErrorInfo with reason "r" only.
+        let first_without_code = br#"{"code":"not_found","message":"m","details":[{"type":"google.rpc.ErrorInfo","value":"CgFy"},{"type":"google.rpc.ErrorInfo","value":"Cglub3RfZm91bmQaGgoEY29kZRISRXJyU2Vzc2lvbk5vdEZvdW5k"}]}"#;
+        assert!(matches!(
+            decode_connect_error(404, first_without_code),
+            ClientError::Rpc {
+                yorkie_code: None,
+                ..
+            }
+        ));
 
         let end_stream = br#"{"error":{"code":"not_found","message":"m","details":[{"type":"google.rpc.ErrorInfo","value":"Cglub3RfZm91bmQaGgoEY29kZRISRXJyU2Vzc2lvbk5vdEZvdW5k"}]}}"#;
         assert!(decode_end_stream(end_stream)
