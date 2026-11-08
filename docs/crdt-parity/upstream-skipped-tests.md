@@ -1,6 +1,6 @@
 # Upstream Skipped Tests
 
-Last reviewed: 2026-05-14
+Last reviewed: 2026-11-08
 
 This document tracks CRDT-related tests that are skipped or dynamically skipped
 in the JS SDK or Go implementation. These tests are not Rust pass targets while
@@ -34,7 +34,7 @@ they remain skipped upstream.
 | Tree history | `packages/sdk/test/integration/history_tree_test.ts:667` | Case 5 `overlap_start`: remote overlaps start of undo range. | Overlapping reconciliation needs symmetric index computation. | Keep skipped or ignored. |
 | Tree history | `packages/sdk/test/integration/history_tree_test.ts:712` | Case 6 `overlap_end`: remote overlaps end of undo range. | Overlapping reconciliation needs symmetric index computation. | Keep skipped or ignored. |
 | Tree split history | `packages/sdk/test/integration/history_tree_split_test.ts:799` | Chained undo case where `op1 === "split-l2"` and `op2 === "split-l2"`. | Upstream notes a known undo bug in the boundary-deletion reverse operation when consecutive L2 splits create tombstoned structure. | Keep skipped or ignored. |
-| Tree CRDT unit | `packages/sdk/test/unit/document/crdt/tree_test.ts:1444` | `Can merge different levels with edit`. | Upstream TODO says the test and change assertions need to be fixed. | Keep skipped or ignored; do not infer new merge semantics from this test alone. |
+| Tree CRDT unit | `packages/sdk/test/unit/document/crdt/tree_test.ts:1700` | `Can merge different levels with edit`. | Upstream TODO says the test and change assertions need to be fixed. | Ported as the ignored `crdt::tree::tests::merges_different_levels_with_edit`; do not infer new merge semantics from this test alone. |
 
 Non-CRDT skips and todos found during this pass are excluded from the parity
 inventory, such as schema validator todos, benchmark environment skips,
@@ -48,10 +48,11 @@ database setup skips, and server push-pull consistency skips.
 
 ## Current Rust Status
 
-Rust does not currently carry ignored tests for the skipped upstream cases
-listed above. That is intentional for now because several required layers are
-not yet present, especially full history undo/redo and Tree edit/style
-operations.
+Rust carries one ignored test for the skipped upstream cases listed above:
+`crdt::tree::tests::merges_different_levels_with_edit` for the JS Tree CRDT
+unit case. The history cases wait for Tree undo/redo. The JS
+`tree_concurrency_test.ts` matrices have no skipped combinations, and every
+Rust combination converges.
 
 When those layers are added, port active upstream tests first. Then add ignored
 Rust tests for the skipped upstream cases only when they are useful as visible

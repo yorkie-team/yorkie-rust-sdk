@@ -118,9 +118,10 @@ Current Rust behavior:
   update's change context, and records the matching `EditOperation` or
   `StyleOperation`, so later edits in the same update see earlier ones, as in
   JS.
-- `JsonTree` (JS `Tree`) supports `edit` (JS `edit`/`editBulk`),
-  `edit_by_path` (JS `editByPath`/`editBulkByPath`), `style`, `remove_style`,
-  `to_xml`, `to_json`, `size`, `index_to_path`, and `path_to_index`. Like
+- `JsonTree` (JS `Tree`) supports `edit` (JS `edit`/`editBulk`, splits
+  included), `edit_by_path` (JS `editByPath`/`editBulkByPath`),
+  `split_by_path`, `merge_by_path`, `style`, `remove_style`, `to_xml`,
+  `to_json`, `size`, `index_to_path`, and `path_to_index`. Like
   `JsonText`, it holds a copy of the CRDT tree, applies each edit or style to
   it, and records the matching `TreeEditOperation` or `TreeStyleOperation`.
   Input nodes are `TreeNodeInput` values (JS `ElementNode`/`TextNode`),
@@ -152,10 +153,7 @@ Gap:
 - Rust value-based array search uses `JsonValue` equality. For non-primitive
   containers, JS compares wrapped element identity; Rust callers should use the
   explicit ID search methods when identity matters.
-- `JsonTree` does not accept `split_level > 0` yet; such an edit fails with
-  `YorkieError::Unimplemented`. Splits and merges through the facade are
-  Task 10 of the JS parity plan.
-- `JsonTree` does not port JS `splitByPath`, `mergeByPath`, `styleByPath`,
+- `JsonTree` does not port JS `styleByPath`,
   `removeStyleByPath`, `getNodeSize`, `getIndexTree`, `getRootTreeNode`, the
   position-range conversions (`indexRangeToPosRange`, `posRangeToIndexRange`,
   `pathRangeToPosRange`, `posRangeToPathRange`), or the test helpers. There is
@@ -543,9 +541,10 @@ Current Rust behavior:
 
 - `TreeNodeId` models the same creation-ticket plus UTF-16 offset identity used
   by JS `CRDTTreeNodeID` and Go `TreeNodeID`.
-- `CrdtTree` stores a root `TreeNode`, rebuilds a node lookup map by ID, and
-  resolves split-node floor lookups only when the requested ID has the same
-  creation ticket.
+- `CrdtTree` stores a root `TreeNode`, rebuilds the set of node IDs after
+  each structural change, and resolves split-node floor lookups only when the
+  requested ID has the same creation ticket. Nodes are found by walking the
+  tree, so each lookup costs a tree walk where JS and Go keep an LLRB map.
 - `TreeNode` supports element nodes, text nodes, optional `Rht` attributes,
   tombstones, split-link metadata, merge metadata, JSON/XML output, UTF-16 text
   sizing, active attribute data size, and internal GC pair discovery.
@@ -575,18 +574,36 @@ Current Rust behavior:
 - `CrdtTree` can apply split-free element insert/delete edits and text-node
   split insert/delete edits, collect tree edit operation info, register removed
   node GC pairs, and report reverse operation inputs.
-- `CrdtTree` can apply multi-level element splits by cloning the split element
-  type and attributes, moving the right-side children into new siblings, and
-  issuing split node IDs with the same delimiter progression used by JS/Go.
-- `CrdtTree` can merge visible element boundaries by tombstoning merge source
-  elements, moving live children into the left-side parent, and recording basic
-  `mergedFrom`, `mergedAt`, and `mergedInto` metadata.
-- `CrdtTree` covers representative concurrent split cases ported from JS/Go:
-  same-position splits, different-position splits on the same node, and
-  different-level splits.
-- `CrdtTree` also covers representative concurrent insert/delete cases around
-  split positions, including inserts into the original node, split boundary, and
-  split node.
+- `CrdtTree::edit` ports JS `CRDTTree.edit` step by step, by node ID:
+  - 01-1: the ends advance past the split siblings the editor did not know,
+    stopping at the editor's own split products (§7.7), and the traversal is
+    narrowed when a concurrent split put the ends in different parents;
+  - 02: the traversal removes what the editor knew, reaches the unknown split
+    siblings of a deleted element (JS `collectUnknownSplitSiblings`), and
+    resolves concurrent deletions last writer wins;
+  - 03: a merge moves every child of a merged element, removed ones too, to
+    the resolved merge target (chained merges stay flat), stamps
+    `mergedFrom`/`mergedAt` on the first move only, points the source at the
+    target, and tombstones in place what would close a cycle;
+  - 03-1: deleting a merge source deletes the children it gave away, unless
+    the edit's own positions declared it (JS `declaredBoundaries`);
+  - 04: splits use physical child offsets, keep merge-moved children of the
+    level (Fix 8) and concurrent inserts at the boundary (§7.3) on the left,
+    move an empty product in front of a re-parented sibling (§7.4), advance
+    per level past unknown split siblings (§7.5), order same-boundary splits
+    by ticket (JS `orderSameBoundarySplit`), and link the next split sibling
+    back to the product. A split is reported as one empty change where it
+    opened;
+  - 05: content inserted at a position declared in a merged-away parent is
+    stamped with that parent and the merge ticket (§9.4).
+- The tickets of the elements a split creates come from the recorded
+  `TreeEditOperation.split_tickets` (JS `splitTickets`), then from the JS
+  fallback that rebuilds them from `executed_at` and the top-level content
+  count. The wire shape and the proto converter carry `split_tickets`.
+- Purging a removed node links its split siblings to each other, as JS
+  `CRDTTree.purge` does.
+- `rebuild_merge_state` follows JS `rebuildMergeState` for trees loaded from
+  a snapshot.
 - `CrdtElement::Tree` participates in metadata dispatch, JSON conversion,
   data-size accounting, removal, and deep copy.
 - `CrdtRoot` can find tree elements by creation time, rebuild tree internal GC
@@ -624,29 +641,35 @@ Gap:
 - Rust Tree style operation is still partial. It now propagates style/remove
   style to direct unknown split siblings in the JS/Go shape, but the broader
   concurrent style matrices and range-narrowing edge cases are not yet ported.
-- Rust Tree edit operation is still partial. It now supports text split ranges,
-  multi-level element split, visible element-boundary merge, representative
-  concurrent split/insert/delete cases, range narrowing, and basic merge metadata, but
-  redo tagging after split undo, full `insPrevID`/`insNextID` maintenance across
-  existing neighbors, and the broader concurrent edit matrix still need JS/Go
-  parity work.
+- Tree undo and redo are not ported. Reverse tree edit operations are still
+  built for insert/delete, pure split and merge edits, but a reverse that
+  does not fit the tree after a concurrent merge is dropped rather than
+  failing the edit, and the JS reverse machinery (restore spans, split
+  reconciliation, `mergeSourceOf`, `redoSplitLevel`, `dropDuplicateContents`
+  for copy-reinserted content) is not ported.
 - Like `CrdtText`, Tree text-node splitting uses valid Rust strings. Splitting
   inside an invalid standalone UTF-16 surrogate edge would need the same
   deliberate representation choice as Text.
-- Split and merge metadata is stored, new text/element split nodes receive the
-  basic split identity/link metadata, and merge source children receive basic
-  merge metadata. Neighbor-link maintenance and concurrent split/merge metadata
-  still need broader parity coverage.
+- A split does not register the attribute tombstones its product copies
+  (JS `pushPendingGCPair` for `split.getGCPairs()`): the root keys GC pairs by
+  ID string, and the copy carries the same attribute IDs as the original. They
+  stay uncollected garbage; content is unaffected.
+- TreeEdit content decoded from the wire keeps the split links and merge
+  lineage it carries; JS drops them (`dropEngineOnlyLinks`). Content created
+  by JS, Go, or Rust editors never carries them.
+- Rust style resolution does not port the JS §9.4 interloper guards
+  (`mergedAnchorInterloperGuard`, `reversedFromAnchorRecovery`) or the
+  declared-lineage checks of `styleTargets`. The ported style matrices,
+  merge and split included, converge and match JS.
 - Operation-time GC registration exists for split-free tree-node deletion,
   text-node split deletion, and visible-boundary merge source tombstones, but
   concurrent element split/merge deletion paths still need JS/Go parity.
-- The public `JsonTree` facade covers insert, delete, style, and remove-style
-  edits, but not splits and merges (Task 10). Wire conversion exists for full
-  `JSONElement.Tree` payloads and tree edit/style operation bodies, but
-  broader JS/Go protocol replay fixtures are still needed.
-- Concurrent edits converge in the ported JS `tree_concurrency_test.ts`
-  edit-edit, style-style, and edit-style matrices without merge and split
-  operations. The matrices with them are not ported yet.
+- Wire conversion exists for full `JSONElement.Tree` payloads and tree
+  edit/style operation bodies, but broader JS/Go protocol replay fixtures are
+  still needed.
+- All the matrices of JS `tree_concurrency_test.ts` are ported, merge and
+  split operations included. Every combination converges, and on 2026-11-08
+  each ended with the same XML as the JS SDK run against the same server.
 - Tree attribute JSON output still uses its own scalar parsing helper. JS
   re-encodes every value through `JSON.parse`, emits `"attributes":{}` for a
   node whose attributes were all removed, and does not escape text in
@@ -655,18 +678,13 @@ Gap:
 - Rust `TreeNode::can_style` still refuses a removed node unless the style is
   later than the removal, where JS styles removed nodes too. Removed nodes
   report no change either way, so only an undo restore could tell them apart.
-- Element splits (`split_element_at`) do not yet update the `insPrevID` of
-  the node after the split node, which text splits now do as in JS
-  `CRDTTreeNode.split`.
 
 Expected direction:
 
 - Extend path/index conversion tests around removed nodes and mixed
   element/text children so edit/style operations can reuse the same position
   semantics.
-- Add Tree edit operation tests from JS/Go around redo after split undo,
-  removed-node ranges, mixed-level merge cases, and the broader generated
-  concurrent edit matrix before exposing public Tree methods.
+- Port Tree undo and redo, with the JS split and merge reverse operations.
 - Extend Tree style parity from direct split-sibling propagation toward the full
   version-vector and concurrent style matrices in JS/Go.
 
