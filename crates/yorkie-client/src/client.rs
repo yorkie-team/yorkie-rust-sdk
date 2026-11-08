@@ -1455,6 +1455,8 @@ mod tests {
         /// once these run out, streams report one session.
         channel_watch_scripts: Mutex<Vec<Vec<ClientResult<WatchChannelResponse>>>>,
         broadcast_requests: Mutex<Vec<BroadcastRequest>>,
+        /// Errors for the next broadcasts, in order; later ones succeed.
+        broadcast_errors: Mutex<Vec<ClientError>>,
     }
 
     impl Default for MockTransport {
@@ -1479,6 +1481,7 @@ mod tests {
                 channel_watch_requests: Mutex::new(Vec::new()),
                 channel_watch_scripts: Mutex::new(Vec::new()),
                 broadcast_requests: Mutex::new(Vec::new()),
+                broadcast_errors: Mutex::new(Vec::new()),
             }
         }
     }
@@ -1616,6 +1619,10 @@ mod tests {
 
         async fn broadcast(&self, request: BroadcastRequest) -> ClientResult<BroadcastResponse> {
             self.broadcast_requests.lock().unwrap().push(request);
+            let mut errors = self.broadcast_errors.lock().unwrap();
+            if !errors.is_empty() {
+                return Err(errors.remove(0));
+            }
             Ok(BroadcastResponse)
         }
     }
@@ -2989,7 +2996,32 @@ mod tests {
             .await?;
         eventually(|| channel.lock().unwrap().is_attached()).await;
 
+        let detached = shared_channel("detached");
+        client
+            .attach_channel(detached.clone(), fast_channel(SyncMode::Polling))
+            .await?;
+        eventually(|| detached.lock().unwrap().is_attached()).await;
+        let refreshes_of = |key: &str| {
+            transport
+                .refresh_requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.channel_key == key)
+                .count()
+        };
+
+        // A detached channel is no longer refreshed, while the other is.
+        client.detach_channel(&detached).await?;
+        let (detached_before, room_before) = (refreshes_of("detached"), refreshes_of("room"));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(detached_before, refreshes_of("detached"));
+        assert!(refreshes_of("room") > room_before);
+
         client.deactivate(DeactivateOptions::default()).await?;
+        let total = transport.refresh_requests.lock().unwrap().len();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(total, transport.refresh_requests.lock().unwrap().len());
 
         assert!(!client.has("room"));
         let channel = channel.lock().unwrap();
@@ -3171,10 +3203,95 @@ mod tests {
         assert_eq!(b"[1,2]".to_vec(), requests[1].payload);
         assert!(errors.lock().unwrap().is_empty());
 
+        // Detaching removes the sending subscriber: after attaching again,
+        // one broadcast is sent once, not twice (JS `unsubscribeLocalBroadcast`).
         client.detach_channel(&channel).await?;
-        assert!(format!("{:?}", channel.lock().unwrap()).contains("subscribers: 0"));
+        client
+            .attach_channel(channel.clone(), fast_channel(SyncMode::Polling))
+            .await?;
+        eventually(|| channel.lock().unwrap().is_attached()).await;
+        channel
+            .lock()
+            .unwrap()
+            .broadcast("again", json!(null), BroadcastOptions::default())?;
+        eventually(|| transport.broadcast_requests.lock().unwrap().len() == 3).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(3, transport.broadcast_requests.lock().unwrap().len());
         Ok(())
     }
+
+    /// Review rule: detaching while a broadcast waits to retry ends the
+    /// retries (Rust checks the attachment on every try).
+    #[tokio::test(start_paused = true)]
+    async fn detaching_ends_broadcast_retries() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        let client = mock_client(fast_loop_options(), &transport);
+        client.activate().await?;
+        let channel = shared_channel("room");
+        client
+            .attach_channel(channel.clone(), fast_channel(SyncMode::Polling))
+            .await?;
+        eventually(|| channel.lock().unwrap().is_attached()).await;
+        transport
+            .broadcast_errors
+            .lock()
+            .unwrap()
+            .push(ClientError::Transport("connection reset".to_owned()));
+
+        let broadcast = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .broadcast("room", "chat", json!(1), BroadcastOptions::default())
+                    .await
+            }
+        });
+        eventually(|| transport.broadcast_requests.lock().unwrap().len() == 1).await;
+        client.detach_channel(&channel).await?;
+
+        assert_eq!(
+            Err(ClientError::NotAttached("room".to_owned())),
+            broadcast.await.unwrap()
+        );
+        assert_eq!(1, transport.broadcast_requests.lock().unwrap().len());
+        Ok(())
+    }
+
+    /// `Client::broadcast` returns a failure that is not retryable at once,
+    /// without waiting to retry.
+    #[tokio::test(start_paused = true)]
+    async fn client_broadcast_returns_a_non_retryable_error() -> ClientResult<()> {
+        let transport = Arc::new(MockTransport::default());
+        let client = mock_client(fast_loop_options(), &transport);
+        client.activate().await?;
+        let channel = shared_channel("room");
+        client
+            .attach_channel(channel.clone(), fast_channel(SyncMode::Polling))
+            .await?;
+        eventually(|| channel.lock().unwrap().is_attached()).await;
+        let denied = ClientError::Rpc {
+            code: "permission_denied".to_owned(),
+            message: "denied".to_owned(),
+            yorkie_code: None,
+        };
+        transport
+            .broadcast_errors
+            .lock()
+            .unwrap()
+            .push(denied.clone());
+
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            Err(denied),
+            client
+                .broadcast("room", "chat", json!(1), BroadcastOptions::default())
+                .await
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(1, transport.broadcast_requests.lock().unwrap().len());
+        Ok(())
+    }
+
     /// Review rule (JS clears `SyncLoop` synchronously): a round that ends
     /// the loop marks it stopped before releasing the task queue, so a call
     /// queued behind the round sees it stopped. This pins the invariant; the
