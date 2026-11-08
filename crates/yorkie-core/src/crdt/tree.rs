@@ -241,6 +241,25 @@ impl TreeNode {
         self.removed_at.is_some()
     }
 
+    /// Reports whether an edit at `edited_at` removes this node (JS
+    /// `canDelete`): its creation must be known to the edit, and a tombstone
+    /// it already has must be one the edit did not know and older, so
+    /// concurrent deletions resolve last writer wins.
+    pub(crate) fn can_delete(
+        &self,
+        edited_at: &TimeTicket,
+        creation_known: bool,
+        tombstone_known: bool,
+    ) -> bool {
+        if !creation_known {
+            return false;
+        }
+        match &self.removed_at {
+            None => true,
+            Some(removed_at) => !tombstone_known && edited_at.after(removed_at),
+        }
+    }
+
     pub(crate) fn can_style(&self, edited_at: &TimeTicket, client_lamport_at_change: i64) -> bool {
         if self.is_text() {
             return false;
@@ -349,29 +368,6 @@ impl TreeNode {
             data: left_size.data + right_size.data - prev_size.data,
             meta: left_size.meta + right_size.meta - prev_size.meta,
         })
-    }
-
-    fn physical_child_offset(&self, visible_offset: usize) -> Result<usize> {
-        let visible_count = self.children().count();
-        if visible_offset > visible_count {
-            return Err(YorkieError::InvalidTreePosition(
-                "child offset is out of range".to_owned(),
-            ));
-        }
-
-        if visible_offset == visible_count {
-            return Ok(self.children.len());
-        }
-
-        self.children
-            .iter()
-            .enumerate()
-            .filter(|(_, child)| !child.is_removed())
-            .nth(visible_offset)
-            .map(|(index, _)| index)
-            .ok_or_else(|| {
-                YorkieError::InvalidTreePosition("child offset is out of range".to_owned())
-            })
     }
 
     pub(crate) fn remove(&mut self, removed_at: TimeTicket) -> bool {
@@ -1037,85 +1033,72 @@ impl CrdtTree {
         } else {
             to_left_raw
         };
-        let from_parent_path = self.path_of(&from_parent)?;
-        let from_left_path = self.path_of(&from_left)?;
-        let to_parent_path = self.path_of(&to_parent)?;
-        let to_left_path = self.path_of(&to_left)?;
-
-        let from_idx = visible_index_of_physical(
-            &self.root,
-            physical_index_after_left_path(&self.root, &from_parent_path, &from_left_path)?,
-        );
-        let to_idx = visible_index_of_physical(
-            &self.root,
-            physical_index_after_left_path(&self.root, &to_parent_path, &to_left_path)?,
-        );
+        let from_idx = self.to_index(&from_parent, &from_left)?;
+        let to_idx = self.to_index(&to_parent, &to_left)?;
         let from_path = self.index_to_path(from_idx)?;
-        let mut collect_from_parent_path = from_parent_path.clone();
-        let mut collect_from_left_path = from_left_path.clone();
-        let mut merge_level = 0;
-        if from_left_path != from_parent_path && from_parent_path != to_parent_path {
-            let mut current_path = from_left_path.clone();
-            loop {
-                let current = node_at_path(&self.root, &current_path)?;
-                let Some(ins_next_id) = current.ins_next_id() else {
+
+        // Range narrowing: when a concurrent split put the two ends in
+        // different parents, start the traversal at the split sibling of
+        // `from_left` in `to_parent`. Merge, split and insert still use the
+        // original `from_parent` and `from_left`.
+        let mut collect_from_parent = from_parent.clone();
+        let mut collect_from_left = from_left.clone();
+        if from_left != from_parent && from_parent != to_parent {
+            let mut walker = InsNextWalker::default();
+            walker.visit(&from_left);
+            let mut current = from_left.clone();
+            while let Some(ins_next_id) = self.node(&current)?.ins_next_id().cloned() {
+                let Some(next) = self.floor_id(&ins_next_id) else {
                     break;
                 };
-                let Some(next_path) = self.floor_node_path(ins_next_id) else {
-                    break;
-                };
-                let next = node_at_path(&self.root, &next_path)?;
-                if next.is_text() {
+                if self.node(&next)?.is_text() || !walker.visit(&next) {
                     break;
                 }
-                if split_parent_path(&next_path).map(|(path, _)| path)
-                    == Some(to_parent_path.clone())
-                {
-                    if to_left_path != to_parent_path {
-                        collect_from_left_path = next_path;
-                        collect_from_parent_path = to_parent_path.clone();
+                if self.parent_id(&next).as_ref() == Some(&to_parent) {
+                    // At the start of `to_parent` the narrowed range would run
+                    // backwards and drop the merge the editor asked for.
+                    if to_left != to_parent {
+                        collect_from_left = next;
+                        collect_from_parent = to_parent.clone();
                     }
                     break;
                 }
-                current_path = next_path;
+                current = next;
             }
         }
 
         // The traversal covers tombstones too (JS `traverseInPosRange`), so it
         // runs over indexes that count removed nodes, not the visible ones.
-        let collect_from_idx = physical_index_after_left_path(
-            &self.root,
-            &collect_from_parent_path,
-            &collect_from_left_path,
-        )?;
-        let collect_to_idx =
-            physical_index_after_left_path(&self.root, &to_parent_path, &to_left_path)?;
-        let mut changes = Vec::new();
-        if collect_from_idx < collect_to_idx {
-            let targets =
-                self.edit_targets(collect_from_idx, collect_to_idx, &edited_at, version_vector);
-            changes = self.make_deletion_changes(&targets.removal_tokens)?;
-            merge_level = targets.merge_paths.len();
-            for path in targets.remove_paths.iter().rev() {
-                let node = node_at_path_mut(&mut self.root, path)?;
-                if node.remove(edited_at.clone()) {
-                    gc_pairs.push((node.id_string(), node.data_size(), edited_at.clone()));
-                    removed_nodes.push(node.clone());
-                }
+        let collect_from_idx =
+            self.physical_index_after(&collect_from_parent, &collect_from_left)?;
+        let collect_to_idx = self.physical_index_after(&to_parent, &to_left)?;
+        let targets = if collect_from_idx < collect_to_idx {
+            self.edit_targets(collect_from_idx, collect_to_idx, &edited_at, version_vector)?
+        } else {
+            EditTargets::default()
+        };
+        // A concurrent deletion splits the range into several changes.
+        let mut changes = self.make_deletion_changes(&targets.removal_tokens)?;
+        let merge_level = targets.merged.len();
+
+        // 02. Delete the nodes marked as removed.
+        for id in &targets.removed {
+            let node = self.node_mut(id)?;
+            if node.remove(edited_at.clone()) {
+                gc_pairs.push((node.id_string(), node.data_size(), edited_at.clone()));
+                removed_nodes.push(node.clone());
             }
-            self.merge_nodes(&from_parent_path, &targets.merge_paths, &edited_at)?;
-            let merge_delete_paths = self.merge_delete_paths(
-                &from_parent_path,
-                &targets.remove_paths,
-                &targets.merge_paths,
-            )?;
-            for path in merge_delete_paths.iter().rev() {
-                let node = node_at_path_mut(&mut self.root, path)?;
-                if node.remove(edited_at.clone()) {
-                    gc_pairs.push((node.id_string(), node.data_size(), edited_at.clone()));
-                    removed_nodes.push(node.clone());
-                }
-            }
+        }
+
+        // 03. Merge: move the children of the merged elements to the merge
+        // target, and 03-1, delete what earlier merges moved out of the
+        // elements this edit deleted whole.
+        let dest = self.resolve_merge_target(&from_parent)?;
+        for (id, size) in self.move_merged_children(&targets.moved, &dest, &edited_at)? {
+            gc_pairs.push((id, size, edited_at.clone()));
+        }
+        for (id, size) in self.propagate_merge_deletes(&targets, &dest, &range, &edited_at)? {
+            gc_pairs.push((id, size, edited_at.clone()));
         }
 
         // 04. Split the elements for the split level.
@@ -1183,7 +1166,6 @@ impl CrdtTree {
         }
 
         self.rebuild_node_map();
-        self.rebuild_merge_state();
         gc_pairs.extend(self.drain_pending_gc_pairs());
 
         let changes = attach_insertion_change(changes, from_idx, from_path, inserted_value);
@@ -1247,7 +1229,6 @@ impl CrdtTree {
         let purged = self.root.purge_gc_pair_by_id(child_id);
         if purged {
             self.rebuild_node_map();
-            self.rebuild_merge_state();
         }
         purged
     }
@@ -1521,66 +1502,267 @@ impl CrdtTree {
         Ok(1)
     }
 
+    /// Collects what an edit of the range between the two indexes, which
+    /// count removed nodes, removes and merges (JS `CRDTTree.edit` step 01's
+    /// traversal).
     fn edit_targets(
         &self,
         from_idx: usize,
         to_idx: usize,
         edited_at: &TimeTicket,
         version_vector: Option<&crate::VersionVector>,
-    ) -> EditTargets {
+    ) -> Result<EditTargets> {
+        let tokens = collect_tokens_between(&self.root, from_idx, to_idx, true);
+        // The elements the range covers whole, start and end tokens both.
+        let enclosed = tokens
+            .iter()
+            .filter(|token| token.kind == TreeTokenKind::Start && token.ended)
+            .filter_map(|token| node_at_path(&self.root, &token.path).ok())
+            .map(|node| node.id().clone())
+            .collect::<BTreeSet<_>>();
+
         let mut targets = EditTargets::default();
         let mut removed = BTreeSet::new();
         let mut merged = BTreeSet::new();
+        for token in tokens {
+            let node = node_at_path(&self.root, &token.path)?;
+            let id = node.id().clone();
 
-        for token in collect_tokens_between(&self.root, from_idx, to_idx, true) {
-            let Ok(node) = node_at_path(&self.root, &token.path) else {
-                continue;
-            };
-
+            // An element whose start token alone is in the range is merged:
+            // its children move to the merge target, removed ones too, so
+            // they stay anchors there. An element created concurrently is
+            // not, as crossing into it is an artifact of a concurrent split
+            // (Fix 9).
             if token.kind == TreeTokenKind::Start
                 && !token.ended
                 && ticket_known(version_vector, node.id().created_at())
             {
-                targets.merge_paths.push(token.path.clone());
-                merged.insert(token.path.clone());
+                targets.merged.push(id.clone());
+                merged.insert(id.clone());
+                targets
+                    .moved
+                    .extend(node.all_children().map(|child| child.id().clone()));
             }
 
+            let creation_known = ticket_known(version_vector, node.id().created_at());
+            let tombstone_known = node
+                .removed_at()
+                .is_some_and(|removed_at| ticket_known(version_vector, removed_at));
             let parent_removed = split_parent_path(&token.path)
-                .map(|(parent_path, _)| {
-                    removed.contains(&parent_path) && !merged.contains(&parent_path)
-                })
-                .unwrap_or(false);
-
-            if !(node_can_delete(node, edited_at, version_vector) || parent_removed) {
+                .and_then(|(parent_path, _)| node_at_path(&self.root, &parent_path).ok())
+                .is_some_and(|parent| {
+                    removed.contains(parent.id()) && !merged.contains(parent.id())
+                });
+            if !(node.can_delete(edited_at, creation_known, tombstone_known) || parent_removed) {
                 continue;
             }
-            targets.removal_tokens.push(token.clone());
 
-            if matches!(token.kind, TreeTokenKind::Text | TreeTokenKind::Start)
-                && removed.insert(token.path.clone())
-            {
-                targets.remove_paths.push(token.path.clone());
+            // An element whose end token alone is in the range stays.
+            if matches!(token.kind, TreeTokenKind::Text | TreeTokenKind::Start) {
+                targets.removed.push(id.clone());
+                removed.insert(id.clone());
 
-                if !node.is_text() && node.ins_next_id().is_some() && !merged.contains(&token.path)
-                {
-                    for split_path in self
-                        .unknown_split_sibling_paths(&token.path, version_vector)
-                        .unwrap_or_default()
-                    {
-                        if removed.insert(split_path.clone()) {
-                            targets.remove_paths.push(split_path.clone());
-                        }
-                        for descendant_path in descendant_paths(&self.root, &split_path) {
-                            if removed.insert(descendant_path.clone()) {
-                                targets.remove_paths.push(descendant_path);
-                            }
-                        }
+                // §4.1: the delete reaches the split siblings of the element a
+                // concurrent split created.
+                if !node.is_text() && node.ins_next_id().is_some() && !merged.contains(&id) {
+                    for sibling in self.unknown_split_siblings_of(&id, version_vector, &enclosed)? {
+                        removed.insert(sibling.clone());
+                        targets.removed.push(sibling);
                     }
                 }
             }
+            targets.removal_tokens.push(token);
         }
 
-        targets
+        Ok(targets)
+    }
+
+    /// Returns the split siblings of the deleted element `id` the editor did
+    /// not know, with their subtrees (JS `collectUnknownSplitSiblings`). The
+    /// walk passes a known sibling only when the editor saw it gone: removed
+    /// by a change it knew, or enclosed whole by this delete.
+    fn unknown_split_siblings_of(
+        &self,
+        id: &TreeNodeId,
+        version_vector: Option<&crate::VersionVector>,
+        enclosed: &BTreeSet<TreeNodeId>,
+    ) -> Result<Vec<TreeNodeId>> {
+        let mut siblings = Vec::new();
+        let mut walker = InsNextWalker::default();
+        walker.visit(id);
+        let mut next = self
+            .node(id)?
+            .ins_next_id()
+            .and_then(|next_id| self.floor_id(next_id));
+        while let Some(next_id) = next {
+            if !walker.visit(&next_id) {
+                break;
+            }
+            let node = self.node(&next_id)?;
+            if ticket_known(version_vector, node.id().created_at()) {
+                let seen_gone = node
+                    .removed_at()
+                    .is_some_and(|removed_at| ticket_known(version_vector, removed_at));
+                if !seen_gone && !enclosed.contains(&next_id) {
+                    break;
+                }
+            } else {
+                siblings.push(next_id.clone());
+                let mut descendants = Vec::new();
+                collect_post_order_ids(node, &mut descendants);
+                descendants.pop();
+                siblings.extend(descendants);
+            }
+            next = node
+                .ins_next_id()
+                .and_then(|next_id| self.floor_id(next_id));
+        }
+        Ok(siblings)
+    }
+
+    /// Follows the merge forwarding chain from `id` while the node is a
+    /// merged-away tombstone, and returns the live target, so a chained merge
+    /// stays flat (JS `resolveMergeTarget`).
+    fn resolve_merge_target(&self, id: &TreeNodeId) -> Result<TreeNodeId> {
+        let mut target = id.clone();
+        let mut seen = BTreeSet::from([target.clone()]);
+        loop {
+            let node = self.node(&target)?;
+            if !node.is_removed() {
+                break;
+            }
+            let Some(next) = self.merge_node_id(node.merged_into()) else {
+                break;
+            };
+            if !seen.insert(next.clone()) {
+                break;
+            }
+            target = next;
+        }
+        Ok(target)
+    }
+
+    /// Moves the children of the merged elements to the end of `dest` (JS
+    /// `CRDTTree.edit` step 03), and returns the GC pairs of the subtrees the
+    /// cycle guard tombstones in place instead.
+    fn move_merged_children(
+        &mut self,
+        moved: &[TreeNodeId],
+        dest: &TreeNodeId,
+        edited_at: &TimeTicket,
+    ) -> Result<Vec<(String, DataSize)>> {
+        let mut stranded = Vec::new();
+        let mut dest_tombstoned = false;
+        for id in moved {
+            let Some(path) = self.physical_path_by_node_id(id) else {
+                continue;
+            };
+            let Some((parent_path, index)) = split_parent_path(&path) else {
+                continue;
+            };
+            // A destination that is the node or lies inside it can only come
+            // from a forged lineage, and moving there would close a cycle. The
+            // node is tombstoned where it stands, and so is the rest once the
+            // destination itself is tombstoned.
+            let dest_path = self.path_of(dest)?;
+            if dest_path.starts_with(&path) {
+                dest_tombstoned = true;
+            }
+            if dest_tombstoned {
+                tombstone_subtree(
+                    node_at_path_mut(&mut self.root, &path)?,
+                    edited_at,
+                    &mut stranded,
+                );
+                continue;
+            }
+
+            let parent = node_at_path_mut(&mut self.root, &parent_path)?;
+            let parent_id = parent.id().clone();
+            let mut child = parent.children.remove(index);
+            // Stamped on the first move only, so a child carried through a
+            // chained merge keeps its original source and merge ticket.
+            if child.merged_from.is_none() {
+                child.merged_from = Some(parent_id);
+                child.merged_at = Some(edited_at.clone());
+            }
+            let merged_from = child.merged_from.clone();
+            let dest_path = self.path_of(dest)?;
+            node_at_path_mut(&mut self.root, &dest_path)?.append(child);
+
+            // Point the source at the resolved destination, as
+            // `rebuild_merge_state` derives it from a snapshot.
+            if let Some(source) = self.merge_node_id(merged_from.as_ref()) {
+                let source = self.node_mut(&source)?;
+                if source.is_removed() {
+                    source.set_merged_into(Some(dest.clone()));
+                }
+            }
+        }
+        Ok(stranded)
+    }
+
+    /// Tombstones the children an earlier merge moved out of each element
+    /// this edit deleted, with their descendants (JS `CRDTTree.edit` step
+    /// 03-1), and returns their GC pairs.
+    fn propagate_merge_deletes(
+        &mut self,
+        targets: &EditTargets,
+        dest: &TreeNodeId,
+        range: &(TreePos, TreePos),
+        edited_at: &TimeTicket,
+    ) -> Result<Vec<(String, DataSize)>> {
+        let mut pairs = Vec::new();
+        let mut declared: Option<BTreeSet<TreeNodeId>> = None;
+        for id in &targets.removed {
+            let Some(merged_into) = self.node(id)?.merged_into().cloned() else {
+                continue;
+            };
+            if targets.merged.contains(id) {
+                continue;
+            }
+            // A source whose children already sit in this edit's destination
+            // stands for the merge this edit asks for only when one of its
+            // positions named that source.
+            if &merged_into == dest {
+                let declared =
+                    declared.get_or_insert_with(|| self.declared_boundaries(&[&range.0, &range.1]));
+                if declared.contains(id) {
+                    continue;
+                }
+            }
+            let Some(target) = self.merge_node_id(Some(&merged_into)) else {
+                continue;
+            };
+            for child in self.node_mut(&target)?.all_children_mut() {
+                if child.merged_from() != Some(id) || child.is_removed() {
+                    continue;
+                }
+                tombstone_subtree(child, edited_at, &mut pairs);
+            }
+        }
+        Ok(pairs)
+    }
+
+    /// Returns the elements the positions name as their parents, with every
+    /// ancestor of them, preferring the element a node was merged out of
+    /// over its current parent (JS `declaredBoundaries`).
+    fn declared_boundaries(&self, positions: &[&TreePos]) -> BTreeSet<TreeNodeId> {
+        let mut boundaries = BTreeSet::new();
+        for pos in positions {
+            let mut current = self.merge_node_id(Some(pos.parent_id()));
+            while let Some(id) = current {
+                if !boundaries.insert(id.clone()) {
+                    break;
+                }
+                let merged_from = self
+                    .node(&id)
+                    .ok()
+                    .and_then(|node| self.merge_node_id(node.merged_from()));
+                current = merged_from.or_else(|| self.parent_id(&id));
+            }
+        }
+        boundaries
     }
 
     /// Splits `split_level` elements from the position after `left` in
@@ -1875,94 +2057,6 @@ impl CrdtTree {
         Ok(diff)
     }
 
-    fn merge_nodes(
-        &mut self,
-        from_parent_path: &[usize],
-        merge_paths: &[Vec<usize>],
-        edited_at: &TimeTicket,
-    ) -> Result<()> {
-        if merge_paths.is_empty() {
-            return Ok(());
-        }
-
-        let from_parent_id = node_at_path(&self.root, from_parent_path)?.id().clone();
-        for merge_path in merge_paths {
-            if merge_path == from_parent_path {
-                continue;
-            }
-
-            let moved_children = {
-                let source = node_at_path_mut(&mut self.root, merge_path)?;
-                let source_id = source.id().clone();
-                source.set_merged_into(Some(from_parent_id.clone()));
-
-                let mut moved = Vec::new();
-                let mut remaining = Vec::new();
-                for mut child in source.children.drain(..) {
-                    if child.is_removed() {
-                        remaining.push(child);
-                    } else {
-                        child.set_merged_from(Some(source_id.clone()));
-                        child.set_merged_at(Some(edited_at.clone()));
-                        moved.push(child);
-                    }
-                }
-                source.children = remaining;
-                moved
-            };
-
-            if !moved_children.is_empty() {
-                let target = node_at_path_mut(&mut self.root, from_parent_path)?;
-                target.children.extend(moved_children);
-            }
-        }
-
-        Ok(())
-    }
-
-    fn merge_delete_paths(
-        &self,
-        from_parent_path: &[usize],
-        remove_paths: &[Vec<usize>],
-        merge_paths: &[Vec<usize>],
-    ) -> Result<Vec<Vec<usize>>> {
-        let from_parent_id = node_at_path(&self.root, from_parent_path)?.id().clone();
-        let merge_paths = merge_paths.iter().collect::<BTreeSet<_>>();
-        let mut paths = Vec::new();
-        let mut seen = BTreeSet::new();
-
-        for remove_path in remove_paths {
-            let node = node_at_path(&self.root, remove_path)?;
-            let Some(merged_into) = node.merged_into() else {
-                continue;
-            };
-            if merge_paths.contains(remove_path) || merged_into == &from_parent_id {
-                continue;
-            }
-            let Some(target_path) = self.physical_path_by_node_id(merged_into) else {
-                continue;
-            };
-            let target = node_at_path(&self.root, &target_path)?;
-            for (index, child) in target.all_children().enumerate() {
-                if child.merged_from() != Some(node.id()) || child.is_removed() {
-                    continue;
-                }
-                let mut child_path = target_path.clone();
-                child_path.push(index);
-                if seen.insert(child_path.clone()) {
-                    paths.push(child_path.clone());
-                }
-                for descendant_path in descendant_paths(&self.root, &child_path) {
-                    if seen.insert(descendant_path.clone()) {
-                        paths.push(descendant_path);
-                    }
-                }
-            }
-        }
-
-        Ok(paths)
-    }
-
     fn physical_path_by_node_id(&self, id: &TreeNodeId) -> Option<Vec<usize>> {
         let mut path = Vec::new();
         find_path_by_node_id(&self.root, id, &mut Vec::new(), &mut path).then_some(path)
@@ -2185,15 +2279,48 @@ impl CrdtTree {
         self.node_ids = ids;
     }
 
+    /// Rebuilds the `merged_into` cache of merge sources from the
+    /// `merged_from` their moved children persist, for a tree loaded from a
+    /// snapshot (JS `rebuildMergeState`). A child under a text node, or one
+    /// naming a live element, is no merge's: a merge removes its source.
     fn rebuild_merge_state(&mut self) {
-        let mut merged_pairs = Vec::new();
-        collect_merge_pairs(&self.root, &mut merged_pairs);
-        if merged_pairs.is_empty() {
-            return;
-        }
+        let mut moved = Vec::new();
+        collect_merged_children(&self.root, &mut Vec::new(), &mut moved);
+        for (child_path, merged_from) in moved {
+            let Some(source) = self.merge_node_id(Some(&merged_from)) else {
+                continue;
+            };
+            let Some((parent_path, _)) = split_parent_path(&child_path) else {
+                continue;
+            };
+            let Ok(parent) = node_at_path(&self.root, &parent_path) else {
+                continue;
+            };
+            if parent.is_text() {
+                continue;
+            }
+            let parent_id = parent.id().clone();
+            let Some(removed_at) = self
+                .node(&source)
+                .ok()
+                .and_then(|node| node.removed_at().cloned())
+            else {
+                continue;
+            };
 
-        rebuild_merge_state_in_node(&mut self.root, &merged_pairs);
-        self.rebuild_node_map();
+            // Snapshots written before `merged_at` existed fall back to the
+            // removal of the source.
+            if let Ok(child) = node_at_path_mut(&mut self.root, &child_path) {
+                if child.merged_at.is_none() {
+                    child.merged_at = Some(removed_at);
+                }
+            }
+            if let Ok(source) = self.node_mut(&source) {
+                if source.merged_into.is_none() {
+                    source.merged_into = Some(parent_id);
+                }
+            }
+        }
     }
 }
 
@@ -2222,8 +2349,14 @@ struct TreeTokenTarget {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct EditTargets {
-    remove_paths: Vec<Vec<usize>>,
-    merge_paths: Vec<Vec<usize>>,
+    /// The nodes the edit removes, in traversal order (JS
+    /// `nodesToBeRemoved`).
+    removed: Vec<TreeNodeId>,
+    /// The elements the edit merges (JS `toBeMergedNodes`).
+    merged: Vec<TreeNodeId>,
+    /// The children of `merged`, removed ones too (JS
+    /// `toBeMovedToFromParents`).
+    moved: Vec<TreeNodeId>,
     /// The tokens of the nodes the edit removes, start and end tokens both,
     /// in document order (JS `tokensToBeRemoved`).
     removal_tokens: Vec<TreeTokenTarget>,
@@ -2459,39 +2592,10 @@ fn left_siblings_size(parent: &TreeNode, offset: usize, include_removed: bool) -
         .sum())
 }
 
-fn visible_offset_for_physical_child(parent: &TreeNode, physical_index: usize) -> Result<usize> {
-    let child = parent.children.get(physical_index).ok_or_else(|| {
-        YorkieError::InvalidTreePosition("child offset is out of range".to_owned())
-    })?;
-    if child.is_removed() {
-        return Err(YorkieError::InvalidTreePosition(
-            "removed child has no visible offset".to_owned(),
-        ));
-    }
-    Ok(parent
-        .children
-        .iter()
-        .take(physical_index)
-        .filter(|sibling| !sibling.is_removed())
-        .count())
-}
-
 fn node_at_visible_path<'a>(root: &'a TreeNode, path: &[usize]) -> Result<&'a TreeNode> {
     let mut node = root;
     for offset in path {
         node = visible_child(node, *offset)
-            .ok_or_else(|| YorkieError::InvalidTreePosition("unacceptable path".to_owned()))?;
-    }
-    Ok(node)
-}
-
-fn node_at_visible_path_mut<'a>(
-    root: &'a mut TreeNode,
-    path: &[usize],
-) -> Result<&'a mut TreeNode> {
-    let mut node = root;
-    for offset in path {
-        node = visible_child_mut(node, *offset)
             .ok_or_else(|| YorkieError::InvalidTreePosition("unacceptable path".to_owned()))?;
     }
     Ok(node)
@@ -2541,13 +2645,6 @@ fn physical_to_visible_path(root: &TreeNode, path: &[usize]) -> Option<Vec<usize
 
 fn visible_child(node: &TreeNode, offset: usize) -> Option<&TreeNode> {
     node.children().nth(offset)
-}
-
-fn visible_child_mut(node: &mut TreeNode, offset: usize) -> Option<&mut TreeNode> {
-    node.children
-        .iter_mut()
-        .filter(|child| !child.is_removed())
-        .nth(offset)
 }
 
 fn visible_child_count(node: &TreeNode) -> usize {
@@ -2766,27 +2863,37 @@ fn collect_tokens_between_node(
     }
 }
 
-fn node_can_delete(
-    node: &TreeNode,
-    edited_at: &TimeTicket,
-    version_vector: Option<&crate::VersionVector>,
-) -> bool {
-    if !ticket_known(version_vector, node.id().created_at()) {
-        return false;
-    }
-
-    match node.removed_at() {
-        None => true,
-        Some(removed_at) => {
-            !ticket_known(version_vector, removed_at) && edited_at.after(removed_at)
-        }
+/// Reports whether the change holding `version_vector` knew `ticket` (JS
+/// `ticketKnown`). No vector, or an empty one, is a local change.
+fn ticket_known(version_vector: Option<&crate::VersionVector>, ticket: &TimeTicket) -> bool {
+    match version_vector {
+        Some(vector) if !vector.is_empty() => vector.after_or_equal(ticket),
+        _ => true,
     }
 }
 
-fn ticket_known(version_vector: Option<&crate::VersionVector>, ticket: &TimeTicket) -> bool {
-    version_vector
-        .map(|vector| vector.after_or_equal(ticket))
-        .unwrap_or(true)
+/// Tombstones `node` and every live node below it with `edited_at`, and
+/// pushes the GC pair of each node it tombstoned, in post-order (JS
+/// `tombstoneSubtree`).
+fn tombstone_subtree(
+    node: &mut TreeNode,
+    edited_at: &TimeTicket,
+    pairs: &mut Vec<(String, DataSize)>,
+) {
+    for child in node.all_children_mut() {
+        tombstone_subtree(child, edited_at, pairs);
+    }
+    if node.removed_at.is_none() && node.remove(edited_at.clone()) {
+        pairs.push((node.id_string(), node.data_size()));
+    }
+}
+
+/// Collects the IDs of the subtree of `node` in post-order, `node` last.
+fn collect_post_order_ids(node: &TreeNode, ids: &mut Vec<TreeNodeId>) {
+    for child in node.all_children() {
+        collect_post_order_ids(child, ids);
+    }
+    ids.push(node.id().clone());
 }
 
 fn find_path_by_node_id(
@@ -2819,24 +2926,6 @@ fn subtree_data_size(node: &TreeNode) -> DataSize {
     size
 }
 
-fn descendant_paths(root: &TreeNode, path: &[usize]) -> Vec<Vec<usize>> {
-    let Ok(node) = node_at_path(root, path) else {
-        return Vec::new();
-    };
-    let mut paths = Vec::new();
-    collect_descendant_paths(node, path.to_vec(), &mut paths);
-    paths
-}
-
-fn collect_descendant_paths(node: &TreeNode, path: Vec<usize>, paths: &mut Vec<Vec<usize>>) {
-    for (index, child) in node.all_children().enumerate() {
-        let mut child_path = path.clone();
-        child_path.push(index);
-        paths.push(child_path.clone());
-        collect_descendant_paths(child, child_path, paths);
-    }
-}
-
 fn client_lamport(version_vector: Option<&crate::VersionVector>, created_at: &TimeTicket) -> i64 {
     version_vector
         .and_then(|vector| vector.get(created_at.actor_id().as_str()))
@@ -2852,24 +2941,20 @@ fn add_data_size(target: &mut DataSize, size: DataSize) {
     target.meta += size.meta;
 }
 
-fn collect_merge_pairs(node: &TreeNode, pairs: &mut Vec<(TreeNodeId, TreeNodeId)>) {
-    for child in node.all_children() {
-        if let Some(merged_from) = child.merged_from() {
-            pairs.push((merged_from.clone(), node.id().clone()));
-        }
-        collect_merge_pairs(child, pairs);
+/// Collects the physical path and `merged_from` of every node a merge moved,
+/// in post-order (JS `traverseAll`).
+fn collect_merged_children(
+    node: &TreeNode,
+    path: &mut Vec<usize>,
+    moved: &mut Vec<(Vec<usize>, TreeNodeId)>,
+) {
+    for (index, child) in node.all_children().enumerate() {
+        path.push(index);
+        collect_merged_children(child, path, moved);
+        path.pop();
     }
-}
-
-fn rebuild_merge_state_in_node(node: &mut TreeNode, pairs: &[(TreeNodeId, TreeNodeId)]) {
-    for (source, target) in pairs {
-        if node.id() == source && node.merged_into().is_none() {
-            node.set_merged_into(Some(target.clone()));
-        }
-    }
-
-    for child in node.all_children_mut() {
-        rebuild_merge_state_in_node(child, pairs);
+    if let (Some(merged_from), false) = (node.merged_from(), path.is_empty()) {
+        moved.push((path.clone(), merged_from.clone()));
     }
 }
 
@@ -4133,6 +4218,252 @@ mod tests {
         }
         assert_eq!(orders[0], orders[1]);
         Ok(())
+    }
+
+    /// JS `CRDTTree.Merge` "Can delete nodes between element nodes with
+    /// edit".
+    #[test]
+    fn merges_paragraphs_by_deleting_across_them() -> crate::Result<()> {
+        let mut tree = paragraphs(&["ab", "cd"]);
+        let range = (tree.find_pos(2, true)?, tree.find_pos(6, true)?);
+        let result = tree.edit_by_range_with_changes(range, None, 0, ticket(10, "a"), None)?;
+        assert_eq!(
+            vec![(2, 6, vec![0, 1], vec![1, 1], false)],
+            change_paths(&result)
+        );
+        assert_eq!("<root><p>ad</p></root>", tree.to_xml());
+        assert_eq!(4, tree.root().len());
+        assert_eq!(2, tree.root().children().next().unwrap().len());
+
+        let pos = tree.find_pos(1, true)?;
+        let result = tree.edit_by_range_with_changes(
+            (pos.clone(), pos),
+            Some(vec![TreeNode::create_text(node_id(11, 0), "@")]),
+            0,
+            ticket(11, "a"),
+            None,
+        )?;
+        assert_eq!(
+            vec![(1, 1, vec![0, 0], vec![0, 0], true)],
+            change_paths(&result)
+        );
+        assert_eq!("<root><p>@ad</p></root>", tree.to_xml());
+        Ok(())
+    }
+
+    /// JS "merge moves an element tombstone with correct length accounting":
+    /// a merge moves the removed children too, so they stay anchors in the
+    /// merge target, and they add nothing to its visible size.
+    #[test]
+    fn moves_removed_children_with_a_merge() -> crate::Result<()> {
+        let mut tree = CrdtTree::create(
+            TreeNode::create_element(
+                node_id(1, 0),
+                "root",
+                None,
+                vec![
+                    TreeNode::create_element(
+                        node_id(2, 0),
+                        "p",
+                        None,
+                        vec![TreeNode::create_text(node_id(3, 0), "ab")],
+                    ),
+                    TreeNode::create_element(
+                        node_id(4, 0),
+                        "p",
+                        None,
+                        vec![
+                            TreeNode::create_element(node_id(5, 0), "b", None, Vec::new()),
+                            TreeNode::create_text(node_id(6, 0), "cd"),
+                        ],
+                    ),
+                ],
+            ),
+            ticket(1, "a"),
+        );
+        let range = (tree.find_pos(2, true)?, tree.find_pos(8, true)?);
+        tree.edit_by_range_with_changes(range, None, 0, ticket(10, "a"), None)?;
+
+        assert_eq!("<root><p>ad</p></root>", tree.to_xml());
+        assert_eq!(4, tree.root().len());
+        let target = tree.root().children().next().unwrap();
+        assert_eq!(2, target.len());
+        let moved = target
+            .all_children()
+            .find(|child| child.id() == &node_id(5, 0))
+            .expect("the removed <b> moves with the merge");
+        assert!(moved.is_removed());
+        assert_eq!(Some(&node_id(4, 0)), moved.merged_from());
+        Ok(())
+    }
+
+    /// JS `tree_merge_anchor_test.ts` "converges when insert is anchored in
+    /// a chained merge": P3 merges into P2 while P2 merges into P1, so the
+    /// children of P3 flow to P1, and an insert declared at the start of P3
+    /// follows them, in every order.
+    #[test]
+    fn converges_when_an_insert_is_anchored_in_a_chained_merge() -> crate::Result<()> {
+        let origin = paragraphs(&["ab", "cd", "ef"]);
+        let edits = vec![
+            RemoteEdit::new(&origin, 2, 6, None, ticket(10, "b"))?,
+            RemoteEdit::new(&origin, 6, 10, None, ticket(10, "c"))?,
+            RemoteEdit::new(
+                &origin,
+                9,
+                9,
+                Some(vec![TreeNode::create_element(
+                    TreeNodeId::new(ticket(10, "d"), 0),
+                    "x",
+                    None,
+                    Vec::new(),
+                )]),
+                ticket(10, "d"),
+            )?,
+        ];
+        for xml in apply_in_every_order(&origin, &edits)? {
+            assert_eq!("<root><p>a<x></x>f</p></root>", xml);
+        }
+        Ok(())
+    }
+
+    /// JS `tree_concurrent_split_merge_test.ts` "keeps the text in order
+    /// when a split meets a merge": the split boundary stands and the rest
+    /// merges behind it.
+    #[test]
+    fn converges_when_a_split_meets_a_merge() -> crate::Result<()> {
+        let origin = paragraphs(&["abc", "de"]);
+        let edits = vec![
+            RemoteEdit::new(&origin, 4, 6, None, ticket(10, "b"))?,
+            RemoteEdit::split(&origin, 2, 1, ticket(10, "c")),
+        ];
+        for xml in apply_in_every_order(&origin, &edits)? {
+            assert_eq!("<root><p>a</p><p>bcde</p></root>", xml);
+        }
+        Ok(())
+    }
+
+    /// JS "resolves a range boundary right after the merge-source
+    /// tombstone": a position at the start of a paragraph merged away
+    /// resolves, for an insert, before the children the merge moved and, for
+    /// a range, right after the removed paragraph (JS step 02-1).
+    #[test]
+    fn resolves_positions_in_a_merged_away_parent() -> crate::Result<()> {
+        let mut tree = paragraphs(&["ab", "cd"]);
+        let pos = tree.find_pos(5, true)?;
+        let range = (tree.find_pos(3, true)?, tree.find_pos(5, true)?);
+        tree.edit_by_range_with_changes(range, None, 0, ticket(10, "a"), None)?;
+        assert_eq!("<root><p>abcd</p></root>", tree.to_xml());
+
+        let mut index_of = |range_boundary: bool| -> crate::Result<usize> {
+            let mut diff = super::DataSize::default();
+            let (parent, left) =
+                tree.find_nodes_and_split_text(&pos, &ticket(11, "a"), range_boundary, &mut diff)?;
+            Ok(super::visible_index_of_physical(
+                &tree.root,
+                super::physical_index_after_left_path(&tree.root, &parent, &left)?,
+            ))
+        };
+        assert_eq!(3, index_of(false)?);
+        assert_eq!(6, index_of(true)?);
+        Ok(())
+    }
+
+    /// An edit made on a replica that knew the base tree only.
+    struct RemoteEdit {
+        range: (super::TreePos, super::TreePos),
+        contents: Option<Vec<TreeNode>>,
+        split_level: usize,
+        edited_at: TimeTicket,
+    }
+
+    impl RemoteEdit {
+        fn new(
+            origin: &CrdtTree,
+            from: usize,
+            to: usize,
+            contents: Option<Vec<TreeNode>>,
+            edited_at: TimeTicket,
+        ) -> crate::Result<Self> {
+            Ok(Self {
+                range: (origin.find_pos(from, true)?, origin.find_pos(to, true)?),
+                contents,
+                split_level: 0,
+                edited_at,
+            })
+        }
+
+        fn split(origin: &CrdtTree, at: usize, level: usize, edited_at: TimeTicket) -> Self {
+            let pos = origin.find_pos(at, true).expect("a valid split position");
+            Self {
+                range: (pos.clone(), pos),
+                contents: None,
+                split_level: level,
+                edited_at,
+            }
+        }
+
+        fn apply(&self, tree: &mut CrdtTree) -> crate::Result<super::TreeEditResult> {
+            let mut version_vector = known("a", 9);
+            version_vector.set(self.edited_at.actor_id().as_str(), self.edited_at.lamport());
+            tree.edit_by_range_with_changes(
+                self.range.clone(),
+                self.contents.clone(),
+                self.split_level,
+                self.edited_at.clone(),
+                Some(&version_vector),
+            )
+        }
+    }
+
+    /// Applies `edits` to copies of `origin` in every order and returns the
+    /// XML each order ends with.
+    fn apply_in_every_order(origin: &CrdtTree, edits: &[RemoteEdit]) -> crate::Result<Vec<String>> {
+        fn permutations(items: Vec<usize>) -> Vec<Vec<usize>> {
+            if items.len() <= 1 {
+                return vec![items];
+            }
+            let mut result = Vec::new();
+            for (index, item) in items.iter().enumerate() {
+                let mut rest = items.clone();
+                rest.remove(index);
+                for mut tail in permutations(rest) {
+                    tail.insert(0, *item);
+                    result.push(tail);
+                }
+            }
+            result
+        }
+
+        let mut results = Vec::new();
+        for order in permutations((0..edits.len()).collect()) {
+            let mut tree = origin.clone();
+            for index in order {
+                edits[index].apply(&mut tree)?;
+            }
+            results.push(tree.to_xml());
+        }
+        Ok(results)
+    }
+
+    /// `<root>` holding one `<p>` per value, each with one text node.
+    fn paragraphs(values: &[&str]) -> CrdtTree {
+        let children = values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let lamport = 2 + 2 * index as i64;
+                TreeNode::create_element(
+                    node_id(lamport, 0),
+                    "p",
+                    None,
+                    vec![TreeNode::create_text(node_id(lamport + 1, 0), *value)],
+                )
+            })
+            .collect();
+        CrdtTree::create(
+            TreeNode::create_element(node_id(1, 0), "root", None, children),
+            ticket(1, "a"),
+        )
     }
 
     fn text_tree(value: &str) -> CrdtTree {
