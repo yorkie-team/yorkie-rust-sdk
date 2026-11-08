@@ -55,7 +55,7 @@ async fn rejects_reattaching_an_attached_key_without_killing_the_client() {
 
 /// JS "rejects a concurrent attach of the same key while the first is in
 /// flight" (duplicate_attach_test.ts:69).
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn rejects_a_concurrent_attach_of_the_same_key() {
     let Some(addr) = rpc_addr() else { return };
     let client = active_client(&addr).await;
@@ -64,6 +64,9 @@ async fn rejects_a_concurrent_attach_of_the_same_key() {
     // Fire the first attach without awaiting it, and let it run up to its
     // request: the key is not attached yet, so the guard must also track the
     // attach in flight.
+    // Under the current_thread runtime, one `yield_now` runs the spawned
+    // task up to its first pending await before this task goes on. The
+    // ordering depends on that: do not switch this test to multi_thread.
     let attach1 = tokio::spawn({
         let (client, doc1) = (client.clone(), shared(&doc_key));
         async move { client.attach(doc1, AttachOptions::default()).await }

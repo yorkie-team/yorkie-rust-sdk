@@ -622,6 +622,9 @@ async fn prevents_remote_changes_while_paused(
     // Simulate the situation in the runSyncLoop where a pushpull request has
     // been sent but a response has not yet been received. The spawned sync
     // runs up to its request before the mode change queues behind it.
+    // Under the current_thread runtime, one `yield_now` runs the spawned
+    // task up to its first pending await before this task goes on. The
+    // ordering depends on that: do not switch this test to multi_thread.
     let in_flight = tokio::spawn({
         let c2 = c2.clone();
         async move { c2.sync(None).await }
@@ -660,7 +663,7 @@ async fn prevents_remote_changes_while_paused(
 
 /// JS "Should prevent remote changes in push-only mode"
 /// (client_test.ts:588).
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn prevents_remote_changes_in_push_only_mode() {
     prevents_remote_changes_while_paused(
         "prevent-remote-push-only",
@@ -672,7 +675,7 @@ async fn prevents_remote_changes_in_push_only_mode() {
 
 /// JS "Should prevent remote changes in sync-off mode"
 /// (client_test.ts:671).
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn prevents_remote_changes_in_sync_off_mode() {
     prevents_remote_changes_while_paused(
         "prevent-remote-sync-off",
@@ -802,7 +805,7 @@ async fn retries_on_network_failure() {
 
 /// JS "Should handle local changes correctly when receiving snapshot"
 /// (client_test.ts:853).
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn handles_local_changes_when_receiving_a_snapshot() {
     let Some(addr) = rpc_addr() else { return };
     let t = TwoClients::attach(&addr, "local-changes-with-snapshot").await;
@@ -818,6 +821,9 @@ async fn handles_local_changes_when_receiving_a_snapshot() {
 
     // 02. c2 receives the snapshot and increases the counter simultaneously.
     // The spawned sync sends its request before the increase is made.
+    // Under the current_thread runtime, one `yield_now` runs the spawned
+    // task up to its first pending await before this task goes on. The
+    // ordering depends on that: do not switch this test to multi_thread.
     let in_flight = tokio::spawn({
         let c2 = t.c2.clone();
         async move { c2.sync(None).await }
@@ -984,6 +990,9 @@ async fn drops_a_pull_in_flight_when_pausing(name: &str, pause_mode: SyncMode) {
     // 02. While that pull is in flight, c1 asks to stop receiving (an IME
     // composition starts). Then the pull's answer arrives. The switch is
     // spawned and run up to the task queue, where it waits behind the pull.
+    // Under the current_thread runtime, one `yield_now` runs the spawned
+    // task up to its first pending await before this task goes on. The
+    // ordering depends on that: do not switch this test to multi_thread.
     let switching = tokio::spawn({
         let (c1, d1) = (c1.clone(), d1.clone());
         async move { c1.change_sync_mode(&d1, pause_mode).await }
@@ -1015,14 +1024,14 @@ async fn drops_a_pull_in_flight_when_pausing(name: &str, pause_mode: SyncMode) {
 
 /// JS "Should drop a pull already in flight when switching to %s" with
 /// `RealtimePushOnly` (client_test.ts:944).
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn drops_a_pull_in_flight_when_switching_to_push_only() {
     drops_a_pull_in_flight_when_pausing("drop-pull-push-only", SyncMode::RealtimePushOnly).await;
 }
 
 /// JS "Should drop a pull already in flight when switching to %s" with
 /// `RealtimeSyncOff` (client_test.ts:944).
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn drops_a_pull_in_flight_when_switching_to_sync_off() {
     drops_a_pull_in_flight_when_pausing("drop-pull-sync-off", SyncMode::RealtimeSyncOff).await;
 }
