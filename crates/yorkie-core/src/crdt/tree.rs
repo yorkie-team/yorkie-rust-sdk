@@ -2849,8 +2849,20 @@ fn tree_pos_to_crdt_pos(root: &TreeNode, tree_pos: &IndexTreePos) -> Result<Tree
             ));
         };
         let parent = node_at_visible_path(root, &parent_path)?;
-        let left_node = if offset_in_parent == 0 && tree_pos.offset == 0 {
-            parent
+        let left_node = if tree_pos.offset == 0 {
+            // A text at offset 0 cannot anchor on itself: a left sibling
+            // means "after it", so the edit would land after the whole text.
+            // Anchor on what precedes the text instead: the previous visible
+            // sibling, or the parent when the text is the first visible
+            // child (JS #1482, yorkie#2079).
+            //
+            // That sibling is always an element: `find_tree_pos` resolves a
+            // boundary between two texts to the end of the left one, so a
+            // text reached at offset 0 never has a text right before it.
+            offset_in_parent
+                .checked_sub(1)
+                .and_then(|prev| visible_child(parent, prev))
+                .unwrap_or(parent)
         } else {
             node
         };

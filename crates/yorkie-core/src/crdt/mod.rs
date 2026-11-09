@@ -15,3 +15,5 @@ pub(crate) mod text;
 #[cfg(test)]
 mod text_ledger_tests;
 pub(crate) mod tree;
+#[cfg(test)]
+mod tree_boundary_tests;
