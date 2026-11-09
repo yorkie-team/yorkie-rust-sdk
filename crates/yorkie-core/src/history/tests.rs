@@ -798,3 +798,53 @@ fn prunes_the_ledger_an_identity_undo_leaves() -> Result<()> {
         .all(|node| node.removal_events().is_empty()));
     Ok(())
 }
+
+/// JS `tree_redo_split_style_test.ts` "re-points only the entries targeting
+/// the same tree": a node ID is unique only within its own tree, so a split
+/// in one tree leaves an entry on another tree alone.
+#[test]
+fn re_points_only_the_entries_targeting_the_same_tree() {
+    let actor = crate::ActorId::from("000000000000000000000001");
+    let tick = |lamport: i64| TimeTicket::new(lamport, 0, actor.clone());
+    let tree_a = tick(1);
+    let tree_b = tick(2);
+    let prev = TreeNodeId::new(tick(10), 0);
+    let curr = TreeNodeId::new(tick(20), 0);
+    let style_on = |parent_created_at: &TimeTicket| {
+        Operation::TreeStyle(crate::operation::TreeStyleOperation::create(
+            parent_created_at.clone(),
+            TreePos::new(prev.clone(), prev.clone()),
+            TreePos::new(prev.clone(), prev.clone()),
+            BTreeMap::from([("bold".to_owned(), "true".to_owned())]),
+            Some(tick(30)),
+        ))
+    };
+
+    let mut history = History::default();
+    history.push_undo(vec![
+        HistoryOperation::Operation(Box::new(style_on(&tree_a))),
+        HistoryOperation::Operation(Box::new(style_on(&tree_b))),
+    ]);
+
+    history.reconcile_tree_node_id(&tree_a, &prev, &curr);
+
+    let parent_of = |index: usize| {
+        let HistoryOperation::Operation(op) = &history.undo_stack()[0][index] else {
+            panic!("expected an operation");
+        };
+        let Operation::TreeStyle(op) = op.as_ref() else {
+            panic!("expected a tree style");
+        };
+        op.range_from().parent_id().clone()
+    };
+    assert_eq!(
+        curr,
+        parent_of(0),
+        "the entry on the split tree follows the new id"
+    );
+    assert_eq!(
+        prev,
+        parent_of(1),
+        "the entry on another tree keeps its own id"
+    );
+}

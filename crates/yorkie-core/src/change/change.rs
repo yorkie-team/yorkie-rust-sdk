@@ -1,9 +1,10 @@
 use super::ChangeId;
 use crate::crdt::root::CrdtRoot;
+use crate::crdt::tree::TreeNodeId;
 use crate::operation::{OpInfo, OpSource, Operation};
 use crate::presence::{Presence, PresenceChange};
 use crate::time::ActorId;
-use crate::Result;
+use crate::{Result, TimeTicket};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -119,6 +120,19 @@ impl Change {
     /// refining (see `EditOperation::refine_undo_positions`). A Tree undo
     /// edit resolves its stored indexes the same way (see
     /// `TreeEditOperation::resolve_undo_positions`).
+    ///
+    /// A Tree split that re-creates elements a merge removed (the undo of a
+    /// merge, or the redo of a split) mints them under its split tickets,
+    /// while the operations after it in this change may still name the
+    /// removed ones. Each is re-pointed once the split has run and before
+    /// the next operation runs, for the tickets the split really took: a
+    /// level it never reached mints nothing, and re-pointing at its ticket
+    /// would name a node no replica has. The pairs are returned in
+    /// `tree_node_repoints` for the history stacks, which follow only once
+    /// the change has committed (JS `onSplitTicketConsumed` and
+    /// `repointRest` in `executeUndoRedoInternal`). JS runs the change on a
+    /// clone first and keeps the pairs off the handler idempotent; this runs
+    /// it once, so each ticket is seen once.
     pub(crate) fn execute_undo_redo(
         &mut self,
         root: &mut CrdtRoot,
@@ -130,12 +144,44 @@ impl Change {
                 Operation::TreeEdit(operation) => operation.resolve_undo_positions(root)?,
                 _ => {}
             }
+            let executed_before = result.operations.len();
             self.execute_operation(
                 &self.operations[index],
                 root,
                 OpSource::UndoRedo,
                 &mut result,
             )?;
+            if result.operations.len() == executed_before {
+                continue;
+            }
+            let (Operation::TreeEdit(operation), Some(Operation::TreeEdit(executed))) =
+                (&self.operations[index], result.operations.last())
+            else {
+                continue;
+            };
+            // Read off the operation as it stands: an earlier split of this
+            // change may have re-pointed its `replaced_ids`.
+            let executed_at = operation.executed_at()?;
+            let repoints = operation
+                .replaced_ids()
+                .iter()
+                .zip(operation.split_tickets())
+                .take(executed.consumed_split_tickets())
+                .enumerate()
+                .map(|(ticket_index, (prev, ticket))| TreeNodeRepoint {
+                    executed_at: executed_at.clone(),
+                    parent_created_at: operation.parent_created_at().clone(),
+                    prev: prev.clone(),
+                    curr: TreeNodeId::new(ticket.clone(), 0),
+                    ticket_index: Some(ticket_index),
+                })
+                .collect::<Vec<_>>();
+            for repoint in &repoints {
+                for later in &mut self.operations[index + 1..] {
+                    repoint.apply_to(later);
+                }
+            }
+            result.tree_node_repoints.extend(repoints);
         }
         Ok(result)
     }
@@ -209,6 +255,38 @@ pub(crate) struct ChangeExecutionResult {
     pub(crate) operations: Vec<Operation>,
     pub(crate) op_infos: Vec<OpInfo>,
     pub(crate) reverse_ops: Vec<Operation>,
+    /// The Tree nodes an undo or a redo split re-minted, which the history
+    /// stacks have to follow (see `Change::execute_undo_redo`).
+    pub(crate) tree_node_repoints: Vec<TreeNodeRepoint>,
+}
+
+/// A Tree node an undo or a redo minted under a new ID in place of `prev`,
+/// recorded so the rest of its entry and the history stacks can follow it
+/// (an entry of JS `pending` in `executeUndoRedoInternal`).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TreeNodeRepoint {
+    /// The ticket of the Tree edit that minted the node, which names it
+    /// within its change.
+    pub(crate) executed_at: TimeTicket,
+    pub(crate) parent_created_at: TimeTicket,
+    pub(crate) prev: TreeNodeId,
+    pub(crate) curr: TreeNodeId,
+    /// Which of the edit's split tickets `curr` is; `None` for a content ID
+    /// the edit re-issued, which is minted whether or not the split runs.
+    pub(crate) ticket_index: Option<usize>,
+}
+
+impl TreeNodeRepoint {
+    /// Re-points `operation` from `prev` to `curr` if it is a Tree edit or
+    /// style. Like JS `repointRest`, it is not scoped to one tree: it runs
+    /// on the operations of one change, and IDs are change tickets.
+    pub(crate) fn apply_to(&self, operation: &mut Operation) {
+        match operation {
+            Operation::TreeEdit(operation) => operation.reconcile_node_id(&self.prev, &self.curr),
+            Operation::TreeStyle(operation) => operation.reconcile_node_id(&self.prev, &self.curr),
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]

@@ -13,6 +13,7 @@
 //! describe it whole, and otherwise by a split, a boundary deletion or a copy
 //! (see `TreeEditOperation`); a Tree style reverses to the previous values.
 
+use crate::crdt::tree::TreeNodeId;
 use crate::operation::Operation;
 use crate::presence::ReversePresence;
 use crate::{Document, Result, TimeTicket};
@@ -200,6 +201,34 @@ impl History {
                 if op.parent_created_at() == parent_created_at {
                     op.reconcile_operation(from, to, content_size);
                 }
+            }
+        }
+    }
+
+    /// Re-points the tree edits and styles of both stacks on the tree
+    /// `parent_created_at` from the node `prev` to the node `curr` (JS
+    /// `reconcileTreeNodeID`), for a split that re-created a merged-away
+    /// element under a new ID.
+    ///
+    /// Scoped to one tree, as `reconcile_tree_edit` is: a node ID is unique
+    /// only within its own tree, and the pairs come from peers' splits as
+    /// well as this replica's, so an unscoped sweep would let a split in one
+    /// tree re-address entries recorded against another.
+    pub(crate) fn reconcile_tree_node_id(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        prev: &TreeNodeId,
+        curr: &TreeNodeId,
+    ) {
+        for op in self.operations_mut() {
+            match op {
+                Operation::TreeEdit(op) if op.parent_created_at() == parent_created_at => {
+                    op.reconcile_node_id(prev, curr);
+                }
+                Operation::TreeStyle(op) if op.parent_created_at() == parent_created_at => {
+                    op.reconcile_node_id(prev, curr);
+                }
+                _ => {}
             }
         }
     }

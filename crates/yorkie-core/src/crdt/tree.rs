@@ -844,6 +844,10 @@ pub(crate) struct TreeStyleChange {
     pub(crate) attributes_to_remove: Vec<String>,
 }
 
+/// What `CrdtTree::split_levels` reports: the index and path where the first
+/// level opened, and the `(removed element, its replacement)` pairs.
+type SplitLevels = (Option<(usize, Vec<usize>)>, Vec<(TreeNodeId, TreeNodeId)>);
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TreeEditChange {
     pub(crate) from: usize,
@@ -893,6 +897,12 @@ pub(crate) struct TreeEditResult {
     /// post-order, each cloned when it was removed (JS `stranded`). They are
     /// not in `removed_nodes`, yet the range the edit consumed holds them.
     pub(crate) stranded_nodes: Vec<TreeNode>,
+    /// The `(removed element, its replacement)` pairs the split produced:
+    /// the elements a merge took away that the split re-created under new
+    /// IDs, innermost first (JS `splitRecreatedIDs`, see `merge_source_of`).
+    /// Reported so a replica applying the split, its own or a peer's, can
+    /// re-point what it recorded against the removed element.
+    pub(crate) split_recreated_ids: Vec<(TreeNodeId, TreeNodeId)>,
     /// Every node the range marked for removal, in traversal order, nodes
     /// already removed and the split siblings a delete reaches included (JS
     /// `nodesToBeRemoved`, which `TreeEditOperation` reads as
@@ -1662,18 +1672,20 @@ impl CrdtTree {
         // range reports, so the growth is measured off the tree: a level born
         // removed, or one the tree has no ancestor for, opens nothing.
         let size_before_split = if split_level > 0 { self.root.len() } else { 0 };
+        let mut split_recreated_ids = Vec::new();
         if split_level > 0 {
-            let (split_idx, split_path) = self
-                .split_levels(
-                    &from_parent,
-                    &from_left,
-                    split_level,
-                    &edited_at,
-                    issue_split_ticket,
-                    version_vector,
-                    &mut diff,
-                )?
-                .unwrap_or_else(|| (from_idx, from_path.clone()));
+            let (first_level, recreated) = self.split_levels(
+                &from_parent,
+                &from_left,
+                split_level,
+                &edited_at,
+                issue_split_ticket,
+                version_vector,
+                &mut diff,
+            )?;
+            split_recreated_ids = recreated;
+            let (split_idx, split_path) =
+                first_level.unwrap_or_else(|| (from_idx, from_path.clone()));
             changes.push(TreeEditChange {
                 from: split_idx,
                 to: split_idx,
@@ -1789,6 +1801,7 @@ impl CrdtTree {
             split_size,
             merged_nodes,
             stranded_nodes,
+            split_recreated_ids,
         })
     }
 
@@ -2569,7 +2582,9 @@ impl CrdtTree {
 
     /// Splits `split_level` elements from the position after `left` in
     /// `parent` upward (JS `CRDTTree.edit` step 04), and returns the index
-    /// and path where the first level opened, measured once it has split.
+    /// and path where the first level opened, measured once it has split,
+    /// with the `(removed element, its replacement)` pairs of the levels
+    /// that re-created an element a merge took away (see `merge_source_of`).
     #[allow(clippy::too_many_arguments)]
     fn split_levels(
         &mut self,
@@ -2580,11 +2595,12 @@ impl CrdtTree {
         issue_split_ticket: &mut dyn FnMut() -> TimeTicket,
         version_vector: Option<&crate::VersionVector>,
         diff: &mut DataSize,
-    ) -> Result<Option<(usize, Vec<usize>)>> {
+    ) -> Result<SplitLevels> {
         let actor_id = edited_at.actor_id().as_str().to_owned();
         let mut parent = parent.clone();
         let mut left = left.clone();
         let mut first_level = None;
+        let mut recreated_ids = Vec::new();
         for split_count in 0..split_level {
             // §7.5: advance past the split siblings of this level the editor
             // did not know, but not past its own split products (§7.7).
@@ -2614,9 +2630,12 @@ impl CrdtTree {
             };
             let (target, offset) =
                 self.order_same_boundary_split(&parent, offset, edited_at, version_vector)?;
-            let split_diff =
+            let (split_id, split_diff) =
                 self.split_element(&target, offset, issue_split_ticket, version_vector)?;
             add_data_size(diff, split_diff);
+            if let Some(recreated) = self.merge_source_of(&split_id, &target)? {
+                recreated_ids.push((recreated, split_id));
+            }
 
             // The split is reported at the end of what stayed in `parent`,
             // where it opened on this replica: concurrent inserts at the
@@ -2640,7 +2659,63 @@ impl CrdtTree {
             left = parent;
             parent = grand_parent;
         }
-        Ok(first_level)
+        Ok((first_level, recreated_ids))
+    }
+
+    /// Returns the ID of the removed element whose children the split
+    /// product `split_id` has just taken back, or `None` when the split
+    /// re-created nothing (JS `mergeSourceOf`).
+    ///
+    /// A merge moves a boundary element's children into the merge target
+    /// and removes the element, stamping each moved child with `merged_from`
+    /// naming it. Reversing that merge is a split, which mints a brand-new
+    /// element (the removed one's ID belongs to a change every replica
+    /// already applied) and moves the stamped children into it. So a product
+    /// holding children stamped for a removed element is that element's
+    /// replacement, and whatever names the element has to follow it. The
+    /// pair is derived from the tree, not carried on the operation, so a
+    /// peer reaches the same conclusion from the change alone.
+    ///
+    /// Narrow on purpose: a split that merely cuts through a merge target
+    /// keeps some of the source's children on the left, and its product is a
+    /// new sibling rather than the source's stand-in. Only a split that takes
+    /// the source's children back whole reverses the merge, so the split
+    /// target `target` must hold no child stamped for the source.
+    fn merge_source_of(
+        &self,
+        split_id: &TreeNodeId,
+        target: &TreeNodeId,
+    ) -> Result<Option<TreeNodeId>> {
+        let split = self.node(split_id)?;
+        let target = self.node(target)?;
+        let stamped_for = |node: &TreeNode, id: &TreeNodeId| {
+            node.all_children().any(|child| {
+                child
+                    .merged_from()
+                    .is_some_and(|merged_from| merged_from.has_same_created_at(id))
+            })
+        };
+
+        for merged_from in split.all_children().filter_map(TreeNode::merged_from) {
+            // The product carries the stamp of the node it split off
+            // (`split_element`); a child stamped for that same element was
+            // merged in one level up and is not what this split re-created.
+            if split
+                .merged_from()
+                .is_some_and(|own| own.has_same_created_at(merged_from))
+            {
+                continue;
+            }
+            if let Some(source) = self.find_floor_node(merged_from) {
+                if source.is_removed()
+                    && source.id().has_same_created_at(merged_from)
+                    && !stamped_for(target, source.id())
+                {
+                    return Ok(Some(source.id().clone()));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Decides which node a split at `offset` of `parent` splits, so that
@@ -2739,7 +2814,7 @@ impl CrdtTree {
         offset: usize,
         issue_split_ticket: &mut dyn FnMut() -> TimeTicket,
         version_vector: Option<&crate::VersionVector>,
-    ) -> Result<DataSize> {
+    ) -> Result<(TreeNodeId, DataSize)> {
         let path = self.path_of(id)?;
         let Some((parent_path, index)) = split_parent_path(&path) else {
             return Err(YorkieError::InvalidTreePosition(
@@ -2856,9 +2931,9 @@ impl CrdtTree {
         if let Some(removed_at) = split_removed_at {
             self.pending_gc_pairs
                 .push((split_id.to_id_string(), diff, removed_at));
-            return Ok(DataSize::default());
+            return Ok((split_id, DataSize::default()));
         }
-        Ok(diff)
+        Ok((split_id, diff))
     }
 
     fn physical_path_by_node_id(&self, id: &TreeNodeId) -> Option<Vec<usize>> {
@@ -5696,6 +5771,93 @@ mod tests {
     /// JS `CRDTTree.Merge` "Can merge different levels with edit", skipped
     /// upstream (`test/unit/document/crdt/tree_test.ts:1700`, `it.skip` with a
     /// TODO to fix the test). See `docs/crdt-parity/upstream-skipped-tests.md`.
+    /// JS `mergeSourceOf`: a split that takes the children of a merged-away
+    /// element back whole re-creates that element, and reports it with its
+    /// replacement; a split that leaves some of them in the merge target, or
+    /// one through children no merge moved, re-creates nothing.
+    #[test]
+    fn reports_the_elements_a_split_re_creates() -> crate::Result<()> {
+        let merged = || -> crate::Result<CrdtTree> {
+            let mut tree = CrdtTree::create(
+                TreeNode::create_element(
+                    node_id(1, 0),
+                    "root",
+                    None,
+                    vec![
+                        TreeNode::create_element(
+                            node_id(2, 0),
+                            "p",
+                            None,
+                            vec![TreeNode::create_text(node_id(3, 0), "ab")],
+                        ),
+                        TreeNode::create_element(
+                            node_id(4, 0),
+                            "p",
+                            None,
+                            vec![TreeNode::create_text(node_id(5, 0), "cd")],
+                        ),
+                    ],
+                ),
+                ticket(1, "a"),
+            );
+            let range = (tree.find_pos(3, true)?, tree.find_pos(5, true)?);
+            let result = tree.edit_by_range_with_changes(range, None, 0, ticket(10, "a"), None)?;
+            assert_eq!("<root><p>abcd</p></root>", tree.to_xml());
+            assert!(
+                result.split_recreated_ids.is_empty(),
+                "a merge splits nothing"
+            );
+            Ok(tree)
+        };
+        let split_at = |tree: &mut CrdtTree, index: usize| -> crate::Result<_> {
+            let pos = tree.find_pos(index, true)?;
+            let result = tree.edit_by_range_with_changes(
+                (pos.clone(), pos),
+                None,
+                1,
+                ticket(20, "a"),
+                None,
+            )?;
+            Ok(result.split_recreated_ids)
+        };
+
+        // At the merge boundary: the product holds all of "cd".
+        let mut tree = merged()?;
+        let recreated = split_at(&mut tree, 3)?;
+        assert_eq!("<root><p>ab</p><p>cd</p></root>", tree.to_xml());
+        let product = tree.root().children().nth(1).unwrap().id().clone();
+        assert_eq!(vec![(node_id(4, 0), product)], recreated);
+
+        // Through the moved children: "c" stays in the merge target.
+        let mut tree = merged()?;
+        assert_eq!(
+            Vec::<(TreeNodeId, TreeNodeId)>::new(),
+            split_at(&mut tree, 4)?
+        );
+        assert_eq!("<root><p>abc</p><p>d</p></root>", tree.to_xml());
+
+        // No merge at all.
+        let mut tree = CrdtTree::create(
+            TreeNode::create_element(
+                node_id(1, 0),
+                "root",
+                None,
+                vec![TreeNode::create_element(
+                    node_id(2, 0),
+                    "p",
+                    None,
+                    vec![TreeNode::create_text(node_id(3, 0), "ab")],
+                )],
+            ),
+            ticket(1, "a"),
+        );
+        assert_eq!(
+            Vec::<(TreeNodeId, TreeNodeId)>::new(),
+            split_at(&mut tree, 2)?
+        );
+        Ok(())
+    }
+
     #[test]
     #[ignore = "skipped upstream: JS tree_test.ts:1700 it.skip"]
     fn merges_different_levels_with_edit() -> crate::Result<()> {

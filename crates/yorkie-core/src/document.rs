@@ -1,5 +1,5 @@
 use crate::change::{
-    Change, ChangeContext, ChangeExecutionResult, ChangeId, ChangePack, Checkpoint,
+    Change, ChangeContext, ChangeExecutionResult, ChangeId, ChangePack, Checkpoint, TreeNodeRepoint,
 };
 use crate::crdt::array::CrdtArray;
 use crate::crdt::counter::CounterValue;
@@ -28,7 +28,7 @@ use crate::{
     ActorId, JsonArray, JsonObject, JsonValue, Result, SchemaRule, TimeTicket, VersionVector,
     YorkieError, INITIAL_ACTOR_ID,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
 
 mod options;
@@ -392,6 +392,11 @@ impl Document {
                     );
                 }
             }
+            // A plain split can re-create an element a merge took away too (a
+            // peer merged two blocks and this user splits them again), and
+            // the stacks may still name the merged-away one. Re-pointed
+            // before this change's own reverse is pushed, as JS `update`.
+            self.reconcile_split_recreated_ids(&executed.operations);
             let entry = HistoryOperation::entry(executed.reverse_ops, reverse_presence);
             if !entry.is_empty() {
                 self.history.push_undo(entry);
@@ -521,6 +526,20 @@ impl Document {
         &self.history
     }
 
+    /// Re-points both stacks at the elements the splits of `operations`
+    /// re-created under new IDs (JS `getSplitRecreatedIDs` with
+    /// `reconcileTreeNodeID`).
+    fn reconcile_split_recreated_ids(&mut self, operations: &[Operation]) {
+        for operation in operations {
+            if let Operation::TreeEdit(operation) = operation {
+                for (prev, curr) in operation.split_recreated_ids() {
+                    self.history
+                        .reconcile_tree_node_id(operation.parent_created_at(), prev, curr);
+                }
+            }
+        }
+    }
+
     /// Pops the latest undo (or redo) entry and applies it as a new local
     /// change (JS `executeUndoRedo`).
     pub(crate) fn execute_undo_redo(&mut self, is_undo: bool) -> Result<()> {
@@ -538,12 +557,17 @@ impl Document {
         // undo or redo leaves the other entries as they were. They name only
         // the other entries, so deferring them changes nothing for this one.
         let mut reconciles = Vec::new();
+        // The Tree nodes this entry re-mints and what they replace, applied
+        // to the stacks the same way (JS `pending`): the content IDs
+        // re-issued here, then the split tickets the change reports.
+        let mut tree_node_repoints = Vec::new();
 
         let actor_id = self.change_id.actor_id().clone();
         let mut context = ChangeContext::create(self.change_id.clone(), None);
         let mut proxy =
             PresenceProxy::new(self.presences.get(&actor_id).cloned().unwrap_or_default());
-        for history_op in entry {
+        let mut entry = VecDeque::from(entry);
+        while let Some(history_op) = entry.pop_front() {
             let mut operation = match history_op {
                 HistoryOperation::Presence(values) => {
                     proxy.restore(values);
@@ -586,10 +610,26 @@ impl Document {
                     // A reverse that inserts a copy of removed nodes carries
                     // their original IDs, and inserting them again would put
                     // two nodes under one ID: the copy takes fresh ones from
-                    // this change. An identity reverse keeps its own. What
-                    // else names the old IDs is re-pointed in a later step
-                    // (JS `repointRest`), not here.
-                    operation.reissue_content_ids(&mut || context.issue_time_ticket())?;
+                    // this change. An identity reverse keeps its own. The
+                    // rest of this entry and the stacks may name the old
+                    // IDs, so they follow (JS `repointRest`).
+                    for (prev, curr) in
+                        operation.reissue_content_ids(&mut || context.issue_time_ticket())?
+                    {
+                        let repoint = TreeNodeRepoint {
+                            executed_at: ticket.clone(),
+                            parent_created_at: operation.parent_created_at().clone(),
+                            prev,
+                            curr,
+                            ticket_index: None,
+                        };
+                        for later in entry.iter_mut() {
+                            if let HistoryOperation::Operation(later) = later {
+                                repoint.apply_to(later);
+                            }
+                        }
+                        tree_node_repoints.push(repoint);
+                    }
 
                     // A split reverse (the undo of a merge, or the redo of a
                     // split) creates one element per level, each under a
@@ -599,6 +639,11 @@ impl Document {
                     // an upper bound: a split that reaches the root stops
                     // early, and a ticket nobody takes only advances the
                     // delimiter.
+                    //
+                    // The elements a split re-creates under these tickets are
+                    // re-pointed in the rest of this entry as it runs (see
+                    // `Change::execute_undo_redo`), only for the tickets the
+                    // split really takes.
                     let level = operation.split_level();
                     if level > 0 {
                         let tickets = (0..level).map(|_| context.issue_time_ticket()).collect();
@@ -623,6 +668,47 @@ impl Document {
         for (prev, curr) in &reconciles {
             self.history.reconcile_created_at(prev, curr);
         }
+        // The stacks follow the IDs this entry minted only now, before the
+        // new reverse is pushed: that one is built from the executed state
+        // and already names them. A pair holds only if its operation ran
+        // (one whose target was removed meanwhile is skipped and mints
+        // nothing) and, for a split ticket, if the split took it.
+        tree_node_repoints.extend(executed.tree_node_repoints.iter().cloned());
+        for repoint in &tree_node_repoints {
+            let ran = executed
+                .operations
+                .iter()
+                .find_map(|operation| match operation {
+                    Operation::TreeEdit(operation)
+                        if operation.executed_at().ok() == Some(&repoint.executed_at) =>
+                    {
+                        Some(operation)
+                    }
+                    _ => None,
+                });
+            let Some(ran) = ran else {
+                continue;
+            };
+            if repoint
+                .ticket_index
+                .is_some_and(|index| index >= ran.consumed_split_tickets())
+            {
+                continue;
+            }
+            self.history.reconcile_tree_node_id(
+                &repoint.parent_created_at,
+                &repoint.prev,
+                &repoint.curr,
+            );
+        }
+        // Then what the tree says the split re-created, as the local and
+        // remote paths do. The pairs above name the merge the reverse was
+        // built for; the split as it ran can reverse one this entry never
+        // knew (a peer merged two blocks while the entry sat on the stack),
+        // while the tree derives a pair only where the merge left stamps
+        // behind. Neither covers the other, and a pair already applied
+        // sweeps nothing.
+        self.reconcile_split_recreated_ids(&executed.operations);
         change.apply_presence_change(&mut self.presences);
 
         let entry = HistoryOperation::entry(executed.reverse_ops, reverse_presence);
@@ -1072,7 +1158,19 @@ impl Document {
                         // order it changed them: an identity edit revives or
                         // re-removes nodes one at a time, each measured on
                         // the tree the one before it left.
+                        //
+                        // First, though, the elements its split re-created
+                        // under new IDs, whoever sent it: an entry still
+                        // naming the merged-away one would address a node GC
+                        // purges (JS `applyChangeInternal`).
                         Operation::TreeEdit(operation) => {
+                            for (prev, curr) in operation.split_recreated_ids() {
+                                self.history.reconcile_tree_node_id(
+                                    operation.parent_created_at(),
+                                    prev,
+                                    curr,
+                                );
+                            }
                             for (from, to, content_size) in operation.executed_ranges() {
                                 self.history.reconcile_tree_edit(
                                     operation.parent_created_at(),

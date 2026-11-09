@@ -1446,3 +1446,515 @@ fn moves_an_undo_past_a_remote_tree_edit() -> Result<()> {
     assert_eq!(xml(&a), xml(&b));
     Ok(())
 }
+
+// --- tree_redo_split_style_test.ts ---
+
+/// JS `grab` of `tree_redo_split_style_test.ts`: the pending local changes,
+/// through the wire, acked.
+fn grab(from: &mut Document) -> Result<Vec<Change>> {
+    let pack = from.create_change_pack();
+    let wire = through_wire(&pack)?;
+    ack(from, &pack)?;
+    Ok(wire.changes().to_vec())
+}
+
+/// `grab` without the wire, for the cases whose undo is an identity edit:
+/// the wire does not carry restore spans yet (Task 6 adds them and moves
+/// these cases to `grab`, as JS sends them through protobuf).
+fn grab_in_memory(from: &mut Document) -> Result<Vec<Change>> {
+    let pack = from.create_change_pack();
+    ack(from, &pack)?;
+    Ok(pack.changes().to_vec())
+}
+
+/// Acks the changes of `pack`, as the server would.
+fn ack(from: &mut Document, pack: &ChangePack) -> Result<()> {
+    let last_seq = pack
+        .changes()
+        .last()
+        .map_or(0, |change| change.id().client_seq());
+    from.apply_change_pack(&ChangePack::create(
+        from.key(),
+        Checkpoint::new(0, last_seq),
+        false,
+        Vec::new(),
+        Some(VersionVector::new()),
+        None,
+    ))
+}
+
+/// How a test hands a replica's changes over.
+type Grab = fn(&mut Document) -> Result<Vec<Change>>;
+
+/// `hello world` in an inline in a paragraph, two levels to split (JS
+/// `seed`).
+fn seed_inline(doc: &mut Document) -> Result<()> {
+    doc.update(|r| {
+        r.set_tree(
+            "t",
+            element(
+                "root",
+                vec![element(
+                    "paragraph",
+                    vec![element("inline", vec![text("hello world")])],
+                )],
+            ),
+        )
+        .map(|_| ())
+    })
+}
+
+/// `<p>ab</p><p>cd</p>`, two blocks to merge and split again (JS
+/// `seedBlocks`).
+fn seed_blocks(doc: &mut Document) -> Result<()> {
+    doc.update(|r| {
+        r.set_tree("t", element("root", vec![p("ab"), p("cd")]))
+            .map(|_| ())
+    })
+}
+
+/// JS `collectBoth`: purges every tombstone both replicas have seen.
+fn collect_all(a: &mut Document, b: &mut Document) {
+    let mut vector = VersionVector::new();
+    for doc in [&*a, &*b] {
+        vector.set(doc.change_id.actor_id().clone(), i64::MAX);
+    }
+    a.garbage_collect(&vector);
+    b.garbage_collect(&vector);
+}
+
+fn bold() -> BTreeMap<String, Value> {
+    attrs(&[("bold", "true")])
+}
+
+/// Two replicas of the inline seed, B having received it, with A's history
+/// cleared.
+fn seeded_pair(seed: fn(&mut Document) -> Result<()>) -> Result<(Document, Document)> {
+    let mut a = replica("d", ACTOR_1);
+    let mut b = replica("d", ACTOR_2);
+    seed(&mut a)?;
+    a.clear_history();
+    deliver(&mut b, grab(&mut a)?)?;
+    Ok((a, b))
+}
+
+/// JS `tree_redo_split_style_test.ts` "lets a peer apply the redo", the
+/// five-row table, each with and without GC: a split and an operation
+/// naming the element it created, in one change. The redo re-mints the
+/// element, so the rest of the entry and the entry it pushes have to name
+/// the new one, or the peer cannot apply them.
+#[test]
+fn lets_a_peer_apply_the_redo_of_a_split_and_what_names_it() -> Result<()> {
+    // The last row's insert reverses to an identity edit, whose spans name
+    // the split-created element as their parent.
+    let cases: [(&str, TreeChange<'_>, Grab); 5] = [
+        (
+            "split in the middle, bold the right piece",
+            &|t| {
+                t.edit_by_path(&[0, 0, 6], &[0, 0, 6], Vec::new(), 1)?;
+                t.style_by_path(&[0, 1], bold())
+            },
+            grab,
+        ),
+        (
+            "split at the end, bold the empty piece",
+            &|t| {
+                t.edit_by_path(&[0, 0, 11], &[0, 0, 11], Vec::new(), 1)?;
+                t.style_by_path(&[0, 1], bold())
+            },
+            grab,
+        ),
+        (
+            "split two levels, bold the new paragraph",
+            &|t| {
+                t.edit_by_path(&[0, 0, 6], &[0, 0, 6], Vec::new(), 2)?;
+                t.style_by_path(&[1], bold())
+            },
+            grab,
+        ),
+        (
+            // The style names the inner element the second ticket did not
+            // mint, which resolves only if the pairing is innermost first.
+            "split two levels, bold the new inline",
+            &|t| {
+                t.edit_by_path(&[0, 0, 6], &[0, 0, 6], Vec::new(), 2)?;
+                t.style_by_path(&[1, 0], bold())
+            },
+            grab,
+        ),
+        (
+            "split, then insert into the new element",
+            &|t| {
+                t.edit_by_path(&[0, 0, 6], &[0, 0, 6], Vec::new(), 1)?;
+                t.edit_by_path(&[0, 1, 0], &[0, 1, 0], vec![text("X")], 0)
+            },
+            grab_in_memory,
+        ),
+    ];
+
+    for (name, edit, grab) in cases {
+        for collect in [false, true] {
+            let name = format!("{name}{}", if collect { ", after GC" } else { "" });
+            let (mut a, mut b) = seeded_pair(seed_inline)?;
+
+            edit_tree(&mut a, edit)?;
+            let edited = xml(&a);
+            deliver(&mut b, grab(&mut a)?)?;
+            assert_eq!(edited, xml(&b), "{name}: edit");
+
+            undo(&mut a)?;
+            deliver(&mut b, grab(&mut a)?)?;
+            let undone = xml(&a);
+            assert_eq!(undone, xml(&b), "{name}: undo");
+            // Both have seen the undo, so its tombstones can be purged.
+            if collect {
+                collect_all(&mut a, &mut b);
+            }
+
+            redo(&mut a)?;
+            assert_eq!(edited, xml(&a), "{name}: redo, locally");
+            deliver(&mut b, grab(&mut a)?)?;
+            assert_eq!(edited, xml(&b), "{name}: redo, on the peer");
+
+            // A second round trip: the redo re-minted the split elements,
+            // so the entry it pushed onto the undo stack has to name them.
+            undo(&mut a)?;
+            deliver(&mut b, grab(&mut a)?)?;
+            assert_eq!(undone, xml(&a), "{name}: second undo, locally");
+            assert_eq!(undone, xml(&b), "{name}: second undo, on the peer");
+            redo(&mut a)?;
+            deliver(&mut b, grab(&mut a)?)?;
+            assert_eq!(edited, xml(&a), "{name}: second redo, locally");
+            assert_eq!(edited, xml(&b), "{name}: second redo, on the peer");
+        }
+    }
+    Ok(())
+}
+
+/// JS `tree_redo_split_style_test.ts` "re-points another history entry at
+/// the re-split elements", with and without GC: the split and the style
+/// naming its element are in different entries, so only the sweep of the
+/// stacks (`History::reconcile_tree_node_id`) can re-point the style.
+#[test]
+fn re_points_another_history_entry_at_the_re_split_elements() -> Result<()> {
+    for collect in [false, true] {
+        let name = if collect { "after GC" } else { "without GC" };
+        let (mut a, mut b) = seeded_pair(seed_inline)?;
+
+        // Entry 1: the split. Entry 2: a style naming what it created.
+        edit_tree(&mut a, |t| {
+            t.edit_by_path(&[0, 0, 6], &[0, 0, 6], Vec::new(), 1)
+        })?;
+        let split = xml(&a);
+        edit_tree(&mut a, |t| t.style_by_path(&[0, 1], bold()))?;
+        let styled = xml(&a);
+        deliver(&mut b, grab(&mut a)?)?;
+        assert_eq!(styled, xml(&b), "{name}: edits");
+
+        // Undo the style, then the split. The redo stack now holds a
+        // re-split entry and, above it, a style naming the pre-split element.
+        undo(&mut a)?;
+        deliver(&mut b, grab(&mut a)?)?;
+        undo(&mut a)?;
+        deliver(&mut b, grab(&mut a)?)?;
+        assert_eq!(xml(&a), xml(&b), "{name}: both undone");
+        if collect {
+            collect_all(&mut a, &mut b);
+        }
+
+        // Redoing the split mints new elements; the style entry still on
+        // the stack has to follow them, or the peer cannot apply it.
+        redo(&mut a)?;
+        deliver(&mut b, grab(&mut a)?)?;
+        assert_eq!(split, xml(&a), "{name}: redo split, locally");
+        assert_eq!(split, xml(&b), "{name}: redo split, on the peer");
+        if collect {
+            collect_all(&mut a, &mut b);
+        }
+
+        redo(&mut a)?;
+        assert_eq!(styled, xml(&a), "{name}: redo style, locally");
+        deliver(&mut b, grab(&mut a)?)?;
+        assert_eq!(styled, xml(&b), "{name}: redo style, on the peer");
+    }
+    Ok(())
+}
+
+/// JS `tree_redo_split_style_test.ts` "re-points the history when the split
+/// is a local edit": a peer merges two blocks, and a plain split here
+/// separates them again under a new ID. An entry naming the merged-away
+/// block has to follow it, or its undo names a purged node.
+#[test]
+fn re_points_the_history_when_the_split_is_a_local_edit() -> Result<()> {
+    let (mut a, mut b) = seeded_pair(seed_blocks)?;
+
+    // A's entry names the second block; B merges it into the first.
+    edit_tree(&mut a, |t| t.style_by_path(&[1], bold()))?;
+    deliver(&mut b, grab(&mut a)?)?;
+    edit_tree(&mut b, |t| t.edit_by_path(&[0, 2], &[1, 0], Vec::new(), 0))?;
+    deliver(&mut a, grab(&mut b)?)?;
+
+    // A splits the blocks apart again, then the merged-away block is purged.
+    edit_tree(&mut a, |t| t.edit_by_path(&[0, 2], &[0, 2], Vec::new(), 1))?;
+    deliver(&mut b, grab(&mut a)?)?;
+    collect_all(&mut a, &mut b);
+
+    undo(&mut a)?;
+    deliver(&mut b, grab(&mut a)?)?;
+    undo(&mut a)?;
+    deliver(&mut b, grab(&mut a)?)?;
+    assert_eq!(xml(&a), xml(&b));
+    Ok(())
+}
+
+/// JS `tree_redo_split_style_test.ts` "re-points the history when the split
+/// arrives from a peer": the same, with the merge and the split made by the
+/// peer, so the pairs come from applying its change.
+#[test]
+fn re_points_the_history_when_the_split_arrives_from_a_peer() -> Result<()> {
+    let (mut a, mut b) = seeded_pair(seed_blocks)?;
+
+    // B's entry names the second block; A merges it away and splits again.
+    edit_tree(&mut b, |t| t.style_by_path(&[1], bold()))?;
+    deliver(&mut a, grab(&mut b)?)?;
+    edit_tree(&mut a, |t| t.edit_by_path(&[0, 2], &[1, 0], Vec::new(), 0))?;
+    edit_tree(&mut a, |t| t.edit_by_path(&[0, 2], &[0, 2], Vec::new(), 1))?;
+    deliver(&mut b, grab(&mut a)?)?;
+    collect_all(&mut a, &mut b);
+
+    undo(&mut b)?;
+    deliver(&mut a, grab(&mut b)?)?;
+    assert_eq!(xml(&a), xml(&b));
+    Ok(())
+}
+
+/// JS `executeUndoRedoInternal`, the stacks re-pointed from what the tree
+/// says the split re-created: a peer merged two blocks while the redo of an
+/// unrelated split sat on the stack, and the redo separates them again. The
+/// redo's own `replaced_ids` name the element its undo merged away, not the
+/// peer's block, so only the pair the tree derives re-points the entry that
+/// names that block.
+#[test]
+fn re_points_the_history_at_a_block_a_redo_split_re_creates() -> Result<()> {
+    let (mut a, mut b) = seeded_pair(seed_blocks)?;
+
+    // A's first entry names the second block. A's split at the end of the
+    // first block opens an empty block, and its undo merges that back.
+    edit_tree(&mut a, |t| t.style_by_path(&[1], bold()))?;
+    edit_tree(&mut a, |t| t.edit_by_path(&[0, 2], &[0, 2], Vec::new(), 1))?;
+    undo(&mut a)?;
+    deliver(&mut b, grab(&mut a)?)?;
+
+    // B merges the second block into the first while the redo waits.
+    edit_tree(&mut b, |t| t.edit_by_path(&[0, 2], &[1, 0], Vec::new(), 0))?;
+    deliver(&mut a, grab(&mut b)?)?;
+    assert_eq!("<root><p>abcd</p></root>", xml(&a));
+
+    // The redo splits where the merge joined them, re-creating the block.
+    redo(&mut a)?;
+    deliver(&mut b, grab(&mut a)?)?;
+    assert_eq!("<root><p>ab</p><p>cd</p></root>", xml(&a));
+    assert_eq!(xml(&a), xml(&b));
+    collect_all(&mut a, &mut b);
+
+    undo(&mut a)?;
+    deliver(&mut b, grab(&mut a)?)?;
+    undo(&mut a)?;
+    deliver(&mut b, grab(&mut a)?)?;
+    assert_eq!(xml(&a), xml(&b));
+    Ok(())
+}
+
+/// `<r><p>ab</p></r>`.
+fn ab_doc() -> Result<Document> {
+    let mut doc = Document::new("doc");
+    doc.update(|r| r.set_tree("t", element("r", vec![p("ab")])).map(|_| ()))?;
+    Ok(doc)
+}
+
+/// Purges every tombstone of a document edited by one replica.
+fn collect_one(doc: &mut Document) {
+    let mut vector = VersionVector::new();
+    vector.set(doc.change_id.actor_id().clone(), i64::MAX);
+    doc.garbage_collect(&vector);
+}
+
+/// JS `executeUndoRedoInternal` (`repointRest` of the re-issued content
+/// IDs): the undo of a deletion re-inserts a copy under fresh IDs, and the
+/// reverse after it in the same entry, the undo of a style on the deleted
+/// element, has to follow the copy. Left naming the tombstone, its own
+/// reverse names it too, and the redo cannot find it once GC purged it.
+#[test]
+fn re_points_the_rest_of_an_entry_at_a_re_inserted_copy() -> Result<()> {
+    let mut doc = ab_doc()?;
+    let before = xml(&doc);
+
+    let _forced = force_copy_path::force();
+    edit_tree(&mut doc, |t| {
+        t.style(0, 1, bold())?;
+        t.edit(0, 4, Vec::new(), 0)
+    })?;
+    let after = xml(&doc);
+    assert_eq!("<r></r>", after);
+
+    undo(&mut doc)?;
+    assert_eq!(before, xml(&doc), "undo");
+    collect_one(&mut doc);
+    redo(&mut doc)?;
+    assert_eq!(after, xml(&doc), "redo");
+    undo(&mut doc)?;
+    assert_eq!(before, xml(&doc), "second undo");
+    Ok(())
+}
+
+/// The same, with the style and the deletion in separate entries: the
+/// stacks follow the re-issued IDs once the undo has run (JS `pending`),
+/// or the style's undo names a tombstone GC purged.
+#[test]
+fn re_points_another_entry_at_a_re_inserted_copy() -> Result<()> {
+    let mut doc = ab_doc()?;
+    let before = xml(&doc);
+
+    let _forced = force_copy_path::force();
+    edit_tree(&mut doc, |t| t.style(0, 1, bold()))?;
+    edit_tree(&mut doc, |t| t.edit(0, 4, Vec::new(), 0))?;
+
+    undo(&mut doc)?;
+    assert_eq!(r#"<r><p bold="true">ab</p></r>"#, xml(&doc));
+    collect_one(&mut doc);
+    undo(&mut doc)?;
+    assert_eq!(before, xml(&doc));
+    Ok(())
+}
+
+// --- tree_split_cascade_regression_test.ts ---
+//
+// JS sends these through protobuf. The undo of a span deletion is an
+// identity edit, whose restore spans the wire does not carry yet, so the
+// changes go in memory until Task 6 adds them.
+
+/// JS `start`: `n` synced replicas under actors 1..n holding
+/// `<p><span>abc</span><span>de</span></p><p><span>fg</span></p>`.
+fn cascade_replicas(n: usize) -> Result<Vec<Document>> {
+    let mut replicas = (1..=n)
+        .map(|i| replica("doc", &format!("{i:024x}")))
+        .collect::<Vec<_>>();
+    replicas[0].update(|r| {
+        r.set_tree(
+            "t",
+            element(
+                "doc",
+                vec![
+                    element(
+                        "p",
+                        vec![
+                            element("span", vec![text("abc")]),
+                            element("span", vec![text("de")]),
+                        ],
+                    ),
+                    element("p", vec![element("span", vec![text("fg")])]),
+                ],
+            ),
+        )
+        .map(|_| ())
+    })?;
+    let init = grab(&mut replicas[0])?;
+    for replica in replicas.iter_mut().skip(1) {
+        deliver(replica, init.clone())?;
+    }
+    Ok(replicas)
+}
+
+/// JS `visibleText`.
+fn visible_text(xml: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    for ch in xml.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            ch if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A split a replica makes concurrently with the span deletion.
+type SplitEdit = fn(&mut JsonTree) -> Result<()>;
+
+/// The editor's Enter right before a styled run (JS `enterAtSpanStart`).
+fn enter_at_span_start(t: &mut JsonTree) -> Result<()> {
+    t.edit_by_path(&[0, 1, 0], &[0, 1, 0], Vec::new(), 1)?;
+    t.split_by_path(&[0, 2])?;
+    t.edit_by_path(&[0, 1], &[0, 2], Vec::new(), 0)
+}
+
+/// JS `splitAt0DropLeft`.
+fn split_at_0_drop_left(t: &mut JsonTree) -> Result<()> {
+    t.edit_by_path(&[0, 1, 0], &[0, 1, 0], Vec::new(), 1)?;
+    t.edit_by_path(&[0, 1], &[0, 2], Vec::new(), 0)
+}
+
+/// JS `tree_split_cascade_regression_test.ts` "delete span + undo vs
+/// ${name}: "de" stays visible on both", both rows: r1 deletes the styled
+/// span and undoes it while r2 presses Enter right before it; nobody
+/// deleted "de".
+#[test]
+fn keeps_de_after_a_span_delete_and_undo_vs_a_split() -> Result<()> {
+    let cases: [(&str, SplitEdit); 2] = [
+        ("Enter at span start", enter_at_span_start),
+        ("split at 0 + drop left", split_at_0_drop_left),
+    ];
+    for (name, op) in cases {
+        let mut replicas = cascade_replicas(2)?;
+        let [r1, r2] = replicas.as_mut_slice() else {
+            unreachable!()
+        };
+        edit_tree(r1, |t| t.edit_by_path(&[0, 1], &[0, 2], Vec::new(), 0))?;
+        undo(r1)?;
+        edit_tree(r2, op)?;
+        let p1 = grab_in_memory(r1)?;
+        let p2 = grab_in_memory(r2)?;
+        deliver(r2, p1)?;
+        deliver(r1, p2)?;
+        assert!(
+            visible_text(&xml(r1)).contains("de"),
+            "{name}: r1 lost \"de\""
+        );
+        assert!(
+            visible_text(&xml(r2)).contains("de"),
+            "{name}: r2 lost \"de\""
+        );
+    }
+    Ok(())
+}
+
+/// JS `tree_split_cascade_regression_test.ts` "delete span + undo vs
+/// split-at-0+drop vs split-in-middle+drop: converge".
+#[test]
+fn converges_after_a_span_delete_and_undo_vs_two_splits_that_drop() -> Result<()> {
+    let mut replicas = cascade_replicas(3)?;
+    let [r1, r2, r3] = replicas.as_mut_slice() else {
+        unreachable!()
+    };
+    edit_tree(r1, |t| t.edit_by_path(&[0, 1], &[0, 2], Vec::new(), 0))?;
+    undo(r1)?;
+    let p1 = grab_in_memory(r1)?;
+    edit_tree(r2, split_at_0_drop_left)?;
+    let p2 = grab_in_memory(r2)?;
+    deliver(r3, p1.clone())?;
+    edit_tree(r3, |t| {
+        t.edit_by_path(&[0, 1, 1], &[0, 1, 1], Vec::new(), 1)?;
+        t.edit_by_path(&[0, 1], &[0, 2], Vec::new(), 0)
+    })?;
+    let p3 = grab_in_memory(r3)?;
+    deliver(r1, p2.clone())?;
+    deliver(r1, p3.clone())?;
+    deliver(r2, p1)?;
+    deliver(r2, p3)?;
+    deliver(r3, p2)?;
+    assert_eq!(xml(r1), xml(r2), "r2 diverged from r1");
+    assert_eq!(xml(r1), xml(r3), "r3 diverged from r1");
+    Ok(())
+}

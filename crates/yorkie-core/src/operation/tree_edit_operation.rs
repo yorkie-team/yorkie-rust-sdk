@@ -247,7 +247,7 @@ impl TreeEditOperation {
                 inserted_content_size: Some(result.inserted_size),
                 split_size: result.split_size,
                 executed_ranges: None,
-                split_recreated_ids: Vec::new(),
+                split_recreated_ids: result.split_recreated_ids,
                 consumed_split_tickets,
             }),
         }))
