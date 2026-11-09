@@ -1,6 +1,6 @@
 # Upstream Skipped Tests
 
-Last reviewed: 2026-11-08
+Last reviewed: 2026-11-09
 
 This document tracks CRDT-related tests that are skipped or dynamically skipped
 in the JS SDK or Go implementation. These tests are not Rust pass targets while
@@ -26,8 +26,8 @@ they remain skipped upstream.
 | Area | Source | Skipped case | Upstream reason | Rust handling |
 | --- | --- | --- | --- | --- |
 | Array history | `packages/sdk/test/integration/history_array_test.ts:101` | Undo matrix cases where `op1 === "move"` and `op3 === "set"` in the `add/remove/move/set` triple matrix. | The set operation restores at the moved element's original dead position; upstream notes that fixing this requires a proto-level change. | Skipped in the matrix loop of `returns_to_each_array_state` (`crates/yorkie-core/tests/history.rs`) until upstream unskips the cases. |
-| Text history | `packages/sdk/test/integration/history_text_test.ts:705` | Case 3 correctness: both undo overlapping deletes should restore the original text. | Both clients converge to the same wrong content because deep-copy re-insert duplicates the overlapping removed range. | Ignored as `restores_the_original_after_both_undo_contained_deletions` in `crates/yorkie/tests/integration_history.rs`. Upstream still skips it; the JS identity-preserving restore, not ported to Rust, targets this case. |
-| Text history | `packages/sdk/test/integration/history_text_test.ts:742` | Case 5 correctness: both undo partially overlapping deletes should restore the original text. | Same deep-copy re-insert limitation as Case 3. | Ignored as `restores_the_original_after_both_undo_overlapping_deletions` in `crates/yorkie/tests/integration_history.rs`, for the same reason as Case 3. |
+| Text history | `packages/sdk/test/integration/history_text_test.ts:705` | Case 3 correctness: both undo overlapping deletes should restore the original text. | Both clients converge to the same wrong content because deep-copy re-insert duplicates the overlapping removed range. | Runs live as `restores_the_original_after_both_undo_contained_deletions` in `crates/yorkie/tests/integration_history.rs`. A recorded divergence: the JS skip comment predates identity-preserving restore, which fixes the case, and Go runs it live (`test/integration/history_text_reconcile_test.go` `TestReconcileOverlappingUndoDuplicatesContent`). Rust ports that restore (`docs/plans/2026-11-09-text-removal-ledger.md`); see Undo and Redo in `docs/current-porting-gaps.md`. |
+| Text history | `packages/sdk/test/integration/history_text_test.ts:742` | Case 5 correctness: both undo partially overlapping deletes should restore the original text. | Same deep-copy re-insert limitation as Case 3. | Runs live as `restores_the_original_after_both_undo_overlapping_deletions` in `crates/yorkie/tests/integration_history.rs`, for the same reason as Case 3. |
 | Tree history | `packages/sdk/test/integration/history_tree_test.ts:414` | Redo matrix case where `op1 === "insert-text"` and `op2 === "delete-text"`. | Upstream marks adjacent or overlapping redo ranges as Phase 2 because some combinations diverge. | Keep skipped or ignored when Tree history tests are ported. |
 | Tree history | `packages/sdk/test/integration/history_tree_test.ts:574` | Case 3 `contained_by`: undo range contained by remote should collapse. | Overlapping reconciliation needs symmetric index computation. | Keep skipped or ignored. |
 | Tree history | `packages/sdk/test/integration/history_tree_test.ts:619` | Case 4 `contains`: remote range contained by undo should adjust. | Overlapping reconciliation needs symmetric index computation. | Keep skipped or ignored. |
@@ -50,7 +50,8 @@ database setup skips, and server push-pull consistency skips.
 
 Rust carries one ignored test for the skipped upstream cases listed above:
 `crdt::tree::tests::merges_different_levels_with_edit` for the JS Tree CRDT
-unit case. The history cases wait for Tree undo/redo. The JS
+unit case. The two JS Text history correctness cases run live, as Go runs
+them (see the inventory). The history cases wait for Tree undo/redo. The JS
 `tree_concurrency_test.ts` matrices have no skipped combinations, and every
 Rust combination converges.
 

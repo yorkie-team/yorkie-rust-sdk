@@ -946,3 +946,98 @@ fn keeps_a_plain_re_inserted_run_unstyled_when_redoing_after_gc() -> Result<()> 
     assert!(attrs_at(&doc, 1).is_empty());
     Ok(())
 }
+
+// --- The interop snapshot (`yorkie-protocol` `text_undo_interop.rs`) ---
+
+/// Builds the document of the JS `ledger_snapshot_pack` fixture
+/// (`tools/interop/text_undo_fixtures_test.ts`) and checks that its root
+/// projects to the Text nodes JS wrote, the ledgers and the attribute
+/// tickets included. `yorkie-protocol` checks that this projection encodes
+/// to the fixture's bytes.
+///
+/// The recreated `ef` keeps the attribute ticket of its insertion, as in JS:
+/// the undoing replica restores the removed value it kept. Go stamps the
+/// recreated attribute with the undo's ticket (3, A1) instead, so Go writes
+/// different bytes for this snapshot.
+#[test]
+fn builds_the_root_of_the_js_ledger_snapshot_fixture() -> Result<()> {
+    let mut d1 = restore_doc("text-undo-interop", A1);
+    let mut d2 = restore_doc("text-undo-interop", A2);
+    d1.update(|root| {
+        root.set_text("t")?
+            .edit(0, 0, "abcdefgh", Some(attrs([("b", "1")])))
+            .map(|_| ())
+    })?;
+    cross_sync(&mut d1, &mut d2)?;
+
+    delete(&mut d1, 4, 6)?;
+    cross_sync(&mut d1, &mut d2)?;
+    assert!(d1.garbage_collect(&max_vector_of(&[A1])) > 0);
+    undo(&mut d1)?;
+    cross_sync(&mut d1, &mut d2)?;
+    assert_eq!("abcdefgh", text(&d1));
+
+    delete(&mut d1, 2, 4)?;
+    cross_sync(&mut d1, &mut d2)?;
+    undo(&mut d1)?;
+    cross_sync(&mut d1, &mut d2)?;
+    delete(&mut d2, 2, 4)?;
+    cross_sync(&mut d1, &mut d2)?;
+    assert_eq!("abefgh", text(&d1));
+    assert_eq!(d1.to_sorted_json(), d2.to_sorted_json());
+
+    let root = WireJsonElement::try_from(&CrdtElement::object(d1.crdt_root.object().clone()))?;
+    let WireJsonElement::Object { nodes: members, .. } = root else {
+        panic!("expected an object root");
+    };
+    let WireJsonElement::Text { nodes, .. } = &members[0].element else {
+        panic!("expected a text at t");
+    };
+    let ticket = |lamport, delimiter, actor| crate::TimeTicket::new(lamport, delimiter, actor);
+    let inserted = ticket(1, 2, A1);
+    let got = nodes
+        .iter()
+        .map(|node| {
+            assert_eq!(inserted, node.id.created_at);
+            let attr = &node.attributes["b"];
+            assert_eq!(("\"1\"", false), (attr.value.as_str(), attr.is_removed));
+            (
+                node.value.as_str(),
+                node.id.offset,
+                node.ins_prev_id.as_ref().map(|id| id.offset),
+                node.removed_at.clone(),
+                node.removal_events.clone(),
+                attr.updated_at.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        vec![
+            ("ab", 0, None, None, vec![], inserted.clone()),
+            (
+                "cd",
+                2,
+                Some(0),
+                Some(ticket(7, 1, A2)),
+                vec![ticket(4, 1, A1), ticket(5, 1, A1)],
+                inserted.clone(),
+            ),
+            (
+                "ef",
+                4,
+                Some(2),
+                None,
+                vec![ticket(0, 0, A1), ticket(3, 1, A1)],
+                inserted.clone(),
+            ),
+            ("gh", 6, Some(4), None, vec![], inserted.clone()),
+        ],
+        got
+    );
+
+    let mut vector = VersionVector::new();
+    vector.set(A1, 8);
+    vector.set(A2, 7);
+    assert_eq!(&vector, d1.version_vector());
+    Ok(())
+}
