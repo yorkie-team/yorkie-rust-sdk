@@ -13,7 +13,7 @@
 //! `ba82ed91`). Every vector that authorises a purge is one the server could
 //! compute: the element-wise min of the replicas' own vectors.
 
-use super::Document;
+use super::{Document, DocumentOptions};
 use crate::change::{Change, ChangePack, Checkpoint};
 use crate::crdt::root::CrdtRoot;
 use crate::wire::WireChange;
@@ -169,6 +169,93 @@ fn counts_and_collects_removed_elements_with_their_descendants() -> Result<()> {
     assert_eq!(4, doc.garbage_len());
     assert_eq!(4, doc.garbage_collect(&max_vector_of(&[A1])));
     assert_eq!(0, doc.garbage_len());
+    Ok(())
+}
+
+/// JS `should not collect garbage if disabled` (`gc_test.ts` 67-95):
+/// `DocumentOptions::disable_gc` makes `garbage_collect` purge nothing.
+#[test]
+fn does_not_collect_garbage_when_disabled() -> Result<()> {
+    let options = DocumentOptions {
+        disable_gc: true,
+        ..Default::default()
+    };
+    let mut doc = Document::with_options("test-doc", options)?;
+    doc.set_actor(A1);
+    doc.update(|root| {
+        root.set("1", 1)?;
+        root.set("2", JsonArray::new())?;
+        root.get_array_mut("2")?.push(1)?.push(2)?.push(3)?;
+        root.set("3", 3)?;
+        Ok(())
+    })?;
+    assert_eq!(r#"{"1":1,"2":[1,2,3],"3":3}"#, doc.to_sorted_json());
+
+    doc.update(|root| {
+        root.remove("2");
+        Ok(())
+    })?;
+    assert_eq!(r#"{"1":1,"3":3}"#, doc.to_sorted_json());
+    assert_eq!(4, doc.garbage_len());
+    assert_eq!(0, doc.garbage_collect(&max_vector_of(&[A1])));
+    assert_eq!(4, doc.garbage_len());
+    Ok(())
+}
+
+/// JS `Document.applyChangePack` still runs `garbageCollect` with the
+/// pack's vector, which returns 0 under `DocumentOptions::disable_gc`.
+#[test]
+fn an_applied_change_pack_collects_nothing_when_disabled() -> Result<()> {
+    let options = DocumentOptions {
+        disable_gc: true,
+        ..Default::default()
+    };
+    let mut doc = Document::with_options("test-doc", options)?;
+    doc.set_actor(A1);
+    doc.update(|root| root.set("k", 1).map(|_| ()))?;
+    doc.update(|root| {
+        root.remove("k");
+        Ok(())
+    })?;
+
+    doc.apply_change_pack(&ack_with_vector(&doc, 2, max_vector_of(&[A1])))?;
+    assert_eq!(1, doc.garbage_len());
+    assert!(!doc.has_local_changes());
+    Ok(())
+}
+
+/// JS `Document.applyChange` (`document.ts` 3064-3066): an attachment that
+/// opted out of GC advances only its lamport on a remote change, so its
+/// version vector keeps its own entry alone; otherwise the remote actor's
+/// entry is merged in.
+#[test]
+fn an_opted_out_attachment_does_not_merge_remote_vectors() -> Result<()> {
+    let (mut d1, mut d2) = replicas();
+    d2.update(|root| root.set("k", 1).map(|_| ()))?;
+    d2.update(|root| root.set("k", 2).map(|_| ()))?;
+    let changes = push(&mut d2)?;
+
+    let mut plain = d1.clone();
+    d1.set_disable_gc(true);
+    pull(&mut d1, changes.clone())?;
+    pull(&mut plain, changes)?;
+
+    assert_eq!(r#"{"k":2}"#, d1.to_sorted_json());
+    let vector = d1.version_vector();
+    assert_eq!(1, vector.size());
+    assert_eq!(Some(3), vector.get(A1));
+    d1.update(|root| root.set("j", 3).map(|_| ()))?;
+    assert_eq!(1, d1.version_vector().size());
+    assert_eq!(Some(4), d1.version_vector().get(A1));
+
+    assert_eq!(2, plain.version_vector().size());
+    assert_eq!(Some(2), plain.version_vector().get(A2));
+
+    // Turning it off again goes back to merging, as a re-attach does.
+    d1.set_disable_gc(false);
+    d2.update(|root| root.set("k", 4).map(|_| ()))?;
+    pull(&mut d1, push(&mut d2)?)?;
+    assert_eq!(Some(3), d1.version_vector().get(A2));
     Ok(())
 }
 

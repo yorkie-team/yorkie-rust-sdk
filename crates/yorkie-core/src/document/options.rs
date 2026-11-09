@@ -25,4 +25,10 @@ pub struct DocumentOptions {
     /// reverse entry keeps a copy of the content it would restore, so a
     /// larger depth holds more memory.
     pub max_undo_depth: Option<usize>,
+    /// Turns garbage collection off for this document (JS `disableGC`):
+    /// `Document::garbage_collect` purges nothing and returns 0, so removed
+    /// elements stay as tombstones. It is local only; declaring an attachment
+    /// GC-free to the server is `AttachOptions::disable_gc` in the client,
+    /// and neither implies the other.
+    pub disable_gc: bool,
 }

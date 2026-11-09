@@ -53,6 +53,7 @@ pub fn to_attach_document_request(
         client_id: request.client_id.to_string(),
         change_pack: Some(converter::to_change_pack(&request.change_pack)?),
         schema_key: request.schema_key.clone().unwrap_or_default(),
+        disable_gc: request.disable_gc,
         ..Default::default()
     })
 }
@@ -125,7 +126,7 @@ pub fn to_push_pull_changes_request(
         document_id: request.document_id.clone(),
         change_pack: Some(converter::to_change_pack(&request.change_pack)?),
         push_only: request.push_only,
-        ..Default::default()
+        disable_gc: request.disable_gc,
     })
 }
 
@@ -390,6 +391,7 @@ mod tests {
             client_id: ActorId::new("000000000000000000000001"),
             change_pack: doc.create_change_pack(),
             schema_key: Some("schema".to_owned()),
+            disable_gc: false,
             shard_key: "api-key/doc-key".to_owned(),
         };
 
@@ -478,6 +480,7 @@ mod tests {
             document_id: "document-id".to_owned(),
             change_pack: doc.create_change_pack(),
             push_only: true,
+            disable_gc: false,
             shard_key: "api-key/doc-key".to_owned(),
         };
 
@@ -492,6 +495,34 @@ mod tests {
         })?;
         assert_eq!("doc-key", response.change_pack.document_key());
         assert!(response.change_pack.has_changes());
+        Ok(())
+    }
+
+    /// JS `attachDocument` (`client.ts` 1588) and `syncInternal` (4025-4037)
+    /// send the attachment's `disableGC` as the request's `disableGc`.
+    #[test]
+    fn encodes_disable_gc_on_attach_and_push_pull() -> Result<()> {
+        let doc = Document::new("doc-key");
+        for disable_gc in [true, false] {
+            let attach = to_attach_document_request(&AttachDocumentRequest {
+                client_id: ActorId::new("000000000000000000000001"),
+                change_pack: doc.create_change_pack(),
+                schema_key: None,
+                disable_gc,
+                shard_key: "api-key/doc-key".to_owned(),
+            })?;
+            assert_eq!(disable_gc, attach.disable_gc);
+
+            let push_pull = to_push_pull_changes_request(&PushPullChangesRequest {
+                client_id: ActorId::new("000000000000000000000001"),
+                document_id: "document-id".to_owned(),
+                change_pack: doc.create_change_pack(),
+                push_only: false,
+                disable_gc,
+                shard_key: "api-key/doc-key".to_owned(),
+            })?;
+            assert_eq!(disable_gc, push_pull.disable_gc);
+        }
         Ok(())
     }
 

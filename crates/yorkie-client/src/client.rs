@@ -141,6 +141,8 @@ pub(crate) struct SyncTarget {
     request_mode: SyncMode,
     /// Mode of the attachment when the sync started.
     attachment_mode: SyncMode,
+    /// The attachment opted out of garbage collection.
+    disable_gc: bool,
 }
 
 /// A running background loop. Dropping the handle stops the loop at its next
@@ -423,6 +425,7 @@ impl Client {
             sync_mode,
             document_poll_interval,
             schema,
+            disable_gc,
         } = options;
 
         let _queue = self.lock_task_queue().await;
@@ -476,6 +479,7 @@ impl Client {
                 client_id: session.client_id.clone(),
                 change_pack,
                 schema_key: schema,
+                disable_gc,
                 shard_key: self.shard_key(&key),
             })
             .await
@@ -492,6 +496,10 @@ impl Client {
             if !response.schema_rules.is_empty() {
                 doc.set_schema_rules(response.schema_rules.clone());
             }
+            // As in JS, before the response is applied, so the remote changes
+            // it carries already take the lamport-only path; and on every
+            // attach, so a re-attach without the option merges vectors again.
+            doc.set_disable_gc(disable_gc);
             doc.apply_change_pack(&response.change_pack)?;
             let removed = doc.status() == DocStatus::Removed;
             if !removed {
@@ -514,6 +522,7 @@ impl Client {
                     sync_mode,
                     poll_interval,
                     poll_interval_pinned,
+                    disable_gc,
                 );
                 let watch_ready = uses_watch_stream(sync_mode).then(|| {
                     let (task, ready) = watch::spawn(&self.inner, key.clone(), doc.clone());
@@ -1177,6 +1186,7 @@ impl Client {
                 document_id: target.document_id.clone(),
                 change_pack,
                 push_only: target.request_mode == SyncMode::RealtimePushOnly,
+                disable_gc: target.disable_gc,
                 shard_key: self.shard_key(&target.key),
             })
             .await?;
@@ -1552,6 +1562,7 @@ impl SyncTarget {
             document_id: attachment.resource_id.clone(),
             request_mode,
             attachment_mode: attachment.sync_mode,
+            disable_gc: attachment.disable_gc,
         }
     }
 }
@@ -1893,6 +1904,9 @@ mod tests {
         /// acknowledge the pushed ones, as the JS re-issue tests' fake
         /// `attachDocument` and `detachDocument` do.
         ack_pushes: bool,
+        /// When set, the next attach reply carries this pack instead of
+        /// `reply_pack` of the pushed one.
+        attach_reply: Mutex<Option<yorkie_core::ChangePack>>,
     }
 
     impl Default for MockTransport {
@@ -1926,6 +1940,7 @@ mod tests {
                 push_pull_server_seq: Mutex::new(None),
                 attach_errors: Mutex::new(Vec::new()),
                 ack_pushes: false,
+                attach_reply: Mutex::new(None),
             }
         }
     }
@@ -1975,7 +1990,12 @@ mod tests {
             &self,
             request: AttachDocumentRequest,
         ) -> ClientResult<AttachDocumentResponse> {
-            let change_pack = self.reply_pack(&request.change_pack);
+            let change_pack = self
+                .attach_reply
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_else(|| self.reply_pack(&request.change_pack));
             self.attach_requests.lock().unwrap().push(request);
             {
                 let mut errors = self.attach_errors.lock().unwrap();
@@ -2138,6 +2158,7 @@ mod tests {
             .block_on(future)
     }
 
+    mod disable_gc;
     mod reissue;
 
     fn mock_client(options: ClientOptions, transport: &Arc<MockTransport>) -> Client {

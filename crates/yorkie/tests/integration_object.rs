@@ -15,7 +15,10 @@ mod integration_support;
 use integration_support::two_clients::{active_client, manual_attach, shared, TwoClients};
 use integration_support::{assert_undo_redo, json_value, rpc_addr, unique_key};
 use serde_json::json;
-use yorkie::{Client, DeactivateOptions, Document, JsonObject, JsonValue, SharedDocument};
+use std::sync::{Arc, Mutex};
+use yorkie::{
+    Client, DeactivateOptions, Document, DocumentOptions, JsonObject, JsonValue, SharedDocument,
+};
 
 fn sorted_json(doc: &SharedDocument) -> String {
     doc.lock().unwrap().to_sorted_json()
@@ -783,19 +786,32 @@ async fn applies_remote_sets_made_before_a_local_undo() {
 }
 
 /// JS "Should handle case of reverse operations referencing already
-/// garbage-collected elements" (object_test.ts:923). JS attaches both
-/// documents with `disableGC: true` (with a TODO to remove it). With
-/// collection on, the undo's reverse operation names the replaced object
-/// after it has been purged, and the undo fails with `MissingCrdtElement`.
+/// garbage-collected elements" (object_test.ts:923). As in JS, both
+/// documents are created with `DocumentOptions::disable_gc` (JS has a TODO
+/// to remove it): with collection on, the undo's reverse operation names the
+/// replaced object after it has been purged, and the undo fails with
+/// `MissingCrdtElement`.
 #[tokio::test]
-#[ignore = "disable-GC not ported: with collection on, the undo names a purged object, see docs/current-porting-gaps.md"]
 async fn skips_an_undo_of_a_garbage_collected_object() {
     let Some(addr) = rpc_addr() else { return };
     let key = unique_key("object-undo-gc-element");
     let (client1, client2) = two_clients_ordered(&addr).await;
+    let gc_disabled = || {
+        let options = DocumentOptions {
+            disable_gc: true,
+            ..Default::default()
+        };
+        Arc::new(Mutex::new(Document::with_options(&key, options).unwrap()))
+    };
 
-    let doc1 = client1.attach(shared(&key), manual_attach()).await.unwrap();
-    let doc2 = client2.attach(shared(&key), manual_attach()).await.unwrap();
+    let doc1 = client1
+        .attach(gc_disabled(), manual_attach())
+        .await
+        .unwrap();
+    let doc2 = client2
+        .attach(gc_disabled(), manual_attach())
+        .await
+        .unwrap();
 
     set(&doc1, "shape", json!({"color": "black"}));
     set(&doc2, "shape", json!({"color": "yellow"}));

@@ -166,6 +166,17 @@ pub struct AttachOptions {
     pub sync_mode: SyncMode,
     pub document_poll_interval: Option<Duration>,
     pub schema: Option<String>,
+    /// Declares that this attachment will not produce or consume tombstones
+    /// (JS `disableGC`). The server skips minimum version vector tracking
+    /// and omits the response version vector for this client. Use only with
+    /// Counter or primitive workloads; misuse on a document that uses Tree,
+    /// Text, or Array deletions leads to undefined GC behavior on this
+    /// client.
+    ///
+    /// This option controls the wire contract with the server. It is
+    /// distinct from the local-only `DocumentOptions::disable_gc` on the
+    /// document. Defaults to `false`.
+    pub disable_gc: bool,
 }
 
 /// User-settable options for attaching channels (JS `AttachChannelOptions`).
@@ -212,6 +223,7 @@ impl Default for AttachOptions {
             sync_mode: SyncMode::Realtime,
             document_poll_interval: None,
             schema: None,
+            disable_gc: false,
         }
     }
 }

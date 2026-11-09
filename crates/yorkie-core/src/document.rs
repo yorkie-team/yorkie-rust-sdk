@@ -62,6 +62,14 @@ pub struct Document {
     /// document its key names (JS `mintedOperations`). It is never cleared:
     /// a push cannot be taken back.
     minted_operations: bool,
+    /// `DocumentOptions::disable_gc` (JS `opts.disableGC`): garbage
+    /// collection purges nothing.
+    disable_gc: bool,
+    /// Whether the attachment opted out of garbage collection (JS
+    /// `disableGC`, set by the client on attach): a remote change then
+    /// advances only the lamport clock and leaves the version vector at this
+    /// document's own entry.
+    attach_disable_gc: bool,
 }
 
 /// Document attachment state.
@@ -75,7 +83,7 @@ pub enum DocStatus {
 impl Document {
     /// Creates a document with the given Yorkie resource key.
     pub fn new(key: impl Into<String>) -> Self {
-        Self::create(key.into(), MAX_UNDO_REDO_STACK_DEPTH)
+        Self::create(key.into(), MAX_UNDO_REDO_STACK_DEPTH, false)
     }
 
     /// Creates a document with the given Yorkie resource key and options
@@ -89,10 +97,10 @@ impl Document {
                 "maxUndoDepth must be a positive integer: {max_undo_depth}"
             )));
         }
-        Ok(Self::create(key.into(), max_undo_depth))
+        Ok(Self::create(key.into(), max_undo_depth, options.disable_gc))
     }
 
-    fn create(key: String, max_undo_depth: usize) -> Self {
+    fn create(key: String, max_undo_depth: usize, disable_gc: bool) -> Self {
         Self {
             key,
             status: DocStatus::Detached,
@@ -109,6 +117,8 @@ impl Document {
             history: History::new(max_undo_depth),
             absorbed_remote: false,
             minted_operations: false,
+            disable_gc,
+            attach_disable_gc: false,
         }
     }
 
@@ -671,10 +681,24 @@ impl Document {
     /// Purges the tombstones `vector` covers and returns how many it purged
     /// (JS `garbageCollect`). `apply_change_pack` runs it with the server's
     /// minimum version vector; calling it with a vector the server did not
-    /// send can purge a tombstone a peer's change still anchors on.
+    /// send can purge a tombstone a peer's change still anchors on. A
+    /// document created with `DocumentOptions::disable_gc` purges nothing
+    /// and returns 0.
     #[doc(hidden)]
     pub fn garbage_collect(&mut self, vector: &VersionVector) -> usize {
+        if self.disable_gc {
+            return 0;
+        }
         self.crdt_root.garbage_collect(vector)
+    }
+
+    /// Records whether the attachment opted out of garbage collection (JS
+    /// `setDisableGC`). The client sets it on every attach, before applying
+    /// the attach response, so the remote changes that response carries
+    /// already advance only the lamport clock; a detach leaves it as it is.
+    #[doc(hidden)]
+    pub fn set_disable_gc(&mut self, disable_gc: bool) {
+        self.attach_disable_gc = disable_gc;
     }
 
     /// Returns the size of this document (JS `getDocSize`).
@@ -995,7 +1019,11 @@ impl Document {
             };
             let executed = change.execute(&mut self.crdt_root, execute_source)?;
             change.apply_presence_change(&mut self.presences);
-            self.change_id = self.change_id.sync_clocks(change.id());
+            self.change_id = if self.attach_disable_gc {
+                self.change_id.sync_lamport(change.id())
+            } else {
+                self.change_id.sync_clocks(change.id())
+            };
             // Undo text edits recorded before this change still name the
             // positions they had then; move them past what this edit changed.
             // The change has already run, so a range that does not normalize

@@ -8,15 +8,6 @@
 //! `Infinity`. Rust takes `Option<usize>`, so only `0` is representable; the
 //! other four cannot be written.
 
-// The tests build `DocumentOptions` the way callers do, with
-// `..Default::default()`. While `max_undo_depth` is its only field, that
-// update is needless; this expectation fails once a second field (Task 2's
-// `disable_gc`) lands, and should then be removed.
-#![expect(
-    clippy::needless_update,
-    reason = "DocumentOptions has one field until disable_gc is added"
-)]
-
 use yorkie_core::{Document, DocumentOptions, JsonValue, Result, YorkieError};
 
 /// JS `MaxUndoRedoStackDepth`.
