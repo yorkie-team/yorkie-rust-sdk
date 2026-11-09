@@ -272,22 +272,40 @@ impl JsonTree {
         attributes: BTreeMap<String, Value>,
     ) -> Result<()> {
         let recorder = self.recorder()?;
-        let (from_pos, to_pos) = self.style_range(from, to)?;
-        let attributes = stringify_attributes(attributes);
+        let range = self.style_range(from, to)?;
+        self.style_internal(&recorder, range, attributes)
+    }
 
-        let mut recorder = lock_recorder(&recorder);
-        let executed_at = recorder.issue_time_ticket();
-        let tree = self.tree_mut()?;
-        tree.style_by_range_with_changes(
-            (from_pos.clone(), to_pos.clone()),
-            attributes.clone(),
-            executed_at.clone(),
-            None,
-        )?;
-        // The recorded operation registers these with the document root.
-        tree.drain_pending_gc_pairs();
-        recorder.record_tree_style(tree.created_at(), from_pos, to_pos, attributes, executed_at);
-        Ok(())
+    /// Sets `attributes` on the element at `path` (JS `Tree.styleByPath`
+    /// with one path). The path must name an existing node or character: a
+    /// path one past the parent's content fails with `InvalidArgument`
+    /// rather than styling the parent.
+    pub fn style_by_path(
+        &mut self,
+        path: &[usize],
+        attributes: BTreeMap<String, Value>,
+    ) -> Result<()> {
+        let recorder = self.recorder()?;
+        if path.is_empty() {
+            return Err(YorkieError::InvalidArgument(
+                "path should not be empty".to_owned(),
+            ));
+        }
+        let range = self.tree()?.path_to_pos_range(path)?;
+        self.style_internal(&recorder, range, attributes)
+    }
+
+    /// Sets `attributes` on the elements between two paths (JS
+    /// `Tree.styleByPath` with two paths).
+    pub fn style_by_path_range(
+        &mut self,
+        from_path: &[usize],
+        to_path: &[usize],
+        attributes: BTreeMap<String, Value>,
+    ) -> Result<()> {
+        let recorder = self.recorder()?;
+        let range = self.style_path_range(from_path, to_path)?;
+        self.style_internal(&recorder, range, attributes)
     }
 
     /// Removes the attributes named in `keys` from the elements in
@@ -298,21 +316,25 @@ impl JsonTree {
         S: Into<String>,
     {
         let recorder = self.recorder()?;
-        let (from_pos, to_pos) = self.style_range(from, to)?;
-        let keys = keys.into_iter().map(Into::into).collect::<Vec<_>>();
+        let range = self.style_range(from, to)?;
+        self.remove_style_internal(&recorder, range, keys)
+    }
 
-        let mut recorder = lock_recorder(&recorder);
-        let executed_at = recorder.issue_time_ticket();
-        let tree = self.tree_mut()?;
-        tree.remove_style_by_range_with_changes(
-            (from_pos.clone(), to_pos.clone()),
-            &keys,
-            executed_at.clone(),
-            None,
-        )?;
-        tree.drain_pending_gc_pairs();
-        recorder.record_tree_remove_style(tree.created_at(), from_pos, to_pos, keys, executed_at);
-        Ok(())
+    /// Removes the attributes named in `keys` from the elements between two
+    /// paths (JS `Tree.removeStyleByPath`).
+    pub fn remove_style_by_path<I, S>(
+        &mut self,
+        from_path: &[usize],
+        to_path: &[usize],
+        keys: I,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let recorder = self.recorder()?;
+        let range = self.style_path_range(from_path, to_path)?;
+        self.remove_style_internal(&recorder, range, keys)
     }
 
     /// Returns the XML of this tree (JS `Tree.toXML`).
@@ -325,9 +347,28 @@ impl JsonTree {
         Ok(self.tree()?.to_json())
     }
 
+    /// Returns the ID of this tree (JS `Tree.getID`), the ticket that created
+    /// it.
+    pub fn id(&self) -> Result<&TimeTicket> {
+        Ok(self.tree()?.id())
+    }
+
     /// Returns the size of the root's content (JS `Tree.getSize`).
     pub fn size(&self) -> Result<usize> {
         Ok(self.tree()?.root().len())
+    }
+
+    /// Returns the number of nodes the tree keeps by ID (JS
+    /// `Tree.getNodeSize`), the root included. Removed nodes count until
+    /// garbage collection purges them.
+    pub fn node_size(&self) -> Result<usize> {
+        Ok(self.tree()?.node_map_len())
+    }
+
+    /// Returns the visible content of this tree from its root (JS
+    /// `Tree.getRootTreeNode`).
+    pub fn root_tree_node(&self) -> Result<TreeNodeInput> {
+        Ok(TreeNodeInput::from_crdt(self.tree()?.root()))
     }
 
     /// Converts an index to a path (JS `Tree.indexToPath`).
@@ -513,6 +554,88 @@ impl JsonTree {
         operation.set_split_tickets(split_tickets);
         recorder.record_tree_edit(operation);
         Ok(())
+    }
+
+    /// Applies a style to the local copy and records it (JS `Tree.style` and
+    /// `styleByPath` after the positions are found).
+    fn style_internal(
+        &mut self,
+        recorder: &JsonEditRecorderRef,
+        (from_pos, to_pos): (TreePos, TreePos),
+        attributes: BTreeMap<String, Value>,
+    ) -> Result<()> {
+        let attributes = stringify_attributes(attributes);
+
+        let mut recorder = lock_recorder(recorder);
+        let executed_at = recorder.issue_time_ticket();
+        let tree = self.tree_mut()?;
+        tree.style_by_range_with_changes(
+            (from_pos.clone(), to_pos.clone()),
+            attributes.clone(),
+            executed_at.clone(),
+            None,
+        )?;
+        // The recorded operation registers these with the document root.
+        tree.drain_pending_gc_pairs();
+        recorder.record_tree_style(tree.created_at(), from_pos, to_pos, attributes, executed_at);
+        Ok(())
+    }
+
+    /// Removes attributes on the local copy and records it (JS
+    /// `Tree.removeStyle` and `removeStyleByPath`).
+    fn remove_style_internal<I, S>(
+        &mut self,
+        recorder: &JsonEditRecorderRef,
+        (from_pos, to_pos): (TreePos, TreePos),
+        keys: I,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let keys = keys.into_iter().map(Into::into).collect::<Vec<_>>();
+
+        let mut recorder = lock_recorder(recorder);
+        let executed_at = recorder.issue_time_ticket();
+        let tree = self.tree_mut()?;
+        tree.remove_style_by_range_with_changes(
+            (from_pos.clone(), to_pos.clone()),
+            &keys,
+            executed_at.clone(),
+            None,
+        )?;
+        tree.drain_pending_gc_pairs();
+        recorder.record_tree_remove_style(tree.created_at(), from_pos, to_pos, keys, executed_at);
+        Ok(())
+    }
+
+    /// Checks a path range for styling the way JS `styleByPath` and
+    /// `removeStyleByPath` do, and finds its positions. The end path is an
+    /// insertion point, so one past the parent's content is accepted.
+    fn style_path_range(
+        &self,
+        from_path: &[usize],
+        to_path: &[usize],
+    ) -> Result<(TreePos, TreePos)> {
+        if from_path.len() != to_path.len() {
+            return Err(YorkieError::InvalidArgument(
+                "path length should be equal".to_owned(),
+            ));
+        }
+        if from_path.is_empty() {
+            return Err(YorkieError::InvalidArgument(
+                "path should not be empty".to_owned(),
+            ));
+        }
+        // Slices of equal length compare element by element, as JS
+        // `comparePath` does.
+        if from_path > to_path {
+            return Err(YorkieError::InvalidArgument(
+                "from should be less than or equal to to".to_owned(),
+            ));
+        }
+        let tree = self.tree()?;
+        Ok((tree.path_to_pos(from_path)?, tree.path_to_pos(to_path)?))
     }
 
     fn style_range(&self, from: usize, to: usize) -> Result<(TreePos, TreePos)> {
@@ -702,7 +825,9 @@ fn validate_element_type(node_type: &str) -> Result<()> {
 // Cases follow the single-document tests of JS
 // `test/integration/tree_test.ts`: "Tree", "Tree.edit", "Tree.style",
 // "Tree.splitByPath/mergeByPath" and "Tree(edge cases)", leaving out
-// styleByPath and the position-range conversions.
+// styleByPath and the position-range conversions (see
+// `tree_style_path_tests.rs`, `pos_tests.rs` and
+// `crates/yorkie/tests/integration_tree.rs`).
 #[cfg(test)]
 mod tests {
     use super::{JsonTree, TreeNodeInput};

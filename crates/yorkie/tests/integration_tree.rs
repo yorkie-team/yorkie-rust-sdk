@@ -6,8 +6,8 @@
 //! those) and `packages/sdk/test/integration/tree_concurrency_test.ts` (all
 //! its matrices, merge and split operations included). Like the JS
 //! `withTwoClientsAndDocuments` cases, each test syncs two clients manually.
-//! The single-document range-conversion cases of `tree_test.ts` are here too
-//! and need no server.
+//! The single-document range-conversion and style-by-path cases of
+//! `tree_test.ts` are here too and need no server.
 //! Run with `YORKIE_TEST_RPC_ADDR=http://localhost:18080 cargo test -p yorkie`.
 
 mod integration_support;
@@ -236,6 +236,177 @@ async fn returns_correct_range_from_index_after_a_remote_change() {
     assert_eq!((2, 2), index_range_of(&t.d1, &selection));
 
     t.deactivate().await;
+}
+
+/// A fresh local document holding `root` at `t`.
+fn local_tree_doc(root: TreeNodeInput) -> Document {
+    let mut doc = Document::new("tree-style-by-path");
+    doc.update(|root_object| root_object.set_tree("t", root).map(|_| ()))
+        .unwrap();
+    doc
+}
+
+fn update_local_tree(
+    doc: &mut Document,
+    f: impl FnOnce(&mut JsonTree) -> yorkie::Result<()>,
+) -> yorkie::Result<()> {
+    doc.update(|root| f(root.get_tree_mut("t")?))
+}
+
+fn local_xml(doc: &Document) -> String {
+    tree_of(doc).to_xml().unwrap()
+}
+
+/// `<doc><p a>a</p><p b>b</p></doc>` with each paragraph's attributes.
+fn two_paragraphs(first: &str, second: &str, attrs: [serde_json::Value; 2]) -> TreeNodeInput {
+    let [first_attrs, second_attrs] = attrs;
+    element(
+        "doc",
+        vec![
+            element_with("p", first_attrs, vec![text(first)]),
+            element_with("p", second_attrs, vec![text(second)]),
+        ],
+    )
+}
+
+/// JS "Can style a range by path" (tree_test.ts:2188).
+#[test]
+fn styles_a_range_by_path() -> yorkie::Result<()> {
+    let mut doc = local_tree_doc(two_paragraphs(
+        "a",
+        "b",
+        [json!({"weight": "bold"}), json!({})],
+    ));
+    update_local_tree(&mut doc, |tree| {
+        tree.style_by_path_range(&[0], &[2], attributes(json!({"color": "red"})))
+    })?;
+    assert_eq!(
+        r#"<doc><p color="red" weight="bold">a</p><p color="red">b</p></doc>"#,
+        local_xml(&doc)
+    );
+    Ok(())
+}
+
+/// JS "Can style multiple elements across a range by path"
+/// (tree_test.ts:2219).
+#[test]
+fn styles_multiple_elements_across_a_range_by_path() -> yorkie::Result<()> {
+    let mut doc = local_tree_doc(two_paragraphs("ab", "cd", [json!({}), json!({})]));
+    update_local_tree(&mut doc, |tree| {
+        tree.style_by_path_range(&[0], &[2], attributes(json!({"bold": "true"})))
+    })?;
+    assert_eq!(
+        r#"<doc><p bold="true">ab</p><p bold="true">cd</p></doc>"#,
+        local_xml(&doc)
+    );
+    Ok(())
+}
+
+/// JS "Can style single element by path (backward compat)"
+/// (tree_test.ts:2248).
+#[test]
+fn styles_a_single_element_by_path() -> yorkie::Result<()> {
+    let mut doc = local_tree_doc(doc_p("hello"));
+    update_local_tree(&mut doc, |tree| {
+        tree.style_by_path(&[0], attributes(json!({"bold": "true"})))
+    })?;
+    assert_eq!(r#"<doc><p bold="true">hello</p></doc>"#, local_xml(&doc));
+    Ok(())
+}
+
+/// JS "Can remove style by path" (tree_test.ts:2273).
+#[test]
+fn removes_style_by_path() -> yorkie::Result<()> {
+    let both = json!({"bold": "true", "italic": "true"});
+    let mut doc = local_tree_doc(two_paragraphs("a", "b", [both.clone(), both]));
+    update_local_tree(&mut doc, |tree| {
+        tree.remove_style_by_path(&[0], &[2], ["italic"])
+    })?;
+    assert_eq!(
+        r#"<doc><p bold="true">a</p><p bold="true">b</p></doc>"#,
+        local_xml(&doc)
+    );
+    Ok(())
+}
+
+/// JS "Can remove style from multiple elements across a range by path"
+/// (tree_test.ts:2305).
+#[test]
+fn removes_style_from_multiple_elements_across_a_range_by_path() -> yorkie::Result<()> {
+    let bold = json!({"bold": "true"});
+    let mut doc = local_tree_doc(two_paragraphs("ab", "cd", [bold.clone(), bold]));
+    update_local_tree(&mut doc, |tree| {
+        tree.remove_style_by_path(&[0], &[2], ["bold"])
+    })?;
+    assert_eq!("<doc><p>ab</p><p>cd</p></doc>", local_xml(&doc));
+    Ok(())
+}
+
+fn doc_p_with(attrs: serde_json::Value) -> TreeNodeInput {
+    element("doc", vec![element_with("p", attrs, vec![text("a")])])
+}
+
+/// JS "Should throw on mismatched path lengths for range styleByPath"
+/// (tree_test.ts:2338).
+#[test]
+fn rejects_mismatched_path_lengths_for_range_style_by_path() {
+    let mut doc = local_tree_doc(doc_p("a"));
+    let result = update_local_tree(&mut doc, |tree| {
+        tree.style_by_path_range(&[0], &[0, 0], attributes(json!({"bold": "true"})))
+    });
+    assert_eq!(
+        Err(yorkie::YorkieError::InvalidArgument(
+            "path length should be equal".to_owned()
+        )),
+        result
+    );
+}
+
+/// JS "Should throw on empty paths for styleByPath" (tree_test.ts:2363).
+#[test]
+fn rejects_empty_paths_for_style_by_path() {
+    let mut doc = local_tree_doc(doc_p("a"));
+    let result = update_local_tree(&mut doc, |tree| {
+        tree.style_by_path_range(&[], &[], attributes(json!({"bold": "true"})))
+    });
+    assert_eq!(
+        Err(yorkie::YorkieError::InvalidArgument(
+            "path should not be empty".to_owned()
+        )),
+        result
+    );
+}
+
+/// JS "Should throw on mismatched path lengths for removeStyleByPath"
+/// (tree_test.ts:2386).
+#[test]
+fn rejects_mismatched_path_lengths_for_remove_style_by_path() {
+    let mut doc = local_tree_doc(doc_p_with(json!({"bold": "true"})));
+    let result = update_local_tree(&mut doc, |tree| {
+        tree.remove_style_by_path(&[0], &[0, 0], ["bold"])
+    });
+    assert_eq!(
+        Err(yorkie::YorkieError::InvalidArgument(
+            "path length should be equal".to_owned()
+        )),
+        result
+    );
+}
+
+/// JS "Should throw on empty paths for removeStyleByPath"
+/// (tree_test.ts:2412).
+#[test]
+fn rejects_empty_paths_for_remove_style_by_path() {
+    let mut doc = local_tree_doc(doc_p_with(json!({"bold": "true"})));
+    let result = update_local_tree(&mut doc, |tree| {
+        tree.remove_style_by_path(&[], &[], ["bold"])
+    });
+    assert_eq!(
+        Err(yorkie::YorkieError::InvalidArgument(
+            "path should not be empty".to_owned()
+        )),
+        result
+    );
 }
 
 /// JS "Should return correct range path within doc.subscribe": edits by path
@@ -666,8 +837,7 @@ async fn reports_styles_concurrent_with_an_insert() {
     }
 }
 
-/// JS "TreeChange: Concurrent delete and style". JS styles by path `[0]`,
-/// which is the index range `0..1`.
+/// JS "TreeChange: Concurrent delete and style" (tree_test.ts:6092).
 #[tokio::test]
 async fn reports_a_style_concurrent_with_a_deletion() {
     let Some(addr) = rpc_addr() else { return };
@@ -682,7 +852,7 @@ async fn reports_a_style_concurrent_with_a_deletion() {
     let (ops1, ops2) = (collect_ops(&t.d1), collect_ops(&t.d2));
 
     edit_tree(&t.d1, |tree| {
-        tree.style(0, 1, attributes(json!({"value": "changed"})))
+        tree.style_by_path(&[0], attributes(json!({"value": "changed"})))
     });
     edit_tree(&t.d2, |tree| tree.edit_by_path(&[0], &[1], vec![], 0));
     t.sync_all().await;

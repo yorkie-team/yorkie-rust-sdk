@@ -439,3 +439,74 @@ fn read_path_split_of_pos_range_to_path_range_leaves_the_root() -> Result<()> {
         Ok(())
     })
 }
+
+/// `<doc><p>ab<b>c</b>d</p></doc>`: a parent with both text and element
+/// children.
+fn mixed_root() -> TreeNodeInput {
+    element(
+        "doc",
+        vec![element(
+            "p",
+            vec![text("ab"), element("b", vec![text("c")]), text("d")],
+        )],
+    )
+}
+
+/// JS `posRangeToPathRange` goes through `toPath` (`treePosToPath` of
+/// `toTreePos`), Rust through the index (`index_to_path` of `to_index`).
+/// The values are pinned to JS at `8629993e`, converting each index of the
+/// tree in turn inside one update, as JS did.
+///
+/// Index 6, right after `</b>`, has no pinned value: JS gives `[0, 3]`
+/// (`[0, 2]` before the earlier conversions split `ab`), Rust `[0, 6]`.
+/// Rust anchors a text reached at offset 0 on the text itself rather than on
+/// its previous sibling (JS #1482 is not ported), so the position means
+/// "after `d`"; and for an element position in a parent with text children
+/// Rust counts sizes where JS, whose `hasTextChild` needs every child to be
+/// text, counts children. Taking JS's route would not change the Rust value.
+#[test]
+fn tree_converts_positions_in_a_mixed_parent_to_js_paths() -> Result<()> {
+    let mut doc = tree_doc(mixed_root())?;
+    let expected: [(usize, &[usize]); 8] = [
+        (0, &[0]),
+        (1, &[0, 0]),
+        (2, &[0, 1]),
+        (3, &[0, 2]),
+        (4, &[0, 2, 0]),
+        (5, &[0, 2, 1]),
+        (7, &[0, 6]),
+        (8, &[1]),
+    ];
+    doc.update(|root| {
+        let tree = root.get_tree_mut("t")?;
+        for (index, path) in expected {
+            let range = tree.index_range_to_pos_range((index, index))?;
+            let (from, to) = tree.pos_range_to_path_range(&range)?;
+            assert_eq!((path, path), (&from[..], &to[..]), "index {index}");
+        }
+        Ok(())
+    })
+}
+
+/// Positions taken in a parent that is then removed resolve to where the
+/// parent was, as in JS at `8629993e`.
+#[test]
+fn tree_converts_positions_in_a_removed_mixed_parent_to_js_paths() -> Result<()> {
+    let mut doc = tree_doc(mixed_root())?;
+    let size = tree_of(&doc).size()?;
+    let ranges = (0..=size)
+        .map(|index| tree_of(&doc).index_range_to_pos_range((index, index)))
+        .collect::<Result<Vec<_>>>()?;
+    doc.update(|root| root.get_tree_mut("t")?.edit(0, 8, Vec::new(), 0))?;
+    assert_eq!("<doc></doc>", tree_of(&doc).to_xml()?);
+
+    let mut tree = tree_of(&doc);
+    for (index, range) in ranges.iter().enumerate() {
+        assert_eq!(
+            (vec![0], vec![0]),
+            tree.pos_range_to_path_range(range)?,
+            "index {index}"
+        );
+    }
+    Ok(())
+}

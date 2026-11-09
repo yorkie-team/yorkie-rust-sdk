@@ -960,11 +960,34 @@ impl CrdtTree {
         Ok((from_path, to_path))
     }
 
+    /// Returns the one-index-wide range around the node or character `path`
+    /// names (JS `pathToPosRange`).
+    ///
+    /// `path_to_tree_pos` also accepts the offset one past the parent's
+    /// content, where an insertion goes. That offset is the parent's closing
+    /// tag, so the range would cover the parent; it is rejected here. In a
+    /// text parent the offset at the end of one text node still names the
+    /// first character of the next, so only the end of the last one is out
+    /// of range.
+    ///
+    /// The end index is derived rather than given, so it takes the unchecked
+    /// lookup, as in JS.
     pub(crate) fn path_to_pos_range(&self, path: &[usize]) -> Result<(TreePos, TreePos)> {
-        let from_index = self.path_to_index(path)?;
+        let tree_pos = path_to_tree_pos(&self.root, path)?;
+        let node = node_at_visible_path(&self.root, &tree_pos.path)?;
+        let past_the_end = if node.is_text() {
+            tree_pos.offset >= node.len() && !has_next_visible_sibling(&self.root, &tree_pos.path)?
+        } else {
+            tree_pos.offset >= visible_child_count(node)
+        };
+        if past_the_end {
+            return Err(YorkieError::InvalidArgument("unacceptable path".to_owned()));
+        }
+
+        let from_index = index_of_tree_pos(&self.root, &tree_pos, false)?;
         Ok((
             self.find_pos(from_index, true)?,
-            self.find_pos(from_index + 1, true)?,
+            self.find_pos_unchecked(from_index + 1, true)?,
         ))
     }
 
@@ -2923,6 +2946,16 @@ fn visible_child(node: &TreeNode, offset: usize) -> Option<&TreeNode> {
 
 fn visible_child_count(node: &TreeNode) -> usize {
     node.children().count()
+}
+
+/// Reports whether the node at the visible `path` has a visible next sibling
+/// (JS `IndexTreeNode.nextSibling`).
+fn has_next_visible_sibling(root: &TreeNode, path: &[usize]) -> Result<bool> {
+    let Some((parent_path, offset)) = split_parent_path(path) else {
+        return Ok(false);
+    };
+    let parent = node_at_visible_path(root, &parent_path)?;
+    Ok(visible_child(parent, offset + 1).is_some())
 }
 
 fn split_parent_path(path: &[usize]) -> Option<(Vec<usize>, usize)> {

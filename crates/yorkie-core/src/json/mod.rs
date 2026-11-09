@@ -3,6 +3,8 @@ mod pos;
 mod pos_tests;
 mod text;
 mod tree;
+#[cfg(test)]
+mod tree_style_path_tests;
 
 use crate::crdt::counter::{CounterType, CounterValue, CrdtCounter};
 use crate::crdt::primitive::{CrdtPrimitive, PrimitiveValue};
