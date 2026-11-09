@@ -340,11 +340,25 @@ Gap:
 - `register_element` registers ledger holders but not the GC pairs of the
   tombstones inside a Text or Tree it registers (the GC-pair half of JS
   `registerInternalGCPairs`). Such tombstones are found only when a root is
-  rebuilt. Porting it may trip the `debug_assert!` in
-  `CrdtRoot::register_gc_pair_by_id`, which checks that a Text node is never
-  registered twice without being unregistered in between. That assertion
-  stands in for JS, which takes the node's current size out of gc on such a
-  toggle where Rust would take the size it was registered with.
+  rebuilt.
+- GC pairs are keyed by the child's ID string; JS keys them by parent and
+  child ID. An undo's copy of a removed Text carries the original's node
+  IDs, so a split in the copy can register a piece under an ID whose pair
+  the original left behind, purged (`detached`) or replaced by the copy.
+  JS books two pairs. Rust lets the copy's piece replace the old pair
+  (`CrdtRoot::register_gc_pair_by_id`): the old charge leaves gc as
+  `collect` would take it, and the new one is booked. So a detached node
+  held by two removals stops being counted once a copy's piece takes its
+  ID, where JS keeps counting it. Since the copy's own tombstones are not
+  booked (above), gc after such an undo still differs from a rebuild.
+- Only removed attributes and Array and Tree children toggle off on a
+  second registration. A Text node replaces its pair instead: every revive
+  unregisters first, so a second registration is never a revive. Were a
+  revived node left registered and removed again, JS would drop the pair
+  and keep the tombstone. Telling a Text node apart walks every Text, but
+  only when a pair already holds the ID. This replaces a `debug_assert!`
+  that refused such a registration, with release builds toggling the old
+  pair off and leaving the new piece unbooked.
 - `unregister_gc_pair_by_id` takes a revived node's size out of gc only. JS
   moves it from gc back to live, because its registration took it out of
   live. Rust registration leaves a text removal's size in live (the
@@ -1236,6 +1250,22 @@ Gap:
   (`restore_spans_from_wire`), with different messages ("missing timestamp
   or invalid range" and "invalid range"). Only the first can see a missing
   `created_at` or a negative offset.
+- Two kinds of span pass validation, as in JS, and Rust follows JS rather
+  than reject them. A span whose `created_at` is the initial ticket names
+  the head; recreating it after GC would put a node under the head's ID
+  that shadows the head. A span with `start == end` (empty content) is an
+  interval of nothing; by reading, `retombstone` then isolates and removes
+  the piece that starts at `start`, as JS `findPiecesOverlapping` and
+  `isolateRange` do, so replicas still converge. Hardening either belongs
+  upstream.
+- The public `wire` projection grew for the ledger: `WireTextNode` gained
+  `removal_events`, `WireOperation::Edit` gained `restore_spans`,
+  `restore_mode`, and `retombstone_spans`, and `WireRestoreSpan` and
+  `WireRestoreMode` are new. Code that builds `WireTextNode` or
+  `WireOperation::Edit` with a struct literal, or destructures either
+  without `..`, no longer compiles: a semver-breaking change for users of
+  `yorkie_core::wire`. None of these is `#[non_exhaustive]`, so a later
+  field or variant would break the same way.
 - JS and Go both have direct converter tests for root/object bytes and tree
   bytes. Go also has direct array bytes, change-pack, presence, and snapshot
   converter tests. Rust currently covers object/array simple payload bytes,
@@ -1578,6 +1608,12 @@ Gap:
   against drift only by the replica's JSON and version vector.
 - The Text undo fuzz port reads `TEXT_UNDO_FUZZ_SEEDS` as a number and falls
   back to 10 seeds on anything else; JS runs no seed then.
+- The live-server integration suites run only when `YORKIE_TEST_RPC_ADDR`
+  is set: in CI that is the integration job (`cargo test -p yorkie`), not
+  the default `cargo test --workspace` step, where each case returns early
+  and reports a pass. The two history correctness cases this repo runs and
+  JS skips (`integration_history.rs`, "Case 3/5 correctness") are among
+  them.
 
 Expected direction:
 
