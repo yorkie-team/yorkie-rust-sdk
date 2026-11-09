@@ -149,11 +149,14 @@ async fn opt_out_clients_keep_the_version_vector_at_one_entry() {
 }
 
 /// JS "Opt-out client picks up server lamport when attach returns a
-/// snapshot" (disable_gc_test.ts:159). As in JS, 30 updates are pushed;
-/// against a server whose snapshot threshold is above that, the attach
-/// returns those changes instead of a snapshot, and the lamport catches up
-/// one change at a time. Either way it ends at least 30 with one entry in
-/// the vector.
+/// snapshot" (disable_gc_test.ts:159). As in JS, 30 updates are pushed. The
+/// server's snapshot threshold is 500 (Go `DefaultSnapshotThreshold`), so
+/// despite its title this case takes the change path, in JS and here: the
+/// attach returns the 30 changes and the lamport catches up one change at a
+/// time. The snapshot path is covered by the `yorkie-core` unit tests
+/// `an_opted_out_snapshot_attach_keeps_one_vector_entry` and
+/// `an_opted_in_snapshot_attach_merges_later_remote_vectors`
+/// (`document.rs`).
 #[tokio::test]
 async fn opt_out_client_picks_up_the_server_lamport_on_attach() {
     let Some(addr) = rpc_addr() else { return };

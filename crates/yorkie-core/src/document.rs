@@ -2998,6 +2998,86 @@ mod tests {
         Ok(())
     }
 
+    const OWN_ACTOR: &str = "000000000000000000000001";
+    const REMOTE_ACTOR: &str = "000000000000000000000002";
+    /// The lamport the server's snapshot vector names for the attaching
+    /// client.
+    const SNAPSHOT_LAMPORT: i64 = 40;
+
+    /// Attaches through a snapshot as an opted-out client does: the server
+    /// cuts the snapshot's vector down to `{own actor: max lamport}` (Go
+    /// `server/packs/pushpull.go` 518-539). Then one more remote change
+    /// arrives. Returns the vector after the snapshot and the document.
+    fn attach_through_snapshot(disable_gc: bool) -> Result<(VersionVector, Document)> {
+        let mut source = Document::new("doc");
+        source.set_actor(REMOTE_ACTOR);
+        source.update(|root| root.set("title", "snapshot").map(|_| ()))?;
+        let snapshot_root = source.crdt_root.object().clone();
+        source.update(|root| root.set("after", 1).map(|_| ()))?;
+        let remote_change = source.local_changes[1].clone();
+
+        let mut target = Document::new("doc");
+        target.set_actor(OWN_ACTOR);
+        target.set_disable_gc(disable_gc);
+        let mut vector = VersionVector::new();
+        vector.set(OWN_ACTOR, SNAPSHOT_LAMPORT);
+        target.apply_change_pack(&ChangePack::create_with_snapshot_root(
+            "doc",
+            Checkpoint::new(7, 0),
+            false,
+            Vec::new(),
+            Some(vector),
+            Some(vec![1]),
+            Some(snapshot_root),
+        ))?;
+        assert_eq!(r#"{"title":"snapshot"}"#, target.to_sorted_json());
+        let after_snapshot = target.version_vector().clone();
+
+        target.apply_change_pack(&ChangePack::create(
+            "doc",
+            Checkpoint::new(8, 0),
+            false,
+            vec![remote_change],
+            None,
+            None,
+        ))?;
+        assert_eq!(r#"{"after":1,"title":"snapshot"}"#, target.to_sorted_json());
+        Ok((after_snapshot, target))
+    }
+
+    /// JS "Opt-out client picks up server lamport when attach returns a
+    /// snapshot" (`disable_gc_test.ts` 159), on the snapshot path the live
+    /// test does not reach: the snapshot keeps `set_clocks` (JS 2865), so the
+    /// lamport passes the server's and the vector keeps the one entry the
+    /// server sent; the next remote change advances only the lamport.
+    #[test]
+    fn an_opted_out_snapshot_attach_keeps_one_vector_entry() -> Result<()> {
+        let (after_snapshot, doc) = attach_through_snapshot(true)?;
+
+        assert_eq!(1, after_snapshot.size());
+        assert_eq!(Some(SNAPSHOT_LAMPORT + 1), after_snapshot.get(OWN_ACTOR));
+        assert!(doc.change_id.lamport() > SNAPSHOT_LAMPORT);
+        assert_eq!(1, doc.version_vector().size());
+        assert_eq!(
+            Some(SNAPSHOT_LAMPORT + 2),
+            doc.version_vector().get(OWN_ACTOR)
+        );
+        Ok(())
+    }
+
+    /// The same attach without the opt-out: the snapshot path is the same,
+    /// but the next remote change merges its actor's entry into the vector.
+    #[test]
+    fn an_opted_in_snapshot_attach_merges_later_remote_vectors() -> Result<()> {
+        let (after_snapshot, doc) = attach_through_snapshot(false)?;
+
+        assert_eq!(1, after_snapshot.size());
+        assert_eq!(Some(SNAPSHOT_LAMPORT + 1), after_snapshot.get(OWN_ACTOR));
+        assert_eq!(2, doc.version_vector().size());
+        assert_eq!(Some(2), doc.version_vector().get(REMOTE_ACTOR));
+        Ok(())
+    }
+
     #[test]
     fn reapplies_remaining_local_changes_after_snapshot() -> Result<()> {
         let mut source = Document::new("source-doc");
