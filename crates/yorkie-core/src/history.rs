@@ -17,7 +17,8 @@ use crate::presence::ReversePresence;
 use crate::{Document, Result, TimeTicket};
 
 /// How many entries each of the undo and redo stacks keeps before dropping
-/// the oldest (JS `MaxUndoRedoStackDepth`).
+/// the oldest, unless the document sets `DocumentOptions::max_undo_depth`
+/// (JS `MaxUndoRedoStackDepth`).
 pub(crate) const MAX_UNDO_REDO_STACK_DEPTH: usize = 50;
 
 /// One element of a history entry (JS `HistoryOperation`): a reverse
@@ -58,13 +59,38 @@ impl HistoryOperation {
 }
 
 /// The undo and redo stacks of a document (JS `History`).
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct History {
     undo_stack: Vec<Vec<HistoryOperation>>,
     redo_stack: Vec<Vec<HistoryOperation>>,
+    /// How many entries each stack keeps before dropping the oldest.
+    max_depth: usize,
+}
+
+impl Default for History {
+    fn default() -> Self {
+        Self::new(MAX_UNDO_REDO_STACK_DEPTH)
+    }
 }
 
 impl History {
+    /// Creates empty stacks that each keep `max_depth` entries (JS
+    /// `new History(maxDepth)`). The document validates the depth.
+    pub(crate) fn new(max_depth: usize) -> Self {
+        Self {
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            max_depth,
+        }
+    }
+
+    /// Returns how many entries each of the undo and redo stacks keeps
+    /// before dropping the oldest (JS `getMaxDepth`).
+    #[cfg(test)]
+    pub(crate) fn max_depth(&self) -> usize {
+        self.max_depth
+    }
+
     pub(crate) fn has_undo(&self) -> bool {
         !self.undo_stack.is_empty()
     }
@@ -75,7 +101,7 @@ impl History {
 
     /// Pushes an undo entry, dropping the oldest one at the depth limit.
     pub(crate) fn push_undo(&mut self, ops: Vec<HistoryOperation>) {
-        push_bounded(&mut self.undo_stack, ops);
+        push_bounded(&mut self.undo_stack, ops, self.max_depth);
     }
 
     pub(crate) fn pop_undo(&mut self) -> Option<Vec<HistoryOperation>> {
@@ -84,7 +110,7 @@ impl History {
 
     /// Pushes a redo entry, dropping the oldest one at the depth limit.
     pub(crate) fn push_redo(&mut self, ops: Vec<HistoryOperation>) {
-        push_bounded(&mut self.redo_stack, ops);
+        push_bounded(&mut self.redo_stack, ops, self.max_depth);
     }
 
     pub(crate) fn pop_redo(&mut self) -> Option<Vec<HistoryOperation>> {
@@ -171,8 +197,12 @@ impl History {
     }
 }
 
-fn push_bounded(stack: &mut Vec<Vec<HistoryOperation>>, ops: Vec<HistoryOperation>) {
-    if stack.len() >= MAX_UNDO_REDO_STACK_DEPTH {
+fn push_bounded(
+    stack: &mut Vec<Vec<HistoryOperation>>,
+    ops: Vec<HistoryOperation>,
+    max_depth: usize,
+) {
+    if stack.len() >= max_depth {
         stack.remove(0);
     }
     stack.push(ops);
@@ -239,5 +269,7 @@ impl<'a> HistoryMut<'a> {
     }
 }
 
+#[cfg(test)]
+mod depth_tests;
 #[cfg(test)]
 mod tests;

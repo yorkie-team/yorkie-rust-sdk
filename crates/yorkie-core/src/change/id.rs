@@ -86,6 +86,35 @@ impl ChangeId {
         )
     }
 
+    /// Advances the lamport clock past `other` without merging its version
+    /// vector (JS `syncLamport`), the counterpart of `sync_clocks` for an
+    /// attachment that opted out of garbage collection: it never produces or
+    /// consumes tombstones, so its vector needs no other actor's entry, and
+    /// each later local change carries a vector of one entry instead of one
+    /// per actor. The lamport still advances, so local tickets stay ordered
+    /// after the remote operations.
+    pub(crate) fn sync_lamport(&self, other: &Self) -> Self {
+        if !other.has_clocks() {
+            return self.clone();
+        }
+
+        let lamport = if other.lamport > self.lamport {
+            other.lamport + 1
+        } else {
+            self.lamport + 1
+        };
+        let mut version_vector = self.version_vector.clone();
+        version_vector.set(self.actor_id.clone(), lamport);
+
+        Self::new(
+            self.client_seq,
+            INITIAL_SERVER_SEQ,
+            lamport,
+            self.actor_id.clone(),
+            version_vector,
+        )
+    }
+
     pub(crate) fn set_clocks(&self, lamport: i64, version_vector: VersionVector) -> Self {
         let lamport = self.lamport.max(lamport) + 1;
         let mut version_vector = self.version_vector.max(&version_vector);
@@ -218,5 +247,61 @@ mod tests {
             synced.version_vector().get(synced.actor_id().as_str())
         );
         assert_eq!(Some(5), synced.version_vector().get("actor-b"));
+    }
+
+    fn id_of(actor: &str, lamport: i64, entries: &[(&str, i64)]) -> ChangeId {
+        let mut vector = VersionVector::new();
+        for (entry_actor, entry_lamport) in entries {
+            vector.set(*entry_actor, *entry_lamport);
+        }
+        ChangeId::new(1, 0, lamport, actor, vector)
+    }
+
+    /// JS `ChangeID.syncLamport` (`change_id.ts` 133-154): an ID without
+    /// clocks leaves the receiver as it is.
+    #[test]
+    fn sync_lamport_ignores_an_id_without_clocks() {
+        let id = id_of("actor-a", 3, &[("actor-a", 3)]);
+
+        assert_eq!(id, id.sync_lamport(&ChangeId::initial()));
+        let no_vector = ChangeId::new(1, 0, 9, "actor-b", VersionVector::new());
+        assert_eq!(id, id.sync_lamport(&no_vector));
+    }
+
+    /// JS `syncLamport`: the lamport is the other's plus one when the other
+    /// is ahead, and the receiver's plus one otherwise.
+    #[test]
+    fn sync_lamport_advances_past_the_larger_lamport() {
+        let id = id_of("actor-a", 3, &[("actor-a", 3)]);
+
+        let ahead = id.sync_lamport(&id_of("actor-b", 5, &[("actor-b", 5)]));
+        assert_eq!(6, ahead.lamport());
+        assert_eq!(Some(6), ahead.version_vector().get("actor-a"));
+
+        let behind = id.sync_lamport(&id_of("actor-b", 2, &[("actor-b", 2)]));
+        assert_eq!(4, behind.lamport());
+        assert_eq!(Some(4), behind.version_vector().get("actor-a"));
+
+        let equal = id.sync_lamport(&id_of("actor-b", 3, &[("actor-b", 3)]));
+        assert_eq!(4, equal.lamport());
+    }
+
+    /// JS `syncLamport`: the vector is the receiver's with only its own
+    /// actor moved; none of the other's entries are merged in.
+    #[test]
+    fn sync_lamport_keeps_only_the_receivers_entries() {
+        let id = id_of("actor-a", 1, &[("actor-a", 1)]);
+        let other = id_of(
+            "actor-b",
+            5,
+            &[("actor-b", 5), ("actor-c", 4), ("actor-d", 2)],
+        );
+
+        let synced = id.sync_lamport(&other);
+
+        assert_eq!(1, synced.version_vector().size());
+        assert_eq!(Some(6), synced.version_vector().get("actor-a"));
+        assert_eq!(1, synced.client_seq());
+        assert_eq!("actor-a", synced.actor_id().as_str());
     }
 }

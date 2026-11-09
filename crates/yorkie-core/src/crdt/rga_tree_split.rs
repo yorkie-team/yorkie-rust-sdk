@@ -1,7 +1,10 @@
 use super::element::DataSize;
 use super::splay::{NodeId as SplayNodeId, SplayTree, SplayValue};
 use crate::time::{ticket_known, ActorId};
-use crate::{Result, TimeTicket, VersionVector, YorkieError, TIME_TICKET_SIZE};
+use crate::{
+    Result, TextNodeIdStruct, TextPosStruct, TimeTicket, VersionVector, YorkieError,
+    TIME_TICKET_SIZE,
+};
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -72,6 +75,24 @@ impl RgaTreeSplitNodeId {
     pub(crate) fn to_test_string(&self) -> String {
         format!("{}:{}", self.created_at.to_test_string(), self.offset)
     }
+
+    /// Returns the plain-data form of this ID (JS
+    /// `RGATreeSplitNodeID.toStruct`).
+    pub(crate) fn to_struct(&self) -> TextNodeIdStruct {
+        TextNodeIdStruct {
+            created_at: self.created_at.to_struct(),
+            offset: self.offset,
+        }
+    }
+
+    /// Builds an ID from its plain-data form (JS
+    /// `RGATreeSplitNodeID.fromStruct`).
+    pub(crate) fn from_struct(value: &TextNodeIdStruct) -> Result<Self> {
+        Ok(Self::new(
+            TimeTicket::from_struct(value.created_at.clone())?,
+            value.offset,
+        ))
+    }
 }
 
 impl Ord for RgaTreeSplitNodeId {
@@ -116,6 +137,24 @@ impl RgaTreeSplitPos {
 
     pub(crate) fn to_test_string(&self) -> String {
         format!("{}:{}", self.id.to_test_string(), self.relative_offset)
+    }
+
+    /// Returns the plain-data form of this position (JS
+    /// `RGATreeSplitPos.toStruct`).
+    pub(crate) fn to_struct(&self) -> TextPosStruct {
+        TextPosStruct {
+            id: self.id.to_struct(),
+            relative_offset: self.relative_offset,
+        }
+    }
+
+    /// Builds a position from its plain-data form (JS
+    /// `RGATreeSplitPos.fromStruct`).
+    pub(crate) fn from_struct(value: &TextPosStruct) -> Result<Self> {
+        Ok(Self::new(
+            RgaTreeSplitNodeId::from_struct(&value.id)?,
+            value.relative_offset,
+        ))
     }
 }
 

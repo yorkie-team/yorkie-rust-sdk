@@ -1,5 +1,14 @@
+mod pos;
+#[cfg(test)]
+mod pos_tests;
 mod text;
 mod tree;
+#[cfg(test)]
+mod tree_event_path_tests;
+#[cfg(test)]
+mod tree_style_path_tests;
+#[cfg(test)]
+mod tree_surrogate_tests;
 
 use crate::crdt::counter::{CounterType, CounterValue, CrdtCounter};
 use crate::crdt::primitive::{CrdtPrimitive, PrimitiveValue};
@@ -11,6 +20,10 @@ use std::collections::BTreeMap;
 use std::fmt::{self, Write};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+pub use pos::{
+    TextNodeIdStruct, TextPosStruct, TextPosStructRange, TreeNodeIdStruct, TreePosStruct,
+    TreePosStructRange,
+};
 pub use text::{JsonText, TextChunk};
 pub use tree::{JsonTree, TreeNodeInput};
 

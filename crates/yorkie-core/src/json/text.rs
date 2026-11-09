@@ -2,8 +2,9 @@
 //! `pkg/document/json/text.go`).
 
 use super::{lock_recorder, JsonEditRecorderRef};
+use crate::crdt::rga_tree_split::RgaTreeSplitPos;
 use crate::crdt::text::CrdtText;
-use crate::{Result, TimeTicket, YorkieError};
+use crate::{Result, TextPosStructRange, TimeTicket, YorkieError};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -151,6 +152,40 @@ impl JsonText {
         self.text.is_empty()
     }
 
+    /// Converts an index range to a position range that follows concurrent
+    /// edits, for keeping a selection (JS `Text.indexRangeToPosRange`, through
+    /// `CRDTText.indexRangeToPosRange`). Equal indexes give the same position
+    /// twice. As in JS, the indexes are not checked against surrogate pairs
+    /// or against each other.
+    pub fn index_range_to_pos_range(
+        &self,
+        (from, to): (usize, usize),
+    ) -> Result<TextPosStructRange> {
+        let text = self.in_document()?;
+        let from_pos = text.index_to_pos(from)?.to_struct();
+        if from == to {
+            return Ok((from_pos.clone(), from_pos));
+        }
+        Ok((from_pos, text.index_to_pos(to)?.to_struct()))
+    }
+
+    /// Converts a position range back to an index range (JS
+    /// `Text.posRangeToIndexRange`, through
+    /// `RGATreeSplit.findIndexesFromRange`). A position whose node this text
+    /// does not hold fails with an `ErrInvalidArgument` error.
+    ///
+    /// As in JS, `from` resolves to the right and `to` to the left, so a
+    /// `from` at the end of a node split off an insert comes back at the
+    /// start of the next piece, past anything inserted between them.
+    pub fn pos_range_to_index_range(&self, range: &TextPosStructRange) -> Result<(usize, usize)> {
+        let text = self.in_document()?;
+        let range = (
+            RgaTreeSplitPos::from_struct(&range.0)?,
+            RgaTreeSplitPos::from_struct(&range.1)?,
+        );
+        text.find_indexes_from_range(&range)
+    }
+
     /// Returns the content-attributes runs of this text (JS `Text.values`).
     pub fn values(&self) -> Vec<TextChunk> {
         self.text.values()
@@ -177,10 +212,22 @@ impl JsonText {
     }
 
     fn recorder(&self) -> Result<JsonEditRecorderRef> {
-        self.recorder
-            .clone()
-            .ok_or_else(|| YorkieError::NotInitialized("Text is not initialized yet".to_owned()))
+        self.recorder.clone().ok_or_else(not_initialized)
     }
+
+    /// Returns the CRDT text for a read that needs the document's node IDs.
+    /// A text made by `new` holds none: every element of a document has a
+    /// ticket its change issued, never the initial one.
+    fn in_document(&self) -> Result<&CrdtText> {
+        if self.text.created_at() == &TimeTicket::initial() {
+            return Err(not_initialized());
+        }
+        Ok(&self.text)
+    }
+}
+
+fn not_initialized() -> YorkieError {
+    YorkieError::NotInitialized("Text is not initialized yet".to_owned())
 }
 
 /// Encodes attribute values for the CRDT (JS `stringifyObjectValues`). A

@@ -42,6 +42,8 @@ pub struct AttachDocumentRequest {
     pub client_id: ActorId,
     pub change_pack: ChangePack,
     pub schema_key: Option<String>,
+    /// The attachment opted out of garbage collection (JS `disableGc`).
+    pub disable_gc: bool,
     pub shard_key: String,
 }
 
@@ -92,6 +94,8 @@ pub struct PushPullChangesRequest {
     pub document_id: String,
     pub change_pack: ChangePack,
     pub push_only: bool,
+    /// The attachment opted out of garbage collection (JS `disableGc`).
+    pub disable_gc: bool,
     pub shard_key: String,
 }
 

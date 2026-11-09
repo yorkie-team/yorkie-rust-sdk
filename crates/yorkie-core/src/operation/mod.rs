@@ -30,8 +30,12 @@ use crate::{TimeTicket, TreeNodeInput, VersionVector};
 use crate::Result;
 use std::collections::BTreeMap;
 
+/// The source of an operation (JS `OpSource`): a local edit, a change from
+/// another client, or an undo/redo. Operations created by undo/redo use it to
+/// handle targets removed in the meantime, and change events report it as
+/// `ChangeInfo::source`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OpSource {
+pub enum OpSource {
     Local,
     Remote,
     UndoRedo,

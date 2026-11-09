@@ -48,6 +48,9 @@ pub(crate) struct Attachment {
     /// of its reply while one is pending, so the pull it is waiting behind is
     /// not applied after the caller asked to stop receiving.
     pub(crate) pending_pull_pauses: Arc<AtomicUsize>,
+    /// `AttachOptions::disable_gc` of the attach that made this attachment,
+    /// sent on its every push-pull (JS `Attachment.disableGC`).
+    pub(crate) disable_gc: bool,
 }
 
 impl Attachment {
@@ -57,6 +60,7 @@ impl Attachment {
         sync_mode: SyncMode,
         poll_interval: Duration,
         poll_interval_pinned: bool,
+        disable_gc: bool,
     ) -> Self {
         Self {
             doc,
@@ -64,6 +68,7 @@ impl Attachment {
             sync_mode,
             poll_interval,
             poll_interval_pinned,
+            disable_gc,
             change_event_received: false,
             last_synced_at: None,
             watch_task: None,
@@ -209,7 +214,7 @@ mod tests {
     fn attachment(sync_mode: SyncMode) -> Attachment {
         let doc = Arc::new(Mutex::new(Document::new("doc-key")));
         let (interval, pinned) = resolve_document_poll_interval(sync_mode, None).unwrap();
-        Attachment::new(doc, "document-id", sync_mode, interval, pinned)
+        Attachment::new(doc, "document-id", sync_mode, interval, pinned, false)
     }
 
     /// JS `Attachment.needSync` for a channel.

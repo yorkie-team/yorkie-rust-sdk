@@ -30,13 +30,9 @@ section of the area they touch.
 | Devtools | `packages/sdk/src/devtools/` | Browser-only inspector protocol. |
 | Revisions API | `packages/sdk/src/api/revision.ts`, `yorkie.ts`; `test/integration/revision_test.ts` | Admin-side document revisions. |
 | Epoch re-anchor | `packages/sdk/src/document/document.ts` (`EpochMismatch`, minting suspension), `client/client.ts` | `ErrEpochMismatch` stops the sync loop without telling the document. |
-| Disable-GC attach option | `packages/sdk/src/document/document.ts` (`disableGC`), `client/client.ts` | `AttachOptions` has no such field. |
 | Tree undo and redo | `packages/sdk/src/document/operation/tree_edit_operation.ts`, `tree_style_operation.ts`, `document/crdt/tree.ts`, `document/history.ts`; receive side `api/converter.ts` (`fromOperation` TreeEdit case) | Split and merge reverse machinery, and the `TreeEdit` restore spans: a received `TreeEdit` with `restore_spans`, `retombstone_spans`, or `restore_mode` runs only its positional part, so a Rust replica diverges from a JS peer that undoes a Tree edit. See Undo and Redo. |
 | Auth webhook integration test | `packages/sdk/test/integration/webhook_test.ts` | Needs a server with an auth webhook; the auth path is unit-tested with a mock transport. |
 | Schema and project admin API cases | `packages/sdk/test/integration/document_test.ts`, `schema_test.ts` | `CreateSchema`, `UpdateProject`, `UpdateDocument` need the admin API. |
-| History options | `packages/sdk/src/document/document.ts` (`maxUndoDepth`, `clearHistory`) | See Undo and Redo. |
-| `ChannelStatus.Removed` | `packages/sdk/src/channel/channel.ts` | See Channels and Broadcast. |
-| Text and Tree range helpers | `packages/sdk/src/document/json/text.ts`, `json/tree.ts` | Position-range conversions, `styleByPath`, `removeStyleByPath`. See Public JSON API. |
 
 ## Reference Areas
 
@@ -202,20 +198,35 @@ Current Rust behavior:
 - `JsonValue` is a simple enum wrapper around primitive, counter, text,
   tree, object, and array values.
 - `JsonText` (JS `Text`) supports `edit`, `delete`, `empty`, `set_style`,
-  `to_string`, `len`, `is_empty`, `values`, `id`, and `to_sorted_json`. It
+  `to_string`, `len`, `is_empty`, `values`, `id`, `to_sorted_json`,
+  `index_range_to_pos_range`, and `pos_range_to_index_range`. It
   holds a copy of the CRDT text, applies each edit to it with a ticket from the
   update's change context, and records the matching `EditOperation` or
   `StyleOperation`, so later edits in the same update see earlier ones, as in
   JS.
 - `JsonTree` (JS `Tree`) supports `edit` (JS `edit`/`editBulk`, splits
   included), `edit_by_path` (JS `editByPath`/`editBulkByPath`),
-  `split_by_path`, `merge_by_path`, `style`, `remove_style`, `to_xml`,
-  `to_json`, `size`, `index_to_path`, and `path_to_index`. Like
+  `split_by_path`, `merge_by_path`, `style`, `style_by_path` (JS
+  `styleByPath` with one path), `style_by_path_range` (its range form),
+  `remove_style`, `remove_style_by_path`, `to_xml`, `to_json`, `id`, `size`,
+  `node_size`, `root_tree_node`, `index_to_path`, `path_to_index`,
+  `index_range_to_pos_range`, `path_range_to_pos_range`,
+  `pos_range_to_index_range`, and `pos_range_to_path_range`. Like
   `JsonText`, it holds a copy of the CRDT tree, applies each edit or style to
   it, and records the matching `TreeEditOperation` or `TreeStyleOperation`.
   Input nodes are `TreeNodeInput` values (JS `ElementNode`/`TextNode`),
   validated like JS `validateTreeNodes`, and tree edit op infos report the
   inserted nodes as `TreeNodeInput` values too.
+- The position conversions return `TextPosStructRange` and
+  `TreePosStructRange` (tuples of `TextPosStruct`/`TreePosStruct`, with
+  `TextNodeIdStruct`/`TreeNodeIdStruct`/`TimeTicketStruct` inside), the Rust
+  forms of JS `TextPosStructRange`/`TreePosStructRange`. JS overloads become
+  separate methods (`style_by_path` and `style_by_path_range`).
+- The conversion helpers work on any text or tree that belongs to a document,
+  also on a root read outside `update`, as JS does through `doc.getRoot()`;
+  a text or tree not in a document yet fails with `NotInitialized`.
+  `style_by_path` and `remove_style_by_path` record an operation, so they
+  need an `update`, like `style`.
 - During `Document::update`, public object, array, counter, text, and tree
   values are temporarily attached to a recorder and hidden CRDT identity
   metadata.
@@ -242,11 +253,40 @@ Gap:
 - Rust value-based array search uses `JsonValue` equality. For non-primitive
   containers, JS compares wrapped element identity; Rust callers should use the
   explicit ID search methods when identity matters.
-- `JsonTree` does not port JS `styleByPath`,
-  `removeStyleByPath`, `getNodeSize`, `getIndexTree`, `getRootTreeNode`, the
-  position-range conversions (`indexRangeToPosRange`, `posRangeToIndexRange`,
-  `pathRangeToPosRange`, `posRangeToPathRange`), or the test helpers. There is
-  no `JsonArray::push_tree` or `JsonArray::get_tree_mut` either.
+- `JsonTree` does not port JS `getIndexTree` (it returns the internal index
+  tree) or the test helpers `toTestString`, `toJSForTest`, and
+  `toJSInfoForTest`. There is no `JsonArray::push_tree` or
+  `JsonArray::get_tree_mut` either.
+- `TextPosStruct`, `TreePosStruct`, and their ID structs are plain Rust
+  structs and do not implement `serde::Serialize`. JS stores the ranges in
+  presence as JSON; a Rust caller writes that mapping by hand.
+- The pos-range conversions of `JsonTree` take `&mut self` because JS splits
+  text nodes of the live clone while converting (`posRangeToIndexRange`). The
+  split stays on the facade copy and never reaches the document root, so the
+  GC pairs JS registers for it (`registerPendingGCPairs`) are dropped, as in
+  `style`. A conversion records no operation and a read-only conversion
+  inside `update` does not make the update report a change.
+- The index to pos to index round trip of a Text is not the identity at the
+  boundary of a split insert: an index inside or at the edge of a node that a
+  later insert split can come back as the neighbouring index. JS behaves the
+  same, and the Rust tests pin JS's values.
+- The negative-path cases of JS `tree_style_path_bounds_test.ts` (negative
+  path elements) have no port, because a path is `&[usize]`.
+  `style_by_path` with one path follows JS `pathToPosRange` at
+  `js@f70e9f16` (an element parent rejects `offset >= visible children`; a
+  text-only parent rejects `offset >= visible size` unless the text node has a
+  next sibling); the range form and `path_to_pos` stay laxer, as in JS.
+- A path outside the tree fails with `InvalidArgument` ("unacceptable
+  path"), as in JS; a few internal path helpers still report
+  `InvalidTreePosition` with the same message.
+- Assigning a `JsonTree` that has the same node ID as the one in the
+  document back through `get_mut` (`*root.get_mut("t") = JsonValue::Tree(..)`
+  with a clone read earlier) records nothing, because the update compares
+  trees by ID and sees no change. A new tree or a tree of another key is
+  recorded. JS has no such case, since its `Tree` is a live proxy.
+- `style_change_paths` (the paths of a style change event) returns an error
+  where JS skips the event when the node has no usable range. Today no tree
+  state reaches it.
 - Rust rejects two inputs with `YorkieError::InvalidArgument` that JS has no
   check for: an element whose type is `"text"` and a text root. In JS the type
   alone makes a node a text node, so such input would crash JS when it reads
@@ -255,9 +295,9 @@ Gap:
 - Setting a `JsonTree` read from a document into another key copies its
   current nodes. JS builds an empty tree in that case, because such a `Tree`
   has no initial root.
-- `JsonText` does not port JS `indexRangeToPosRange`/`posRangeToIndexRange`
-  (`TextPosStruct`), `toTestString`, `toJSForTest`, `createRangeForTest`, or
-  the index/ID tree accessors.
+- `JsonText` does not port JS `toTestString`, `toJSForTest`,
+  `createRangeForTest`, or `getTreeByIndex`/`getTreeByID` (they return
+  internal index structures).
 - Setting a `JsonText` that already has content creates an empty text, as JS
   does for `root.k = new Text()`; there is no API to copy a text's content.
 
@@ -379,13 +419,26 @@ Current Rust behavior:
 
 JS/Go behavior:
 
-- JS skips collection for a document attached with `disableGC`.
+- JS has two `disableGC` options. `DocumentOptions.disableGC` makes
+  `garbageCollect` return 0. `AttachOptions.disableGC` is sent on the attach
+  and on every push-pull of that attachment, and makes `applyChange` advance
+  only the lamport clock (`syncLamport`) instead of syncing the version
+  vector (`syncClocks`).
 - JS `registerInternalGCPairs` books both the ledger holders and the GC
   pairs of the tombstones inside an element it registers.
 
 Gap:
 
-- `disableGC` is not ported (see Out-of-Scope Items).
+- Both options are ported, and neither implies the other:
+  `DocumentOptions::disable_gc` makes `Document::garbage_collect` return 0;
+  `AttachOptions::disable_gc` is sent on the attach and every push-pull, and
+  `Client::attach` sets it on the document (hidden
+  `Document::set_disable_gc`) before it applies the attach response, so the
+  first remote changes already take the lamport-only path. Every attach sets
+  the flag again, so a re-attach without the option goes back to syncing the
+  version vector. The snapshot path of an opted-out attach is covered by unit
+  tests. Rust has no `resync` yet: when it is ported, it must send
+  `disable_gc` as JS does.
 - `register_element` registers ledger holders but not the GC pairs of the
   tombstones inside a Text or Tree it registers (the GC-pair half of JS
   `registerInternalGCPairs`). Such tombstones are found only when a root is
@@ -453,8 +506,8 @@ Gap:
   needs a Mongo-backed server. CI runs the memory backend, so the Rust port
   (`integration_gc.rs`) is ignored and never runs there.
 - With collection on, JS object case `object_test.ts:923` fails: the undo
-  names an object that has been purged. JS runs it with `disableGC`, which
-  is not ported, so the Rust port stays ignored.
+  names an object that has been purged. JS runs it with `disableGC`, and the
+  Rust port does too (`DocumentOptions::disable_gc`).
 
 ## CRDT Array and RGA List
 
@@ -979,6 +1032,23 @@ Gap:
   failing the edit, and the JS reverse machinery (restore spans, split
   reconciliation, `mergeSourceOf`, `redoSplitLevel`, `dropDuplicateContents`
   for copy-reinserted content) is not ported.
+- Tree edits, styles, and position lookups reject an index inside a UTF-16
+  surrogate pair (JS `findPos`), as Text does, with
+  `YorkieError::InvalidArgument` (`validate_utf16_boundary`); the Text check
+  fails with `InvalidTextPosition`. Range conversions and the derived end of
+  `style_by_path` use the unchecked lookup (JS `findPosUnchecked`).
+- Ported from JS with the path helpers: the fix for JS #1482 (yorkie#2079:
+  `edit(8, 14)` on `<p><b>hello</b> world</p>` now deletes the range),
+  `hasTextChild` as `every` child is text, and `pathToPos`/`toPath`, which
+  build the paths of change events.
+- A path conversion that splits a text node inside a pair stores U+FFFD for
+  each half in Rust, so JS's assertion that the XML still holds the emoji
+  (`surrogate_index_test.ts:666`) cannot pass here; the port pins the Rust
+  result. A related case is parked: converting a position that falls inside a
+  pair and then editing at the seam in the same update stores U+FFFD, where
+  JS rejects the edit. It comes from Rust text being a `String` and not
+  UTF-16, and a fix needs that representation choice. A seam index is also
+  accepted after a remote split from an SDK without the guard.
 - Like `CrdtText`, Tree text-node splitting uses valid Rust strings. Splitting
   inside an invalid standalone UTF-16 surrogate edge would need the same
   deliberate representation choice as Text.
@@ -1070,7 +1140,7 @@ Gap:
   `AuthError`. Broadcast is a channel event, not a document event, as in
   JS. JS `EpochMismatch`, `WriteRejected`, `LocalChangesDropped`, and
   `PersistDisabled` events are not ported. `ChangeInfo` omits JS
-  `clientSeq`/`serverSeq`/`rawChange`.
+  `clientSeq`/`serverSeq`/`rawChange`, and carries `source`.
 - Change packs can be projected to generated protobuf payloads and
   reconstructed back into core `ChangePack` values for the current operation
   set. Binary round-trip tests cover nested object/array/counter replay, and
@@ -1094,8 +1164,13 @@ Current Rust behavior:
 
 - `Document::history()` returns a `HistoryRef` with `can_undo`/`can_redo`;
   `Document::history_mut()` returns a `HistoryMut` that also has
-  `undo`/`redo` (JS `doc.history`). The stacks keep 50 entries each (JS
-  `MaxUndoRedoStackDepth`).
+  `undo`/`redo` (JS `doc.history`). Each stack keeps
+  `DocumentOptions::max_undo_depth` entries, 50 by default (JS
+  `MaxUndoRedoStackDepth`); the redo stack uses the same depth.
+  `Document::with_options` rejects `Some(0)` with `InvalidArgument`.
+  `Document::clear_history` drops both stacks. `Client::attach` calls it
+  after the initial root is applied, whether or not `initial_root` was
+  given, so an initial root cannot be undone.
 - A local change pushes its reverse operations, newest first, and the
   previous values of the presence keys set with
   `PresenceProxy::set_with_history` (JS `addToHistory: true`). A change with
@@ -1149,6 +1224,7 @@ JS/Go behavior:
 - JS has a `maxUndoDepth` document option, `clearHistory`, and refuses
   undo/redo during an update and while minting is suspended (epoch
   re-anchor). Its change events carry `source: OpSource.UndoRedo`.
+  Every JS event carries `source`, including `Snapshot` (always `Remote`).
 - Go `refinePos` fails on a stale offset past the end of a node (Go fuzz
   seed 152); JS snaps it to the end. Rust `refine_pos` snaps, as JS does.
 
@@ -1177,9 +1253,27 @@ Gap:
   fields would therefore fail on an undo from a current peer, rather than
   ignore it. The wire shape matches JS and Go; this is an upstream
   observation.
-- `maxUndoDepth`, `clearHistory`, and the minting-suspended refusal are not
-  ported. Rust change events do not carry the JS `source` field, so an
-  undo's `LocalChange` looks like any other local change.
+- The minting-suspended refusal is not ported; it comes with epoch
+  re-anchor (see Out-of-Scope Items).
+- JS `ErrRefused` for undo/redo during an update has no Rust counterpart and
+  cannot be reached: `Document::update` borrows the document mutably for the
+  closure, so the closure cannot call `history()` or `history_mut()`. Locking
+  the same `SharedDocument` inside the closure deadlocks, as any re-entrant
+  `std::sync::Mutex` lock does.
+- `max_undo_depth` is an `Option<usize>`, so JS's rejections of a
+  non-integer, negative, `NaN`, or infinite depth cannot occur; only `Some(0)`
+  is rejected, with JS's message.
+- `DocumentOptions` is a plain struct with `disable_gc` and `max_undo_depth`
+  (JS `disablePresence` and `enableDevtools` are not ported). Like
+  `AttachOptions`, it is built with `..Default::default()`, so adding a field
+  later is a semver break for callers that list every field.
+- The change `source` (`OpSource`: `Local`, `Remote`, `UndoRedo`) is the
+  field `ChangeInfo::source`, set on `DocEvent::LocalChange` and
+  `RemoteChange`. `Snapshot` and presence events carry none, where JS puts it
+  on every event; the alternative, struct variants on `DocEvent`, would break
+  every match arm. A local change replayed after a snapshot reports the source
+  it first ran with. `ChangeInfo` gained a public field, so a caller that
+  builds one with a struct literal must add it.
 - JS `getUndoStackForTest`/`getRedoStackForTest` have no public Rust
   counterpart: the stacks are readable only from yorkie-core unit tests.
   The integration port of `doc_presence_test.ts:689` checks the stack depth
@@ -1372,7 +1466,7 @@ Current Rust behavior:
 - `SyncMode`, `DeactivateOptions`, `AttachOptions`, `AttachChannelOptions`,
   and `DetachOptions` are public client-surface types. `AttachOptions` has
   `initial_root`, `initial_presence` (default empty), `sync_mode` (default
-  `Realtime`), `document_poll_interval`, and `schema`, as in JS.
+  `Realtime`), `document_poll_interval`, `schema`, and `disable_gc`, as in JS.
 - `Client` is a cloneable handle over `Arc<ClientInner>`. It owns an
   `Arc<dyn ClientTransport>`: `Client::new` builds a `ConnectTransport`, and
   `Client::with_transport` takes any transport (tests use a mock or wrap
@@ -1559,7 +1653,7 @@ Gap:
   names the first by key; JS names the first set.
 - `DeactivateOptions::keepalive` exists but has no effect: in JS it keeps a
   browser `fetch` alive during page unload, which has no Rust counterpart.
-  `disableGC`, gRPC-web/Connect transport choice, Go TLS options, and Go
+  The gRPC-web/Connect transport choice, Go TLS options, and Go
   receive-size/logger options are not modeled yet.
 - Re-issue claims follow JS where JS and Go differ. Go records the claim
   on every attach (`c.minted[k] = actor`) and declines any repeat attach of
@@ -1622,7 +1716,8 @@ Current Rust behavior:
 
 Gap:
 
-- JS `ChannelStatus.Removed` is not ported.
+- JS `ChannelStatus.Removed` is not ported: no JS code sets it, so a Rust
+  variant would be unreachable and only break exhaustive matches.
 - Deliberate differences from JS: `detach_channel` clears the session ID (JS
   keeps it, so a re-attached channel stays `Detached` until the old session
   expires); every broadcast try checks the channel is still attached (JS

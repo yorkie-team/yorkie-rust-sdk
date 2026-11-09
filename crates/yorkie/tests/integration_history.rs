@@ -16,7 +16,8 @@ use integration_support::rpc_addr;
 use integration_support::two_clients::TwoClients;
 use serde_json::Value;
 use std::collections::BTreeMap;
-use yorkie::{JsonArray, JsonText, JsonValue, SharedDocument};
+use std::sync::{Arc, Mutex};
+use yorkie::{DocEvent, JsonArray, JsonText, JsonValue, OpSource, SharedDocument};
 
 fn sorted_json(doc: &SharedDocument) -> String {
     doc.lock().unwrap().to_sorted_json()
@@ -245,8 +246,24 @@ async fn converges_after_both_clients_undo_and_redo_text_operations() {
     }
 }
 
+/// Records the kind (`true` for local) and the source of every change event.
+fn collect_sources(doc: &SharedDocument) -> Arc<Mutex<Vec<(bool, OpSource)>>> {
+    let sources = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&sources);
+    doc.lock().unwrap().subscribe(move |event| match event {
+        DocEvent::LocalChange(info) => sink.lock().unwrap().push((true, info.source)),
+        DocEvent::RemoteChange(info) => sink.lock().unwrap().push((false, info.source)),
+        _ => {}
+    });
+    sources
+}
+
 /// Runs one reconcile case: d1 and d2 edit `0123456789` concurrently, then
 /// both undo and both redo, converging after each step.
+///
+/// Also checks the `source` of d1's change events (JS `LocalChangeEvent` and
+/// `RemoteChangeEvent`, `src/document/document.ts` 414-435): d1's own undo
+/// and redo report `UndoRedo`, and d2's, pulled by d1, `Remote`.
 async fn reconcile_case(name: &str, d1_edit: (usize, usize, &str), d2_edit: (usize, usize, &str)) {
     let Some(addr) = rpc_addr() else { return };
     let t = with_text(&addr, &format!("history-text-{name}"), "0123456789").await;
@@ -256,15 +273,20 @@ async fn reconcile_case(name: &str, d1_edit: (usize, usize, &str), d2_edit: (usi
     t.sync_all().await;
     assert_converged(&t, "after edits");
 
+    let sources = collect_sources(&t.d1);
+    let undo_redo = vec![(true, OpSource::UndoRedo), (false, OpSource::Remote)];
+
     undo(&t.d1);
     undo(&t.d2);
     t.sync_all().await;
     assert_converged(&t, "after undo");
+    assert_eq!(undo_redo, std::mem::take(&mut *sources.lock().unwrap()));
 
     redo(&t.d1);
     redo(&t.d2);
     t.sync_all().await;
     assert_converged(&t, "after redo");
+    assert_eq!(undo_redo, std::mem::take(&mut *sources.lock().unwrap()));
 
     t.deactivate().await;
 }

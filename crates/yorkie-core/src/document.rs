@@ -12,7 +12,9 @@ use crate::crdt::split_links::drop_split_links_in_element;
 use crate::crdt::text::CrdtText;
 use crate::crdt::tree::{CrdtTree, TreePos};
 use crate::event::{ChangeInfo, DocEvent, OperationInfo, Subscribers, SubscriptionId};
-use crate::history::{History, HistoryMut, HistoryOperation, HistoryRef};
+use crate::history::{
+    History, HistoryMut, HistoryOperation, HistoryRef, MAX_UNDO_REDO_STACK_DEPTH,
+};
 use crate::json::{counter_operand, JsonEditRecorder, JsonEditRecorderRef, RecordedJsonValue};
 use crate::operation::{
     AddOperation, ArraySetOperation, EditOperation, IncreaseOperation, MoveOperation, OpSource,
@@ -28,6 +30,10 @@ use crate::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
+
+mod options;
+
+pub use options::DocumentOptions;
 
 /// A local Yorkie document.
 #[derive(Debug, Clone, PartialEq)]
@@ -56,6 +62,14 @@ pub struct Document {
     /// document its key names (JS `mintedOperations`). It is never cleared:
     /// a push cannot be taken back.
     minted_operations: bool,
+    /// `DocumentOptions::disable_gc` (JS `opts.disableGC`): garbage
+    /// collection purges nothing.
+    disable_gc: bool,
+    /// Whether the attachment opted out of garbage collection (JS
+    /// `disableGC`, set by the client on attach): a remote change then
+    /// advances only the lamport clock and leaves the version vector at this
+    /// document's own entry.
+    attach_disable_gc: bool,
 }
 
 /// Document attachment state.
@@ -69,8 +83,26 @@ pub enum DocStatus {
 impl Document {
     /// Creates a document with the given Yorkie resource key.
     pub fn new(key: impl Into<String>) -> Self {
+        Self::create(key.into(), MAX_UNDO_REDO_STACK_DEPTH, false)
+    }
+
+    /// Creates a document with the given Yorkie resource key and options
+    /// (JS `new Document(key, opts)`).
+    ///
+    /// Fails with `InvalidArgument` when `max_undo_depth` is `Some(0)`.
+    pub fn with_options(key: impl Into<String>, options: DocumentOptions) -> Result<Self> {
+        let max_undo_depth = options.max_undo_depth.unwrap_or(MAX_UNDO_REDO_STACK_DEPTH);
+        if max_undo_depth < 1 {
+            return Err(YorkieError::InvalidArgument(format!(
+                "maxUndoDepth must be a positive integer: {max_undo_depth}"
+            )));
+        }
+        Ok(Self::create(key.into(), max_undo_depth, options.disable_gc))
+    }
+
+    fn create(key: String, max_undo_depth: usize, disable_gc: bool) -> Self {
         Self {
-            key: key.into(),
+            key,
             status: DocStatus::Detached,
             root: JsonObject::new(),
             crdt_root: CrdtRoot::create(),
@@ -82,9 +114,11 @@ impl Document {
             presences: BTreeMap::new(),
             online_clients: BTreeSet::new(),
             subscribers: Subscribers::default(),
-            history: History::default(),
+            history: History::new(max_undo_depth),
             absorbed_remote: false,
             minted_operations: false,
+            disable_gc,
+            attach_disable_gc: false,
         }
     }
 
@@ -233,8 +267,7 @@ impl Document {
         // no `executed_at` until the undo runs it, which the wire projection
         // rejects. They are dropped, the state `apply_snapshot` leaves them
         // in too.
-        self.history.clear_undo();
-        self.history.clear_redo();
+        self.clear_history();
         Ok(true)
     }
 
@@ -371,8 +404,9 @@ impl Document {
 
             // As in JS, the change event is gated on the operations that ran,
             // not on the op infos they produced.
-            let change_event = (!executed.operations.is_empty())
-                .then(|| DocEvent::LocalChange(change_info(&change, executed.op_infos)));
+            let change_event = (!executed.operations.is_empty()).then(|| {
+                DocEvent::LocalChange(change_info(&change, executed.op_infos, OpSource::Local))
+            });
             let presence_event = change
                 .presence_change()
                 .and_then(|_| self.reconcile_presence(&actor_id, prev));
@@ -475,6 +509,14 @@ impl Document {
         HistoryMut::new(self)
     }
 
+    /// Drops both the undo and the redo stack (JS `clearHistory`), so that
+    /// setup changes, such as an attach's initial root, cannot be undone. The
+    /// document, its local changes and its presence stay as they are.
+    pub fn clear_history(&mut self) {
+        self.history.clear_redo();
+        self.history.clear_undo();
+    }
+
     pub(crate) fn history_stacks(&self) -> &History {
         &self.history
     }
@@ -575,8 +617,9 @@ impl Document {
             return Ok(());
         }
 
-        let change_event = (!executed.operations.is_empty())
-            .then(|| DocEvent::LocalChange(change_info(&change, executed.op_infos)));
+        let change_event = (!executed.operations.is_empty()).then(|| {
+            DocEvent::LocalChange(change_info(&change, executed.op_infos, OpSource::UndoRedo))
+        });
         let presence_event = change
             .presence_change()
             .and_then(|_| self.reconcile_presence(&actor_id, prev));
@@ -640,10 +683,24 @@ impl Document {
     /// Purges the tombstones `vector` covers and returns how many it purged
     /// (JS `garbageCollect`). `apply_change_pack` runs it with the server's
     /// minimum version vector; calling it with a vector the server did not
-    /// send can purge a tombstone a peer's change still anchors on.
+    /// send can purge a tombstone a peer's change still anchors on. A
+    /// document created with `DocumentOptions::disable_gc` purges nothing
+    /// and returns 0.
     #[doc(hidden)]
     pub fn garbage_collect(&mut self, vector: &VersionVector) -> usize {
+        if self.disable_gc {
+            return 0;
+        }
         self.crdt_root.garbage_collect(vector)
+    }
+
+    /// Records whether the attachment opted out of garbage collection (JS
+    /// `setDisableGC`). The client sets it on every attach, before applying
+    /// the attach response, so the remote changes that response carries
+    /// already advance only the lamport clock; a detach leaves it as it is.
+    #[doc(hidden)]
+    pub fn set_disable_gc(&mut self, disable_gc: bool) {
+        self.attach_disable_gc = disable_gc;
     }
 
     /// Returns the size of this document (JS `getDocSize`).
@@ -964,7 +1021,11 @@ impl Document {
             };
             let executed = change.execute(&mut self.crdt_root, execute_source)?;
             change.apply_presence_change(&mut self.presences);
-            self.change_id = self.change_id.sync_clocks(change.id());
+            self.change_id = if self.attach_disable_gc {
+                self.change_id.sync_lamport(change.id())
+            } else {
+                self.change_id.sync_clocks(change.id())
+            };
             // Undo text edits recorded before this change still name the
             // positions they had then; move them past what this edit changed.
             // The change has already run, so a range that does not normalize
@@ -987,7 +1048,9 @@ impl Document {
             }
 
             if !executed.operations.is_empty() {
-                let info = change_info(change, executed.op_infos);
+                // As in JS `applyChangeInternal`, the event carries the source
+                // the change ran with.
+                let info = change_info(change, executed.op_infos, execute_source);
                 self.publish(if source == OpSource::Remote {
                     DocEvent::RemoteChange(info)
                 } else {
@@ -1030,8 +1093,7 @@ impl Document {
         self.apply_changes(&local_changes, OpSource::Local)?;
         // The history names elements and positions of the root the snapshot
         // replaced, as in JS `applySnapshot`.
-        self.history.clear_undo();
-        self.history.clear_redo();
+        self.clear_history();
         self.publish(DocEvent::Snapshot);
         Ok(())
     }
@@ -1062,11 +1124,16 @@ struct StagedRoot {
     root: JsonObject,
 }
 
-fn change_info(change: &Change, op_infos: Vec<crate::operation::OpInfo>) -> ChangeInfo {
+fn change_info(
+    change: &Change,
+    op_infos: Vec<crate::operation::OpInfo>,
+    source: OpSource,
+) -> ChangeInfo {
     ChangeInfo {
         actor: change.id().actor_id().clone(),
         message: change.message().map(str::to_owned),
         operations: op_infos.into_iter().map(OperationInfo::from).collect(),
+        source,
     }
 }
 
@@ -1307,7 +1374,7 @@ fn collect_object_changes(
             continue;
         };
 
-        if before_value == after_value {
+        if unchanged(before_value, after_value) {
             continue;
         }
 
@@ -1358,7 +1425,7 @@ fn collect_array_changes(
     before: &JsonArray,
     after: &JsonArray,
 ) -> Result<()> {
-    if before == after {
+    if arrays_unchanged(before, after) {
         return Ok(());
     }
 
@@ -1398,7 +1465,7 @@ fn collect_same_length_array_changes(
         let after_value = after.get(index).ok_or_else(|| {
             YorkieError::InvalidIndex(format!("missing after array index {index}"))
         })?;
-        if before_value == after_value {
+        if unchanged(before_value, after_value) {
             continue;
         }
 
@@ -1534,15 +1601,55 @@ fn push_array_set_operation(
     Ok(())
 }
 
+/// Whether `after` is still `before` for the JSON-diff fallback of
+/// `update_with_presence`, which runs only when the update recorded no
+/// operation.
+///
+/// Values compare as `==` does, except that a tree in the document compares
+/// by identity. Such a tree changes only through its own methods, and every
+/// one that edits records an operation, so a difference the fallback sees
+/// can only come from a read helper: `pos_range_to_index_range` and
+/// `pos_range_to_path_range` split text nodes of the update's copy. JS splits
+/// its live tree there too and records nothing ("these read-path conversions
+/// emit no operation", `json/tree.ts` `registerPendingGCPairs`). Compared by
+/// content, the split pieces would record a `SET` of the whole tree, which
+/// replaces it on every replica.
+fn unchanged(before: &JsonValue, after: &JsonValue) -> bool {
+    match (before, after) {
+        (JsonValue::Tree(before), JsonValue::Tree(after)) => {
+            matches!((before.id(), after.id()), (Ok(before), Ok(after)) if before == after)
+                || before == after
+        }
+        (JsonValue::Object(before), JsonValue::Object(after)) => {
+            before.iter().count() == after.iter().count()
+                && before.iter().all(|(key, before)| {
+                    after.get(key).is_some_and(|after| unchanged(before, after))
+                })
+        }
+        (JsonValue::Array(before), JsonValue::Array(after)) => arrays_unchanged(before, after),
+        _ => before == after,
+    }
+}
+
+fn arrays_unchanged(before: &JsonArray, after: &JsonArray) -> bool {
+    before.len() == after.len()
+        && before
+            .iter()
+            .zip(after.iter())
+            .all(|(before, after)| unchanged(before, after))
+}
+
 fn lcs_pairs(before: &[JsonValue], after: &[JsonValue]) -> Vec<(usize, usize)> {
     let mut lengths = vec![vec![0; after.len() + 1]; before.len() + 1];
     for before_index in (0..before.len()).rev() {
         for after_index in (0..after.len()).rev() {
-            lengths[before_index][after_index] = if before[before_index] == after[after_index] {
-                lengths[before_index + 1][after_index + 1] + 1
-            } else {
-                lengths[before_index + 1][after_index].max(lengths[before_index][after_index + 1])
-            };
+            lengths[before_index][after_index] =
+                if unchanged(&before[before_index], &after[after_index]) {
+                    lengths[before_index + 1][after_index + 1] + 1
+                } else {
+                    lengths[before_index + 1][after_index]
+                        .max(lengths[before_index][after_index + 1])
+                };
         }
     }
 
@@ -1550,7 +1657,7 @@ fn lcs_pairs(before: &[JsonValue], after: &[JsonValue]) -> Vec<(usize, usize)> {
     let mut before_index = 0;
     let mut after_index = 0;
     while before_index < before.len() && after_index < after.len() {
-        if before[before_index] == after[after_index] {
+        if unchanged(&before[before_index], &after[after_index]) {
             pairs.push((before_index, after_index));
             before_index += 1;
             after_index += 1;
@@ -2900,6 +3007,86 @@ mod tests {
         Ok(())
     }
 
+    const OWN_ACTOR: &str = "000000000000000000000001";
+    const REMOTE_ACTOR: &str = "000000000000000000000002";
+    /// The lamport the server's snapshot vector names for the attaching
+    /// client.
+    const SNAPSHOT_LAMPORT: i64 = 40;
+
+    /// Attaches through a snapshot as an opted-out client does: the server
+    /// cuts the snapshot's vector down to `{own actor: max lamport}` (Go
+    /// `server/packs/pushpull.go` 518-539). Then one more remote change
+    /// arrives. Returns the vector after the snapshot and the document.
+    fn attach_through_snapshot(disable_gc: bool) -> Result<(VersionVector, Document)> {
+        let mut source = Document::new("doc");
+        source.set_actor(REMOTE_ACTOR);
+        source.update(|root| root.set("title", "snapshot").map(|_| ()))?;
+        let snapshot_root = source.crdt_root.object().clone();
+        source.update(|root| root.set("after", 1).map(|_| ()))?;
+        let remote_change = source.local_changes[1].clone();
+
+        let mut target = Document::new("doc");
+        target.set_actor(OWN_ACTOR);
+        target.set_disable_gc(disable_gc);
+        let mut vector = VersionVector::new();
+        vector.set(OWN_ACTOR, SNAPSHOT_LAMPORT);
+        target.apply_change_pack(&ChangePack::create_with_snapshot_root(
+            "doc",
+            Checkpoint::new(7, 0),
+            false,
+            Vec::new(),
+            Some(vector),
+            Some(vec![1]),
+            Some(snapshot_root),
+        ))?;
+        assert_eq!(r#"{"title":"snapshot"}"#, target.to_sorted_json());
+        let after_snapshot = target.version_vector().clone();
+
+        target.apply_change_pack(&ChangePack::create(
+            "doc",
+            Checkpoint::new(8, 0),
+            false,
+            vec![remote_change],
+            None,
+            None,
+        ))?;
+        assert_eq!(r#"{"after":1,"title":"snapshot"}"#, target.to_sorted_json());
+        Ok((after_snapshot, target))
+    }
+
+    /// JS "Opt-out client picks up server lamport when attach returns a
+    /// snapshot" (`disable_gc_test.ts` 159), on the snapshot path the live
+    /// test does not reach: the snapshot keeps `set_clocks` (JS 2865), so the
+    /// lamport passes the server's and the vector keeps the one entry the
+    /// server sent; the next remote change advances only the lamport.
+    #[test]
+    fn an_opted_out_snapshot_attach_keeps_one_vector_entry() -> Result<()> {
+        let (after_snapshot, doc) = attach_through_snapshot(true)?;
+
+        assert_eq!(1, after_snapshot.size());
+        assert_eq!(Some(SNAPSHOT_LAMPORT + 1), after_snapshot.get(OWN_ACTOR));
+        assert!(doc.change_id.lamport() > SNAPSHOT_LAMPORT);
+        assert_eq!(1, doc.version_vector().size());
+        assert_eq!(
+            Some(SNAPSHOT_LAMPORT + 2),
+            doc.version_vector().get(OWN_ACTOR)
+        );
+        Ok(())
+    }
+
+    /// The same attach without the opt-out: the snapshot path is the same,
+    /// but the next remote change merges its actor's entry into the vector.
+    #[test]
+    fn an_opted_in_snapshot_attach_merges_later_remote_vectors() -> Result<()> {
+        let (after_snapshot, doc) = attach_through_snapshot(false)?;
+
+        assert_eq!(1, after_snapshot.size());
+        assert_eq!(Some(SNAPSHOT_LAMPORT + 1), after_snapshot.get(OWN_ACTOR));
+        assert_eq!(2, doc.version_vector().size());
+        assert_eq!(Some(2), doc.version_vector().get(REMOTE_ACTOR));
+        Ok(())
+    }
+
     #[test]
     fn reapplies_remaining_local_changes_after_snapshot() -> Result<()> {
         let mut source = Document::new("source-doc");
@@ -3177,6 +3364,38 @@ mod tests {
         let last = &pack.changes()[1];
         assert!(!last.operations().is_empty());
         assert!(last.presence_change().is_some());
+        Ok(())
+    }
+
+    /// The fallback compares a tree in the document by identity, so that the
+    /// split of a read helper records nothing (`json/pos_tests.rs`), but a
+    /// new tree put in its place is still found.
+    #[test]
+    fn fallback_diff_finds_a_tree_replaced_in_place() -> Result<()> {
+        use crate::{JsonTree, TreeNodeInput};
+        let tree = |value: &str| {
+            TreeNodeInput::element(
+                "doc",
+                vec![TreeNodeInput::element(
+                    "p",
+                    vec![TreeNodeInput::text(value)],
+                )],
+            )
+        };
+        let mut doc = attached_doc(1);
+        doc.update(|root| root.set_tree("t", tree("old")).map(|_| ()))?;
+
+        doc.update(|root| {
+            *root.get_mut("t").unwrap() = JsonValue::Tree(JsonTree::new(tree("new")));
+            Ok(())
+        })?;
+
+        let JsonValue::Tree(replaced) = doc.get_root().get("t").unwrap() else {
+            panic!("expected a tree");
+        };
+        assert_eq!("<doc><p>new</p></doc>", replaced.to_xml()?);
+        assert_eq!(crdt_root_json(&doc), doc.to_sorted_json());
+        assert_eq!(2, doc.create_change_pack().change_size());
         Ok(())
     }
 
