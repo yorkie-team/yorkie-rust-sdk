@@ -24,7 +24,9 @@ pub use yorkie_core::{
     DocSize, DocStatus, DocSyncStatus, Document, EditOpValue, ErrorCode, HistoryMut, HistoryRef,
     JsonArray, JsonArrayElement, JsonCounter, JsonObject, JsonText, JsonTree, JsonValue,
     OperationInfo, Presence, PresenceChange, PresenceProxy, Result, SchemaRule,
-    StreamConnectionStatus, StyleOpValue, SubscriptionId, TextChunk, TimeTicket, TimeTicketStruct,
-    TreeNodeInput, TreeNodeRule, TreeStyleOpValue, VersionVector, YorkieError,
+    StreamConnectionStatus, StyleOpValue, SubscriptionId, TextChunk, TextNodeIdStruct,
+    TextPosStruct, TextPosStructRange, TimeTicket, TimeTicketStruct, TreeNodeIdStruct,
+    TreeNodeInput, TreeNodeRule, TreePosStruct, TreePosStructRange, TreeStyleOpValue,
+    VersionVector, YorkieError,
 };
 pub use yorkie_protocol::YORKIE_PROTO_PACKAGE;

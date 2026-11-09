@@ -1,7 +1,10 @@
 use super::element::{CrdtElementMeta, DataSize, GcPairSite};
 use super::rht::{Rht, RhtNode};
 use crate::json::escape_json_string;
-use crate::{Result, TimeTicket, TreeNodeInput, YorkieError, TIME_TICKET_SIZE};
+use crate::{
+    Result, TimeTicket, TreeNodeIdStruct, TreeNodeInput, TreePosStruct, YorkieError,
+    TIME_TICKET_SIZE,
+};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -42,6 +45,23 @@ impl TreeNodeId {
 
     pub(crate) fn to_test_string(&self) -> String {
         format!("{}/{}", self.created_at.to_test_string(), self.offset)
+    }
+
+    /// Returns the plain-data form of this ID (JS `CRDTTreeNodeID.toStruct`).
+    pub(crate) fn to_struct(&self) -> TreeNodeIdStruct {
+        TreeNodeIdStruct {
+            created_at: self.created_at.to_struct(),
+            offset: self.offset,
+        }
+    }
+
+    /// Builds an ID from its plain-data form (JS
+    /// `CRDTTreeNodeID.fromStruct`).
+    pub(crate) fn from_struct(value: &TreeNodeIdStruct) -> Result<Self> {
+        Ok(Self::new(
+            TimeTicket::from_struct(value.created_at.clone())?,
+            value.offset,
+        ))
     }
 }
 
@@ -87,6 +107,24 @@ impl TreePos {
             self.parent_id.to_test_string(),
             self.left_sibling_id.to_test_string()
         )
+    }
+
+    /// Returns the plain-data form of this position (JS
+    /// `CRDTTreePos.toStruct`).
+    pub(crate) fn to_struct(&self) -> TreePosStruct {
+        TreePosStruct {
+            parent_id: self.parent_id.to_struct(),
+            left_sibling_id: self.left_sibling_id.to_struct(),
+        }
+    }
+
+    /// Builds a position from its plain-data form (JS
+    /// `CRDTTreePos.fromStruct`).
+    pub(crate) fn from_struct(value: &TreePosStruct) -> Result<Self> {
+        Ok(Self::new(
+            TreeNodeId::from_struct(&value.parent_id)?,
+            TreeNodeId::from_struct(&value.left_sibling_id)?,
+        ))
     }
 }
 
@@ -793,8 +831,72 @@ impl CrdtTree {
     }
 
     pub(crate) fn find_pos(&self, index: usize, prefer_text: bool) -> Result<TreePos> {
+        self.find_pos_unchecked(index, prefer_text)
+    }
+
+    /// Finds the position of `index` for a selection rather than an edit (JS
+    /// `findPosUnchecked`), so it never rejects an index inside a UTF-16
+    /// surrogate pair. JS `findPos` rejects one for edits; Rust `find_pos`
+    /// does not check yet, so the two agree today, but the call sites keep
+    /// JS's split.
+    pub(crate) fn find_pos_unchecked(&self, index: usize, prefer_text: bool) -> Result<TreePos> {
         let tree_pos = find_tree_pos(&self.root, Vec::new(), index, prefer_text)?;
         tree_pos_to_crdt_pos(&self.root, &tree_pos)
+    }
+
+    /// Returns the positions of the index range `from..to`, the same one
+    /// twice for equal indexes (JS `indexRangeToPosRange`). It converts a
+    /// selection, so it uses the unchecked lookup.
+    pub(crate) fn index_range_to_pos_range(
+        &self,
+        (from, to): (usize, usize),
+    ) -> Result<(TreePos, TreePos)> {
+        let from_pos = self.find_pos_unchecked(from, true)?;
+        if from == to {
+            return Ok((from_pos.clone(), from_pos));
+        }
+        Ok((from_pos, self.find_pos_unchecked(to, true)?))
+    }
+
+    /// Returns the indexes of a position range (JS `posRangeToIndexRange`).
+    /// Like JS, it splits the text nodes the positions fall in; a split of a
+    /// removed node leaves its GC pair pending for the caller to drain.
+    pub(crate) fn pos_range_to_index_range(
+        &mut self,
+        range: &(TreePos, TreePos),
+    ) -> Result<(usize, usize)> {
+        let ((from_parent, from_left), (to_parent, to_left)) = self.pos_range_to_nodes(range)?;
+        Ok((
+            self.to_index(&from_parent, &from_left)?,
+            self.to_index(&to_parent, &to_left)?,
+        ))
+    }
+
+    /// Returns the paths of a position range (JS `posRangeToPathRange`),
+    /// splitting like `pos_range_to_index_range`.
+    pub(crate) fn pos_range_to_path_range(
+        &mut self,
+        range: &(TreePos, TreePos),
+    ) -> Result<(Vec<usize>, Vec<usize>)> {
+        let (from, to) = self.pos_range_to_index_range(range)?;
+        Ok((self.index_to_path(from)?, self.index_to_path(to)?))
+    }
+
+    /// Resolves both ends of `range` to the IDs of their parent and left
+    /// sibling (JS `findNodesAndSplitText` without an edit ticket). Each end
+    /// is taken as IDs at once: splitting the other end can move paths.
+    fn pos_range_to_nodes(
+        &mut self,
+        range: &(TreePos, TreePos),
+    ) -> Result<((TreeNodeId, TreeNodeId), (TreeNodeId, TreeNodeId))> {
+        let mut diff = DataSize::default();
+        let mut resolve = |tree: &mut Self, pos: &TreePos| -> Result<(TreeNodeId, TreeNodeId)> {
+            let (parent, left) = tree.find_nodes_and_split_text(pos, None, false, &mut diff)?;
+            Ok((tree.id_at(&parent)?, tree.id_at(&left)?))
+        };
+        let from = resolve(self, &range.0)?;
+        let to = resolve(self, &range.1)?;
+        Ok((from, to))
     }
 
     pub(crate) fn index_to_path(&self, index: usize) -> Result<Vec<usize>> {
@@ -1100,11 +1202,11 @@ impl CrdtTree {
     ) -> Result<TreeEditResult> {
         let mut diff = DataSize::default();
         let (from_parent_path, from_left_raw_path) =
-            self.find_nodes_and_split_text(&range.0, &edited_at, false, &mut diff)?;
+            self.find_nodes_and_split_text(&range.0, Some(&edited_at), false, &mut diff)?;
         let from_parent = self.id_at(&from_parent_path)?;
         let from_left_raw = self.id_at(&from_left_raw_path)?;
         let (to_parent_path, to_left_raw_path) =
-            self.find_nodes_and_split_text(&range.1, &edited_at, false, &mut diff)?;
+            self.find_nodes_and_split_text(&range.1, Some(&edited_at), false, &mut diff)?;
         let to_parent = self.id_at(&to_parent_path)?;
         let to_left_raw = self.id_at(&to_left_raw_path)?;
         let mut gc_pairs = Vec::new();
@@ -1383,7 +1485,7 @@ impl CrdtTree {
     fn find_nodes_and_split_text(
         &mut self,
         pos: &TreePos,
-        edited_at: &TimeTicket,
+        edited_at: Option<&TimeTicket>,
         range_boundary: bool,
         diff: &mut DataSize,
     ) -> Result<(Vec<usize>, Vec<usize>)> {
@@ -1456,6 +1558,10 @@ impl CrdtTree {
             }
         }
 
+        // A conversion has no edit ticket, so it skips the RGA walk below.
+        let Some(edited_at) = edited_at else {
+            return Ok((real_parent_path, left_path));
+        };
         let parent = node_at_path(&self.root, &real_parent_path)?;
         let start = if is_left_most {
             0
@@ -1576,9 +1682,9 @@ impl CrdtTree {
     ) -> Result<(usize, usize, DataSize)> {
         let mut diff = DataSize::default();
         let (from_parent, from_left) =
-            self.find_nodes_and_split_text(&range.0, edited_at, true, &mut diff)?;
+            self.find_nodes_and_split_text(&range.0, Some(edited_at), true, &mut diff)?;
         let (to_parent, to_left) =
-            self.find_nodes_and_split_text(&range.1, edited_at, true, &mut diff)?;
+            self.find_nodes_and_split_text(&range.1, Some(edited_at), true, &mut diff)?;
         Ok((
             physical_index_after_left_path(&self.root, &from_parent, &from_left)?,
             physical_index_after_left_path(&self.root, &to_parent, &to_left)?,
@@ -4680,8 +4786,12 @@ mod tests {
 
         let mut index_of = |range_boundary: bool| -> crate::Result<usize> {
             let mut diff = super::DataSize::default();
-            let (parent, left) =
-                tree.find_nodes_and_split_text(&pos, &ticket(11, "a"), range_boundary, &mut diff)?;
+            let (parent, left) = tree.find_nodes_and_split_text(
+                &pos,
+                Some(&ticket(11, "a")),
+                range_boundary,
+                &mut diff,
+            )?;
             Ok(super::visible_index_of_physical(
                 &tree.root,
                 super::physical_index_after_left_path(&tree.root, &parent, &left)?,

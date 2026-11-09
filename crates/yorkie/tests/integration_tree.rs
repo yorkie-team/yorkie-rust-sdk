@@ -6,10 +6,13 @@
 //! those) and `packages/sdk/test/integration/tree_concurrency_test.ts` (all
 //! its matrices, merge and split operations included). Like the JS
 //! `withTwoClientsAndDocuments` cases, each test syncs two clients manually.
+//! The single-document range-conversion cases of `tree_test.ts` are here too
+//! and need no server.
 //! Run with `YORKIE_TEST_RPC_ADDR=http://localhost:18080 cargo test -p yorkie`.
 
 mod integration_support;
 
+use integration_support::events::{collect_change_types, ChangeEventType};
 use integration_support::tree::{
     attributes, collect_ops, edit_tree, element, element_with, set_tree, text, xml,
 };
@@ -18,8 +21,8 @@ use integration_support::{rpc_addr, unique_key};
 use serde_json::json;
 use std::sync::Mutex;
 use yorkie::{
-    DeactivateOptions, DetachOptions, OperationInfo, SharedDocument, TreeNodeInput,
-    TreeStyleOpValue,
+    DeactivateOptions, DetachOptions, Document, JsonTree, JsonValue, OperationInfo, SharedDocument,
+    TreeNodeInput, TreePosStructRange, TreeStyleOpValue,
 };
 
 /// A tree edit op info as JS tests compare it: `(from, to, value)`.
@@ -117,6 +120,120 @@ async fn syncs_its_content_with_remove_style() {
     t.c2.sync(None).await.unwrap();
     assert_eq!("<doc><p>hello</p></doc>", xml(&t.d1));
     assert_eq!("<doc><p>hello</p></doc>", xml(&t.d2));
+
+    t.deactivate().await;
+}
+
+/// `<root><p><b><i>ab</i></b></p></root>` in a fresh local document, the
+/// tree of the JS range-conversion cases.
+fn range_doc() -> Document {
+    let mut doc = Document::new("tree-range");
+    doc.update(|root| {
+        root.set_tree(
+            "t",
+            element(
+                "root",
+                vec![element(
+                    "p",
+                    vec![element("b", vec![element("i", vec![text("ab")])])],
+                )],
+            ),
+        )
+        .map(|_| ())
+    })
+    .unwrap();
+    doc
+}
+
+fn tree_of(doc: &Document) -> JsonTree {
+    match doc.get_root().get("t") {
+        Some(JsonValue::Tree(tree)) => tree.clone(),
+        other => panic!("expected a tree, got {other:?}"),
+    }
+}
+
+/// JS "Should return correct range from index" (tree_test.ts:926).
+#[test]
+fn returns_correct_range_from_index() -> yorkie::Result<()> {
+    let mut tree = tree_of(&range_doc());
+    //     0  1  2   3 4 5    6   7   8
+    // <root><p><b><i> a b </i></b></p></root>
+    assert_eq!("<root><p><b><i>ab</i></b></p></root>", tree.to_xml()?);
+
+    let range = tree.index_range_to_pos_range((0, 5))?;
+    assert_eq!((0, 5), tree.pos_range_to_index_range(&range)?);
+
+    let range = tree.index_range_to_pos_range((5, 7))?;
+    assert_eq!((5, 7), tree.pos_range_to_index_range(&range)?);
+    Ok(())
+}
+
+/// JS "Should return correct range from path" (tree_test.ts:964).
+#[test]
+fn returns_correct_range_from_path() -> yorkie::Result<()> {
+    let mut tree = tree_of(&range_doc());
+    assert_eq!("<root><p><b><i>ab</i></b></p></root>", tree.to_xml()?);
+
+    let range = tree.path_range_to_pos_range((&[0], &[0, 0, 0, 2]))?;
+    assert_eq!(
+        (vec![0], vec![0, 0, 0, 2]),
+        tree.pos_range_to_path_range(&range)?
+    );
+
+    let range = tree.path_range_to_pos_range((&[0], &[1]))?;
+    assert_eq!((vec![0], vec![1]), tree.pos_range_to_path_range(&range)?);
+    Ok(())
+}
+
+fn index_range_of(doc: &SharedDocument, range: &TreePosStructRange) -> (usize, usize) {
+    let doc = doc.lock().unwrap();
+    tree_of(&doc).pos_range_to_index_range(range).unwrap()
+}
+
+/// JS "Should return correct range from index within doc.subscribe"
+/// (tree_test.ts:1002).
+///
+/// JS keeps the selection in the presence and converts it inside the
+/// subscription callback. A Rust callback runs while the document is
+/// locked and gets only the event, so it cannot read the tree; the
+/// selection is kept by the test and converted once the remote change event
+/// has arrived. The structs carry no serialization, so they stay out of the
+/// presence.
+#[tokio::test]
+async fn returns_correct_range_from_index_after_a_remote_change() {
+    let Some(addr) = rpc_addr() else { return };
+    let t = TwoClients::with_tree(
+        &addr,
+        "tree-range-subscribe",
+        doc_p("hello"),
+        "<doc><p>hello</p></doc>",
+    )
+    .await;
+
+    let mut selection = None;
+    edit_tree(&t.d1, |tree| {
+        tree.edit(1, 1, vec![text("a")], 0)?;
+        selection = Some(tree.index_range_to_pos_range((2, 2))?);
+        Ok(())
+    });
+    let selection = selection.expect("the selection of the update");
+    t.c1.sync(None).await.unwrap();
+    t.c2.sync(None).await.unwrap();
+    assert_eq!("<doc><p>ahello</p></doc>", xml(&t.d1));
+    assert_eq!("<doc><p>ahello</p></doc>", xml(&t.d2));
+    assert_eq!((2, 2), index_range_of(&t.d1, &selection));
+
+    let events = collect_change_types(&t.d1);
+    edit_tree(&t.d2, |tree| tree.edit(2, 2, vec![text("b")], 0));
+    t.c2.sync(None).await.unwrap();
+    t.c1.sync(None).await.unwrap();
+    assert_eq!("<doc><p>abhello</p></doc>", xml(&t.d1));
+    assert_eq!("<doc><p>abhello</p></doc>", xml(&t.d2));
+
+    events
+        .wait_and_verify_nth(1, ChangeEventType::RemoteChange)
+        .await;
+    assert_eq!((2, 2), index_range_of(&t.d1, &selection));
 
     t.deactivate().await;
 }

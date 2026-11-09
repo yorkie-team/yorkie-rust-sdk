@@ -7,7 +7,7 @@ use crate::crdt::rht::Rht;
 use crate::crdt::tree::{CrdtTree, TreeNode, TreeNodeId, TreePos};
 use crate::event::parse_attr_value;
 use crate::operation::TreeEditOperation;
-use crate::{Result, TimeTicket, YorkieError};
+use crate::{Result, TimeTicket, TreePosStruct, TreePosStructRange, YorkieError};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -340,6 +340,58 @@ impl JsonTree {
         self.tree()?.path_to_index(path)
     }
 
+    /// Converts an index range to a position range that follows concurrent
+    /// edits, for keeping a selection (JS `Tree.indexRangeToPosRange`). Equal
+    /// indexes give the same position twice.
+    pub fn index_range_to_pos_range(&self, range: (usize, usize)) -> Result<TreePosStructRange> {
+        let (from, to) = self.tree()?.index_range_to_pos_range(range)?;
+        Ok((from.to_struct(), to.to_struct()))
+    }
+
+    /// Converts a path range to a position range (JS
+    /// `Tree.pathRangeToPosRange`), through the index range as in JS.
+    pub fn path_range_to_pos_range(
+        &self,
+        range: (&[usize], &[usize]),
+    ) -> Result<TreePosStructRange> {
+        let tree = self.tree()?;
+        let indexes = (tree.path_to_index(range.0)?, tree.path_to_index(range.1)?);
+        let (from, to) = tree.index_range_to_pos_range(indexes)?;
+        Ok((from.to_struct(), to.to_struct()))
+    }
+
+    /// Converts a position range back to an index range (JS
+    /// `Tree.posRangeToIndexRange`).
+    ///
+    /// Like JS, it splits the text nodes the positions fall in, which is why
+    /// it takes `&mut self`. The split stays on this copy and never reaches
+    /// the document, so the GC pairs JS registers for pieces split off a
+    /// removed node (`registerPendingGCPairs`) are dropped here.
+    pub fn pos_range_to_index_range(
+        &mut self,
+        range: &TreePosStructRange,
+    ) -> Result<(usize, usize)> {
+        let range = pos_range_from_struct(range)?;
+        let tree = self.tree_mut()?;
+        let indexes = tree.pos_range_to_index_range(&range);
+        tree.drain_pending_gc_pairs();
+        indexes
+    }
+
+    /// Converts a position range back to a path range (JS
+    /// `Tree.posRangeToPathRange`). It splits as `pos_range_to_index_range`
+    /// does.
+    pub fn pos_range_to_path_range(
+        &mut self,
+        range: &TreePosStructRange,
+    ) -> Result<(Vec<usize>, Vec<usize>)> {
+        let range = pos_range_from_struct(range)?;
+        let tree = self.tree_mut()?;
+        let paths = tree.pos_range_to_path_range(&range);
+        tree.drain_pending_gc_pairs();
+        paths
+    }
+
     /// Serializes this tree as JSON, like `to_json`, for `JsonValue`. A tree
     /// that does not belong to a document yet is written from its root.
     pub(crate) fn to_json_string(&self) -> String {
@@ -490,6 +542,12 @@ impl JsonTree {
     fn recorder(&self) -> Result<JsonEditRecorderRef> {
         self.recorder.clone().ok_or_else(not_initialized)
     }
+}
+
+fn pos_range_from_struct(
+    (from, to): &(TreePosStruct, TreePosStruct),
+) -> Result<(TreePos, TreePos)> {
+    Ok((TreePos::from_struct(from)?, TreePos::from_struct(to)?))
 }
 
 fn not_initialized() -> YorkieError {

@@ -1,3 +1,6 @@
+mod pos;
+#[cfg(test)]
+mod pos_tests;
 mod text;
 mod tree;
 
@@ -11,6 +14,10 @@ use std::collections::BTreeMap;
 use std::fmt::{self, Write};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+pub use pos::{
+    TextNodeIdStruct, TextPosStruct, TextPosStructRange, TreeNodeIdStruct, TreePosStruct,
+    TreePosStructRange,
+};
 pub use text::{JsonText, TextChunk};
 pub use tree::{JsonTree, TreeNodeInput};
 

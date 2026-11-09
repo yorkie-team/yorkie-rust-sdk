@@ -37,7 +37,8 @@ pub use event::{
 pub use history::{HistoryMut, HistoryRef};
 pub use json::{
     JsonArray, JsonArrayElement, JsonCounter, JsonObject, JsonText, JsonTree, JsonValue, TextChunk,
-    TreeNodeInput,
+    TextNodeIdStruct, TextPosStruct, TextPosStructRange, TreeNodeIdStruct, TreeNodeInput,
+    TreePosStruct, TreePosStructRange,
 };
 pub use presence::{Presence, PresenceChange, PresenceProxy};
 pub use schema::{SchemaRule, TreeNodeRule};
