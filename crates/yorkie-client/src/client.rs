@@ -410,8 +410,8 @@ impl Client {
     /// client key was generated and no earlier document of the key has
     /// minted under this client's actor, those tickets are re-issued to the
     /// actor first, so a position or element ID taken from the document
-    /// before the attach no longer resolves after it. A failed request
-    /// leaves the document re-issued.
+    /// before the attach no longer resolves after it, and the undo and redo
+    /// stacks are cleared. A failed request leaves the document re-issued.
     pub async fn attach(
         &self,
         doc: SharedDocument,

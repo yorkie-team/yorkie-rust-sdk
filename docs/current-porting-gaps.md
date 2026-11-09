@@ -140,6 +140,9 @@ Gap:
   the other client-only `Document` methods (`apply_change_pack`,
   `garbage_collect`), and `has_minted_operations` is hidden public too. JS
   test "refuses a re-issue asked for without the token" has no counterpart.
+- A generated client key always comes from the OS CSPRNG (`getrandom`), so
+  JS's refusal to generate a key when no unguessable source exists has no
+  Rust path, and its test is not ported.
 - The ticket walk runs over the `wire` projection, destructuring every
   struct and variant without `..`, where JS walks the protobuf message by
   reflection. Coverage is the same and a new field fails to compile until

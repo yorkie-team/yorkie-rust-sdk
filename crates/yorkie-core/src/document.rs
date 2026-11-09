@@ -147,7 +147,8 @@ impl Document {
     /// Only the client's attach calls it: whether the re-issue is sound
     /// depends on what else the actor has minted under the document's key,
     /// which only the client knows. A position or element ID taken from the
-    /// document before the call no longer resolves after a re-issue.
+    /// document before the call no longer resolves after a re-issue, and a
+    /// re-issue clears the undo and redo stacks, as JS does.
     ///
     /// An error leaves the document as it was.
     #[doc(hidden)]
