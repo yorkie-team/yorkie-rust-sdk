@@ -30,7 +30,6 @@ section of the area they touch.
 | Devtools | `packages/sdk/src/devtools/` | Browser-only inspector protocol. |
 | Revisions API | `packages/sdk/src/api/revision.ts`, `yorkie.ts`; `test/integration/revision_test.ts` | Admin-side document revisions. |
 | Epoch re-anchor | `packages/sdk/src/document/document.ts` (`EpochMismatch`, minting suspension), `client/client.ts` | `ErrEpochMismatch` stops the sync loop without telling the document. |
-| Tree undo and redo | `packages/sdk/src/document/operation/tree_edit_operation.ts`, `tree_style_operation.ts`, `document/crdt/tree.ts`, `document/history.ts`; receive side `api/converter.ts` (`fromOperation` TreeEdit case) | Split and merge reverse machinery, and the `TreeEdit` restore spans: a received `TreeEdit` with `restore_spans`, `retombstone_spans`, or `restore_mode` runs only its positional part, so a Rust replica diverges from a JS peer that undoes a Tree edit. See Undo and Redo. |
 | Auth webhook integration test | `packages/sdk/test/integration/webhook_test.ts` | Needs a server with an auth webhook; the auth path is unit-tested with a mock transport. |
 | Schema and project admin API cases | `packages/sdk/test/integration/document_test.ts`, `schema_test.ts` | `CreateSchema`, `UpdateProject`, `UpdateDocument` need the admin API. |
 
@@ -147,10 +146,11 @@ Gap:
   re-encode (JS `walkNestedElement`). A Text value of `Set`, `Add` or
   `ArraySet` goes through the full Text encoding (content, ledger, links),
   as in JS.
-- Rust Tree edits push no undo entry (Tree undo is out of scope), so the
-  port of JS "keeps tree splits, undo/redo, tree style and array set"
-  covers Tree splits and style only. Its Tree undo parts come back with
-  Tree undo.
+- The walk visits the restore spans of a `TreeEdit` (identity, anchors,
+  attribute tickets), as JS does. The port of JS "keeps tree splits,
+  undo/redo, tree style and array set" undoes and redoes the split before
+  the re-issue: the redo is a split under tickets it issued, which move to
+  the new actor with the rest.
 - A Text piece recreated after GC records a stand-in removal at lamport 0,
   followed by its cancel (see Text and RGATreeSplit). The lamport-0 rule
   leaves the stand-in under the previous actor while its cancel moves to
@@ -463,10 +463,10 @@ Gap:
   pair off and leaving the new piece unbooked.
 - `unregister_gc_pair_by_id` takes a revived node's size out of gc only. JS
   moves it from gc back to live, because its registration took it out of
-  live. Rust registration leaves a text removal's size in live (the
+  live. Rust registration leaves a text or tree removal's size in live (the
   `doc_size` gap below), so moving it back would count it twice. Live size
-  after a Text undo therefore differs from JS until that gap is fixed; gc
-  matches a rebuild.
+  after a Text or Tree undo therefore differs from JS until that gap is
+  fixed; gc matches a rebuild.
 - A pair whose Text left with its container skips the successor barrier.
   JS still checks `purgeBarrierAt` on the detached split and can defer when
   a concurrent insertion is not yet covered; Rust drops a stable, unheld
@@ -482,7 +482,8 @@ Gap:
   not registered (JS `bookCopiedAttrTombstones`): the root keys GC pairs by
   ID string, and a copy carries the original's attribute IDs, so booking it
   would toggle the original's pairs off. They stay uncollected garbage;
-  content is unaffected. Tree splits have the same gap (see Tree).
+  content is unaffected. Tree splits and the nodes a Tree restore recreates
+  have the same gap (see Tree).
 - The split `find_restore_anchor` makes in its last fallback
   (`find_node_with_split`) reports no size diff. JS and Go discard it too.
 - Collection cost: once any GC pair is registered, every pass walks every
@@ -497,6 +498,15 @@ Gap:
   barrier tests check the running size against a rebuild; the Rust ports
   check the garbage count only. Removed elements and their descendants do
   match a rebuild (JS `sizeInGC`), before and after collection.
+- With Tree undo the live size also differs between replicas, by delivery
+  order. A node a remote undo recreates after GC is charged to live; a
+  removal of its parent delivered after that leaves it in live, and
+  collection takes it from gc only. In the six delivery orders of JS
+  `tree_restore_ticket_test.ts`, JS ends every replica at live `{0, 96}`;
+  Rust at `{8, 192}` in four orders and `{12, 216}` in the two that deliver
+  the restore first, gc 0 in all. The port compares gc, and the live check
+  is the ignored `keeps_the_live_size_equal_across_delivery_orders`
+  (`document/tree_restore_tests.rs`). It goes away with the gap above.
 - JS keeps a clone root and collects it too (`getGarbageLenFromClone`).
   Rust has no clone to collect: a local change runs on a copy that replaces
   the root.
@@ -907,6 +917,17 @@ Gap:
 - Version-vector-aware edit/style conflict behavior is modeled at the internal
   helper level and is passed through `Change`, but it still needs broader
   multi-change replay coverage at the operation layer.
+- `RgaTreeSplitNode::can_style` still refuses a node removed before the
+  style's ticket. Since JS `e0609c7a` (`canStyle` reads only whether the
+  change knew the node, `ticketKnown`), JS styles it: the replica that
+  issued a style concurrent with a removal applied it to a live node and
+  never retracts it, so a receiver that refuses it holds other attributes
+  and another `doc_size.gc` for good. Rust Tree has the same rule (see
+  Tree). The port of JS `test/unit/document/style_tombstone_test.ts:536`
+  ("sends an undo whose style lands only on a tombstone",
+  `document/tree_undo_tests.rs`) is
+  ignored until both are ported, with the ledger fixes `e0609c7a` makes in
+  text, tree, root and array.
 - Rust strings cannot represent invalid standalone UTF-16 surrogate halves.
   Local edits refuse a mid-pair index, but a remote position inside a pair
   (which only an SDK without that check can send) still splits the node with
@@ -999,10 +1020,51 @@ Current Rust behavior:
   size diff, and creates reverse tree style operations.
 - `TreeEditOperation` executes split-free element insert/delete operations and
   text-node split insert/delete operations plus multi-level element split and
-  visible-boundary merge operations, registers removed tree-node GC pairs,
-  accumulates root size diff for inserted nodes and splits, and creates reverse
-  tree edit operations for insert/delete, pure split, and visible-boundary merge
-  cases.
+  visible-boundary merge operations, registers removed tree-node GC pairs, and
+  accumulates root size diff for inserted nodes and splits.
+- Tree edits and styles are undoable (see Undo and Redo). A Tree edit's
+  reverse is chosen as in JS `toReverseOperation` and
+  `toSplitReverseOperation`:
+  - an identity edit, when the restore spans `CrdtTree::edit` captured
+    describe the edit whole (JS `spansComplete`: no merge, and every plain
+    deletion has its span). `TreeRestoreSpan` names a node by its insertion
+    ID, kind, UTF-16 length, value and attributes, with its parent and
+    sibling anchors. Running the edit re-removes by identity
+    (`CrdtTree::retombstone`) and then revives (`CrdtTree::restore`), so
+    concurrent undos of one deletion converge rather than duplicate. A node
+    GC purged is recreated from its span and anchors (JS
+    `recreateFromSpan`), and a text span isolates its exact interval from
+    whatever pieces overlap it. A span whose `is_text` disagrees with its
+    `node_type` is skipped, never rejected;
+  - a split again, for the boundary deletion that undid a split (JS
+    `redoSplitLevel`);
+  - a split for a merge, re-creating the merged-away elements (JS
+    `replacedIDs`, `mergedAwayIDs`, innermost first);
+  - otherwise a copy of what the edit removed, inserted over what it
+    inserted, unless that range runs past the tree (JS `maxNeededIdx`). The
+    undo gives the copy fresh IDs (JS `reissueContentIDs`), and a reissue
+    asked of a splitting edit fails with `YorkieError::Refused` (JS
+    `ErrRefused`). Inserted content that carries an ID of another change
+    the tree already holds is dropped whole (JS `dropDuplicateContents`):
+    it is a copy of a node that exists, as an older client's undo sent.
+
+  A pure split (no content, nothing marked for removal; nodes removed before
+  count, as in JS `isPureSplit`) reverses to a deletion of the boundaries it
+  opened, sized by what it opened (JS `splitSize`). Content inserted under a
+  removed parent counts toward the inserted size, as in JS
+  `insertedContentSize`.
+- An error building a reverse fails a local or undo/redo edit, as JS has no
+  catch there; for a remote change the reverse is thrown away anyway, and
+  the error is dropped so the change still applies (`settle_reverse`).
+- What one run of an edit measured (JS `lastFromIdx`, `lastToIdx`,
+  `insertedContentSize`, `splitSize`, `executedRanges`,
+  `splitRecreatedIDs`, `consumedSplitTickets`) comes back in
+  `TreeEditExecution` and rides on the copy of the operation the change
+  records, since `execute` takes `&self`. It is never encoded, and the
+  operation's `PartialEq` compares only the encoded fields.
+- A split that re-creates an element a merge removed reports the
+  `(removed, re-created)` pair (JS `splitRecreatedIDs`, via
+  `merge_source_of`), whoever issued the split.
 
 JS/Go behavior:
 
@@ -1014,6 +1076,24 @@ JS/Go behavior:
   produce reverse operation info.
 - Public Tree wrappers create context-backed tree edits instead of direct node
   mutation.
+- A Tree removal ledger like Text's (`removal_events` on Tree nodes, holding
+  tombstones for undo) exists only on unmerged upstream branches. JS main at
+  `8629993e`, which this port follows, has none, and neither has Rust. This
+  is not a gap.
+- Where JS and Go differ on Tree undo, Rust follows JS:
+  - `isPureSplit`: Go also requires that no node was removed before the
+    edit (`operations/tree_edit.go`); JS checks only the content and the
+    nodes the edit marked.
+  - The copy-reinsert anchor: Go derives `fromPos`/`toPos` from the nodes
+    the edit touched (an open, filed divergence in `tree_edit.go`); JS uses
+    `findPosUnchecked` on the index the edit started at, plus the inserted
+    size.
+  - Go rejects a restore span whose `created_at` lies beyond the change's
+    version vector (`validateTreeRestoreIdentities`); JS does not, as for
+    Text.
+  - Go has no `reconcileTreeNodeID`, `replacedIDs`, `splitRecreatedIDs`, or
+    split-ticket re-pointing (JS `b173c093`), and its `ReissueContentIDs`
+    returns no pairs, so the re-pointing has no Go cross-check.
 
 Gap:
 
@@ -1025,13 +1105,31 @@ Gap:
 - Rust Tree style operation is still partial. It now propagates style/remove
   style to direct unknown split siblings in the JS/Go shape, but the broader
   concurrent style matrices and range-narrowing edge cases are not yet ported.
-- Tree undo and redo are not ported. Reverse tree edit operations are still
-  built for insert/delete, pure split and merge edits, but the document
-  history drops them (see Undo and Redo), and a reverse that
-  does not fit the tree after a concurrent merge is dropped rather than
-  failing the edit, and the JS reverse machinery (restore spans, split
-  reconciliation, `mergeSourceOf`, `redoSplitLevel`, `dropDuplicateContents`
-  for copy-reinserted content) is not ported.
+- JS `registerNode` (two nodes under one ID: keep the live one over a
+  tombstone, else the last registered) is not ported. Rust keeps a set of
+  node IDs and finds a node by walking the tree, so a lookup takes the first
+  node the walk reaches. Only documents that already hold a duplicate ID (an
+  older client's copy-reinsert undo) can tell the two apart, and only on a
+  reload, where JS registration order changes.
+- The depth of each element a merge removed is read off the tree by ID
+  (`CrdtTree::depth_of`), since the result holds copies. A lookup that
+  finds nothing fails building the merge's reverse (the edit, if local),
+  where JS reads the depth off the node objects and cannot fail. No known
+  edit reaches it.
+- No known remote change fails building its reverse after the JS guards
+  were ported; the remote drop in `settle_reverse` is defensive, and its
+  test calls it directly.
+- `CrdtTree::edit` spins forever on a tree whose nodes share one
+  `created_at` at different offsets as distinct nodes (overlapping text
+  pieces). Honest changes never build one, but a hostile or broken change
+  decoded from the wire could, and hang the client. Older than Tree undo,
+  and JS likely does the same. A fix is a progress guard in that loop and
+  an overlap check at decode; it is a follow-up issue.
+- Capturing the subtrees a merge strands clones each node with its
+  subtree, which is quadratic in depth. Only the cycle guard of a forged
+  merge lineage takes that path.
+- `crdt/tree.rs` holds the restore and retombstone port in the same file
+  (about 6150 lines); it could move to a submodule, as could Text's.
 - Tree edits, styles, and position lookups reject an index inside a UTF-16
   surrogate pair (JS `findPos`), as Text does, with
   `YorkieError::InvalidArgument` (`validate_utf16_boundary`); the Text check
@@ -1053,9 +1151,11 @@ Gap:
   inside an invalid standalone UTF-16 surrogate edge would need the same
   deliberate representation choice as Text.
 - A split does not register the attribute tombstones its product copies
-  (JS `pushPendingGCPair` for `split.getGCPairs()`): the root keys GC pairs by
-  ID string, and the copy carries the same attribute IDs as the original. They
-  stay uncollected garbage; content is unaffected.
+  (JS `pushPendingGCPair` for `split.getGCPairs()`), nor does a restore those
+  of a node it recreates from a span (JS `recreatedAttrPairs`, `gcOnlySize`):
+  the root keys GC pairs by ID string, and the copy carries the same
+  attribute IDs as the original. They stay uncollected garbage; content is
+  unaffected.
 - TreeEdit content decoded from the wire keeps the split links and merge
   lineage it carries; JS drops them (`dropEngineOnlyLinks`). Content created
   by JS, Go, or Rust editors never carries them.
@@ -1082,15 +1182,21 @@ Gap:
   `toXML`, where Rust escapes `&`, `<`, and `>`; Rust XML attributes also do
   not escape `'` as JS does.
 - Rust `TreeNode::can_style` still refuses a removed node unless the style is
-  later than the removal, where JS styles removed nodes too. Removed nodes
-  report no change either way, so only an undo restore could tell them apart.
+  later than the removal. Since JS `e0609c7a` JS styles it whenever the change
+  knew the node (`ticketKnown`), for Text and Tree alike. Removed nodes report
+  no change either way, but a style concurrent with a removal leaves the
+  replicas with other attributes on the tombstone, which an undo that
+  restores it shows. Text has the same gap (see Text and RGATreeSplit).
 
 Expected direction:
 
 - Extend path/index conversion tests around removed nodes and mixed
   element/text children so edit/style operations can reuse the same position
   semantics.
-- Port Tree undo and redo, with the JS split and merge reverse operations.
+- Port JS `e0609c7a` (`canStyle` by `ticketKnown`) for Text and Tree
+  together, with its ledger fixes, and lift the ignore on the
+  `style_tombstone_test.ts:536` port.
+- Guard `CrdtTree::edit` against nodes sharing a `created_at` (see above).
 - Extend Tree style parity from direct split-sibling propagation toward the full
   version-vector and concurrent style matrices in JS/Go.
 
@@ -1176,10 +1282,10 @@ Current Rust behavior:
   `PresenceProxy::set_with_history` (JS `addToHistory: true`). A change with
   operation info clears the redo stack; a presence-only change does not.
 - Object set/remove, array add/remove/move/set, counter increase, text
-  edit/style, and presence are undoable. An undo or redo is a new local
-  change: it is queued for the server, publishes `LocalChange`, and replays
-  with `OpSource::UndoRedo` after a snapshot (JS `replaySourceOf`). An empty
-  stack makes `undo`/`redo` a no-op, as in JS.
+  edit/style, tree edit/style, and presence are undoable. An undo or redo is
+  a new local change: it is queued for the server, publishes `LocalChange`,
+  and replays with `OpSource::UndoRedo` after a snapshot (JS
+  `replaySourceOf`). An empty stack makes `undo`/`redo` a no-op, as in JS.
 - Text edits reverse by identity, as in JS
   (`operation/edit_operation.rs`). The reverse of an edit that removed or
   inserted anything is an identity edit: `restore_spans` name the removed
@@ -1208,6 +1314,42 @@ Current Rust behavior:
   the element's new creation time (JS `reconcileCreatedAt`). A remote or
   replayed text edit shifts the undo text edits of the same text (JS
   `reconcileTextEdit`/`reconcileOperation`).
+- Tree edits reverse by identity where their restore spans describe them,
+  and otherwise by a split, a boundary deletion, or a copy (see Tree). A
+  Tree style reverses to the previous values. The reverse of a style that
+  changed some keys and added others carries both maps, and an operation
+  with both runs as a style of its attributes alone, as in JS and Go: the
+  added keys stay after the undo.
+- A Tree undo edit that is not an identity edit keeps the visible indexes
+  of the edit it reverses (JS `fromIdx`/`toIdx`). They resolve to positions
+  just before it runs, in `Change::execute_undo_redo`
+  (`TreeEditOperation::resolve_undo_positions`, without the surrogate pair
+  check), and the change carries the resolved positions to other replicas.
+  JS resolves them inside `execute`.
+- A remote or replayed Tree edit shifts the undo Tree edits of the same
+  tree, once per range it changed, in order (JS `reconcileTreeEdit`): one
+  range for a positional edit, one per node an identity edit revived or
+  re-removed. Identity undo edits find their nodes by ID and are not
+  shifted. As in JS and Go, this runs only in `apply_changes` (remote
+  changes and replays), never after `update` or an undo or redo.
+- A split that re-creates an element a merge removed re-points the stacks
+  from the removed element to the new one (JS `reconcileTreeNodeID`, scoped
+  to one tree), on the local, remote, and undo/redo paths, before the
+  edit-range shifts and before the new reverse is pushed. Within one undo or
+  redo entry:
+  - a reverse that splits gets one fresh ticket per level from the undo's
+    change, after its own ticket, so its elements do not take the ticket of
+    the next operation;
+  - a copy-reinsert reverse takes fresh content IDs (JS
+    `reissueContentIDs`);
+  - the later operations of the entry are re-pointed at what each operation
+    minted as soon as it has run, and the stacks only once the change has
+    committed, for the split tickets the split really took (JS
+    `consumedSplitTickets`).
+
+  JS runs the undo change on a clone first and keeps its re-point handler
+  idempotent across the two runs. Rust stages one run on a copy of the root,
+  so each ticket is seen once and only the consumed-count check remains.
 - A snapshot clears both stacks, as in JS `applySnapshot`.
 - An undo or redo runs on a copy of the CRDT root, like a local update (see
   Change, ChangeContext, and ChangePack). One that fails leaves the document
@@ -1220,7 +1362,8 @@ JS/Go behavior:
 
 - JS undoes and redoes Tree edits and styles, with split reconciliation
   (`reconcileTreeNodeID`, `reconcileTreeEdit`, split tickets), and reverses
-  a Tree edit by identity with `TreeEdit` restore spans.
+  a Tree edit by identity with `TreeEdit` restore spans. JS keeps what each
+  run measured on the operation, which its `execute` mutates.
 - JS has a `maxUndoDepth` document option, `clearHistory`, and refuses
   undo/redo during an update and while minting is suspended (epoch
   re-anchor). Its change events carry `source: OpSource.UndoRedo`.
@@ -1230,20 +1373,28 @@ JS/Go behavior:
 
 Gap:
 
-- Tree undo and redo are not ported. Tree edits and styles push no reverse
-  operation, so an undo never replays a tree change, and a change that mixes
-  tree and other edits is undone only for the other edits.
-- **Interop: a Rust replica does not converge with a JS peer that undoes a
-  Tree edit.** JS sends the undo of a Tree edit with `restore_spans`,
-  `retombstone_spans`, and `restore_mode` on `TreeEdit` (`toOperation`
-  TreeEdit case in `packages/sdk/src/api/converter.ts`,
-  `document/operation/tree_edit_operation.ts`), and a JS receiver revives or
-  re-removes the nodes by identity. The Rust decoder
-  (`crates/yorkie-protocol/src/converter.rs`, the `TreeEdit` arm of the
-  operation decode) drops the three fields and runs only the positional
-  part, so the content a JS Tree undo brings back never reappears on the
-  Rust replica. Text undo has no such gap: Rust sends and applies the
-  identity fields of `Edit` as JS does.
+- What a Tree edit's run measured rides on the copy of the operation the
+  change records (`TreeEditExecution`), not on the operation itself, since
+  `execute` takes `&self`. Only the undo stacks read it.
+- Rust builds from before this port drop the `TreeEdit` restore fields and
+  run only the positional part, so they do not converge with a peer that
+  undoes a Tree edit by identity. They also read a `TreeStyle` carrying
+  both maps as a remove-style only, so a Tree style undo that changed some
+  keys and added others runs another operation there.
+- A JS defect, pinned for parity: when a peer types into a `<p>` this
+  replica deleted, the text lands under the removed `<p>` and takes no room,
+  but its size counts as inserted (JS `insertedContentSize`), so this
+  replica's pending split undo shifts past it. Both SDKs then converge on a
+  corrupted tree (`<p>ab</p><p>cd</p>f` for `<p>cdef</p>`). The test
+  `shifts_a_split_undo_past_text_typed_under_a_removed_parent_as_js_does`
+  (`document/tree_restore_tests.rs`) pins the JS result; it is a candidate
+  for an upstream issue, and flips if JS changes.
+- Cases JS and Go skip are ignored here with the same reason:
+  `history_tree_concurrent_test.ts` "KNOWN: delete a whole <p> vs edit text
+  inside it, both undo" and "KNOWN: delete two <p> vs edit inside first,
+  both undo (segmentation)" (the visible XML agrees, the text segmentation
+  after GC does not), and `history_tree_split_test.ts` "should undo chain:
+  split-l2 → split-l2" (TODO #1235).
 - The positional part of an identity edit is not a harmless no-op for a
   peer that ignores the restore fields. It is the normalized `from` position
   (the head with a relative offset, as JS `toReverseOperation` writes it),
@@ -1255,8 +1406,9 @@ Gap:
   observation.
 - The minting-suspended refusal is not ported; it comes with epoch
   re-anchor (see Out-of-Scope Items).
-- JS `ErrRefused` for undo/redo during an update has no Rust counterpart and
-  cannot be reached: `Document::update` borrows the document mutably for the
+- JS `ErrRefused` for undo/redo during an update cannot be reached in Rust
+  (`YorkieError::Refused` exists, for a content reissue asked of a splitting
+  Tree edit): `Document::update` borrows the document mutably for the
   closure, so the closure cannot call `history()` or `history_mut()`. Locking
   the same `SharedDocument` inside the closure deadlocks, as any re-entrant
   `std::sync::Mutex` lock does.
@@ -1281,8 +1433,7 @@ Gap:
 
 Expected direction:
 
-- Port Tree undo and redo with the JS split and merge reverse machinery,
-  and the `TreeEdit` restore spans on both sides of the wire.
+- Raise the split-undo shift under a removed parent upstream (see above).
 
 ## Serialization and Protocol Conversion
 
@@ -1346,10 +1497,25 @@ Current Rust behavior:
   is dropped, never an error. A position resolved through a link to a
   higher offset fails with `InvalidTextPosition` instead of underflowing.
   The re-issue's Text value round trip and every snapshot rely on this.
-- `TreeEdit` restore fields, and `restore_mode` on `Set`, `Add`, and
-  `ArraySet`, are ignored on decode and unset on encode. For `Set`, `Add`,
-  and `ArraySet` this matches the JS converter; for `TreeEdit` it is the
-  Tree undo gap (see Undo and Redo).
+- A `TreeEdit` carries `restore_spans` (field 8), `restore_mode` (9), and
+  `retombstone_spans` (10) both ways (`WireOperation::TreeEdit`,
+  `WireTreeRestoreSpan`, proto `TreeRestoreSpan` fields 1-9), as JS
+  `toOperation`/`fromOperation` do. Both lists and the mode are written only
+  when a list is non-empty, in the order `edit` captured the spans (parent
+  before child). On decode the lists are read only when one is non-empty,
+  and then the mode is `Retombstone` if the sender wrote it and `Restore`
+  otherwise, the proto default included. A span's `value` is read only for
+  a text span, an empty attribute map means none, and an empty `value` or
+  an absent anchor is not written. A span whose `id` or any present anchor
+  lacks `created_at`, or whose attribute lacks `updated_at`, fails the
+  operation with `InvalidArgument` (JS `ErrInvalidArgument`); a negative
+  `length` fails with `InvalidOffset`, as every negative offset in this
+  decoder does. Nothing else is checked: a kind that disagrees with
+  `node_type` decodes, and restore skips the span.
+- A `TreeStyle` decodes with both its maps (`TreeStyleOperation::new`), as
+  JS and Go do. It used to keep only the removals when both were present.
+- `restore_mode` on `Set`, `Add`, and `ArraySet` is ignored on decode and
+  unset on encode, as in the JS converter.
 - Cross-language bytes for Text undo
   (`crates/yorkie-protocol/tests/text_undo_interop.rs`): JS `84068f70`
   wrote a change pack holding a deletion's undo (`Restore`) and redo
@@ -1364,6 +1530,17 @@ Current Rust behavior:
   (`builds_the_root_of_the_js_ledger_snapshot_fixture`). The generators are
   `tools/interop/text_undo_fixtures_test.ts` and `.go`; the fixture README
   has the commands.
+- Cross-language bytes for Tree undo
+  (`crates/yorkie-protocol/tests/tree_undo_interop.rs`): JS `8629993e`
+  wrote a change pack holding a Tree deletion with its undo (`Restore`) and
+  redo (`Retombstone`), then a replace of a styled paragraph, whose undo and
+  redo carry both span lists; and a pack holding a merge, its undo (a split
+  with `split_tickets`), and its redo. Rust decodes each pack and encodes
+  every change back to the bytes JS wrote, checks the spans it read, applies
+  the pack change by change, reading the XML JS read after each, and,
+  making the same edits, writes the same changes. A Set's `moved_at` is
+  cleared on both sides first (see Gap). The generator is
+  `tools/interop/tree_undo_fixtures_test.ts`; there are no Go copies.
 
 JS/Go behavior:
 
@@ -1386,6 +1563,11 @@ JS/Go behavior:
     when a Text node's insertion link names no node it has decoded
     ("insPrevNode should be presence"); JS `fromText` drops the link and
     keeps the node, and so does Rust.
+  - Go `fromTreeRestoreSpans` (`api/converter/from_pb.go`) also rejects a
+    text span whose `length` is not the UTF-16 length of its `value`, and a
+    `TreeEdit` with spans but no mode or a mode but no spans. JS and Rust
+    accept all three. Rust rejects a negative `length`, which `usize` cannot
+    hold, as Go does; JS accepts it.
 
 Gap:
 
@@ -1402,9 +1584,18 @@ Gap:
   decodes `Snapshot.root` into a core snapshot root for
   `Document::apply_change_pack`. Snapshot presences replace the document's
   presences.
-- Cross-language binary tests cover Text undo only (see above). Other
-  payloads are checked against JS/Go in-repo converter scenarios, not
+- Cross-language binary tests cover Text and Tree undo only (see above).
+  Other payloads are checked against JS/Go in-repo converter scenarios, not
   against bytes JS or Go wrote.
+- A `Set` of a container value (Object, Array, Tree) is not byte-identical
+  with JS. JS writes the value's `moved_at` only inside the nested
+  `JSONElement` bytes of `JSONElementSimple.value`. Rust also writes it on
+  the `JSONElementSimple` when it re-encodes a decoded value, and writes it
+  nowhere for a Set of its own (the value is copied before it runs). What a
+  replica builds is the same. Older than Tree undo; the Tree undo interop
+  test clears a Set's `moved_at` in both places on both sides before it
+  compares bytes, which would also hide such a difference on a Set that
+  holds no Tree.
 - JS logs a warning (`logger.warn`) when it drops a malformed ledger. Rust
   drops it silently: `yorkie-core` has no logging facade and takes no
   dependency for one.
@@ -1427,11 +1618,13 @@ Gap:
 - The public `wire` projection grew for the ledger: `WireTextNode` gained
   `removal_events`, `WireOperation::Edit` gained `restore_spans`,
   `restore_mode`, and `retombstone_spans`, and `WireRestoreSpan` and
-  `WireRestoreMode` are new. Code that builds `WireTextNode` or
-  `WireOperation::Edit` with a struct literal, or destructures either
-  without `..`, no longer compiles: a semver-breaking change for users of
-  `yorkie_core::wire`. None of these is `#[non_exhaustive]`, so a later
-  field or variant would break the same way.
+  `WireRestoreMode` are new. For Tree undo, `WireOperation::TreeEdit` gained
+  the same three fields and `WireTreeRestoreSpan` is new. Code that builds
+  `WireTextNode`, `WireOperation::Edit`, or `WireOperation::TreeEdit` with a
+  struct literal, or destructures one without `..`, no longer compiles: a
+  semver-breaking change for users of `yorkie_core::wire`. None of these is
+  `#[non_exhaustive]`, so a later field or variant would break the same
+  way.
 - JS and Go both have direct converter tests for root/object bytes and tree
   bytes. Go also has direct array bytes, change-pack, presence, and snapshot
   converter tests. Rust currently covers object/array simple payload bytes,
@@ -1445,7 +1638,9 @@ Gap:
 Expected direction:
 
 - Continue porting JS/Go in-repo converter scenarios before adding external
-  binary fixtures for payloads other than Text undo.
+  binary fixtures for payloads other than Text and Tree undo.
+- Write a container value's `moved_at` where JS does (see above), then drop
+  the clearing from the Tree undo interop test.
 - Add snapshot GC/presence behavior once sync and presence are pulled into the
   document lifecycle.
 - Use JS converter files and Yorkie proto definitions as the main reference,
@@ -1761,6 +1956,9 @@ Gap:
   this SDK does not know; JS keeps the raw string.
 - JS `ChangeApplyError` (`ErrChangeApplyFailed` with change and operation
   details) has no Rust counterpart.
+- `YorkieError::Refused` (`ErrRefused`) was added for Tree undo, a public
+  variant of the `#[non_exhaustive]` enum. Only a content reissue asked of
+  a splitting Tree edit returns it, which honest undo entries never ask.
 
 Expected direction:
 
@@ -1810,6 +2008,16 @@ Gap:
   against drift only by the replica's JSON and version vector.
 - The Text undo fuzz port reads `TEXT_UNDO_FUZZ_SEEDS` as a number and falls
   back to 10 seeds on anything else; JS runs no seed then.
+- Some Tree undo paths have no test of their own: the skip in
+  `merge_source_of` of children stamped for the element the split product
+  itself split off (its own `merged_from`), and the check
+  that a re-issued content pair re-points the stacks only if its operation
+  ran. The remote drop of a reverse error is tested on `settle_reverse`
+  directly, since no remote change is known to reach it. Two tests with no
+  JS counterpart
+  (`moves_a_peer_split_undo_past_every_range_of_a_remote_restore`,
+  `shifts_a_split_undo_past_text_typed_under_a_removed_parent_as_js_does`)
+  pin trees measured on JS `8629993e` with a script that is not committed.
 - The live-server integration suites run only when `YORKIE_TEST_RPC_ADDR`
   is set: in CI that is the integration job (`cargo test -p yorkie`), not
   the default `cargo test --workspace` step, where each case returns early

@@ -71,3 +71,13 @@ pub fn collect_ops(doc: &SharedDocument) -> Arc<Mutex<Vec<OperationInfo>>> {
     });
     ops
 }
+
+/// `<p>` holding the text `value`.
+pub fn p(value: &str) -> TreeNodeInput {
+    element("p", vec![text(value)])
+}
+
+/// `<doc>` holding `children`.
+pub fn doc_of(children: Vec<TreeNodeInput>) -> TreeNodeInput {
+    element("doc", children)
+}

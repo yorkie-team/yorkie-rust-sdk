@@ -717,14 +717,16 @@ fn keeps_the_split_links_of_a_text_restored_by_undo() -> Result<()> {
 }
 
 /// JS `keeps tree splits, undo/redo, tree style and array set`; Go `tree
-/// splits, undo/redo, tree style and array set survive`. Rust Tree edits
-/// push no undo entry (Tree undo is not ported), so the undo and redo of
-/// the split are left out.
+/// splits, undo/redo, tree style and array set survive`. The undo of the
+/// split is a boundary deletion and its redo a split under tickets the redo
+/// issued, which the re-issue moves to the new actor with the rest.
 #[test]
-fn keeps_tree_splits_tree_style_and_array_set() -> Result<()> {
+fn keeps_tree_splits_undo_redo_tree_style_and_array_set() -> Result<()> {
     let mut doc = Document::new("d");
     doc.update(|root| root.set_tree("tree", tree_of("abcd")).map(|_| ()))?;
     doc.update(|root| root.get_tree_mut("tree")?.edit(3, 3, Vec::new(), 1))?;
+    doc.history_mut().undo()?;
+    doc.history_mut().redo()?;
     doc.update(|root| {
         root.get_tree_mut("tree")?.style(0, 1, attrs("a", "b"))?;
         let mut arr = JsonArray::new();

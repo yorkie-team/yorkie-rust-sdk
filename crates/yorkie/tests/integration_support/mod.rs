@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 pub mod events;
+pub mod history;
 pub mod stub_transport;
 pub mod tree;
 pub mod two_clients;

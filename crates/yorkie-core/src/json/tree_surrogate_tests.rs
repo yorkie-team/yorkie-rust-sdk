@@ -11,16 +11,17 @@
 //! Not ported:
 //! - "Reject lone-surrogate content": a Rust `&str` cannot hold a lone half.
 //! - The Text cases: `json/text.rs` ports them.
-//! - "applies a remote mid-pair operation from an older client", "undoes and
-//!   redoes around an intact pair", "runs a reconciled undo whose index lands
-//!   inside a pair" and the undo/redo half of "discards earlier edits of the
-//!   rejected update": Tree undo/redo is not ported.
 //! - "styles a single path whose derived end lands inside a pair" lives in
 //!   `tree_style_path_tests.rs`; "builds reverse operations at indexes inside
-//!   a pair" in `operation/tree_edit_operation.rs`.
+//!   a pair" and "runs a reconciled undo whose index lands inside a pair" in
+//!   `operation/tree_edit_operation.rs`.
+//!
+//! Where a pair is cut in half, Rust keeps U+FFFD for each lone half where JS
+//! keeps the raw code unit (yorkie#2065), so those cases check only that the
+//! emoji is gone.
 
 use crate::change::{ChangePack, Checkpoint};
-use crate::wire::WireChangePack;
+use crate::wire::{WireChangePack, WireOperation};
 use crate::{Document, JsonTree, JsonValue, Result, TreeNodeInput, VersionVector, YorkieError};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -198,8 +199,7 @@ fn resolves_tree_indexes_after_a_split() -> Result<()> {
     Ok(())
 }
 
-/// JS "discards earlier edits of the rejected update", Tree case, without
-/// the undo/redo that follows it in JS (Tree undo is not ported).
+/// JS "discards earlier edits of the rejected update", Tree case.
 #[test]
 fn discards_earlier_edits_of_the_rejected_update() -> Result<()> {
     let mut doc = new_surrogate_doc()?;
@@ -212,7 +212,80 @@ fn discards_earlier_edits_of_the_rejected_update() -> Result<()> {
     assert_eq!(original, xml(&doc));
 
     update_tree(&mut doc, |t| t.edit(4, 4, vec![text("z")], 0))?;
-    assert_eq!("<r><p>😀xz</p></r>", xml(&doc));
+    let edited = "<r><p>😀xz</p></r>";
+    assert_eq!(edited, xml(&doc));
+
+    doc.history_mut().undo()?;
+    assert_eq!(original, xml(&doc));
+    doc.history_mut().redo()?;
+    assert_eq!(edited, xml(&doc));
+    Ok(())
+}
+
+/// JS "applies a remote mid-pair operation from an older client", Tree
+/// case: a remote operation carries CRDT positions and never resolves an
+/// index, so one an older client wrote with a mid-pair offset still
+/// applies, and the receiver's own undo and redo still work after it.
+#[test]
+fn applies_a_remote_mid_pair_operation_from_an_older_client() -> Result<()> {
+    let mut sender = new_surrogate_doc()?;
+    let mut receiver = new_actor("000000000000000000000002");
+    let initial = grab(&mut sender)?;
+    feed(&mut receiver, &initial)?;
+
+    // The receiver makes a local edit it will later undo and redo.
+    update_tree(&mut receiver, |t| t.edit(4, 4, vec![text("z")], 0))?;
+
+    // The sender inserts right after the emoji, a valid index, and the
+    // operation is then moved one code unit to the left, into the middle of
+    // the pair: what an older client would have sent.
+    update_tree(&mut sender, |t| t.edit(3, 3, vec![text("y")], 0))?;
+    let mut wire = WireChangePack::try_from(&grab(&mut sender)?)?;
+    let operations = &mut wire.changes.last_mut().expect("the insert").operations;
+    assert_eq!(1, operations.len());
+    match &mut operations[0] {
+        WireOperation::TreeEdit { from, to, .. } => {
+            from.left_sibling_id.offset -= 1;
+            to.left_sibling_id.offset -= 1;
+        }
+        other => panic!("unexpected operation {other:?}"),
+    }
+    feed(&mut receiver, &ChangePack::try_from(wire)?)?;
+
+    // The edit landed inside the pair, so the emoji no longer survives.
+    let applied = xml(&receiver);
+    assert!(!applied.contains('😀'), "the remote edit split the pair");
+
+    receiver.history_mut().undo()?;
+    assert_eq!(applied.replace('z', ""), xml(&receiver));
+    receiver.history_mut().redo()?;
+    assert_eq!(applied, xml(&receiver));
+    Ok(())
+}
+
+/// JS "undoes and redoes around an intact pair", the Tree half of each
+/// case.
+#[test]
+fn undoes_and_redoes_around_an_intact_pair() -> Result<()> {
+    type Case = (&'static str, fn(&mut JsonTree) -> Result<()>);
+    let cases: [Case; 3] = [
+        ("insert after the pair", |t| {
+            t.edit(3, 3, vec![text("y")], 0)
+        }),
+        ("delete the pair", |t| t.edit(1, 3, Vec::new(), 0)),
+        ("replace the pair", |t| t.edit(1, 3, vec![text("y")], 0)),
+    ];
+    for (name, f) in cases {
+        let mut doc = new_surrogate_doc()?;
+        let original = xml(&doc);
+        update_tree(&mut doc, f)?;
+        let edited = xml(&doc);
+
+        doc.history_mut().undo()?;
+        assert_eq!(original, xml(&doc), "{name}");
+        doc.history_mut().redo()?;
+        assert_eq!(edited, xml(&doc), "{name}");
+    }
     Ok(())
 }
 

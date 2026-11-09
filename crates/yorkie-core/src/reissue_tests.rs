@@ -335,6 +335,86 @@ fn reissues_the_tickets_of_spans_split_tickets_and_removal_events() -> Result<()
     Ok(())
 }
 
+/// No JS case: JS reaches these fields by reflection. The undo of a Tree
+/// replace is an identity edit carrying both span lists, and its redo the
+/// same lists the other way; every ticket of their spans (the span IDs, the
+/// parent and sibling anchors, and the `updated_at` of the attribute
+/// snapshot) comes back re-issued.
+#[test]
+fn reissues_the_tickets_of_tree_restore_spans() -> Result<()> {
+    let mut doc = Document::new("d");
+    let styled = TreeNodeInput::element_with_attributes(
+        "p",
+        BTreeMap::from([("a".to_owned(), "1".into())]),
+        vec![TreeNodeInput::text("cd")],
+    );
+    doc.update(|root| {
+        root.set_tree(
+            "tree",
+            TreeNodeInput::element(
+                "doc",
+                vec![
+                    TreeNodeInput::element("p", vec![TreeNodeInput::text("ab")]),
+                    styled,
+                    TreeNodeInput::element("p", vec![TreeNodeInput::text("ef")]),
+                ],
+            ),
+        )
+        .map(|_| ())
+    })?;
+    // Replace the styled middle paragraph, which has a sibling either side.
+    doc.update(|root| {
+        root.get_tree_mut("tree")?.edit(
+            4,
+            8,
+            vec![TreeNodeInput::element("p", vec![TreeNodeInput::text("X")])],
+            0,
+        )
+    })?;
+    doc.history_mut().undo()?;
+    doc.history_mut().redo()?;
+
+    let ops = ops_of(&doc);
+    let reissued = reissue_operations(&ops, &initial(), &actor_a())?;
+    assert_reissued(&wire_tickets(&ops)?, &wire_tickets(&reissued)?);
+
+    let mut identity_edits = 0;
+    let mut anchors = 0;
+    let mut attributes = 0;
+    for op in &reissued {
+        let WireOperation::TreeEdit {
+            restore_spans,
+            retombstone_spans,
+            ..
+        } = WireOperation::try_from(op)?
+        else {
+            continue;
+        };
+        if restore_spans.is_empty() || retombstone_spans.is_empty() {
+            continue;
+        }
+        identity_edits += 1;
+        for span in restore_spans.iter().chain(&retombstone_spans) {
+            let tickets = tickets_in(&format!("{span:?}"));
+            assert!(
+                tickets
+                    .iter()
+                    .all(|(actor, lamport)| *lamport == 0 || actor == ACTOR_A),
+                "{span:?}"
+            );
+            anchors += [&span.left_sibling_id, &span.right_sibling_id]
+                .into_iter()
+                .flatten()
+                .count();
+            attributes += span.attributes.len();
+        }
+    }
+    assert_eq!(2, identity_edits, "the undo and the redo of the replace");
+    assert!(anchors > 0, "a span with sibling anchors");
+    assert!(attributes > 0, "a span with an attribute snapshot");
+    Ok(())
+}
+
 /// No JS case: a Tree node's merge tickets come only from a concurrent merge
 /// applied remotely, which a never-synced document cannot hold, so the walk
 /// is checked on a node built by hand. A ticket of a third actor, next to

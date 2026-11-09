@@ -20,7 +20,7 @@ pub(crate) enum RestoreMode {
 }
 
 impl RestoreMode {
-    fn flipped(self) -> Self {
+    pub(crate) fn flipped(self) -> Self {
         match self {
             Self::Restore => Self::Retombstone,
             Self::Retombstone => Self::Restore,
@@ -136,6 +136,7 @@ impl EditOperation {
                 op_infos: Vec::new(),
                 reverse_op: (source != OpSource::Remote)
                     .then(|| Operation::Edit(self.empty_reverse())),
+                tree_edit: None,
             }));
         }
 
@@ -196,6 +197,7 @@ impl EditOperation {
                 result.removed_spans,
                 executed_at,
             )),
+            tree_edit: None,
         }))
     }
 
@@ -302,6 +304,7 @@ impl EditOperation {
                 mode.flipped(),
                 retombstone_spans,
             ))),
+            tree_edit: None,
         })
     }
 

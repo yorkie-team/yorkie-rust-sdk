@@ -126,6 +126,97 @@ impl TreePos {
             TreeNodeId::from_struct(&value.left_sibling_id)?,
         ))
     }
+
+    /// Returns this position with `prev` replaced by `curr` wherever it
+    /// names the parent or the left sibling (JS `CRDTTreePos.replaceNodeID`).
+    pub(crate) fn replace_node_id(&self, prev: &TreeNodeId, curr: &TreeNodeId) -> Self {
+        Self::new(
+            replace_tree_node_id(&self.parent_id, prev, curr),
+            replace_tree_node_id(&self.left_sibling_id, prev, curr),
+        )
+    }
+}
+
+/// Returns `id` re-pointed from the node `prev` names to the node `curr`
+/// names, or `id` itself when it names a different node (JS
+/// `replaceTreeNodeID`).
+///
+/// The match is on the creation ticket alone, and the offset is kept from
+/// `id`: the ticket names the node, while the offset says where in it the
+/// reference lands (the child index when a position names an element as its
+/// left sibling, the character offset inside a text node). Comparing the
+/// offset too would miss every reference that is not to the node's head.
+pub(crate) fn replace_tree_node_id(
+    id: &TreeNodeId,
+    prev: &TreeNodeId,
+    curr: &TreeNodeId,
+) -> TreeNodeId {
+    if !id.has_same_created_at(prev) {
+        return id.clone();
+    }
+    TreeNodeId::new(curr.created_at().clone(), id.offset())
+}
+
+/// A node an edit took from visible to removed, or inserted, for undo and
+/// redo by node identity (JS `TreeRestoreSpan`).
+///
+/// A text span is the UTF-16 interval `[id.offset, id.offset + length)` of
+/// the original insertion, which splits do not change; an element span is
+/// the whole node, with `length` 0. `value` and `attrs` are copies, so a node
+/// GC purged can be recreated. The anchors are the boundaries of the run
+/// captured when the node was removed or inserted: `left_sibling_id` is the
+/// last character of the left sibling (see `left_anchor_id`), `None` for a
+/// first child, and `right_sibling_id` the head of the right sibling, `None`
+/// for a last child. A run's spans travel together, so restore needs only
+/// one surviving anchor to place it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TreeRestoreSpan {
+    pub(crate) id: TreeNodeId,
+    pub(crate) node_type: String,
+    pub(crate) is_text: bool,
+    pub(crate) length: usize,
+    pub(crate) value: Option<String>,
+    pub(crate) attrs: Option<Rht>,
+    pub(crate) parent_id: Option<TreeNodeId>,
+    pub(crate) left_sibling_id: Option<TreeNodeId>,
+    pub(crate) right_sibling_id: Option<TreeNodeId>,
+}
+
+impl TreeRestoreSpan {
+    /// Builds the span of the child at `index` of `parent`, or of `node`
+    /// itself when it has no parent, from the tree as it stands (JS
+    /// `CRDTTree.edit` span capture).
+    fn capture(node: &TreeNode, parent: Option<&TreeNode>, index: usize) -> Self {
+        let sibling = |at: Option<usize>| {
+            parent
+                .zip(at)
+                .and_then(|(parent, at)| parent.children.get(at))
+        };
+        Self {
+            id: node.id().clone(),
+            node_type: node.node_type().to_owned(),
+            is_text: node.is_text(),
+            length: if node.is_text() {
+                utf16_len(node.value())
+            } else {
+                0
+            },
+            value: node.is_text().then(|| node.value().to_owned()),
+            attrs: node.attrs().cloned(),
+            parent_id: parent.map(|parent| parent.id().clone()),
+            left_sibling_id: sibling(index.checked_sub(1)).map(left_anchor_id),
+            right_sibling_id: sibling(Some(index + 1)).map(|right| right.id().clone()),
+        }
+    }
+
+    /// Reports whether `is_text` matches `node_type`, as it always does on
+    /// a span an honest replica captured (JS `restoreSpanKindAgrees`, Go
+    /// `TreeRestoreSpan.kindAgrees`). Decoding cannot reject a span that
+    /// disagrees, since stored changes must stay loadable, so restore and
+    /// retombstone skip it, alike on every replica.
+    pub(crate) fn kind_agrees(&self) -> bool {
+        self.is_text == (self.node_type == DEFAULT_TEXT_TYPE)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -385,8 +476,18 @@ impl TreeNode {
 
         let child_start = child.id().offset();
         let child_end = child_start + child.len();
-        if absolute_offset <= child_start || absolute_offset >= child_end {
+        if absolute_offset <= child_start || absolute_offset == child_end {
             return Ok(DataSize::default());
+        }
+        // A position anchored past the end of the node cannot be resolved
+        // here. Treating it as a split at the end would put the edit at the
+        // wrong position (JS `IndexTreeNode.splitText`).
+        if absolute_offset > child_end {
+            return Err(YorkieError::InvalidArgument(format!(
+                "split at {} of {}: offset out of range",
+                absolute_offset - child_start,
+                child_end - child_start
+            )));
         }
 
         let relative_offset = absolute_offset - child_start;
@@ -439,6 +540,42 @@ impl TreeNode {
             self.removed_at = Some(removed_at);
         }
         false
+    }
+
+    /// Takes this node back from removed to live, for an undo that restores
+    /// it by identity (JS `CRDTTreeNode.unremove`). A merge source's pointer
+    /// to its target goes too: a live node holding one is a pointer a
+    /// replica loading a snapshot would not rebuild.
+    pub(crate) fn unremove(&mut self) {
+        if self.removed_at.is_none() {
+            return;
+        }
+        self.removed_at = None;
+        self.merged_into = None;
+    }
+
+    /// Gives this node a new identity, for a copy that must not share the
+    /// identity of the node it was copied from (JS `reissueContentIDs`).
+    pub(crate) fn set_id(&mut self, id: TreeNodeId) {
+        self.id = id;
+    }
+
+    /// Drops every descendant `keep` rejects, with its subtree (JS
+    /// `filterChildren`).
+    pub(crate) fn retain_descendants(&mut self, keep: &dyn Fn(&TreeNode) -> bool) {
+        self.children.retain(|child| keep(child));
+        for child in &mut self.children {
+            child.retain_descendants(keep);
+        }
+    }
+
+    /// Calls `visit` on every node of this subtree, children before their
+    /// parent (JS `traverseAll`).
+    pub(crate) fn for_each_post_order_mut(&mut self, visit: &mut dyn FnMut(&mut TreeNode)) {
+        for child in &mut self.children {
+            child.for_each_post_order_mut(visit);
+        }
+        visit(self);
     }
 
     pub(crate) fn clear_removed_recursively(&mut self) {
@@ -707,6 +844,10 @@ pub(crate) struct TreeStyleChange {
     pub(crate) attributes_to_remove: Vec<String>,
 }
 
+/// What `CrdtTree::split_levels` reports: the index and path where the first
+/// level opened, and the `(removed element, its replacement)` pairs.
+type SplitLevels = (Option<(usize, Vec<usize>)>, Vec<(TreeNodeId, TreeNodeId)>);
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TreeEditChange {
     pub(crate) from: usize,
@@ -716,16 +857,107 @@ pub(crate) struct TreeEditChange {
     pub(crate) value: Option<Vec<TreeNodeInput>>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct TreeEditResult {
     pub(crate) changes: Vec<TreeEditChange>,
     pub(crate) gc_pairs: Vec<(String, DataSize, TimeTicket)>,
     pub(crate) diff: DataSize,
+    /// The nodes the edit took from visible to removed, each cloned when it
+    /// was removed, in traversal order.
     pub(crate) removed_nodes: Vec<TreeNode>,
     pub(crate) merge_level: usize,
+    /// The visible index of the start of the range before the edit, taken
+    /// after the boundary texts split and before anything was removed (JS
+    /// `preEditFromIdx`).
     pub(crate) from_idx: usize,
     pub(crate) to_idx: usize,
+    /// The size of the content the edit inserted, without the content it
+    /// dropped for reusing an ID (JS `insertedContentSize`). As in JS
+    /// (`CRDTTree.edit` step 05), it is measured before the insert, so
+    /// content born removed under a removed parent still counts: the
+    /// reverse's `maxNeededIdx` guard relies on that to see the edit had no
+    /// visible effect.
     pub(crate) inserted_size: usize,
+    /// The ID strings of the nodes in the range that were already removed
+    /// before the edit (JS `preTombstoned`), which a reverse must not revive.
+    pub(crate) pre_tombstoned: BTreeSet<String>,
+    /// The spans of the nodes the edit removed, parents before children.
+    /// Empty unless the spans describe the edit whole (see `edit`).
+    pub(crate) removed_spans: Vec<TreeRestoreSpan>,
+    /// The spans of the nodes the edit inserted, parents before children.
+    /// Empty unless the spans describe the edit whole (see `edit`).
+    pub(crate) inserted_spans: Vec<TreeRestoreSpan>,
+    /// The visible size the split opened: two tokens per level that split,
+    /// none for a level born removed or one the tree had no room for.
+    pub(crate) split_size: usize,
+    /// The merge-boundary elements, the ones whose children the edit moved
+    /// into the merge target, cloned after the edit (JS `toBeMergedNodes`).
+    pub(crate) merged_nodes: Vec<TreeNode>,
+    /// The subtrees the merge's cycle guard tombstoned in place, in
+    /// post-order, each cloned when it was removed (JS `stranded`). They are
+    /// not in `removed_nodes`, yet the range the edit consumed holds them.
+    pub(crate) stranded_nodes: Vec<TreeNode>,
+    /// The `(removed element, its replacement)` pairs the split produced:
+    /// the elements a merge took away that the split re-created under new
+    /// IDs, innermost first (JS `splitRecreatedIDs`, see `merge_source_of`).
+    /// Reported so a replica applying the split, its own or a peer's, can
+    /// re-point what it recorded against the removed element.
+    pub(crate) split_recreated_ids: Vec<(TreeNodeId, TreeNodeId)>,
+    /// Every node the range marked for removal, in traversal order, nodes
+    /// already removed and the split siblings a delete reaches included (JS
+    /// `nodesToBeRemoved`, which `TreeEditOperation` reads as
+    /// `removedNodes`). Unlike `removed_nodes`, these are IDs into the tree
+    /// as the edit left it.
+    pub(crate) removal_targets: Vec<TreeNodeId>,
+}
+
+/// A content change an identity restore or retombstone made, with the
+/// visible size it inserted, zero for a deletion (JS `TreeVisibleEdit`). An
+/// insertion reports a collapsed range, so the size is not readable from the
+/// change, and undo-stack reconciliation needs it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TreeVisibleEdit {
+    pub(crate) change: TreeEditChange,
+    pub(crate) inserted_size: usize,
+}
+
+/// A node a restore took back to live or recreated, with its size once the
+/// restore finished (JS reads the node after `restore` returns).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TreeRestoredNode {
+    pub(crate) id: TreeNodeId,
+    pub(crate) size: DataSize,
+}
+
+/// The result of `CrdtTree::restore` (JS `restore`'s tuple).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct TreeRestoreResult {
+    /// Nodes revived in place. The caller unregisters their GC pairs.
+    pub(crate) untombstoned: Vec<TreeRestoredNode>,
+    /// Nodes rebuilt for purged spans. The caller adds their size to live.
+    pub(crate) recreated: Vec<TreeRestoredNode>,
+    /// Pending GC pairs: pieces split off removed nodes, born removed, and
+    /// nodes recreated under a removed parent. The caller registers them
+    /// before it unregisters `untombstoned`: a revived piece may be one of
+    /// them.
+    pub(crate) gc_pairs: Vec<(String, DataSize, TimeTicket)>,
+    /// The size the splits of live pieces added. The caller adds it to live.
+    pub(crate) diff: DataSize,
+    /// One insertion per node that became visible, in the order it did,
+    /// each measured right after its node came back.
+    pub(crate) changes: Vec<TreeVisibleEdit>,
+}
+
+/// The result of `CrdtTree::retombstone` (JS `retombstone`'s tuple).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct TreeRetombstoneResult {
+    /// The GC pairs of the nodes this call took from live to removed.
+    pub(crate) gc_pairs: Vec<(String, DataSize, TimeTicket)>,
+    /// The size the splits of live pieces added.
+    pub(crate) diff: DataSize,
+    /// One deletion per visible node it removed, each measured right before
+    /// the removal.
+    pub(crate) changes: Vec<TreeVisibleEdit>,
 }
 
 type TreeStyleResult = (
@@ -1402,39 +1634,58 @@ impl CrdtTree {
         let mut changes = self.make_deletion_changes(&targets.removal_tokens)?;
         let merge_level = targets.merged.len();
 
-        // 02. Delete the nodes marked as removed.
+        // 02. Delete the nodes marked as removed. Each node this edit takes
+        // from visible to removed gets a restore span, so an undo can revive
+        // it by identity; `remove` returning true is exactly that, which
+        // leaves out nodes already removed and LWW overwrites. The traversal
+        // order puts parents before children, which restoring a purged
+        // subtree relies on.
+        let mut removed_spans = Vec::new();
         for id in &targets.removed {
-            let node = self.node_mut(id)?;
+            let path = self.path_of(id)?;
+            let node = node_at_path_mut(&mut self.root, &path)?;
             if node.remove(edited_at.clone()) {
                 gc_pairs.push((node.id_string(), node.data_size(), edited_at.clone()));
                 removed_nodes.push(node.clone());
+                removed_spans.push(self.capture_restore_span(&path)?);
             }
         }
+        // The pairs of the plain deletes. Anything after them that produces
+        // garbage, other than the content's own, means the spans do not
+        // describe the edit whole.
+        let delete_pair_count = gc_pairs.len();
 
         // 03. Merge: move the children of the merged elements to the merge
         // target, and 03-1, delete what earlier merges moved out of the
         // elements this edit deleted whole.
         let dest = self.resolve_merge_target(&from_parent)?;
-        for (id, size) in self.move_merged_children(&targets.moved, &dest, &edited_at)? {
-            gc_pairs.push((id, size, edited_at.clone()));
+        let stranded_nodes = self.move_merged_children(&targets.moved, &dest, &edited_at)?;
+        for node in &stranded_nodes {
+            gc_pairs.push((node.id_string(), node.data_size(), edited_at.clone()));
         }
         for (id, size) in self.propagate_merge_deletes(&targets, &dest, &range, &edited_at)? {
             gc_pairs.push((id, size, edited_at.clone()));
         }
 
-        // 04. Split the elements for the split level.
+        // 04. Split the elements for the split level. The boundaries it opens
+        // grow the visible index, which neither the content nor the removed
+        // range reports, so the growth is measured off the tree: a level born
+        // removed, or one the tree has no ancestor for, opens nothing.
+        let size_before_split = if split_level > 0 { self.root.len() } else { 0 };
+        let mut split_recreated_ids = Vec::new();
         if split_level > 0 {
-            let (split_idx, split_path) = self
-                .split_levels(
-                    &from_parent,
-                    &from_left,
-                    split_level,
-                    &edited_at,
-                    issue_split_ticket,
-                    version_vector,
-                    &mut diff,
-                )?
-                .unwrap_or_else(|| (from_idx, from_path.clone()));
+            let (first_level, recreated) = self.split_levels(
+                &from_parent,
+                &from_left,
+                split_level,
+                &edited_at,
+                issue_split_ticket,
+                version_vector,
+                &mut diff,
+            )?;
+            split_recreated_ids = recreated;
+            let (split_idx, split_path) =
+                first_level.unwrap_or_else(|| (from_idx, from_path.clone()));
             changes.push(TreeEditChange {
                 from: split_idx,
                 to: split_idx,
@@ -1443,10 +1694,20 @@ impl CrdtTree {
                 value: None,
             });
         }
+        let split_size = if split_level > 0 {
+            self.root.len().saturating_sub(size_before_split)
+        } else {
+            0
+        };
         let from_parent_path = self.path_of(&from_parent)?;
         let from_left_path = self.path_of(&from_left)?;
 
+        // 05. Insert. The ID check runs here rather than on entry: resolving
+        // the range splits text nodes, and a split can create the very ID a
+        // content node carries.
+        let contents = contents.map(|contents| self.drop_duplicate_contents(contents, &edited_at));
         let mut inserted_size = 0;
+        let mut inserted_spans = Vec::new();
         let mut inserted_value = contents.as_ref().map(|nodes| {
             nodes
                 .iter()
@@ -1478,13 +1739,20 @@ impl CrdtTree {
                     content.merged_from = Some(merged_from.clone());
                     content.merged_at = merged_at.clone();
                 }
+                // Measured while the content is still detached, as JS
+                // measures `insertedContentSize`: born removed, it would
+                // read back as nothing.
+                inserted_size += content.padded_size(false);
                 if parent_removed {
                     content.remove_recursively(edited_at.clone(), &mut gc_pairs, &mut Vec::new());
                 } else {
-                    inserted_size += content.padded_size(false);
                     add_data_size(&mut diff, subtree_data_size(&content));
                 }
                 parent.insert_at(insert_index, content);
+                // The spans of the inserted nodes, children before parents,
+                // so an undo re-removes them by identity rather than by index,
+                // which would take out content restored concurrently.
+                push_subtree_spans(parent, insert_index, &mut inserted_spans);
             }
             if parent_removed {
                 inserted_value = None;
@@ -1494,9 +1762,31 @@ impl CrdtTree {
         self.rebuild_node_map();
         gc_pairs.extend(self.drain_pending_gc_pairs());
 
+        // Identity restore covers plain deletions only. A merge, or garbage
+        // beyond the plain deletes (merge propagation, content born removed,
+        // pieces split off removed nodes), leaves the spans short of the
+        // edit, so none are reported and the reverse falls back to a copy.
+        let spans_complete = merge_level == 0 && gc_pairs.len() == delete_pair_count;
+        let (removed_spans, inserted_spans) = if spans_complete {
+            // Captured children first; reversed, parents come first, which
+            // recreating a purged subtree needs.
+            inserted_spans.reverse();
+            (removed_spans, inserted_spans)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        // Reported, not needed by the edit itself, so a lookup that fails
+        // leaves the node out rather than failing an edit JS applies.
+        let merged_nodes = targets
+            .merged
+            .iter()
+            .filter_map(|id| self.node(id).ok().cloned())
+            .collect();
+
         let changes = attach_insertion_change(changes, from_idx, from_path, inserted_value);
 
         Ok(TreeEditResult {
+            removal_targets: targets.removed,
             changes,
             gc_pairs,
             diff,
@@ -1505,6 +1795,61 @@ impl CrdtTree {
             from_idx,
             to_idx,
             inserted_size,
+            pre_tombstoned: targets.pre_tombstoned,
+            removed_spans,
+            inserted_spans,
+            split_size,
+            merged_nodes,
+            stranded_nodes,
+            split_recreated_ids,
+        })
+    }
+
+    /// Returns the contents that would not put a second node under an ID
+    /// already in the tree (JS `dropDuplicateContents`).
+    ///
+    /// Content an edit creates carries the edit's lamport and actor, so a
+    /// content node whose ID names another change is a copy of a node that
+    /// exists, as the copy-reinsert undo sends when it reverses a deletion.
+    /// Content of this edit's own change is kept even when its ID collides:
+    /// the delimiters an element split consumes are simulated rather than
+    /// replayed, so an ID issued here can legitimately collide. Dropping
+    /// rather than failing keeps changes already in stored histories
+    /// loadable. A collision anywhere in a content's subtree drops it whole,
+    /// as a copy is copied whole.
+    fn drop_duplicate_contents(
+        &self,
+        contents: Vec<TreeNode>,
+        edited_at: &TimeTicket,
+    ) -> Vec<TreeNode> {
+        contents
+            .into_iter()
+            .filter(|content| !self.reuses_an_id(content, edited_at))
+            .collect()
+    }
+
+    /// Reports whether `node` or a node below it carries an ID of another
+    /// change that is already in the tree.
+    fn reuses_an_id(&self, node: &TreeNode, edited_at: &TimeTicket) -> bool {
+        let created_at = node.id().created_at();
+        let own = created_at.lamport() == edited_at.lamport()
+            && created_at.actor_id() == edited_at.actor_id();
+        (!own && self.node_ids.contains(node.id()))
+            || node
+                .all_children()
+                .any(|child| self.reuses_an_id(child, edited_at))
+    }
+
+    /// Builds the restore span of the node at `path` from the tree as it
+    /// stands.
+    fn capture_restore_span(&self, path: &[usize]) -> Result<TreeRestoreSpan> {
+        let node = node_at_path(&self.root, path)?;
+        Ok(match split_parent_path(path) {
+            Some((parent_path, index)) => {
+                let parent = node_at_path(&self.root, &parent_path)?;
+                TreeRestoreSpan::capture(node, Some(parent), index)
+            }
+            None => TreeRestoreSpan::capture(node, None, 0),
         })
     }
 
@@ -1649,31 +1994,8 @@ impl CrdtTree {
             }
         }
 
-        let left = node_at_path(&self.root, &left_path)?;
-        if left.is_text() {
-            if let Some((text_parent_path, index)) = split_parent_path(&left_path) {
-                let split_diff = node_at_path_mut(&mut self.root, &text_parent_path)?
-                    .split_text_child_at(index, pos.left_sibling_id().offset())?;
-                if split_diff != DataSize::default() {
-                    let mut split_path = text_parent_path;
-                    split_path.push(index + 1);
-                    let split = node_at_path(&self.root, &split_path)?;
-                    // A piece split off a removed node is born removed: it
-                    // was never live, so it goes to GC with the size the
-                    // split added rather than to the live diff (JS
-                    // `CRDTTreeNode.split`).
-                    match split.removed_at() {
-                        Some(removed_at) => self.pending_gc_pairs.push((
-                            split.id_string(),
-                            split_diff,
-                            removed_at.clone(),
-                        )),
-                        None => add_data_size(diff, split_diff),
-                    }
-                    self.rebuild_node_map();
-                    self.link_split_to_next(&split_path)?;
-                }
-            }
+        if node_at_path(&self.root, &left_path)?.is_text() {
+            self.split_text_node(&left_path, pos.left_sibling_id().offset(), diff)?;
         }
 
         // A conversion has no edit ticket, so it skips the RGA walk below.
@@ -1728,6 +2050,42 @@ impl CrdtTree {
             .and_then(|child| child.merged_at().cloned())
             .or_else(|| declared_node.removed_at().cloned());
         Ok(Some((declared, merged_at)))
+    }
+
+    /// Splits the text node at the physical `path` at `offset`, a UTF-16
+    /// offset of its insertion (JS `CRDTTreeNode.split` of a text node). A
+    /// split at either end does nothing. The size a split of a live node
+    /// adds goes to `diff`.
+    fn split_text_node(
+        &mut self,
+        path: &[usize],
+        offset: usize,
+        diff: &mut DataSize,
+    ) -> Result<()> {
+        let Some((parent_path, index)) = split_parent_path(path) else {
+            return Ok(());
+        };
+        let split_diff =
+            node_at_path_mut(&mut self.root, &parent_path)?.split_text_child_at(index, offset)?;
+        if split_diff == DataSize::default() {
+            return Ok(());
+        }
+
+        let mut split_path = parent_path;
+        split_path.push(index + 1);
+        let split = node_at_path(&self.root, &split_path)?;
+        // A piece split off a removed node is born removed: it was never
+        // live, so it goes to GC with the size the split added rather than
+        // to the live diff (JS `CRDTTreeNode.split`).
+        match split.removed_at() {
+            Some(removed_at) => {
+                self.pending_gc_pairs
+                    .push((split.id_string(), split_diff, removed_at.clone()))
+            }
+            None => add_data_size(diff, split_diff),
+        }
+        self.rebuild_node_map();
+        self.link_split_to_next(&split_path)
     }
 
     /// Returns and clears the GC pairs buffered by text splits (JS
@@ -2009,6 +2367,10 @@ impl CrdtTree {
 
             // An element whose end token alone is in the range stays.
             if matches!(token.kind, TreeTokenKind::Text | TreeTokenKind::Start) {
+                // Removed before this edit: a reverse must not revive it.
+                if node.is_removed() {
+                    targets.pre_tombstoned.insert(id.to_id_string());
+                }
                 targets.removed.push(id.clone());
                 removed.insert(id.clone());
 
@@ -2093,14 +2455,15 @@ impl CrdtTree {
     }
 
     /// Moves the children of the merged elements to the end of `dest` (JS
-    /// `CRDTTree.edit` step 03), and returns the GC pairs of the subtrees the
-    /// cycle guard tombstones in place instead.
+    /// `CRDTTree.edit` step 03), and returns the nodes the cycle guard
+    /// tombstones in place instead, in post-order, each cloned when it was
+    /// removed (JS `stranded`).
     fn move_merged_children(
         &mut self,
         moved: &[TreeNodeId],
         dest: &TreeNodeId,
         edited_at: &TimeTicket,
-    ) -> Result<Vec<(String, DataSize)>> {
+    ) -> Result<Vec<TreeNode>> {
         let mut stranded = Vec::new();
         let mut dest_tombstoned = false;
         for id in moved {
@@ -2122,7 +2485,7 @@ impl CrdtTree {
                 tombstone_subtree(
                     node_at_path_mut(&mut self.root, &path)?,
                     edited_at,
-                    &mut stranded,
+                    &mut |node| stranded.push(node.clone()),
                 );
                 continue;
             }
@@ -2188,7 +2551,9 @@ impl CrdtTree {
                 if child.merged_from() != Some(id) || child.is_removed() {
                     continue;
                 }
-                tombstone_subtree(child, edited_at, &mut pairs);
+                tombstone_subtree(child, edited_at, &mut |node| {
+                    pairs.push((node.id_string(), node.data_size()));
+                });
             }
         }
         Ok(pairs)
@@ -2217,7 +2582,9 @@ impl CrdtTree {
 
     /// Splits `split_level` elements from the position after `left` in
     /// `parent` upward (JS `CRDTTree.edit` step 04), and returns the index
-    /// and path where the first level opened, measured once it has split.
+    /// and path where the first level opened, measured once it has split,
+    /// with the `(removed element, its replacement)` pairs of the levels
+    /// that re-created an element a merge took away (see `merge_source_of`).
     #[allow(clippy::too_many_arguments)]
     fn split_levels(
         &mut self,
@@ -2228,11 +2595,12 @@ impl CrdtTree {
         issue_split_ticket: &mut dyn FnMut() -> TimeTicket,
         version_vector: Option<&crate::VersionVector>,
         diff: &mut DataSize,
-    ) -> Result<Option<(usize, Vec<usize>)>> {
+    ) -> Result<SplitLevels> {
         let actor_id = edited_at.actor_id().as_str().to_owned();
         let mut parent = parent.clone();
         let mut left = left.clone();
         let mut first_level = None;
+        let mut recreated_ids = Vec::new();
         for split_count in 0..split_level {
             // §7.5: advance past the split siblings of this level the editor
             // did not know, but not past its own split products (§7.7).
@@ -2262,9 +2630,12 @@ impl CrdtTree {
             };
             let (target, offset) =
                 self.order_same_boundary_split(&parent, offset, edited_at, version_vector)?;
-            let split_diff =
+            let (split_id, split_diff) =
                 self.split_element(&target, offset, issue_split_ticket, version_vector)?;
             add_data_size(diff, split_diff);
+            if let Some(recreated) = self.merge_source_of(&split_id, &target)? {
+                recreated_ids.push((recreated, split_id));
+            }
 
             // The split is reported at the end of what stayed in `parent`,
             // where it opened on this replica: concurrent inserts at the
@@ -2288,7 +2659,63 @@ impl CrdtTree {
             left = parent;
             parent = grand_parent;
         }
-        Ok(first_level)
+        Ok((first_level, recreated_ids))
+    }
+
+    /// Returns the ID of the removed element whose children the split
+    /// product `split_id` has just taken back, or `None` when the split
+    /// re-created nothing (JS `mergeSourceOf`).
+    ///
+    /// A merge moves a boundary element's children into the merge target
+    /// and removes the element, stamping each moved child with `merged_from`
+    /// naming it. Reversing that merge is a split, which mints a brand-new
+    /// element (the removed one's ID belongs to a change every replica
+    /// already applied) and moves the stamped children into it. So a product
+    /// holding children stamped for a removed element is that element's
+    /// replacement, and whatever names the element has to follow it. The
+    /// pair is derived from the tree, not carried on the operation, so a
+    /// peer reaches the same conclusion from the change alone.
+    ///
+    /// Narrow on purpose: a split that merely cuts through a merge target
+    /// keeps some of the source's children on the left, and its product is a
+    /// new sibling rather than the source's stand-in. Only a split that takes
+    /// the source's children back whole reverses the merge, so the split
+    /// target `target` must hold no child stamped for the source.
+    fn merge_source_of(
+        &self,
+        split_id: &TreeNodeId,
+        target: &TreeNodeId,
+    ) -> Result<Option<TreeNodeId>> {
+        let split = self.node(split_id)?;
+        let target = self.node(target)?;
+        let stamped_for = |node: &TreeNode, id: &TreeNodeId| {
+            node.all_children().any(|child| {
+                child
+                    .merged_from()
+                    .is_some_and(|merged_from| merged_from.has_same_created_at(id))
+            })
+        };
+
+        for merged_from in split.all_children().filter_map(TreeNode::merged_from) {
+            // The product carries the stamp of the node it split off
+            // (`split_element`); a child stamped for that same element was
+            // merged in one level up and is not what this split re-created.
+            if split
+                .merged_from()
+                .is_some_and(|own| own.has_same_created_at(merged_from))
+            {
+                continue;
+            }
+            if let Some(source) = self.find_floor_node(merged_from) {
+                if source.is_removed()
+                    && source.id().has_same_created_at(merged_from)
+                    && !stamped_for(target, source.id())
+                {
+                    return Ok(Some(source.id().clone()));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Decides which node a split at `offset` of `parent` splits, so that
@@ -2387,7 +2814,7 @@ impl CrdtTree {
         offset: usize,
         issue_split_ticket: &mut dyn FnMut() -> TimeTicket,
         version_vector: Option<&crate::VersionVector>,
-    ) -> Result<DataSize> {
+    ) -> Result<(TreeNodeId, DataSize)> {
         let path = self.path_of(id)?;
         let Some((parent_path, index)) = split_parent_path(&path) else {
             return Err(YorkieError::InvalidTreePosition(
@@ -2504,9 +2931,9 @@ impl CrdtTree {
         if let Some(removed_at) = split_removed_at {
             self.pending_gc_pairs
                 .push((split_id.to_id_string(), diff, removed_at));
-            return Ok(DataSize::default());
+            return Ok((split_id, DataSize::default()));
         }
-        Ok(diff)
+        Ok((split_id, diff))
     }
 
     fn physical_path_by_node_id(&self, id: &TreeNodeId) -> Option<Vec<usize>> {
@@ -2544,8 +2971,15 @@ impl CrdtTree {
         })
     }
 
-    fn node(&self, id: &TreeNodeId) -> Result<&TreeNode> {
+    /// Returns the node `id` names exactly, removed ones included.
+    pub(crate) fn node(&self, id: &TreeNodeId) -> Result<&TreeNode> {
         node_at_path(&self.root, &self.path_of(id)?)
+    }
+
+    /// Returns how many ancestors the node `id` has, the root none (JS
+    /// `mergedAwayIDs`'s `depth`).
+    pub(crate) fn depth_of(&self, id: &TreeNodeId) -> Option<usize> {
+        self.physical_path_by_node_id(id).map(|path| path.len())
     }
 
     fn node_mut(&mut self, id: &TreeNodeId) -> Result<&mut TreeNode> {
@@ -2554,7 +2988,7 @@ impl CrdtTree {
     }
 
     /// Returns the ID of the parent of `id`, or `None` for the root.
-    fn parent_id(&self, id: &TreeNodeId) -> Option<TreeNodeId> {
+    pub(crate) fn parent_id(&self, id: &TreeNodeId) -> Option<TreeNodeId> {
         let path = self.physical_path_by_node_id(id)?;
         let (parent_path, _) = split_parent_path(&path)?;
         node_at_path(&self.root, &parent_path)
@@ -2776,6 +3210,452 @@ impl CrdtTree {
     }
 }
 
+/// Identity undo and redo: restoring and re-removing nodes by the spans an
+/// edit captured (JS `CRDTTree.restore` and `retombstone`).
+impl CrdtTree {
+    /// Brings back the nodes `spans` describe under their own identities
+    /// (JS `CRDTTree.restore`): a live node is left alone, a removed one is
+    /// revived in place, and a purged one is recreated. A span whose kind
+    /// disagrees with itself is skipped, as `retombstone` skips it. Spans
+    /// come parent before child, as `edit` captures them.
+    ///
+    /// JS also takes the edit ticket, for the actor of each change; Rust
+    /// changes carry no actor.
+    pub(crate) fn restore(&mut self, spans: &[TreeRestoreSpan]) -> Result<TreeRestoreResult> {
+        let mut untombstoned = Vec::new();
+        let mut recreated = Vec::new();
+        let mut diff = DataSize::default();
+        let mut changes = Vec::new();
+
+        for span in spans {
+            if !span.kind_agrees() {
+                continue;
+            }
+            if !span.is_text {
+                if self.floor_id(&span.id).as_ref() == Some(&span.id) {
+                    if self.node(&span.id)?.is_removed() {
+                        self.dissolve_merge(&span.id)?;
+                        self.node_mut(&span.id)?.unremove();
+                        changes.extend(self.make_insertion_change(&span.id));
+                        untombstoned.push(span.id.clone());
+                    }
+                    continue;
+                }
+                if let Some(id) = self.recreate_from_span(span, span.id.offset(), span.length)? {
+                    changes.extend(self.make_insertion_change(&id));
+                    recreated.push(id);
+                }
+                continue;
+            }
+
+            // Pieces may be split finer than the span, and a concurrent edit
+            // or an earlier recreate can leave pieces straddling it. The
+            // exact `[start, end)` is isolated out of every overlapping
+            // piece, live or removed, so all replicas converge on the same
+            // segmentation; then the removed parts are revived and the purged
+            // gaps recreated.
+            let start = span.id.offset();
+            let end = start + span.length;
+            let pieces = self.find_pieces_overlapping(span.id.created_at(), start, end);
+            let mut cursor = start;
+            let mut piece_index = 0;
+            while cursor < end {
+                let piece = match pieces.get(piece_index) {
+                    Some(id) => Some((id, id.offset(), id.offset() + self.node(id)?.len())),
+                    None => None,
+                };
+                match piece {
+                    Some((id, piece_start, piece_end)) if piece_start <= cursor => {
+                        let overlap_end = piece_end.min(end);
+                        let target = self.isolate_text_range(id, cursor, overlap_end, &mut diff)?;
+                        let node = self.node_mut(&target)?;
+                        if node.is_removed() {
+                            node.unremove();
+                            changes.extend(self.make_insertion_change(&target));
+                            untombstoned.push(target);
+                        }
+                        cursor = overlap_end;
+                        if overlap_end >= piece_end {
+                            piece_index += 1;
+                        }
+                    }
+                    piece => {
+                        let gap_end = piece.map_or(end, |(_, piece_start, _)| piece_start.min(end));
+                        if let Some(id) = self.recreate_from_span(span, cursor, gap_end - cursor)? {
+                            changes.extend(self.make_insertion_change(&id));
+                            recreated.push(id);
+                        }
+                        cursor = gap_end;
+                    }
+                }
+            }
+        }
+
+        // The sizes are read once the restore is done, as JS reads the nodes
+        // it returns. Every ID names a node this call just revived or
+        // created, so a failed lookup is a bug, not a node to skip: skipping
+        // it would leave its size out of the live and GC accounting.
+        let measure = |ids: Vec<TreeNodeId>| {
+            ids.into_iter()
+                .map(|id| {
+                    let size = self.node(&id)?.data_size();
+                    Ok(TreeRestoredNode { id, size })
+                })
+                .collect::<Result<Vec<_>>>()
+        };
+        let untombstoned = measure(untombstoned)?;
+        let recreated = measure(recreated)?;
+        Ok(TreeRestoreResult {
+            untombstoned,
+            recreated,
+            gc_pairs: self.drain_pending_gc_pairs(),
+            diff,
+            changes,
+        })
+    }
+
+    /// Removes again the nodes `spans` describe, the redo of an identity
+    /// undo (JS `CRDTTree.retombstone`). Only live pieces are removed, so a
+    /// second call changes nothing. A piece straddling a span boundary is
+    /// split there, so only the span's part goes, mirroring `restore`. A
+    /// span whose kind disagrees with itself is skipped, as `restore` skips
+    /// it.
+    pub(crate) fn retombstone(
+        &mut self,
+        spans: &[TreeRestoreSpan],
+        executed_at: &TimeTicket,
+    ) -> Result<TreeRetombstoneResult> {
+        let mut gc_pairs = Vec::new();
+        let mut diff = DataSize::default();
+        let mut changes = Vec::new();
+        for span in spans {
+            if !span.kind_agrees() {
+                continue;
+            }
+            let start = span.id.offset();
+            let end = start + span.length.max(1);
+            let pieces = if span.is_text {
+                self.find_pieces_overlapping(span.id.created_at(), start, end)
+            } else if self.floor_id(&span.id).as_ref() == Some(&span.id) {
+                vec![span.id.clone()]
+            } else {
+                Vec::new()
+            };
+
+            for piece_id in pieces {
+                let piece = self.node(&piece_id)?;
+                if piece.is_removed() {
+                    continue;
+                }
+                let target = if piece.is_text() {
+                    let piece_end = piece_id.offset() + piece.len();
+                    let from = piece_id.offset().max(start);
+                    let to = piece_end.min(end);
+                    self.isolate_text_range(&piece_id, from, to, &mut diff)?
+                } else {
+                    piece_id
+                };
+
+                // Measured while the target is still visible.
+                let range = self.visible_range_of(&target);
+                let node = self.node_mut(&target)?;
+                if node.remove(executed_at.clone()) {
+                    gc_pairs.push((node.id_string(), node.data_size(), executed_at.clone()));
+                    if let Some((from, to, from_path, to_path)) = range {
+                        changes.push(TreeVisibleEdit {
+                            change: TreeEditChange {
+                                from,
+                                to,
+                                from_path,
+                                to_path,
+                                value: None,
+                            },
+                            inserted_size: 0,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(TreeRetombstoneResult {
+            gc_pairs,
+            diff,
+            changes,
+        })
+    }
+
+    /// Clears the merge pointers between the merge source `source` and its
+    /// target before the source is restored (JS `CRDTTree.dissolveMerge`):
+    /// the source's `merged_into`, and the `merged_from` of the children the
+    /// merge moved. With both gone, neither a later edit nor a later
+    /// retombstone can derive the merge again. The children stay in the
+    /// target. The target is resolved as an exact element, as every merge
+    /// pointer is; the source's own pointer goes whether or not it resolves.
+    fn dissolve_merge(&mut self, source: &TreeNodeId) -> Result<()> {
+        let Some(merged_into) = self.node(source)?.merged_into().cloned() else {
+            return Ok(());
+        };
+        let target = self.merge_node_id(Some(&merged_into));
+        self.node_mut(source)?.set_merged_into(None);
+        let Some(target) = target else {
+            return Ok(());
+        };
+
+        for child in self.node_mut(&target)?.all_children_mut() {
+            if child.merged_from() == Some(source) {
+                child.set_merged_from(None);
+                child.set_merged_at(None);
+            }
+        }
+        Ok(())
+    }
+
+    /// Splits the text piece `piece` so that a node covers exactly the
+    /// UTF-16 interval `[from, to)` of its insertion, and returns that
+    /// node's ID (JS `CRDTTree.isolateTextRange`). Splitting at the
+    /// boundaries, rather than skipping a straddling piece, is what lets
+    /// concurrent restores converge on the same segmentation. A split of a
+    /// live piece adds its size to `diff`; one of a removed piece leaves a
+    /// pending GC pair. Requires `piece start <= from < to <= piece end`.
+    fn isolate_text_range(
+        &mut self,
+        piece: &TreeNodeId,
+        from: usize,
+        to: usize,
+        diff: &mut DataSize,
+    ) -> Result<TreeNodeId> {
+        let mut id = piece.clone();
+        if from > id.offset() {
+            let path = self.path_of(&id)?;
+            self.split_text_node(&path, from, diff)?;
+            id = TreeNodeId::new(id.created_at().clone(), from);
+        }
+        if to < id.offset() + self.node(&id)?.len() {
+            let path = self.path_of(&id)?;
+            self.split_text_node(&path, to, diff)?;
+        }
+        Ok(id)
+    }
+
+    /// Returns the visible index range the node `id` covers and the paths
+    /// of its ends (JS `CRDTTree.visibleRangeOf`), or `None` when the node
+    /// or an ancestor is removed and so takes no room. A tree the index
+    /// cannot walk also gives `None`: the range is reported to subscribers
+    /// after the state settled, and failing there would fail a remote
+    /// change every replica must apply.
+    fn visible_range_of(&self, id: &TreeNodeId) -> Option<(usize, usize, Vec<usize>, Vec<usize>)> {
+        let path = self.physical_path_by_node_id(id)?;
+        let mut node = &self.root;
+        if node.is_removed() {
+            return None;
+        }
+        for &index in &path {
+            node = node.children.get(index)?;
+            if node.is_removed() {
+                return None;
+            }
+        }
+        let (parent_path, _) = split_parent_path(&path)?;
+
+        let after = physical_index_after_left_path(&self.root, &parent_path, &path).ok()?;
+        let to = visible_index_of_physical(&self.root, after);
+        let from = to.checked_sub(node.padded_size(false))?;
+        Some((
+            from,
+            to,
+            self.index_to_path(from).ok()?,
+            self.index_to_path(to).ok()?,
+        ))
+    }
+
+    /// Describes the node `id` becoming visible as an insertion where it
+    /// stands (JS `CRDTTree.makeInsertionChange`). A node still under a
+    /// removed ancestor gives nothing.
+    fn make_insertion_change(&self, id: &TreeNodeId) -> Option<TreeVisibleEdit> {
+        let (from, to, path, _) = self.visible_range_of(id)?;
+        let node = self.node(id).ok()?;
+        Some(TreeVisibleEdit {
+            change: TreeEditChange {
+                from,
+                to: from,
+                from_path: path.clone(),
+                to_path: path,
+                value: Some(vec![TreeNodeInput::from_crdt(node)]),
+            },
+            inserted_size: to - from,
+        })
+    }
+
+    /// Returns the IDs of the surviving pieces, live or removed, of the text
+    /// inserted at `created_at` that overlap the UTF-16 interval `[start,
+    /// end)`, in offset order (JS `CRDTTree.findPiecesOverlapping`). The
+    /// pieces are found by floor lookups from the end down.
+    fn find_pieces_overlapping(
+        &self,
+        created_at: &TimeTicket,
+        start: usize,
+        end: usize,
+    ) -> Vec<TreeNodeId> {
+        let mut pieces = Vec::new();
+        let mut probe = end.checked_sub(1);
+        while let Some(offset) = probe {
+            let Some(node) = self.find_floor_node(&TreeNodeId::new(created_at.clone(), offset))
+            else {
+                break;
+            };
+            if !node.is_text() {
+                break;
+            }
+            let node_start = node.id().offset();
+            let node_end = node_start + node.len();
+            if node_end <= start {
+                break;
+            }
+            if node_start < end && node_end > start {
+                pieces.push(node.id().clone());
+            }
+            if node_start <= start {
+                break;
+            }
+            probe = node_start.checked_sub(1);
+        }
+        pieces.reverse();
+        pieces
+    }
+
+    /// Returns the ID of the node a recreated span goes under, or `None`
+    /// when the span is left unplaced (JS `CRDTTree.recreateParent`): the
+    /// parent is gone, the parent is text and holds no children, or `id`,
+    /// the identity to recreate, is held by a surviving node, exactly or
+    /// inside a text run of the same insertion. Recreating there would put
+    /// a second node under one identity. Each test reads state that never
+    /// changes, so every replica skips the same spans.
+    fn recreate_parent(&self, span: &TreeRestoreSpan, id: &TreeNodeId) -> Option<TreeNodeId> {
+        let parent_id = span.parent_id.as_ref()?;
+        let parent = self.find_floor_node(parent_id)?;
+        if parent.id() != parent_id || parent.is_text() {
+            return None;
+        }
+
+        if let Some(holder) = self.find_floor_node(id) {
+            let holder_offset = holder.id().offset();
+            if holder_offset == id.offset()
+                || (holder.is_text() && holder_offset + holder.len() > id.offset())
+            {
+                return None;
+            }
+        }
+        Some(parent_id.clone())
+    }
+
+    /// Rebuilds a purged node, or a purged part of a text span, under its
+    /// own identity and places it (JS `CRDTTree.recreateFromSpan`). The
+    /// slot is the first of: (a) for text, right before the next piece or
+    /// right after the previous piece of the same insertion; (b) right
+    /// after the left anchor; (c) right before the right anchor; (d) before
+    /// the first child of the parent whose ID is greater, a slot every
+    /// replica computes alike. Each anchor counts only while it is a child
+    /// of the parent.
+    ///
+    /// Under a parent removed since, the node is born removed with the
+    /// parent's removal ticket, the one that removal wrote on its siblings,
+    /// and its GC pair is left pending; it is not reported, since its size
+    /// never was live. Returns the ID of a node recreated live.
+    ///
+    /// JS also books the attribute tombstones the span's attributes copy.
+    /// Rust keys GC pairs by ID string and the copy carries the original's
+    /// attribute IDs, so, as for a Tree split's copies, they are not booked.
+    fn recreate_from_span(
+        &mut self,
+        span: &TreeRestoreSpan,
+        offset: usize,
+        length: usize,
+    ) -> Result<Option<TreeNodeId>> {
+        let created_at = span.id.created_at();
+        let id = TreeNodeId::new(created_at.clone(), offset);
+        let Some(parent_id) = self.recreate_parent(span, &id) else {
+            return Ok(None);
+        };
+
+        let mut node = if span.is_text {
+            let relative = offset - span.id.offset();
+            let value = utf16_substring(
+                span.value.as_deref().unwrap_or_default(),
+                relative,
+                relative + length,
+            );
+            TreeNode::create_text(id, value)
+        } else {
+            TreeNode::create_element(
+                span.id.clone(),
+                span.node_type.clone(),
+                span.attrs.clone(),
+                Vec::new(),
+            )
+        };
+
+        let parent_path = self.path_of(&parent_id)?;
+        let parent = node_at_path(&self.root, &parent_path)?;
+        let index_in_parent = |child: &TreeNodeId| {
+            parent
+                .children
+                .iter()
+                .position(|sibling| sibling.id() == child)
+        };
+        let floor = |id: TreeNodeId| self.find_floor_node(&id);
+        let mut slot = None;
+        if span.is_text {
+            let next = floor(TreeNodeId::new(created_at.clone(), offset + length));
+            slot = next
+                .filter(|next| next.is_text() && next.id().offset() == offset + length)
+                .and_then(|next| index_in_parent(next.id()));
+            if slot.is_none() && offset > 0 {
+                slot = floor(TreeNodeId::new(created_at.clone(), offset - 1))
+                    .filter(|prev| prev.is_text())
+                    .and_then(|prev| index_in_parent(prev.id()))
+                    .map(|index| index + 1);
+            }
+        }
+        if slot.is_none() {
+            slot = span
+                .left_sibling_id
+                .clone()
+                .and_then(floor)
+                .and_then(|left| index_in_parent(left.id()))
+                .map(|index| index + 1);
+        }
+        if slot.is_none() {
+            slot = span
+                .right_sibling_id
+                .clone()
+                .and_then(floor)
+                .and_then(|right| index_in_parent(right.id()));
+        }
+        let slot = slot.unwrap_or_else(|| {
+            parent
+                .children
+                .iter()
+                .position(|sibling| sibling.id() > node.id())
+                .unwrap_or(parent.children.len())
+        });
+
+        let parent_removed_at = parent.removed_at().cloned();
+        let id = node.id().clone();
+        let pending = parent_removed_at.map(|removed_at| {
+            node.remove(removed_at.clone());
+            (node.id_string(), node.data_size(), removed_at)
+        });
+        node_at_path_mut(&mut self.root, &parent_path)?.insert_at(slot, node);
+        self.node_ids.insert(id.clone());
+        match pending {
+            Some(pair) => {
+                self.pending_gc_pairs.push(pair);
+                Ok(None)
+            }
+            None => Ok(Some(id)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StyleTarget {
     path: Vec<usize>,
@@ -2812,6 +3692,9 @@ struct EditTargets {
     /// The tokens of the nodes the edit removes, start and end tokens both,
     /// in document order (JS `tokensToBeRemoved`).
     removal_tokens: Vec<TreeTokenTarget>,
+    /// The ID strings of the nodes in `removed` the range reached already
+    /// removed (JS `preTombstoned`).
+    pre_tombstoned: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3374,19 +4257,48 @@ fn ticket_known(version_vector: Option<&crate::VersionVector>, ticket: &TimeTick
 }
 
 /// Tombstones `node` and every live node below it with `edited_at`, and
-/// pushes the GC pair of each node it tombstoned, in post-order (JS
+/// hands each node it tombstoned to `removed`, in post-order (JS
 /// `tombstoneSubtree`).
 fn tombstone_subtree(
     node: &mut TreeNode,
     edited_at: &TimeTicket,
-    pairs: &mut Vec<(String, DataSize)>,
+    removed: &mut dyn FnMut(&TreeNode),
 ) {
     for child in node.all_children_mut() {
-        tombstone_subtree(child, edited_at, pairs);
+        tombstone_subtree(child, edited_at, removed);
     }
     if node.removed_at.is_none() && node.remove(edited_at.clone()) {
-        pairs.push((node.id_string(), node.data_size()));
+        removed(node);
     }
+}
+
+/// Pushes the restore spans of the child at `index` of `parent` and of every
+/// node below it, in post-order (JS `traverseAll`), each with its siblings
+/// as they stand.
+fn push_subtree_spans(parent: &TreeNode, index: usize, spans: &mut Vec<TreeRestoreSpan>) {
+    let Some(node) = parent.children.get(index) else {
+        return;
+    };
+    for child_index in 0..node.children.len() {
+        push_subtree_spans(node, child_index, spans);
+    }
+    spans.push(TreeRestoreSpan::capture(node, Some(parent), index));
+}
+
+/// Returns the ID a restore span names as the left anchor when `sibling` is
+/// the node to its left (JS `CRDTTree.leftAnchorID`).
+///
+/// For text it is the sibling's last character: a later split leaves the
+/// head ID on the leftmost piece, while the last character floor-resolves to
+/// the rightmost one, the true left neighbour of the restored node. An
+/// element, never split by offset, and a text with no characters, which has
+/// no last character, are named by their own ID.
+fn left_anchor_id(sibling: &TreeNode) -> TreeNodeId {
+    let length = utf16_len(sibling.value());
+    if !sibling.is_text() || length == 0 {
+        return sibling.id().clone();
+    }
+    sibling.id().split(length - 1)
 }
 
 /// Collects the IDs of the subtree of `node` in post-order, `node` last.
@@ -3483,6 +4395,15 @@ fn validate_utf16_boundary(value: &str, offset: usize) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Returns the UTF-16 units `[start, end)` of `value`, clamped to its length
+/// (JS `String.substring`).
+fn utf16_substring(value: &str, start: usize, end: usize) -> String {
+    let units = value.encode_utf16().collect::<Vec<_>>();
+    let end = end.min(units.len());
+    let start = start.min(end);
+    String::from_utf16_lossy(&units[start..end])
 }
 
 fn split_utf16(value: &str, offset: usize) -> (String, String) {
@@ -4455,7 +5376,9 @@ mod tests {
 
     /// JS `tree_test.ts` "TreeChange: Concurrent delete and insert when parent
     /// removed": the content is inserted removed, counts as garbage, and
-    /// reports no change.
+    /// reports no change. Its size is still reported, measured before the
+    /// insert as JS `CRDTTree.edit` measures `insertedContentSize`: the
+    /// reverse's `maxNeededIdx` guard reads it to tell the edit had no effect.
     #[test]
     fn inserts_into_a_removed_parent_as_removed_content() -> crate::Result<()> {
         let mut tree = text_tree("ab");
@@ -4477,7 +5400,7 @@ mod tests {
 
         assert_eq!("<root></root>", tree.to_xml());
         assert!(result.changes.is_empty());
-        assert_eq!(0, result.inserted_size);
+        assert_eq!(1, result.inserted_size);
         // As in JS: "c", and the "b" split off the removed "ab", which was
         // never live either.
         let ids = result
@@ -4842,6 +5765,93 @@ mod tests {
             change_paths(&result)
         );
         assert_eq!("<root><p><b>ad</b></p></root>", tree.to_xml());
+        Ok(())
+    }
+
+    /// JS `mergeSourceOf`: a split that takes the children of a merged-away
+    /// element back whole re-creates that element, and reports it with its
+    /// replacement; a split that leaves some of them in the merge target, or
+    /// one through children no merge moved, re-creates nothing.
+    #[test]
+    fn reports_the_elements_a_split_re_creates() -> crate::Result<()> {
+        let merged = || -> crate::Result<CrdtTree> {
+            let mut tree = CrdtTree::create(
+                TreeNode::create_element(
+                    node_id(1, 0),
+                    "root",
+                    None,
+                    vec![
+                        TreeNode::create_element(
+                            node_id(2, 0),
+                            "p",
+                            None,
+                            vec![TreeNode::create_text(node_id(3, 0), "ab")],
+                        ),
+                        TreeNode::create_element(
+                            node_id(4, 0),
+                            "p",
+                            None,
+                            vec![TreeNode::create_text(node_id(5, 0), "cd")],
+                        ),
+                    ],
+                ),
+                ticket(1, "a"),
+            );
+            let range = (tree.find_pos(3, true)?, tree.find_pos(5, true)?);
+            let result = tree.edit_by_range_with_changes(range, None, 0, ticket(10, "a"), None)?;
+            assert_eq!("<root><p>abcd</p></root>", tree.to_xml());
+            assert!(
+                result.split_recreated_ids.is_empty(),
+                "a merge splits nothing"
+            );
+            Ok(tree)
+        };
+        let split_at = |tree: &mut CrdtTree, index: usize| -> crate::Result<_> {
+            let pos = tree.find_pos(index, true)?;
+            let result = tree.edit_by_range_with_changes(
+                (pos.clone(), pos),
+                None,
+                1,
+                ticket(20, "a"),
+                None,
+            )?;
+            Ok(result.split_recreated_ids)
+        };
+
+        // At the merge boundary: the product holds all of "cd".
+        let mut tree = merged()?;
+        let recreated = split_at(&mut tree, 3)?;
+        assert_eq!("<root><p>ab</p><p>cd</p></root>", tree.to_xml());
+        let product = tree.root().children().nth(1).unwrap().id().clone();
+        assert_eq!(vec![(node_id(4, 0), product)], recreated);
+
+        // Through the moved children: "c" stays in the merge target.
+        let mut tree = merged()?;
+        assert_eq!(
+            Vec::<(TreeNodeId, TreeNodeId)>::new(),
+            split_at(&mut tree, 4)?
+        );
+        assert_eq!("<root><p>abc</p><p>d</p></root>", tree.to_xml());
+
+        // No merge at all.
+        let mut tree = CrdtTree::create(
+            TreeNode::create_element(
+                node_id(1, 0),
+                "root",
+                None,
+                vec![TreeNode::create_element(
+                    node_id(2, 0),
+                    "p",
+                    None,
+                    vec![TreeNode::create_text(node_id(3, 0), "ab")],
+                )],
+            ),
+            ticket(1, "a"),
+        );
+        assert_eq!(
+            Vec::<(TreeNodeId, TreeNodeId)>::new(),
+            split_at(&mut tree, 2)?
+        );
         Ok(())
     }
 

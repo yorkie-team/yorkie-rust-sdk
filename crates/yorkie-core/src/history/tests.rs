@@ -11,7 +11,7 @@ use super::{History, HistoryOperation, MAX_UNDO_REDO_STACK_DEPTH};
 use crate::change::{ChangePack, Checkpoint};
 use crate::crdt::rga_tree_split::{RgaTreeSplitNodeId, RgaTreeSplitPos};
 use crate::crdt::tree::{TreeNodeId, TreePos};
-use crate::operation::{EditOperation, OpSource, Operation};
+use crate::operation::{EditOperation, OpSource, Operation, TreeEditOperation};
 use crate::presence::ReversePresence;
 use crate::{DocStatus, Document, JsonObject, Presence, Result, TimeTicket};
 use serde_json::{json, Value};
@@ -208,8 +208,9 @@ fn drops_the_oldest_entry_past_the_maximum_depth() {
     assert!(history.has_undo());
 }
 
+/// JS `Document.update` pushes every reverse, Tree ones included.
 #[test]
-fn leaves_tree_reverses_out_of_an_entry() {
+fn keeps_tree_reverses_in_an_entry() {
     let root = || TreeNodeId::new(TimeTicket::initial(), 0);
     let tree_style = crate::operation::TreeStyleOperation::create(
         TimeTicket::initial(),
@@ -218,14 +219,36 @@ fn leaves_tree_reverses_out_of_an_entry() {
         BTreeMap::new(),
         None,
     );
+    let tree_edit = TreeEditOperation::create(
+        TimeTicket::initial(),
+        TreePos::new(root(), root()),
+        TreePos::new(root(), root()),
+        None,
+        0,
+        None,
+    );
 
-    assert!(HistoryOperation::entry(vec![Operation::TreeStyle(tree_style)], None).is_empty());
+    let entry = HistoryOperation::entry(
+        vec![
+            Operation::TreeStyle(tree_style.clone()),
+            Operation::TreeEdit(tree_edit.clone()),
+        ],
+        None,
+    );
+    assert_eq!(
+        vec![
+            HistoryOperation::Operation(Box::new(Operation::TreeStyle(tree_style))),
+            HistoryOperation::Operation(Box::new(Operation::TreeEdit(tree_edit))),
+        ],
+        entry
+    );
 }
 
-/// Tree undo is not ported: a tree edit or style pushes nothing, and still
-/// clears the redo stack like any other local edit.
+/// A Tree edit and a Tree style in one change push one entry with both
+/// reverses, newest first, and clear the redo stack like any other local
+/// edit.
 #[test]
-fn pushes_nothing_for_tree_edits_and_styles() -> Result<()> {
+fn pushes_one_entry_for_tree_edits_and_styles() -> Result<()> {
     use crate::TreeNodeInput;
 
     let mut doc = Document::new("test-doc");
@@ -247,9 +270,77 @@ fn pushes_nothing_for_tree_edits_and_styles() -> Result<()> {
         tree.style(0, 1, attributes)
     })?;
 
-    assert_eq!(1, doc.undo_stack_for_test().len());
+    assert_eq!(2, doc.undo_stack_for_test().len());
+    let entry = doc.undo_stack_for_test().last().unwrap();
+    assert!(matches!(
+        entry.as_slice(),
+        [HistoryOperation::Operation(style), HistoryOperation::Operation(edit)]
+            if matches!(style.as_ref(), Operation::TreeStyle(_))
+                && matches!(edit.as_ref(), Operation::TreeEdit(_))
+    ));
     assert!(!doc.history().can_redo());
     Ok(())
+}
+
+/// An undo tree edit over `from..to` of the tree `parent`, by index.
+fn undo_tree_edit(parent: &TimeTicket, from: usize, to: usize) -> TreeEditOperation {
+    let root = TreeNodeId::new(parent.clone(), 0);
+    let pos = TreePos::new(root.clone(), root);
+    TreeEditOperation::create(parent.clone(), pos.clone(), pos, None, 0, None).into_undo(from, to)
+}
+
+fn tree_undo_indexes(history: &History) -> Vec<Option<(usize, usize)>> {
+    history
+        .undo_stack()
+        .iter()
+        .flatten()
+        .map(|op| match op {
+            HistoryOperation::Operation(op) => match op.as_ref() {
+                Operation::TreeEdit(op) => op.undo_indexes(),
+                other => panic!("unexpected {other:?}"),
+            },
+            HistoryOperation::Presence(_) => panic!("unexpected presence"),
+        })
+        .collect()
+}
+
+/// JS `reconcileTreeEdit`: only the undo tree edits of the tree the edit
+/// changed move, and an identity edit, which finds its nodes by ID, does
+/// not.
+#[test]
+fn reconciles_only_the_tree_edits_of_the_edited_tree() {
+    let edited = TimeTicket::new(1, 1, TimeTicket::initial().actor_id().clone());
+    let other = TimeTicket::new(1, 2, TimeTicket::initial().actor_id().clone());
+    let identity = undo_tree_edit(&edited, 5, 7).with_identity(
+        Vec::new(),
+        crate::operation::RestoreMode::Restore,
+        Vec::new(),
+    );
+
+    let mut history = History::default();
+    history.push_undo(vec![
+        HistoryOperation::Operation(Box::new(Operation::TreeEdit(undo_tree_edit(&edited, 5, 7)))),
+        HistoryOperation::Operation(Box::new(Operation::TreeEdit(undo_tree_edit(&other, 5, 7)))),
+        HistoryOperation::Operation(Box::new(Operation::TreeEdit(identity))),
+    ]);
+    history.push_redo(vec![HistoryOperation::Operation(Box::new(
+        Operation::TreeEdit(undo_tree_edit(&edited, 6, 8)),
+    ))]);
+
+    // An insertion of 3 at 1, left of every range.
+    history.reconcile_tree_edit(&edited, 1, 1, 3);
+
+    assert_eq!(
+        vec![Some((8, 10)), Some((5, 7)), Some((5, 7))],
+        tree_undo_indexes(&history)
+    );
+    let Some(HistoryOperation::Operation(op)) = history.redo_stack()[0].first() else {
+        panic!("expected an operation");
+    };
+    let Operation::TreeEdit(op) = op.as_ref() else {
+        panic!("expected a tree edit");
+    };
+    assert_eq!(Some((9, 11)), op.undo_indexes());
 }
 
 /// An undo edit over `from..to` on a text whose positions were normalized to
@@ -706,4 +797,54 @@ fn prunes_the_ledger_an_identity_undo_leaves() -> Result<()> {
         .nodes()
         .all(|node| node.removal_events().is_empty()));
     Ok(())
+}
+
+/// JS `tree_redo_split_style_test.ts` "re-points only the entries targeting
+/// the same tree": a node ID is unique only within its own tree, so a split
+/// in one tree leaves an entry on another tree alone.
+#[test]
+fn re_points_only_the_entries_targeting_the_same_tree() {
+    let actor = crate::ActorId::from("000000000000000000000001");
+    let tick = |lamport: i64| TimeTicket::new(lamport, 0, actor.clone());
+    let tree_a = tick(1);
+    let tree_b = tick(2);
+    let prev = TreeNodeId::new(tick(10), 0);
+    let curr = TreeNodeId::new(tick(20), 0);
+    let style_on = |parent_created_at: &TimeTicket| {
+        Operation::TreeStyle(crate::operation::TreeStyleOperation::create(
+            parent_created_at.clone(),
+            TreePos::new(prev.clone(), prev.clone()),
+            TreePos::new(prev.clone(), prev.clone()),
+            BTreeMap::from([("bold".to_owned(), "true".to_owned())]),
+            Some(tick(30)),
+        ))
+    };
+
+    let mut history = History::default();
+    history.push_undo(vec![
+        HistoryOperation::Operation(Box::new(style_on(&tree_a))),
+        HistoryOperation::Operation(Box::new(style_on(&tree_b))),
+    ]);
+
+    history.reconcile_tree_node_id(&tree_a, &prev, &curr);
+
+    let parent_of = |index: usize| {
+        let HistoryOperation::Operation(op) = &history.undo_stack()[0][index] else {
+            panic!("expected an operation");
+        };
+        let Operation::TreeStyle(op) = op.as_ref() else {
+            panic!("expected a tree style");
+        };
+        op.range_from().parent_id().clone()
+    };
+    assert_eq!(
+        curr,
+        parent_of(0),
+        "the entry on the split tree follows the new id"
+    );
+    assert_eq!(
+        prev,
+        parent_of(1),
+        "the entry on another tree keeps its own id"
+    );
 }

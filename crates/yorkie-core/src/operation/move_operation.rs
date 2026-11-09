@@ -78,6 +78,7 @@ impl MoveOperation {
                 self.created_at.clone(),
                 None,
             ))),
+            tree_edit: None,
         }))
     }
 

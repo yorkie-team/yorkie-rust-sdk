@@ -11,7 +11,7 @@ use yorkie_core::wire::{
     WireChange, WireChangeId, WireChangePack, WireJsonElement, WireJsonElementSimple, WireNodeAttr,
     WireOperation, WirePresence, WirePresenceChange, WireRestoreMode, WireRestoreSpan, WireRgaNode,
     WireRhtNode, WireTextNode, WireTextNodeId, WireTextNodePos, WireTreeNode, WireTreeNodeId,
-    WireTreePos, WireValueType,
+    WireTreePos, WireTreeRestoreSpan, WireValueType,
 };
 use yorkie_core::{ChangePack as CoreChangePack, Checkpoint as CoreCheckpoint};
 use yorkie_core::{SchemaRule as CoreSchemaRule, TreeNodeRule as CoreTreeNodeRule};
@@ -446,10 +446,7 @@ fn wire_operation_to_proto(operation: &WireOperation) -> Result<api::Operation> 
             if !restore_spans.is_empty() || !retombstone_spans.is_empty() {
                 edit.restore_spans = wire_restore_spans_to_proto(restore_spans)?;
                 edit.retombstone_spans = wire_restore_spans_to_proto(retombstone_spans)?;
-                edit.restore_mode = match restore_mode {
-                    Some(WireRestoreMode::Retombstone) => api::RestoreMode::Retombstone,
-                    Some(WireRestoreMode::Restore) | None => api::RestoreMode::Restore,
-                } as i32;
+                edit.restore_mode = wire_restore_mode_to_proto(*restore_mode) as i32;
             }
             api::operation::Body::Edit(edit)
         }
@@ -488,29 +485,42 @@ fn wire_operation_to_proto(operation: &WireOperation) -> Result<api::Operation> 
             split_level,
             executed_at,
             split_tickets,
-        } => api::operation::Body::TreeEdit(api::operation::TreeEdit {
-            parent_created_at: Some(to_time_ticket(parent_created_at)?),
-            from: Some(wire_tree_pos_to_proto(from)?),
-            to: Some(wire_tree_pos_to_proto(to)?),
-            created_at_map_by_actor: BTreeMap::new(),
-            contents: contents
-                .as_ref()
-                .map(|groups| {
-                    groups
-                        .iter()
-                        .map(|nodes| wire_tree_nodes_to_proto(nodes))
-                        .collect::<Result<Vec<_>>>()
-                })
-                .transpose()?
-                .unwrap_or_default(),
-            split_level: i32_from_usize(*split_level, "tree_edit.split_level")?,
-            executed_at: Some(to_time_ticket(executed_at)?),
-            split_tickets: split_tickets
-                .iter()
-                .map(to_time_ticket)
-                .collect::<Result<Vec<_>>>()?,
-            ..Default::default()
-        }),
+            restore_spans,
+            restore_mode,
+            retombstone_spans,
+        } => {
+            let mut tree_edit = api::operation::TreeEdit {
+                parent_created_at: Some(to_time_ticket(parent_created_at)?),
+                from: Some(wire_tree_pos_to_proto(from)?),
+                to: Some(wire_tree_pos_to_proto(to)?),
+                created_at_map_by_actor: BTreeMap::new(),
+                contents: contents
+                    .as_ref()
+                    .map(|groups| {
+                        groups
+                            .iter()
+                            .map(|nodes| wire_tree_nodes_to_proto(nodes))
+                            .collect::<Result<Vec<_>>>()
+                    })
+                    .transpose()?
+                    .unwrap_or_default(),
+                split_level: i32_from_usize(*split_level, "tree_edit.split_level")?,
+                executed_at: Some(to_time_ticket(executed_at)?),
+                split_tickets: split_tickets
+                    .iter()
+                    .map(to_time_ticket)
+                    .collect::<Result<Vec<_>>>()?,
+                ..Default::default()
+            };
+            // JS `toOperation`, as for Text: both span lists and the mode
+            // are written only when a list is non-empty.
+            if !restore_spans.is_empty() || !retombstone_spans.is_empty() {
+                tree_edit.restore_spans = wire_tree_restore_spans_to_proto(restore_spans)?;
+                tree_edit.retombstone_spans = wire_tree_restore_spans_to_proto(retombstone_spans)?;
+                tree_edit.restore_mode = wire_restore_mode_to_proto(*restore_mode) as i32;
+            }
+            api::operation::Body::TreeEdit(tree_edit)
+        }
         WireOperation::TreeStyle {
             parent_created_at,
             from,
@@ -522,11 +532,9 @@ fn wire_operation_to_proto(operation: &WireOperation) -> Result<api::Operation> 
             parent_created_at: Some(to_time_ticket(parent_created_at)?),
             from: Some(wire_tree_pos_to_proto(from)?),
             to: Some(wire_tree_pos_to_proto(to)?),
-            attributes: if attributes_to_remove.is_empty() {
-                attributes.clone()
-            } else {
-                BTreeMap::new()
-            },
+            // Both maps, as JS and Go write them: the reverse of a style that
+            // overwrote some attributes and added others carries both.
+            attributes: attributes.clone(),
             executed_at: Some(to_time_ticket(executed_at)?),
             attributes_to_remove: attributes_to_remove.clone(),
             created_at_map_by_actor: BTreeMap::new(),
@@ -623,14 +631,9 @@ fn proto_operation_to_wire(operation: &api::Operation) -> Result<WireOperation> 
                 if operation.restore_spans.is_empty() && operation.retombstone_spans.is_empty() {
                     (Vec::new(), None, Vec::new())
                 } else {
-                    let mode = if operation.restore_mode == api::RestoreMode::Retombstone as i32 {
-                        WireRestoreMode::Retombstone
-                    } else {
-                        WireRestoreMode::Restore
-                    };
                     (
                         proto_restore_spans_to_wire(&operation.restore_spans)?,
-                        Some(mode),
+                        Some(proto_restore_mode_to_wire(operation.restore_mode)),
                         proto_restore_spans_to_wire(&operation.retombstone_spans)?,
                     )
                 };
@@ -684,35 +687,59 @@ fn proto_operation_to_wire(operation: &api::Operation) -> Result<WireOperation> 
             )?,
             actor: (!operation.actor.is_empty()).then(|| operation.actor.clone()),
         }),
-        api::operation::Body::TreeEdit(operation) => Ok(WireOperation::TreeEdit {
-            parent_created_at: proto_required_time_ticket(
-                &operation.parent_created_at,
-                "operation.tree_edit.parent_created_at",
-            )?,
-            from: proto_tree_pos_to_wire(required(&operation.from, "operation.tree_edit.from")?)?,
-            to: proto_tree_pos_to_wire(required(&operation.to, "operation.tree_edit.to")?)?,
-            contents: (!operation.contents.is_empty())
-                .then(|| {
-                    operation
-                        .contents
-                        .iter()
-                        .map(proto_tree_nodes_to_wire)
-                        .collect::<Result<Vec<_>>>()
-                })
-                .transpose()?,
-            split_level: usize_from_i32(operation.split_level, "operation.tree_edit.split_level")?,
-            executed_at: proto_required_time_ticket(
-                &operation.executed_at,
-                "operation.tree_edit.executed_at",
-            )?,
-            // Read back as sent, as JS and Go read them: the server applies
-            // them verbatim.
-            split_tickets: operation
-                .split_tickets
-                .iter()
-                .map(from_time_ticket)
-                .collect(),
-        }),
+        api::operation::Body::TreeEdit(operation) => {
+            // JS `fromOperation`: the spans are read only when a list is
+            // non-empty, and then the mode is set, RESTORE unless the sender
+            // wrote RETOMBSTONE, the proto default included.
+            let (restore_spans, restore_mode, retombstone_spans) =
+                if operation.restore_spans.is_empty() && operation.retombstone_spans.is_empty() {
+                    (Vec::new(), None, Vec::new())
+                } else {
+                    (
+                        proto_tree_restore_spans_to_wire(&operation.restore_spans)?,
+                        Some(proto_restore_mode_to_wire(operation.restore_mode)),
+                        proto_tree_restore_spans_to_wire(&operation.retombstone_spans)?,
+                    )
+                };
+            Ok(WireOperation::TreeEdit {
+                parent_created_at: proto_required_time_ticket(
+                    &operation.parent_created_at,
+                    "operation.tree_edit.parent_created_at",
+                )?,
+                from: proto_tree_pos_to_wire(required(
+                    &operation.from,
+                    "operation.tree_edit.from",
+                )?)?,
+                to: proto_tree_pos_to_wire(required(&operation.to, "operation.tree_edit.to")?)?,
+                contents: (!operation.contents.is_empty())
+                    .then(|| {
+                        operation
+                            .contents
+                            .iter()
+                            .map(proto_tree_nodes_to_wire)
+                            .collect::<Result<Vec<_>>>()
+                    })
+                    .transpose()?,
+                split_level: usize_from_i32(
+                    operation.split_level,
+                    "operation.tree_edit.split_level",
+                )?,
+                executed_at: proto_required_time_ticket(
+                    &operation.executed_at,
+                    "operation.tree_edit.executed_at",
+                )?,
+                // Read back as sent, as JS and Go read them: the server applies
+                // them verbatim.
+                split_tickets: operation
+                    .split_tickets
+                    .iter()
+                    .map(from_time_ticket)
+                    .collect(),
+                restore_spans,
+                restore_mode,
+                retombstone_spans,
+            })
+        }
         api::operation::Body::TreeStyle(operation) => Ok(WireOperation::TreeStyle {
             parent_created_at: proto_required_time_ticket(
                 &operation.parent_created_at,
@@ -720,11 +747,7 @@ fn proto_operation_to_wire(operation: &api::Operation) -> Result<WireOperation> 
             )?,
             from: proto_tree_pos_to_wire(required(&operation.from, "operation.tree_style.from")?)?,
             to: proto_tree_pos_to_wire(required(&operation.to, "operation.tree_style.to")?)?,
-            attributes: if operation.attributes_to_remove.is_empty() {
-                operation.attributes.clone()
-            } else {
-                BTreeMap::new()
-            },
+            attributes: operation.attributes.clone(),
             attributes_to_remove: operation.attributes_to_remove.clone(),
             executed_at: proto_required_time_ticket(
                 &operation.executed_at,
@@ -1052,6 +1075,108 @@ fn proto_restore_spans_to_wire(spans: &[api::RestoreSpan]) -> Result<Vec<WireRes
                 end,
                 content: span.content.clone(),
                 attributes: span.attributes.clone(),
+            })
+        })
+        .collect()
+}
+
+fn wire_restore_mode_to_proto(mode: Option<WireRestoreMode>) -> api::RestoreMode {
+    match mode {
+        Some(WireRestoreMode::Retombstone) => api::RestoreMode::Retombstone,
+        Some(WireRestoreMode::Restore) | None => api::RestoreMode::Restore,
+    }
+}
+
+/// Any mode but RETOMBSTONE, unspecified or unknown included, means restore
+/// (JS `fromOperation`).
+fn proto_restore_mode_to_wire(mode: i32) -> WireRestoreMode {
+    if mode == api::RestoreMode::Retombstone as i32 {
+        WireRestoreMode::Retombstone
+    } else {
+        WireRestoreMode::Restore
+    }
+}
+
+/// JS `toPbTreeRestoreSpan`. An empty `value` and an absent anchor are not
+/// written, as JS leaves them unset.
+fn wire_tree_restore_spans_to_proto(
+    spans: &[WireTreeRestoreSpan],
+) -> Result<Vec<api::TreeRestoreSpan>> {
+    let anchor =
+        |id: &Option<WireTreeNodeId>| id.as_ref().map(wire_tree_node_id_to_proto).transpose();
+    spans
+        .iter()
+        .map(|span| {
+            Ok(api::TreeRestoreSpan {
+                id: Some(wire_tree_node_id_to_proto(&span.id)?),
+                node_type: span.node_type.clone(),
+                is_text: span.is_text,
+                length: i32_from_usize(span.length, "tree_restore_span.length")?,
+                value: span.value.clone(),
+                attributes: wire_attrs_to_proto(&span.attributes)?,
+                parent_id: anchor(&span.parent_id)?,
+                left_sibling_id: anchor(&span.left_sibling_id)?,
+                right_sibling_id: anchor(&span.right_sibling_id)?,
+            })
+        })
+        .collect()
+}
+
+/// Reads the spans of an identity Tree edit (JS `fromPbTreeRestoreSpan`, Go
+/// `fromTreeRestoreSpans`). A span addresses nodes by insertion identity, so
+/// its `id` and every anchor it carries are malformed without a
+/// `created_at`, and its attribute snapshot without an `updated_at`: those
+/// reject the whole operation with `ErrInvalidArgument`, as JS throws,
+/// instead of failing deep in the restore path. Nothing else is checked, as
+/// in JS: a `length` that disagrees with `value`, or a kind that disagrees
+/// with `node_type` (which restore skips), decodes, where Go rejects the
+/// former. A negative `length` or offset, which `usize` cannot hold, is
+/// rejected as a negative offset is everywhere else in this decoder; Go
+/// rejects a negative `length` too.
+fn proto_tree_restore_spans_to_wire(
+    spans: &[api::TreeRestoreSpan],
+) -> Result<Vec<WireTreeRestoreSpan>> {
+    let anchor =
+        |id: &Option<api::TreeNodeId>| id.as_ref().map(proto_tree_node_id_to_wire).transpose();
+    spans
+        .iter()
+        .map(|span| {
+            let malformed = || {
+                ProtocolError::Core(YorkieError::InvalidArgument(
+                    "malformed tree restore span: missing timestamp".to_owned(),
+                ))
+            };
+            let id = span
+                .id
+                .as_ref()
+                .filter(|id| id.created_at.is_some())
+                .ok_or_else(malformed)?;
+            let anchors = [
+                &span.parent_id,
+                &span.left_sibling_id,
+                &span.right_sibling_id,
+            ];
+            if anchors.iter().any(|anchor| {
+                anchor
+                    .as_ref()
+                    .is_some_and(|anchor| anchor.created_at.is_none())
+            }) || span
+                .attributes
+                .values()
+                .any(|attr| attr.updated_at.is_none())
+            {
+                return Err(malformed());
+            }
+            Ok(WireTreeRestoreSpan {
+                id: proto_tree_node_id_to_wire(id)?,
+                node_type: span.node_type.clone(),
+                is_text: span.is_text,
+                length: usize_from_i32(span.length, "tree_restore_span.length")?,
+                value: span.value.clone(),
+                attributes: proto_attrs_to_wire(&span.attributes)?,
+                parent_id: anchor(&span.parent_id)?,
+                left_sibling_id: anchor(&span.left_sibling_id)?,
+                right_sibling_id: anchor(&span.right_sibling_id)?,
             })
         })
         .collect()
@@ -1446,7 +1571,7 @@ mod tests {
         WireChange, WireChangeId, WireChangePack, WireJsonElement, WireJsonElementSimple,
         WireNodeAttr, WireOperation, WirePresence, WirePresenceChange, WireRestoreMode,
         WireRestoreSpan, WireRgaNode, WireRhtNode, WireTextNode, WireTextNodeId, WireTextNodePos,
-        WireTreeNode, WireTreeNodeId, WireTreePos, WireValueType,
+        WireTreeNode, WireTreeNodeId, WireTreePos, WireTreeRestoreSpan, WireValueType,
     };
     use yorkie_core::{
         Checkpoint, Document, JsonValue, SchemaRule, TimeTicket, TreeNodeRule, VersionVector,
@@ -1686,6 +1811,9 @@ mod tests {
                 TimeTicket::new(10, 3, "000000000000000000000001"),
                 TimeTicket::new(10, 4, "000000000000000000000001"),
             ],
+            restore_spans: Vec::new(),
+            restore_mode: None,
+            retombstone_spans: Vec::new(),
         };
 
         let proto = wire_operation_to_proto(&operation)?;
@@ -1700,6 +1828,38 @@ mod tests {
                 .map(|ticket| ticket.delimiter)
                 .collect::<Vec<_>>()
         );
+        assert_eq!(operation, proto_operation_to_wire(&proto)?);
+        Ok(())
+    }
+
+    // JS `tree_style_combined_test.ts` "keeps both halves across the
+    // protobuf round trip": the reverse of a style that overwrote `b` and
+    // added `c` restores the one and removes the other in one operation,
+    // and both halves reach the peer.
+    #[test]
+    fn roundtrips_both_halves_of_a_tree_style() -> Result<(), Box<dyn Error>> {
+        let pos = WireTreePos {
+            parent_id: tree_node_id(1, 0),
+            left_sibling_id: tree_node_id(2, 0),
+        };
+        let operation = WireOperation::TreeStyle {
+            parent_created_at: ticket(1),
+            from: pos.clone(),
+            to: pos,
+            attributes: BTreeMap::from([("b".to_owned(), "x".to_owned())]),
+            attributes_to_remove: vec!["c".to_owned()],
+            executed_at: ticket(10),
+        };
+
+        let proto = wire_operation_to_proto(&operation)?;
+        let Some(Body::TreeStyle(tree_style)) = &proto.body else {
+            panic!("expected a tree style");
+        };
+        assert_eq!(
+            BTreeMap::from([("b".to_owned(), "x".to_owned())]),
+            tree_style.attributes
+        );
+        assert_eq!(vec!["c".to_owned()], tree_style.attributes_to_remove);
         assert_eq!(operation, proto_operation_to_wire(&proto)?);
         Ok(())
     }
@@ -2903,45 +3063,287 @@ mod tests {
         Ok(doc)
     }
 
-    /// The Tree's restore fields stay unread (Tree undo is not ported): a
-    /// `TreeEdit` carrying them decodes to its positional part, as before.
-    #[test]
-    fn decodes_a_tree_edit_with_restore_fields_to_its_positional_part() -> Result<(), Box<dyn Error>>
-    {
+    // --- Tree restore spans (JS tree_restore_converter_test.ts) ---
+
+    /// The JS test's element span: `<p bold="true">` with all three anchors.
+    fn tree_element_span() -> WireTreeRestoreSpan {
+        WireTreeRestoreSpan {
+            id: tree_node_id(1, 2),
+            node_type: "p".to_owned(),
+            is_text: false,
+            length: 0,
+            value: String::new(),
+            attributes: BTreeMap::from([(
+                "bold".to_owned(),
+                WireNodeAttr {
+                    value: "true".to_owned(),
+                    updated_at: ticket(1),
+                    is_removed: false,
+                },
+            )]),
+            parent_id: Some(tree_node_id(1, 0)),
+            left_sibling_id: Some(tree_node_id(1, 1)),
+            right_sibling_id: Some(tree_node_id(1, 3)),
+        }
+    }
+
+    /// The JS test's text span: `hello` under the element, its only anchor
+    /// the parent.
+    fn tree_text_span() -> WireTreeRestoreSpan {
+        WireTreeRestoreSpan {
+            id: tree_node_id(1, 5),
+            node_type: "text".to_owned(),
+            is_text: true,
+            length: 5,
+            value: "hello".to_owned(),
+            attributes: BTreeMap::new(),
+            parent_id: Some(tree_node_id(1, 2)),
+            left_sibling_id: None,
+            right_sibling_id: None,
+        }
+    }
+
+    fn tree_edit(
+        restore_spans: Vec<WireTreeRestoreSpan>,
+        restore_mode: Option<WireRestoreMode>,
+        retombstone_spans: Vec<WireTreeRestoreSpan>,
+    ) -> WireOperation {
         let pos = WireTreePos {
             parent_id: tree_node_id(1, 0),
-            left_sibling_id: tree_node_id(2, 1),
+            left_sibling_id: tree_node_id(1, 0),
         };
-        let operation = WireOperation::TreeEdit {
-            parent_created_at: ticket(1),
+        WireOperation::TreeEdit {
+            parent_created_at: TimeTicket::initial(),
             from: pos.clone(),
             to: pos,
             contents: None,
             split_level: 0,
-            executed_at: ticket(10),
+            executed_at: ticket(4),
             split_tickets: Vec::new(),
-        };
-        let mut proto = wire_operation_to_proto(&operation)?;
-        let Some(Body::TreeEdit(tree_edit)) = &mut proto.body else {
+            restore_spans,
+            restore_mode,
+            retombstone_spans,
+        }
+    }
+
+    fn tree_spans_of(
+        operation: WireOperation,
+    ) -> (
+        Option<WireRestoreMode>,
+        Vec<WireTreeRestoreSpan>,
+        Vec<WireTreeRestoreSpan>,
+    ) {
+        let WireOperation::TreeEdit {
+            restore_spans,
+            restore_mode,
+            retombstone_spans,
+            ..
+        } = operation
+        else {
             panic!("expected a tree edit");
         };
-        assert!(tree_edit.restore_spans.is_empty());
-        assert_eq!(0, tree_edit.restore_mode);
-        let span = api::TreeRestoreSpan {
-            id: Some(super::wire_tree_node_id_to_proto(&tree_node_id(2, 0))?),
-            node_type: "text".to_owned(),
-            is_text: true,
-            length: 2,
-            value: "ab".to_owned(),
-            ..Default::default()
-        };
-        tree_edit.restore_spans = vec![span.clone()];
-        tree_edit.retombstone_spans = vec![span];
-        tree_edit.restore_mode = api::RestoreMode::Retombstone as i32;
+        (restore_mode, restore_spans, retombstone_spans)
+    }
 
-        let decoded =
-            proto_operation_to_wire(&api::Operation::decode(proto.encode_to_vec().as_slice())?)?;
+    /// JS `tree_restore_converter_test.ts` "round-trips element + text
+    /// restore spans with anchors and attrs".
+    #[test]
+    fn roundtrips_element_and_text_tree_restore_spans() -> Result<(), Box<dyn Error>> {
+        let operation = tree_edit(
+            vec![tree_element_span(), tree_text_span()],
+            Some(WireRestoreMode::Restore),
+            Vec::new(),
+        );
+
+        let decoded = operation_through_bytes(&operation)?;
         assert_eq!(operation, decoded);
+        let (mode, spans, retombstone) = tree_spans_of(decoded);
+        assert_eq!(Some(WireRestoreMode::Restore), mode);
+        assert!(retombstone.is_empty());
+        let [element, text] = &spans[..] else {
+            panic!("expected two spans, got {spans:?}");
+        };
+        // Identity, the tree anchors and the attribute snapshot survive.
+        assert_eq!(tree_node_id(1, 2), element.id);
+        assert_eq!(("p", false), (element.node_type.as_str(), element.is_text));
+        assert_eq!(Some(tree_node_id(1, 0)), element.parent_id);
+        assert_eq!(Some(tree_node_id(1, 1)), element.left_sibling_id);
+        assert_eq!(Some(tree_node_id(1, 3)), element.right_sibling_id);
+        assert_eq!("true", element.attributes["bold"].value);
+        // Identity, value and length survive.
+        assert_eq!(tree_node_id(1, 5), text.id);
+        assert!(text.is_text);
+        assert_eq!((5, "hello"), (text.length, text.value.as_str()));
+        assert_eq!(Some(tree_node_id(1, 2)), text.parent_id);
+        Ok(())
+    }
+
+    /// JS `tree_restore_converter_test.ts` "round-trips a pure-insert
+    /// reverse (retombstone spans only)": the reverse of an insert carries
+    /// its nodes only in `retombstone_spans`.
+    #[test]
+    fn roundtrips_a_pure_insert_tree_reverse() -> Result<(), Box<dyn Error>> {
+        let operation = tree_edit(
+            Vec::new(),
+            Some(WireRestoreMode::Restore),
+            vec![tree_element_span(), tree_text_span()],
+        );
+
+        let decoded = operation_through_bytes(&operation)?;
+        assert_eq!(operation, decoded);
+        let (mode, spans, retombstone) = tree_spans_of(decoded);
+        assert_eq!(Some(WireRestoreMode::Restore), mode);
+        assert!(spans.is_empty());
+        assert_eq!(2, retombstone.len());
+        assert_eq!(tree_node_id(1, 2), retombstone[0].id);
+        assert_eq!("hello", retombstone[1].value);
+        Ok(())
+    }
+
+    /// JS `tree_restore_converter_test.ts` "round-trips a redo (retombstone
+    /// direction)".
+    #[test]
+    fn roundtrips_a_tree_redo() -> Result<(), Box<dyn Error>> {
+        let operation = tree_edit(
+            vec![tree_text_span()],
+            Some(WireRestoreMode::Retombstone),
+            vec![tree_element_span()],
+        );
+
+        let decoded = operation_through_bytes(&operation)?;
+        assert_eq!(operation, decoded);
+        let (mode, spans, retombstone) = tree_spans_of(decoded);
+        assert_eq!(Some(WireRestoreMode::Retombstone), mode);
+        assert_eq!((1, 1), (spans.len(), retombstone.len()));
+        Ok(())
+    }
+
+    /// JS `tree_restore_converter_test.ts` "leaves ordinary tree edits
+    /// without a restore payload": no span list and no mode on the wire, so
+    /// the bytes are the ones written before restore spans existed, and a
+    /// mode with no span leaves no trace.
+    #[test]
+    fn leaves_ordinary_tree_edits_without_a_restore_payload() -> Result<(), Box<dyn Error>> {
+        for mode in [None, Some(WireRestoreMode::Retombstone)] {
+            let proto = wire_operation_to_proto(&tree_edit(Vec::new(), mode, Vec::new()))?;
+            let Some(Body::TreeEdit(edit)) = &proto.body else {
+                panic!("expected a tree edit");
+            };
+            assert!(edit.restore_spans.is_empty());
+            assert!(edit.retombstone_spans.is_empty());
+            assert_eq!(0, edit.restore_mode, "{mode:?}");
+            assert_eq!(
+                (None, Vec::new(), Vec::new()),
+                tree_spans_of(proto_operation_to_wire(&proto)?)
+            );
+        }
+        Ok(())
+    }
+
+    /// JS `fromOperation` reads any mode but RETOMBSTONE as restore, so a
+    /// peer that leaves `restore_mode` at its proto default still sends an
+    /// identity edit, which Rust tells apart by its mode.
+    #[test]
+    fn reads_a_tree_identity_edit_without_a_mode_as_a_restore() -> Result<(), Box<dyn Error>> {
+        let operation = tree_edit(
+            vec![tree_text_span()],
+            Some(WireRestoreMode::Restore),
+            Vec::new(),
+        );
+        let mut proto = wire_operation_to_proto(&operation)?;
+        let Some(Body::TreeEdit(edit)) = &mut proto.body else {
+            panic!("expected a tree edit");
+        };
+        edit.restore_mode = api::RestoreMode::Unspecified as i32;
+        let bytes = proto.encode_to_vec();
+
+        assert_eq!(
+            operation,
+            proto_operation_to_wire(&api::Operation::decode(bytes.as_slice())?)?
+        );
+        Ok(())
+    }
+
+    /// JS `tree_restore_converter_test.ts` "rejects a span with a missing
+    /// created_at", every row: a span addresses nodes by insertion identity,
+    /// so a missing `created_at` on its id or an anchor, or a missing
+    /// `updated_at` on an attribute, rejects the whole operation with
+    /// `ErrInvalidArgument`. A disagreeing kind or length still decodes.
+    #[test]
+    fn rejects_a_tree_span_with_a_missing_timestamp() -> Result<(), Box<dyn Error>> {
+        type Corrupt = fn(&mut api::TreeRestoreSpan);
+        let decode_with = |corrupt: Corrupt| -> Result<_, Box<dyn Error>> {
+            let operation = tree_edit(
+                vec![tree_element_span()],
+                Some(WireRestoreMode::Restore),
+                Vec::new(),
+            );
+            let mut proto = wire_operation_to_proto(&operation)?;
+            let Some(Body::TreeEdit(edit)) = &mut proto.body else {
+                panic!("expected a tree edit");
+            };
+            corrupt(&mut edit.restore_spans[0]);
+            let bytes = proto.encode_to_vec();
+            Ok(proto_operation_to_wire(&api::Operation::decode(
+                bytes.as_slice(),
+            )?))
+        };
+
+        let rows: [(&str, Corrupt); 6] = [
+            ("on the span id", |span| {
+                span.id.as_mut().unwrap().created_at = None;
+            }),
+            ("without a span id", |span| span.id = None),
+            ("on the parent id", |span| {
+                span.parent_id.as_mut().unwrap().created_at = None;
+            }),
+            ("on the left sibling id", |span| {
+                span.left_sibling_id.as_mut().unwrap().created_at = None;
+            }),
+            ("on the right sibling id", |span| {
+                span.right_sibling_id.as_mut().unwrap().created_at = None;
+            }),
+            ("on an attribute updatedAt", |span| {
+                span.attributes.get_mut("bold").unwrap().updated_at = None;
+            }),
+        ];
+        for (name, corrupt) in rows {
+            assert!(
+                matches!(
+                    decode_with(corrupt)?,
+                    Err(ProtocolError::Core(YorkieError::InvalidArgument(_)))
+                ),
+                "{name}"
+            );
+        }
+
+        // A negative length is not a missing timestamp, but `usize` cannot
+        // hold it, so it fails as a negative offset does everywhere in this
+        // decoder (Go rejects it too; JS does not).
+        assert!(
+            matches!(
+                decode_with(|span| span.length = -1)?,
+                Err(ProtocolError::InvalidOffset {
+                    field: "tree_restore_span.length",
+                    value: -1,
+                })
+            ),
+            "with a negative length"
+        );
+
+        let decodes: [(&str, Corrupt); 4] = [
+            ("as written", |_| {}),
+            ("with a kind that disagrees", |span| span.is_text = true),
+            ("with a length that disagrees", |span| span.length = 7),
+            ("without anchors", |span| {
+                span.parent_id = None;
+                span.left_sibling_id = None;
+                span.right_sibling_id = None;
+            }),
+        ];
+        for (name, corrupt) in decodes {
+            assert!(decode_with(corrupt)?.is_ok(), "{name}");
+        }
         Ok(())
     }
 

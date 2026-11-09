@@ -17,3 +17,5 @@ mod text_ledger_tests;
 pub(crate) mod tree;
 #[cfg(test)]
 mod tree_boundary_tests;
+#[cfg(test)]
+mod tree_undo_tests;

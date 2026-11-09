@@ -1,7 +1,7 @@
 use super::{ExecutionResult, OpInfo, OpSource, Operation, OperationMeta};
 use crate::crdt::rht::RhtNode;
 use crate::crdt::root::CrdtRoot;
-use crate::crdt::tree::{TreePos, TreeStyleChange};
+use crate::crdt::tree::{TreeNodeId, TreePos, TreeStyleChange};
 use crate::time::ActorId;
 use crate::{Result, TimeTicket, VersionVector, YorkieError};
 use std::collections::BTreeMap;
@@ -89,7 +89,10 @@ impl TreeStyleOperation {
                 return Err(self.tree_parent_error(root));
             };
 
-            let result = if !self.attributes_to_remove.is_empty() {
+            // As in JS and Go, attributes pick the style: an operation that
+            // carries both maps, the reverse of a style that changed some
+            // keys and added others, runs as a style of its attributes.
+            let result = if self.attributes.is_empty() {
                 let (removed_nodes, remove_diff, remove_changes, previous_attributes) = tree
                     .remove_style_by_range_with_changes(
                         range,
@@ -149,6 +152,7 @@ impl TreeStyleOperation {
         Ok(Some(ExecutionResult {
             op_infos,
             reverse_op,
+            tree_edit: None,
         }))
     }
 
@@ -182,6 +186,15 @@ impl TreeStyleOperation {
 
     pub(crate) fn set_actor(&mut self, actor_id: impl Into<ActorId>) {
         self.meta.set_actor(actor_id);
+    }
+
+    /// Points this operation at `curr` wherever its range named `prev` (JS
+    /// `reconcileNodeID`): an undo or redo that splits again mints the
+    /// element under a new ID, and an operation recorded against the old
+    /// one would address a node that may no longer exist.
+    pub(crate) fn reconcile_node_id(&mut self, prev: &TreeNodeId, curr: &TreeNodeId) {
+        self.from_pos = self.from_pos.replace_node_id(prev, curr);
+        self.to_pos = self.to_pos.replace_node_id(prev, curr);
     }
 
     pub(crate) fn to_test_string(&self) -> String {
@@ -274,7 +287,7 @@ mod tests {
     use crate::crdt::element::CrdtElement;
     use crate::crdt::object::CrdtObject;
     use crate::crdt::root::CrdtRoot;
-    use crate::crdt::tree::{CrdtTree, TreeNode, TreeNodeId};
+    use crate::crdt::tree::{CrdtTree, TreeNode, TreeNodeId, TreePos};
     use crate::operation::{OpInfo, OpSource, Operation, TreeEditOperation};
     use crate::{TimeTicket, VersionVector};
     use std::collections::BTreeMap;
@@ -439,6 +452,89 @@ mod tests {
         assert_eq!(3, root.get_garbage_len());
         assert_eq!(live, root.doc_size().live);
         Ok(())
+    }
+
+    /// JS `TreeStyleOperation.execute`: an operation carrying attributes
+    /// runs as a style, whatever keys it also names for removal. The
+    /// reverse of a style that both changed and added keys carries both
+    /// maps (JS `execute`, the both-maps case first), and a replica must run
+    /// it as JS and Go do to converge with them.
+    #[test]
+    fn runs_an_operation_with_both_maps_as_a_style() -> crate::Result<()> {
+        let tree_at = ticket(1, "a");
+        let mut root = seeded_root(tree_at.clone());
+        let range = root
+            .tree_by_created_at(&tree_at)
+            .unwrap()
+            .path_to_pos_range(&[0])?;
+        TreeStyleOperation::create(
+            tree_at.clone(),
+            range.0.clone(),
+            range.1.clone(),
+            BTreeMap::from([("color".to_owned(), "blue".to_owned())]),
+            Some(ticket(10, "a")),
+        )
+        .execute(&mut root, OpSource::Remote, None)?;
+
+        let result = TreeStyleOperation::create(
+            tree_at.clone(),
+            range.0.clone(),
+            range.1.clone(),
+            BTreeMap::from([
+                ("bold".to_owned(), "true".to_owned()),
+                ("color".to_owned(), "red".to_owned()),
+            ]),
+            Some(ticket(11, "a")),
+        )
+        .execute(&mut root, OpSource::Remote, None)?
+        .unwrap();
+        let Some(Operation::TreeStyle(reverse)) = result.reverse_op else {
+            panic!("expected a tree style reverse");
+        };
+        assert_eq!(
+            &BTreeMap::from([("color".to_owned(), "blue".to_owned())]),
+            reverse.attributes()
+        );
+        assert_eq!(&["bold".to_owned()], reverse.attributes_to_remove());
+
+        TreeStyleOperation::new(
+            tree_at.clone(),
+            range.0,
+            range.1,
+            BTreeMap::from([("color".to_owned(), "green".to_owned())]),
+            vec!["bold".to_owned()],
+            Some(ticket(12, "a")),
+        )
+        .execute(&mut root, OpSource::Remote, None)?;
+        assert_eq!(
+            r#"<root><p bold="true" color="green">hello</p></root>"#,
+            root.tree_by_created_at(&tree_at).unwrap().to_xml()
+        );
+        Ok(())
+    }
+
+    /// JS `TreeStyleOperation.reconcileNodeID`: re-pointing a node rewrites
+    /// the range wherever it names it.
+    #[test]
+    fn re_points_its_range_at_a_re_created_element() {
+        let prev = TreeNodeId::new(ticket(2, "a"), 0);
+        let curr = TreeNodeId::new(ticket(20, "a"), 0);
+        let other = TreeNodeId::new(ticket(3, "a"), 1);
+        let mut operation = TreeStyleOperation::create(
+            ticket(1, "a"),
+            TreePos::new(prev.clone(), prev.clone()),
+            TreePos::new(prev.clone(), other.clone()),
+            BTreeMap::new(),
+            None,
+        );
+
+        operation.reconcile_node_id(&prev, &curr);
+
+        assert_eq!(
+            &TreePos::new(curr.clone(), curr.clone()),
+            operation.range_from()
+        );
+        assert_eq!(&TreePos::new(curr, other), operation.to_pos());
     }
 
     fn seeded_root(tree_at: TimeTicket) -> CrdtRoot {
