@@ -136,17 +136,10 @@ fn keeps_valid_tree_boundaries_editable() -> Result<()> {
 ///
 /// In JS that split stays on the document's tree, and the guard reads the
 /// neighbouring node to see the pair across the seam. A Rust `JsonTree` is
-/// meant to be a copy whose split never reaches the document, so the edit
-/// would meet the pair inside one node.
-///
-/// It fails today: an update that records no operation falls back to diffing
-/// the JSON view (`collect_object_changes`), and the split text nodes show
-/// there, so the update records a `SET` of the whole tree with each half of
-/// the emoji decoded as U+FFFD. The same happens without a surrogate pair:
-/// any read-path split of a text node in an update that records nothing
-/// else replaces the tree. JS records nothing.
+/// a copy whose split never reaches the document, so the edit meets the
+/// pair inside one node. The update records nothing, as in JS, so the
+/// document keeps the pair whole.
 #[test]
-#[ignore = "a read-path split in an update with no operation records a SET of the tree"]
 fn rejects_a_tree_index_at_a_local_seam_inside_a_pair() -> Result<()> {
     let mut doc = new_surrogate_doc()?;
     update_tree(&mut doc, |t| {

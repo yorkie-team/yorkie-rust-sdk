@@ -613,3 +613,140 @@ fn tree_converts_positions_in_a_removed_mixed_parent_to_js_paths() -> Result<()>
     }
     Ok(())
 }
+
+// --- Read helpers record nothing ---
+//
+// JS records no operation for a read helper: `posRangeToIndexRange` and
+// `posRangeToPathRange` split text nodes of the live tree, but "these
+// read-path conversions emit no operation" (`registerPendingGCPairs`,
+// `src/document/json/tree.ts` at `8629993e`), and an update with no
+// operation and no presence change records no change (`document.ts`
+// `update`, `ctx.hasChange()`).
+
+/// `<r><p>a😀b</p><p>cd</p></r>`: Tree index 3 cuts the emoji in half.
+fn emoji_tree() -> TreeNodeInput {
+    element(
+        "r",
+        vec![
+            element("p", vec![text("a😀b")]),
+            element("p", vec![text("cd")]),
+        ],
+    )
+}
+
+/// Calls every read helper of `tree` on every index range, as an editor
+/// resolving stored selections would. The position conversions split the
+/// text nodes, inside the emoji's pair at index 3.
+fn read_tree(tree: &mut JsonTree) -> Result<()> {
+    let size = tree.size()?;
+    for from in 0..=size {
+        for to in from..=size {
+            let range = tree.index_range_to_pos_range((from, to))?;
+            assert_eq!((from, to), tree.pos_range_to_index_range(&range)?);
+            tree.pos_range_to_path_range(&range)?;
+        }
+        let path = tree.index_to_path(from)?;
+        assert_eq!(from, tree.path_to_index(&path)?);
+        tree.path_range_to_pos_range((&path, &path))?;
+    }
+    tree.to_xml()?;
+    tree.to_json()?;
+    tree.node_size()?;
+    tree.root_tree_node()?;
+    tree.id()?;
+    Ok(())
+}
+
+/// Calls every read helper of `text` on every index range.
+fn read_text(text: &JsonText) -> Result<()> {
+    let len = text.len();
+    for from in 0..=len {
+        for to in from..=len {
+            let range = text.index_range_to_pos_range((from, to))?;
+            text.pos_range_to_index_range(&range)?;
+        }
+    }
+    text.values();
+    text.to_sorted_json();
+    text.to_string();
+    text.id();
+    Ok(())
+}
+
+/// A `presence_change` alone: the only thing the update should record.
+fn some_presence() -> crate::Presence {
+    serde_json::json!({"cursor": 1})
+        .as_object()
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn tree_read_helpers_record_nothing() -> Result<()> {
+    let mut doc = tree_doc(emoji_tree())?;
+    let _ = push(&mut doc)?;
+    let xml = tree_of(&doc).to_xml()?;
+
+    doc.update(|root| read_tree(root.get_tree_mut("t")?))?;
+
+    assert!(!doc.has_local_changes());
+    assert_eq!(xml, tree_of(&doc).to_xml()?);
+    Ok(())
+}
+
+#[test]
+fn text_read_helpers_record_nothing() -> Result<()> {
+    let mut doc = text_doc(&[(0, 0, "a😀b"), (4, 4, "cd")])?;
+    let _ = push(&mut doc)?;
+    let json = doc.to_sorted_json();
+
+    doc.update(|root| read_text(root.get_text_mut("k")?))?;
+
+    assert!(!doc.has_local_changes());
+    assert_eq!(json, doc.to_sorted_json());
+    Ok(())
+}
+
+/// A presence update that resolves selections, the common editor case,
+/// records the presence change and no operation.
+#[test]
+fn read_helpers_in_a_presence_update_record_only_the_presence() -> Result<()> {
+    let mut doc = tree_doc(emoji_tree())?;
+    doc.update(|root| {
+        root.set_text("k")?.edit(0, 0, "a😀b", None)?;
+        Ok(())
+    })?;
+    let _ = push(&mut doc)?;
+
+    doc.update_with_presence(|root, presence| {
+        presence.set(some_presence());
+        read_tree(root.get_tree_mut("t")?)?;
+        read_text(root.get_text_mut("k")?)
+    })?;
+
+    let pack = doc.create_change_pack();
+    assert_eq!(1, pack.changes().len());
+    assert!(pack.changes()[0].operations().is_empty());
+    assert!(pack.changes()[0].presence_change().is_some());
+    Ok(())
+}
+
+/// The read helpers leave a peer's concurrent edits in place: before the
+/// fix, the update replaced the whole tree, which dropped the peer's insert
+/// and decoded each half of the emoji as U+FFFD.
+#[test]
+fn read_helpers_leave_a_peer_edit_in_place() -> Result<()> {
+    let mut d1 = tree_doc(emoji_tree())?;
+    let mut d2 = Document::new("test-doc");
+    d2.set_actor(A2);
+    cross_sync(&mut d1, &mut d2)?;
+
+    d2.update(|root| root.get_tree_mut("t")?.edit(9, 9, vec![text("z")], 0))?;
+    d1.update(|root| read_tree(root.get_tree_mut("t")?))?;
+    cross_sync(&mut d1, &mut d2)?;
+
+    let expected = "<r><p>a😀b</p><p>cdz</p></r>";
+    assert_eq!(expected, tree_of(&d1).to_xml()?);
+    assert_eq!(expected, tree_of(&d2).to_xml()?);
+    Ok(())
+}

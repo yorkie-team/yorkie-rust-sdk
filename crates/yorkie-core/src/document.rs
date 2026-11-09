@@ -1307,7 +1307,7 @@ fn collect_object_changes(
             continue;
         };
 
-        if before_value == after_value {
+        if unchanged(before_value, after_value) {
             continue;
         }
 
@@ -1358,7 +1358,7 @@ fn collect_array_changes(
     before: &JsonArray,
     after: &JsonArray,
 ) -> Result<()> {
-    if before == after {
+    if arrays_unchanged(before, after) {
         return Ok(());
     }
 
@@ -1398,7 +1398,7 @@ fn collect_same_length_array_changes(
         let after_value = after.get(index).ok_or_else(|| {
             YorkieError::InvalidIndex(format!("missing after array index {index}"))
         })?;
-        if before_value == after_value {
+        if unchanged(before_value, after_value) {
             continue;
         }
 
@@ -1534,15 +1534,55 @@ fn push_array_set_operation(
     Ok(())
 }
 
+/// Whether `after` is still `before` for the JSON-diff fallback of
+/// `update_with_presence`, which runs only when the update recorded no
+/// operation.
+///
+/// Values compare as `==` does, except that a tree in the document compares
+/// by identity. Such a tree changes only through its own methods, and every
+/// one that edits records an operation, so a difference the fallback sees
+/// can only come from a read helper: `pos_range_to_index_range` and
+/// `pos_range_to_path_range` split text nodes of the update's copy. JS splits
+/// its live tree there too and records nothing ("these read-path conversions
+/// emit no operation", `json/tree.ts` `registerPendingGCPairs`). Compared by
+/// content, the split pieces would record a `SET` of the whole tree, which
+/// replaces it on every replica.
+fn unchanged(before: &JsonValue, after: &JsonValue) -> bool {
+    match (before, after) {
+        (JsonValue::Tree(before), JsonValue::Tree(after)) => {
+            matches!((before.id(), after.id()), (Ok(before), Ok(after)) if before == after)
+                || before == after
+        }
+        (JsonValue::Object(before), JsonValue::Object(after)) => {
+            before.iter().count() == after.iter().count()
+                && before.iter().all(|(key, before)| {
+                    after.get(key).is_some_and(|after| unchanged(before, after))
+                })
+        }
+        (JsonValue::Array(before), JsonValue::Array(after)) => arrays_unchanged(before, after),
+        _ => before == after,
+    }
+}
+
+fn arrays_unchanged(before: &JsonArray, after: &JsonArray) -> bool {
+    before.len() == after.len()
+        && before
+            .iter()
+            .zip(after.iter())
+            .all(|(before, after)| unchanged(before, after))
+}
+
 fn lcs_pairs(before: &[JsonValue], after: &[JsonValue]) -> Vec<(usize, usize)> {
     let mut lengths = vec![vec![0; after.len() + 1]; before.len() + 1];
     for before_index in (0..before.len()).rev() {
         for after_index in (0..after.len()).rev() {
-            lengths[before_index][after_index] = if before[before_index] == after[after_index] {
-                lengths[before_index + 1][after_index + 1] + 1
-            } else {
-                lengths[before_index + 1][after_index].max(lengths[before_index][after_index + 1])
-            };
+            lengths[before_index][after_index] =
+                if unchanged(&before[before_index], &after[after_index]) {
+                    lengths[before_index + 1][after_index + 1] + 1
+                } else {
+                    lengths[before_index + 1][after_index]
+                        .max(lengths[before_index][after_index + 1])
+                };
         }
     }
 
@@ -1550,7 +1590,7 @@ fn lcs_pairs(before: &[JsonValue], after: &[JsonValue]) -> Vec<(usize, usize)> {
     let mut before_index = 0;
     let mut after_index = 0;
     while before_index < before.len() && after_index < after.len() {
-        if before[before_index] == after[after_index] {
+        if unchanged(&before[before_index], &after[after_index]) {
             pairs.push((before_index, after_index));
             before_index += 1;
             after_index += 1;
@@ -3177,6 +3217,38 @@ mod tests {
         let last = &pack.changes()[1];
         assert!(!last.operations().is_empty());
         assert!(last.presence_change().is_some());
+        Ok(())
+    }
+
+    /// The fallback compares a tree in the document by identity, so that the
+    /// split of a read helper records nothing (`json/pos_tests.rs`), but a
+    /// new tree put in its place is still found.
+    #[test]
+    fn fallback_diff_finds_a_tree_replaced_in_place() -> Result<()> {
+        use crate::{JsonTree, TreeNodeInput};
+        let tree = |value: &str| {
+            TreeNodeInput::element(
+                "doc",
+                vec![TreeNodeInput::element(
+                    "p",
+                    vec![TreeNodeInput::text(value)],
+                )],
+            )
+        };
+        let mut doc = attached_doc(1);
+        doc.update(|root| root.set_tree("t", tree("old")).map(|_| ()))?;
+
+        doc.update(|root| {
+            *root.get_mut("t").unwrap() = JsonValue::Tree(JsonTree::new(tree("new")));
+            Ok(())
+        })?;
+
+        let JsonValue::Tree(replaced) = doc.get_root().get("t").unwrap() else {
+            panic!("expected a tree");
+        };
+        assert_eq!("<doc><p>new</p></doc>", replaced.to_xml()?);
+        assert_eq!(crdt_root_json(&doc), doc.to_sorted_json());
+        assert_eq!(2, doc.create_change_pack().change_size());
         Ok(())
     }
 
