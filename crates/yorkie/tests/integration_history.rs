@@ -313,6 +313,13 @@ fn content_of(doc: &SharedDocument) -> String {
 
 /// Both clients undo overlapping deletions: the content should be the
 /// original text.
+///
+/// JS `history_text_test.ts` "Case 3/5 correctness" still marks these
+/// `it.skip`, with a comment about positional re-insertion that identity
+/// restore has made stale; Go runs them live
+/// (`test/integration/history_text_reconcile_test.go`
+/// `TestReconcileOverlappingUndoDuplicatesContent`). They pass here because
+/// an undo revives the removed pieces by identity.
 async fn overlapping_undo_restores_original(
     name: &str,
     d1_edit: (usize, usize),
@@ -334,16 +341,16 @@ async fn overlapping_undo_restores_original(
     t.deactivate().await;
 }
 
+/// JS "Case 3 correctness: both undo of overlapping deletes should restore
+/// original" (`it.skip` there), Go "case 3 correctness".
 #[tokio::test]
-#[ignore = "skipped upstream; needs identity-preserving undo restore, see the \
-            Undo and Redo section of docs/current-porting-gaps.md"]
 async fn restores_the_original_after_both_undo_contained_deletions() {
     overlapping_undo_restores_original("correctness-contained", (4, 6), (2, 8)).await;
 }
 
+/// JS "Case 5 correctness: both undo of partially overlapping deletes should
+/// restore original" (`it.skip` there), Go "case 5 correctness".
 #[tokio::test]
-#[ignore = "skipped upstream; needs identity-preserving undo restore, see the \
-            Undo and Redo section of docs/current-porting-gaps.md"]
 async fn restores_the_original_after_both_undo_overlapping_deletions() {
     overlapping_undo_restores_original("correctness-overlap", (4, 8), (2, 6)).await;
 }

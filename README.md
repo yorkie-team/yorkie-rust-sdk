@@ -117,15 +117,14 @@ other JS features are not ported. See
 [docs/current-porting-gaps.md](docs/current-porting-gaps.md) for the full list
 with JS source paths.
 
-**Interop limitation: undo in mixed JS and Rust sessions.** The JS SDK undoes
-Text edits, and Tree edits, by node identity: the operation it sends carries
+**Interop limitation: Tree undo in mixed JS and Rust sessions.** The JS SDK
+undoes Tree edits by node identity: the `TreeEdit` it sends carries
 `restore_spans`, `retombstone_spans`, and `restore_mode`. The Rust SDK does
-not port these. Its decoder drops them and runs only the positional part of
-the operation (for a Text undo, an empty edit of the original range), so the
-content a JS undo brings back never reappears on a Rust replica, and the
-documents diverge. Avoid mixing JS and Rust clients on a document where JS
-users undo Text or Tree edits. A Rust undo is sent as a plain positional
-edit, which every peer applies alike.
+not port Tree undo. Its decoder drops these fields and runs only the
+positional part of the operation, so the content a JS Tree undo brings back
+never reappears on a Rust replica, and the documents diverge. Avoid mixing JS
+and Rust clients on a document where JS users undo Tree edits. Text undo is
+ported: Rust sends and applies the same identity fields on Text edits as JS.
 
 ## License
 

@@ -9,8 +9,9 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use yorkie_core::wire::{
     WireChange, WireChangeId, WireChangePack, WireJsonElement, WireJsonElementSimple, WireNodeAttr,
-    WireOperation, WirePresence, WirePresenceChange, WireRgaNode, WireRhtNode, WireTextNode,
-    WireTextNodeId, WireTextNodePos, WireTreeNode, WireTreeNodeId, WireTreePos, WireValueType,
+    WireOperation, WirePresence, WirePresenceChange, WireRestoreMode, WireRestoreSpan, WireRgaNode,
+    WireRhtNode, WireTextNode, WireTextNodeId, WireTextNodePos, WireTreeNode, WireTreeNodeId,
+    WireTreePos, WireValueType,
 };
 use yorkie_core::{ChangePack as CoreChangePack, Checkpoint as CoreCheckpoint};
 use yorkie_core::{SchemaRule as CoreSchemaRule, TreeNodeRule as CoreTreeNodeRule};
@@ -426,16 +427,32 @@ fn wire_operation_to_proto(operation: &WireOperation) -> Result<api::Operation> 
             content,
             attributes,
             executed_at,
-        } => api::operation::Body::Edit(api::operation::Edit {
-            parent_created_at: Some(to_time_ticket(parent_created_at)?),
-            from: Some(wire_text_node_pos_to_proto(from)?),
-            to: Some(wire_text_node_pos_to_proto(to)?),
-            created_at_map_by_actor: BTreeMap::new(),
-            content: content.clone(),
-            executed_at: Some(to_time_ticket(executed_at)?),
-            attributes: attributes.clone(),
-            ..Default::default()
-        }),
+            restore_spans,
+            restore_mode,
+            retombstone_spans,
+        } => {
+            let mut edit = api::operation::Edit {
+                parent_created_at: Some(to_time_ticket(parent_created_at)?),
+                from: Some(wire_text_node_pos_to_proto(from)?),
+                to: Some(wire_text_node_pos_to_proto(to)?),
+                created_at_map_by_actor: BTreeMap::new(),
+                content: content.clone(),
+                executed_at: Some(to_time_ticket(executed_at)?),
+                attributes: attributes.clone(),
+                ..Default::default()
+            };
+            // JS `toOperation`: both span lists and the mode are written only
+            // when a list is non-empty, so an ordinary edit keeps its bytes.
+            if !restore_spans.is_empty() || !retombstone_spans.is_empty() {
+                edit.restore_spans = wire_restore_spans_to_proto(restore_spans)?;
+                edit.retombstone_spans = wire_restore_spans_to_proto(retombstone_spans)?;
+                edit.restore_mode = match restore_mode {
+                    Some(WireRestoreMode::Retombstone) => api::RestoreMode::Retombstone,
+                    Some(WireRestoreMode::Restore) | None => api::RestoreMode::Restore,
+                } as i32;
+            }
+            api::operation::Body::Edit(edit)
+        }
         WireOperation::Style {
             parent_created_at,
             from,
@@ -599,20 +616,45 @@ fn proto_operation_to_wire(operation: &api::Operation) -> Result<WireOperation> 
                 "operation.remove.executed_at",
             )?,
         }),
-        api::operation::Body::Edit(operation) => Ok(WireOperation::Edit {
-            parent_created_at: proto_required_time_ticket(
-                &operation.parent_created_at,
-                "operation.edit.parent_created_at",
-            )?,
-            from: proto_text_node_pos_to_wire(required(&operation.from, "operation.edit.from")?)?,
-            to: proto_text_node_pos_to_wire(required(&operation.to, "operation.edit.to")?)?,
-            content: operation.content.clone(),
-            attributes: operation.attributes.clone(),
-            executed_at: proto_required_time_ticket(
-                &operation.executed_at,
-                "operation.edit.executed_at",
-            )?,
-        }),
+        api::operation::Body::Edit(operation) => {
+            // JS `fromOperation`: the spans are read only when a list is
+            // non-empty; then any mode but RETOMBSTONE means restore.
+            let (restore_spans, restore_mode, retombstone_spans) =
+                if operation.restore_spans.is_empty() && operation.retombstone_spans.is_empty() {
+                    (Vec::new(), None, Vec::new())
+                } else {
+                    let mode = if operation.restore_mode == api::RestoreMode::Retombstone as i32 {
+                        WireRestoreMode::Retombstone
+                    } else {
+                        WireRestoreMode::Restore
+                    };
+                    (
+                        proto_restore_spans_to_wire(&operation.restore_spans)?,
+                        Some(mode),
+                        proto_restore_spans_to_wire(&operation.retombstone_spans)?,
+                    )
+                };
+            Ok(WireOperation::Edit {
+                parent_created_at: proto_required_time_ticket(
+                    &operation.parent_created_at,
+                    "operation.edit.parent_created_at",
+                )?,
+                from: proto_text_node_pos_to_wire(required(
+                    &operation.from,
+                    "operation.edit.from",
+                )?)?,
+                to: proto_text_node_pos_to_wire(required(&operation.to, "operation.edit.to")?)?,
+                content: operation.content.clone(),
+                attributes: operation.attributes.clone(),
+                executed_at: proto_required_time_ticket(
+                    &operation.executed_at,
+                    "operation.edit.executed_at",
+                )?,
+                restore_spans,
+                restore_mode,
+                retombstone_spans,
+            })
+        }
         api::operation::Body::Style(operation) => Ok(WireOperation::Style {
             parent_created_at: proto_required_time_ticket(
                 &operation.parent_created_at,
@@ -967,6 +1009,54 @@ fn proto_rga_node_to_wire(node: &api::RgaNode) -> Result<WireRgaNode> {
     })
 }
 
+fn wire_restore_spans_to_proto(spans: &[WireRestoreSpan]) -> Result<Vec<api::RestoreSpan>> {
+    spans
+        .iter()
+        .map(|span| {
+            Ok(api::RestoreSpan {
+                created_at: Some(to_time_ticket(&span.created_at)?),
+                start: i32_from_usize(span.start, "restore_span.start")?,
+                end: i32_from_usize(span.end, "restore_span.end")?,
+                content: span.content.clone(),
+                attributes: span.attributes.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Reads the spans of an identity edit (JS `fromPbSpan`, Go
+/// `fromRestoreSpans`). A span addresses content by insertion identity, so it
+/// is malformed without a `created_at`, and `restore` slices its content by
+/// offset, so `[start, end)` has to be an ordered interval exactly covering
+/// the content, in UTF-16 code units. A malformed span rejects the whole
+/// operation here, as JS throws `ErrInvalidArgument`, instead of failing deep
+/// in the restore path on every peer.
+fn proto_restore_spans_to_wire(spans: &[api::RestoreSpan]) -> Result<Vec<WireRestoreSpan>> {
+    spans
+        .iter()
+        .map(|span| {
+            let malformed = || {
+                ProtocolError::Core(YorkieError::InvalidArgument(
+                    "malformed restore span: missing timestamp or invalid range".to_owned(),
+                ))
+            };
+            let created_at = span.created_at.as_ref().ok_or_else(malformed)?;
+            let start = usize::try_from(span.start).map_err(|_| malformed())?;
+            let end = usize::try_from(span.end).map_err(|_| malformed())?;
+            if end < start || end - start != span.content.encode_utf16().count() {
+                return Err(malformed());
+            }
+            Ok(WireRestoreSpan {
+                created_at: from_time_ticket(created_at),
+                start,
+                end,
+                content: span.content.clone(),
+                attributes: span.attributes.clone(),
+            })
+        })
+        .collect()
+}
+
 fn wire_text_node_to_proto(node: &WireTextNode) -> Result<api::TextNode> {
     Ok(api::TextNode {
         id: Some(wire_text_node_id_to_proto(&node.id)?),
@@ -978,7 +1068,13 @@ fn wire_text_node_to_proto(node: &WireTextNode) -> Result<api::TextNode> {
             .map(wire_text_node_id_to_proto)
             .transpose()?,
         attributes: wire_attrs_to_proto(&node.attributes)?,
-        ..Default::default()
+        // JS `toTextNodes`: empty when `removed_at` says it all, so such a
+        // node encodes to the bytes it did before the ledger.
+        removal_events: node
+            .removal_events
+            .iter()
+            .map(to_time_ticket)
+            .collect::<Result<Vec<_>>>()?,
     })
 }
 
@@ -993,6 +1089,9 @@ fn proto_text_node_to_wire(node: &api::TextNode) -> Result<WireTextNode> {
             .map(proto_text_node_id_to_wire)
             .transpose()?,
         attributes: proto_attrs_to_wire(&node.attributes)?,
+        // Kept as sent; the domain decoder drops a ledger that breaks the
+        // rules (JS `fromTextNode`).
+        removal_events: node.removal_events.iter().map(from_time_ticket).collect(),
     })
 }
 
@@ -1334,9 +1433,10 @@ mod tests {
     use super::{
         decode_change_pack, encode_change_pack, from_change_pack, from_schema_rules,
         proto_change_pack_to_wire, proto_json_element_to_wire, proto_operation_to_wire,
-        proto_tree_nodes_to_wire, to_change_pack, to_schema_rules, to_time_ticket,
-        to_version_vector, wire_change_pack_to_proto, wire_json_element_to_proto,
-        wire_operation_to_proto, wire_tree_nodes_to_proto, ProtocolError,
+        proto_tree_nodes_to_wire, snapshot_from_bytes, snapshot_root_to_bytes, to_change_pack,
+        to_schema_rules, to_time_ticket, to_version_vector, wire_change_pack_to_proto,
+        wire_change_to_proto, wire_json_element_to_proto, wire_operation_to_proto,
+        wire_tree_nodes_to_proto, ProtocolError,
     };
     use crate::yorkie::v1::{self as api, json_element, operation::Body, ValueType};
     use prost::Message;
@@ -1344,11 +1444,14 @@ mod tests {
     use std::error::Error;
     use yorkie_core::wire::{
         WireChange, WireChangeId, WireChangePack, WireJsonElement, WireJsonElementSimple,
-        WireNodeAttr, WireOperation, WirePresence, WirePresenceChange, WireRgaNode, WireRhtNode,
-        WireTextNode, WireTextNodeId, WireTextNodePos, WireTreeNode, WireTreeNodeId, WireTreePos,
-        WireValueType,
+        WireNodeAttr, WireOperation, WirePresence, WirePresenceChange, WireRestoreMode,
+        WireRestoreSpan, WireRgaNode, WireRhtNode, WireTextNode, WireTextNodeId, WireTextNodePos,
+        WireTreeNode, WireTreeNodeId, WireTreePos, WireValueType,
     };
-    use yorkie_core::{Checkpoint, Document, SchemaRule, TimeTicket, TreeNodeRule, VersionVector};
+    use yorkie_core::{
+        Checkpoint, Document, JsonValue, SchemaRule, TimeTicket, TreeNodeRule, VersionVector,
+        YorkieError,
+    };
 
     #[test]
     fn converts_time_tickets_to_proto_shape() -> Result<(), Box<dyn Error>> {
@@ -1772,6 +1875,9 @@ mod tests {
                         content: "Hello World".to_owned(),
                         attributes: BTreeMap::new(),
                         executed_at: text_insert_at.clone(),
+                        restore_spans: Vec::new(),
+                        restore_mode: None,
+                        retombstone_spans: Vec::new(),
                     },
                     WireOperation::Style {
                         parent_created_at: text_at,
@@ -2012,6 +2118,7 @@ mod tests {
                 removed_at: None,
                 ins_prev_id: None,
                 attributes: BTreeMap::new(),
+                removal_events: Vec::new(),
             }],
             created_at,
             moved_at: None,
@@ -2443,5 +2550,795 @@ mod tests {
         expected.insert("name".to_owned(), serde_json::json!("b"));
         assert_eq!(Some(expected), doc.presence(&actor));
         Ok(())
+    }
+
+    // --- Text restore spans (JS restore_converter_test.ts) ---
+
+    /// JS `restore_converter_test.ts` "round-trips a restore operation over
+    /// the wire".
+    #[test]
+    fn roundtrips_a_restore_operation_over_the_wire() -> Result<(), Box<dyn Error>> {
+        let operation = identity_edit(
+            vec![restore_span(4, 6, "45"), restore_span(2, 8, "234567")],
+            WireRestoreMode::Restore,
+            Vec::new(),
+        );
+
+        let decoded = operation_through_bytes(&operation)?;
+        assert_eq!(operation, decoded);
+        let WireOperation::Edit {
+            restore_spans,
+            restore_mode,
+            ..
+        } = decoded
+        else {
+            panic!("expected an edit");
+        };
+        assert_eq!(Some(WireRestoreMode::Restore), restore_mode);
+        assert_eq!(2, restore_spans.len());
+        assert_eq!((4, 6, "45"), span_parts(&restore_spans[0]));
+        assert_eq!("234567", restore_spans[1].content);
+        assert_eq!(ticket(1), restore_spans[0].created_at);
+        Ok(())
+    }
+
+    /// JS `restore_converter_test.ts` "round-trips a retombstone operation".
+    #[test]
+    fn roundtrips_a_retombstone_operation() -> Result<(), Box<dyn Error>> {
+        let operation = identity_edit(
+            vec![restore_span(4, 6, "45")],
+            WireRestoreMode::Retombstone,
+            Vec::new(),
+        );
+
+        let proto = wire_operation_to_proto(&operation)?;
+        let Some(Body::Edit(edit)) = &proto.body else {
+            panic!("expected an edit");
+        };
+        assert_eq!(api::RestoreMode::Retombstone as i32, edit.restore_mode);
+        assert_eq!(operation, operation_through_bytes(&operation)?);
+        Ok(())
+    }
+
+    /// JS `restore_converter_test.ts` "round-trips the companion
+    /// retombstone_spans of a replace reverse": the reverse of a replace
+    /// revives the removed content and re-removes the inserted content, both
+    /// by identity, and both span lists must survive the wire.
+    #[test]
+    fn roundtrips_the_companion_retombstone_spans_of_a_replace_reverse(
+    ) -> Result<(), Box<dyn Error>> {
+        let operation = identity_edit(
+            vec![restore_span(2, 4, "CD")],
+            WireRestoreMode::Restore,
+            vec![restore_span(0, 2, "12")],
+        );
+
+        let decoded = operation_through_bytes(&operation)?;
+        assert_eq!(operation, decoded);
+        let WireOperation::Edit {
+            restore_spans,
+            retombstone_spans,
+            ..
+        } = decoded
+        else {
+            panic!("expected an edit");
+        };
+        assert_eq!("CD", restore_spans[0].content);
+        assert_eq!(1, retombstone_spans.len());
+        assert_eq!("12", retombstone_spans[0].content);
+        assert_eq!(ticket(1), retombstone_spans[0].created_at);
+        Ok(())
+    }
+
+    /// JS `restore_converter_test.ts` "keeps span attributes, stamped with
+    /// executedAt": the attribute map crosses the wire as it was. The stamp
+    /// is the domain decoder's (`yorkie-core` wire test
+    /// `stamps_span_attributes_with_executed_at`).
+    #[test]
+    fn keeps_span_attributes() -> Result<(), Box<dyn Error>> {
+        let mut styled = restore_span(0, 1, "X");
+        styled.attributes.insert("b".to_owned(), "1".to_owned());
+        let operation = identity_edit(Vec::new(), WireRestoreMode::Restore, vec![styled]);
+
+        let WireOperation::Edit {
+            retombstone_spans, ..
+        } = operation_through_bytes(&operation)?
+        else {
+            panic!("expected an edit");
+        };
+        assert_eq!(
+            BTreeMap::from([("b".to_owned(), "1".to_owned())]),
+            retombstone_spans[0].attributes
+        );
+        Ok(())
+    }
+
+    /// JS `restore_converter_test.ts` "rejects a malformed span": a span is
+    /// untrusted input from any peer, so a missing `created_at`, a negative
+    /// start, an inverted interval, or an interval that does not cover the
+    /// content in UTF-16 code units rejects the whole operation at the
+    /// boundary instead of failing deep in the restore path.
+    #[test]
+    fn rejects_a_malformed_span() -> Result<(), Box<dyn Error>> {
+        let decode_with = |corrupt: &dyn Fn(&mut api::RestoreSpan)| -> Result<_, Box<dyn Error>> {
+            let operation = identity_edit(
+                vec![restore_span(4, 6, "45")],
+                WireRestoreMode::Restore,
+                Vec::new(),
+            );
+            let mut proto = wire_operation_to_proto(&operation)?;
+            let Some(Body::Edit(edit)) = &mut proto.body else {
+                panic!("expected an edit");
+            };
+            corrupt(&mut edit.restore_spans[0]);
+            let bytes = proto.encode_to_vec();
+            Ok(proto_operation_to_wire(&api::Operation::decode(
+                bytes.as_slice(),
+            )?))
+        };
+        let rejects = |result: super::Result<WireOperation>| {
+            matches!(
+                result,
+                Err(ProtocolError::Core(YorkieError::InvalidArgument(_)))
+            )
+        };
+
+        assert!(decode_with(&|_| {})?.is_ok());
+        assert!(rejects(decode_with(&|span| span.created_at = None)?));
+        assert!(rejects(decode_with(&|span| {
+            span.start = -2;
+            span.end = 0;
+        })?));
+        assert!(rejects(decode_with(&|span| {
+            span.start = 6;
+            span.end = 4;
+        })?));
+        assert!(rejects(decode_with(&|span| span.end = 9)?));
+        // An emoji is two UTF-16 code units and four UTF-8 bytes.
+        assert!(decode_with(&|span| {
+            span.content = "\u{1F600}".to_owned();
+        })?
+        .is_ok());
+        assert!(rejects(decode_with(&|span| {
+            span.content = "\u{1F600}".to_owned();
+            span.end = 8;
+        })?));
+        // The retombstone list is checked the same way.
+        let operation = identity_edit(
+            Vec::new(),
+            WireRestoreMode::Restore,
+            vec![restore_span(4, 6, "45")],
+        );
+        let mut proto = wire_operation_to_proto(&operation)?;
+        let Some(Body::Edit(edit)) = &mut proto.body else {
+            panic!("expected an edit");
+        };
+        edit.retombstone_spans[0].end = 9;
+        assert!(rejects(proto_operation_to_wire(&proto)));
+        Ok(())
+    }
+
+    /// A malformed span fails the change pack that carries it, as JS throws
+    /// from `fromOperation`.
+    #[test]
+    fn rejects_a_change_pack_with_a_malformed_span() -> Result<(), Box<dyn Error>> {
+        let mut pack = api::ChangePack {
+            document_key: "doc-key".to_owned(),
+            checkpoint: Some(api::Checkpoint {
+                server_seq: 0,
+                client_seq: 1,
+            }),
+            changes: vec![wire_change_to_proto(&WireChange {
+                id: wire_change_id(1, 4),
+                message: None,
+                presence_change: None,
+                operations: vec![identity_edit(
+                    vec![restore_span(4, 6, "45")],
+                    WireRestoreMode::Restore,
+                    Vec::new(),
+                )],
+            })?],
+            ..Default::default()
+        };
+        let Some(Body::Edit(edit)) = &mut pack.changes[0].operations[0].body else {
+            panic!("expected an edit");
+        };
+        edit.restore_spans[0].end = 9;
+
+        assert!(matches!(
+            decode_change_pack(&pack.encode_to_vec()),
+            Err(ProtocolError::Core(YorkieError::InvalidArgument(_)))
+        ));
+        Ok(())
+    }
+
+    /// JS `restore_converter_test.ts` "leaves ordinary edits without a
+    /// restore payload": no span list and no mode on the wire, so the bytes
+    /// are the ones written before restore spans existed.
+    #[test]
+    fn leaves_ordinary_edits_without_a_restore_payload() -> Result<(), Box<dyn Error>> {
+        let operation = WireOperation::Edit {
+            parent_created_at: TimeTicket::initial(),
+            from: text_pos(ticket(1), 0, 0),
+            to: text_pos(ticket(1), 0, 0),
+            content: "hi".to_owned(),
+            attributes: BTreeMap::new(),
+            executed_at: ticket(4),
+            restore_spans: Vec::new(),
+            restore_mode: None,
+            retombstone_spans: Vec::new(),
+        };
+
+        let proto = wire_operation_to_proto(&operation)?;
+        let Some(Body::Edit(edit)) = &proto.body else {
+            panic!("expected an edit");
+        };
+        assert!(edit.restore_spans.is_empty());
+        assert!(edit.retombstone_spans.is_empty());
+        assert_eq!(0, edit.restore_mode);
+        assert_eq!(operation, operation_through_bytes(&operation)?);
+        Ok(())
+    }
+
+    /// JS `toOperation` writes `restore_mode` only with a span, so a mode
+    /// with no span leaves no trace in the bytes.
+    #[test]
+    fn writes_no_restore_mode_without_a_span() -> Result<(), Box<dyn Error>> {
+        let operation = identity_edit(Vec::new(), WireRestoreMode::Retombstone, Vec::new());
+
+        let proto = wire_operation_to_proto(&operation)?;
+        let Some(Body::Edit(edit)) = &proto.body else {
+            panic!("expected an edit");
+        };
+        assert_eq!(0, edit.restore_mode);
+        assert!(matches!(
+            proto_operation_to_wire(&proto)?,
+            WireOperation::Edit {
+                restore_mode: None,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    /// JS `fromOperation` reads any mode other than RETOMBSTONE as restore.
+    #[test]
+    fn reads_an_unspecified_mode_with_spans_as_restore() -> Result<(), Box<dyn Error>> {
+        let operation = identity_edit(
+            vec![restore_span(4, 6, "45")],
+            WireRestoreMode::Restore,
+            Vec::new(),
+        );
+        let mut proto = wire_operation_to_proto(&operation)?;
+        let Some(Body::Edit(edit)) = &mut proto.body else {
+            panic!("expected an edit");
+        };
+        edit.restore_mode = api::RestoreMode::Unspecified as i32;
+
+        assert_eq!(operation, proto_operation_to_wire(&proto)?);
+        Ok(())
+    }
+
+    /// JS `restore_converter_test.ts` "decodes to a harmless no-op for peers
+    /// that ignore restore fields": an undo by identity carries its content
+    /// only in its spans, and its positional part is a zero-width,
+    /// empty-content edit, so a peer that drops the restore fields has no
+    /// inline content to re-insert and no range to delete. A peer that reads
+    /// them restores the text.
+    #[test]
+    fn decodes_to_a_harmless_no_op_for_peers_that_ignore_restore_fields(
+    ) -> Result<(), Box<dyn Error>> {
+        let source = deleted_then(|doc| doc.history_mut().undo())?;
+        let restored = r#"{"t":[{"val":"a"},{"val":"b"},{"val":"c"}]}"#;
+        assert_eq!(restored, source.to_sorted_json());
+
+        let proto = to_change_pack(&source.create_change_pack())?;
+        let undo = &proto.changes.last().unwrap().operations[0];
+        let Some(Body::Edit(edit)) = &undo.body else {
+            panic!("expected the undo edit");
+        };
+        assert_eq!("", edit.content, "no inline content to re-insert");
+
+        let WireOperation::Edit {
+            from,
+            to,
+            content,
+            restore_spans,
+            restore_mode,
+            ..
+        } = operation_through_bytes(&proto_operation_to_wire(undo)?)?
+        else {
+            panic!("expected an edit");
+        };
+        assert_eq!(from, to, "zero-width, so nothing to delete either");
+        assert_eq!("", content);
+        assert_eq!(Some(WireRestoreMode::Restore), restore_mode);
+        assert_eq!(1, restore_spans.len());
+
+        let mut target = Document::new("doc-key");
+        target.apply_change_pack(&decode_change_pack(&proto.encode_to_vec())?)?;
+        assert_eq!(restored, target.to_sorted_json());
+        Ok(())
+    }
+
+    /// The redo of an undo by identity re-removes by identity on the peer.
+    #[test]
+    fn carries_an_identity_redo_through_change_pack_bytes() -> Result<(), Box<dyn Error>> {
+        let source = deleted_then(|doc| {
+            doc.history_mut().undo()?;
+            doc.history_mut().redo()
+        })?;
+        assert_eq!(
+            r#"{"t":[{"val":"a"},{"val":"c"}]}"#,
+            source.to_sorted_json()
+        );
+
+        let proto = to_change_pack(&source.create_change_pack())?;
+        let Some(Body::Edit(redo)) = &proto.changes.last().unwrap().operations[0].body else {
+            panic!("expected the redo edit");
+        };
+        assert_eq!(api::RestoreMode::Retombstone as i32, redo.restore_mode);
+
+        let mut target = Document::new("doc-key");
+        target.apply_change_pack(&decode_change_pack(&proto.encode_to_vec())?)?;
+        assert_eq!(source.to_sorted_json(), target.to_sorted_json());
+        Ok(())
+    }
+
+    /// A document whose text `abc` lost its `b`, then `then` ran on it.
+    fn deleted_then(
+        then: impl FnOnce(&mut Document) -> yorkie_core::Result<()>,
+    ) -> Result<Document, Box<dyn Error>> {
+        let mut doc = Document::new("doc-key");
+        doc.set_actor(A1);
+        doc.update(|root| {
+            root.set_text("t")?.edit(0, 0, "abc", None)?;
+            Ok(())
+        })?;
+        doc.update(|root| {
+            root.get_text_mut("t")?.edit(1, 2, "", None)?;
+            Ok(())
+        })?;
+        then(&mut doc)?;
+        Ok(doc)
+    }
+
+    /// The Tree's restore fields stay unread (Tree undo is not ported): a
+    /// `TreeEdit` carrying them decodes to its positional part, as before.
+    #[test]
+    fn decodes_a_tree_edit_with_restore_fields_to_its_positional_part() -> Result<(), Box<dyn Error>>
+    {
+        let pos = WireTreePos {
+            parent_id: tree_node_id(1, 0),
+            left_sibling_id: tree_node_id(2, 1),
+        };
+        let operation = WireOperation::TreeEdit {
+            parent_created_at: ticket(1),
+            from: pos.clone(),
+            to: pos,
+            contents: None,
+            split_level: 0,
+            executed_at: ticket(10),
+            split_tickets: Vec::new(),
+        };
+        let mut proto = wire_operation_to_proto(&operation)?;
+        let Some(Body::TreeEdit(tree_edit)) = &mut proto.body else {
+            panic!("expected a tree edit");
+        };
+        assert!(tree_edit.restore_spans.is_empty());
+        assert_eq!(0, tree_edit.restore_mode);
+        let span = api::TreeRestoreSpan {
+            id: Some(super::wire_tree_node_id_to_proto(&tree_node_id(2, 0))?),
+            node_type: "text".to_owned(),
+            is_text: true,
+            length: 2,
+            value: "ab".to_owned(),
+            ..Default::default()
+        };
+        tree_edit.restore_spans = vec![span.clone()];
+        tree_edit.retombstone_spans = vec![span];
+        tree_edit.restore_mode = api::RestoreMode::Retombstone as i32;
+
+        let decoded =
+            proto_operation_to_wire(&api::Operation::decode(proto.encode_to_vec().as_slice())?)?;
+        assert_eq!(operation, decoded);
+        Ok(())
+    }
+
+    // --- Text removal ledger in snapshots ---
+
+    /// A Text node without a ledger encodes to the snapshot bytes it did
+    /// before `removal_events` existed. The vector was captured from `main`
+    /// (a3ad7b8) before the change.
+    #[test]
+    fn encodes_a_text_node_without_a_ledger_to_the_bytes_it_did_before(
+    ) -> Result<(), Box<dyn Error>> {
+        const BEFORE: [u8; 201] = [
+            10, 198, 1, 10, 195, 1, 10, 176, 1, 10, 1, 116, 18, 170, 1, 42, 167, 1, 10, 52, 10, 18,
+            10, 16, 8, 2, 26, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 18, 2, 97, 98, 42, 26, 10, 1,
+            98, 18, 21, 10, 1, 49, 18, 16, 8, 3, 26, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 10,
+            64, 10, 20, 10, 16, 8, 2, 26, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 16, 2, 18, 2, 99,
+            100, 26, 16, 8, 5, 26, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 34, 18, 10, 16, 8, 2,
+            26, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 10, 27, 10, 18, 10, 16, 8, 4, 26, 12, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 18, 5, 240, 159, 152, 128, 120, 18, 16, 8, 1, 26, 12, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 18, 14, 26, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let root = text_snapshot_root(ledger_text_nodes(Vec::new()));
+        assert_eq!(
+            BEFORE.to_vec(),
+            snapshot_root_to_bytes(&root, &BTreeMap::new())?
+        );
+        Ok(())
+    }
+
+    /// JS `toTextNodes`/`fromTextNode`: a ledger beyond `removed_at` survives
+    /// snapshot bytes in ticket order, and the snapshot applies.
+    #[test]
+    fn roundtrips_a_ledgered_text_node_through_snapshot_bytes() -> Result<(), Box<dyn Error>> {
+        // `cd` was removed by A at 3, restored by A at 4, removed by B at 5.
+        let events = vec![actor_ticket(3, A1), actor_ticket(4, A1)];
+        let root = text_snapshot_root(ledger_text_nodes(events.clone()));
+
+        let bytes = snapshot_root_to_bytes(&root, &BTreeMap::new())?;
+        let snapshot = api::Snapshot::decode(bytes.as_slice())?;
+        let Some(json_element::Body::JsonObject(object)) = &snapshot.root.as_ref().unwrap().body
+        else {
+            panic!("expected an object");
+        };
+        let Some(json_element::Body::Text(text)) = &object.nodes[0].element.as_ref().unwrap().body
+        else {
+            panic!("expected a text");
+        };
+        assert_eq!(
+            vec![3, 4],
+            text.nodes[1]
+                .removal_events
+                .iter()
+                .map(|ticket| ticket.lamport)
+                .collect::<Vec<_>>()
+        );
+        assert!(text.nodes[0].removal_events.is_empty());
+
+        let (decoded, _) = snapshot_from_bytes(&bytes)?;
+        assert_eq!(root, decoded);
+
+        let mut doc = Document::new("doc-key");
+        doc.apply_change_pack(&decode_change_pack(&snapshot_pack(bytes).encode_to_vec())?)?;
+        assert_eq!(
+            r#"{"t":[{"attrs":{"b":1},"val":"ab"},{"val":"😀x"}]}"#,
+            doc.to_sorted_json()
+        );
+        Ok(())
+    }
+
+    /// JS `fromTextNode`: a ledger that breaks the rules is dropped, the node
+    /// keeps `removed_at` alone, and the snapshot still applies.
+    #[test]
+    fn drops_a_malformed_ledger_and_still_applies_the_snapshot() -> Result<(), Box<dyn Error>> {
+        for events in [
+            // repeats removed_at
+            vec![actor_ticket(5, A2)],
+            // an uncancelled removal later than removed_at, which it would replace
+            vec![actor_ticket(9, A1)],
+        ] {
+            let root = text_snapshot_root(ledger_text_nodes(events));
+            let bytes = snapshot_root_to_bytes(&root, &BTreeMap::new())?;
+
+            let mut doc = Document::new("doc-key");
+            doc.apply_change_pack(&decode_change_pack(&snapshot_pack(bytes).encode_to_vec())?)?;
+            assert_eq!(
+                r#"{"t":[{"attrs":{"b":1},"val":"ab"},{"val":"😀x"}]}"#,
+                doc.to_sorted_json()
+            );
+        }
+        Ok(())
+    }
+
+    const A1: &str = "000000000000000000000001";
+    const A2: &str = "000000000000000000000002";
+
+    fn actor_ticket(lamport: i64, actor: &str) -> TimeTicket {
+        TimeTicket::new(lamport, 0, actor)
+    }
+
+    /// `ab` (styled), `cd` removed by A2 at 5 with `removal_events`, and an
+    /// emoji run by A2.
+    fn ledger_text_nodes(removal_events: Vec<TimeTicket>) -> Vec<WireTextNode> {
+        let id = |lamport, actor, offset| WireTextNodeId {
+            created_at: actor_ticket(lamport, actor),
+            offset,
+        };
+        vec![
+            WireTextNode {
+                id: id(2, A1, 0),
+                value: "ab".to_owned(),
+                removed_at: None,
+                ins_prev_id: None,
+                attributes: BTreeMap::from([(
+                    "b".to_owned(),
+                    WireNodeAttr {
+                        value: "1".to_owned(),
+                        updated_at: actor_ticket(3, A1),
+                        is_removed: false,
+                    },
+                )]),
+                removal_events: Vec::new(),
+            },
+            WireTextNode {
+                id: id(2, A1, 2),
+                value: "cd".to_owned(),
+                removed_at: Some(actor_ticket(5, A2)),
+                ins_prev_id: Some(id(2, A1, 0)),
+                attributes: BTreeMap::new(),
+                removal_events,
+            },
+            WireTextNode {
+                id: id(4, A2, 0),
+                value: "\u{1F600}x".to_owned(),
+                removed_at: None,
+                ins_prev_id: None,
+                attributes: BTreeMap::new(),
+                removal_events: Vec::new(),
+            },
+        ]
+    }
+
+    fn text_snapshot_root(nodes: Vec<WireTextNode>) -> WireJsonElement {
+        WireJsonElement::Object {
+            nodes: vec![rht_node(
+                "t",
+                WireJsonElement::Text {
+                    nodes,
+                    created_at: actor_ticket(1, A1),
+                    moved_at: None,
+                    removed_at: None,
+                },
+            )],
+            created_at: TimeTicket::initial(),
+            moved_at: None,
+            removed_at: None,
+        }
+    }
+
+    fn snapshot_pack(snapshot: Vec<u8>) -> api::ChangePack {
+        let mut version_vector = VersionVector::new();
+        version_vector.set(A1, 5);
+        version_vector.set(A2, 5);
+        api::ChangePack {
+            document_key: "doc-key".to_owned(),
+            checkpoint: Some(api::Checkpoint {
+                server_seq: 7,
+                client_seq: 0,
+            }),
+            snapshot,
+            version_vector: Some(to_version_vector(&version_vector).unwrap()),
+            ..Default::default()
+        }
+    }
+
+    fn identity_edit(
+        restore_spans: Vec<WireRestoreSpan>,
+        mode: WireRestoreMode,
+        retombstone_spans: Vec<WireRestoreSpan>,
+    ) -> WireOperation {
+        WireOperation::Edit {
+            parent_created_at: TimeTicket::initial(),
+            from: text_pos(ticket(1), 0, 0),
+            to: text_pos(ticket(1), 0, 0),
+            content: String::new(),
+            attributes: BTreeMap::new(),
+            executed_at: ticket(4),
+            restore_spans,
+            restore_mode: Some(mode),
+            retombstone_spans,
+        }
+    }
+
+    fn restore_span(start: usize, end: usize, content: &str) -> WireRestoreSpan {
+        WireRestoreSpan {
+            created_at: ticket(1),
+            start,
+            end,
+            content: content.to_owned(),
+            attributes: BTreeMap::new(),
+        }
+    }
+
+    fn span_parts(span: &WireRestoreSpan) -> (usize, usize, &str) {
+        (span.start, span.end, span.content.as_str())
+    }
+
+    fn operation_through_bytes(operation: &WireOperation) -> super::Result<WireOperation> {
+        let bytes = wire_operation_to_proto(operation)?.encode_to_vec();
+        proto_operation_to_wire(&api::Operation::decode(bytes.as_slice())?)
+    }
+
+    // --- Text undo ledger replays over protobuf bytes ---
+    //
+    // JS `text_undo_removal_ledger_test.ts` passes every change pack through
+    // protobuf; `yorkie-core` replays it over the wire projection only. These
+    // replay its key cases over the bytes.
+
+    /// JS `send`: delivers `from`'s pending changes to each of `to` as
+    /// change pack bytes, without acking them at `from`.
+    fn send_bytes(from: &Document, to: &mut [&mut Document]) -> Result<(), Box<dyn Error>> {
+        let mut proto = to_change_pack(&from.create_change_pack())?;
+        proto.checkpoint = Some(api::Checkpoint {
+            server_seq: 0,
+            client_seq: 0,
+        });
+        proto.version_vector = Some(to_version_vector(&VersionVector::new())?);
+        let bytes = proto.encode_to_vec();
+        for doc in to {
+            doc.apply_change_pack(&decode_change_pack(&bytes)?)?;
+        }
+        Ok(())
+    }
+
+    /// JS `ack`: drops the changes `doc` has already sent.
+    fn ack_bytes(doc: &mut Document) -> Result<(), Box<dyn Error>> {
+        let sent = to_change_pack(&doc.create_change_pack())?;
+        let last_seq = sent
+            .changes
+            .last()
+            .and_then(|change| change.id.as_ref())
+            .map_or(0, |id| id.client_seq);
+        let proto = api::ChangePack {
+            document_key: doc.key().to_owned(),
+            checkpoint: Some(api::Checkpoint {
+                server_seq: 0,
+                client_seq: last_seq,
+            }),
+            version_vector: Some(to_version_vector(&VersionVector::new())?),
+            ..Default::default()
+        };
+        doc.apply_change_pack(&decode_change_pack(&proto.encode_to_vec())?)?;
+        Ok(())
+    }
+
+    fn exchange_bytes(a: &mut Document, b: &mut Document) -> Result<(), Box<dyn Error>> {
+        send_bytes(a, &mut [b])?;
+        send_bytes(b, &mut [a])?;
+        ack_bytes(a)?;
+        ack_bytes(b)
+    }
+
+    fn ledger_replicas(content: &str) -> Result<(Document, Document), Box<dyn Error>> {
+        let mut a = Document::new("ledger");
+        let mut b = Document::new("ledger");
+        a.set_actor(A1);
+        b.set_actor(A2);
+        a.update(|root| root.set_text("t")?.edit(0, 0, content, None).map(|_| ()))?;
+        exchange_bytes(&mut a, &mut b)?;
+        Ok((a, b))
+    }
+
+    fn delete_text(doc: &mut Document, from: usize, to: usize) -> yorkie_core::Result<()> {
+        doc.update(|root| root.get_text_mut("t")?.edit(from, to, "", None).map(|_| ()))
+    }
+
+    fn text_of(doc: &Document) -> String {
+        match doc.get_root().get("t") {
+            Some(JsonValue::Text(text)) => text.to_string(),
+            other => panic!("expected a text at t, got {other:?}"),
+        }
+    }
+
+    /// JS `does not remove text a concurrent undo revives (yorkie#2237)`,
+    /// every change as protobuf bytes.
+    #[test]
+    fn replays_yorkie_2237_over_proto_bytes() -> Result<(), Box<dyn Error>> {
+        let (mut d1, mut d2) = ledger_replicas("efgh")?;
+        delete_text(&mut d2, 1, 2)?;
+        exchange_bytes(&mut d1, &mut d2)?;
+        assert_eq!("egh", text_of(&d1));
+
+        // d1 deletes `g` while d2 undoes its deletion of `f`.
+        delete_text(&mut d1, 1, 2)?;
+        d2.history_mut().undo()?;
+        exchange_bytes(&mut d1, &mut d2)?;
+
+        // d1 saw `f` removed, so its deletion leaves the revived `f` alone.
+        assert_eq!("efh", text_of(&d1));
+        assert_eq!("efh", text_of(&d2));
+        assert_eq!(d1.to_sorted_json(), d2.to_sorted_json());
+        Ok(())
+    }
+
+    /// JS `keeps the ledger through a snapshot`, every change and the
+    /// snapshot as protobuf bytes.
+    ///
+    /// The protocol crate cannot read a document's root, so the snapshot of
+    /// `b` is written out here: `abcdefgh` inserted by A1 at 1, `d` removed
+    /// by A2 at 3 and by A1 at 2 (its `removal_events`, as `removed_at` is
+    /// the later A2 removal), `efgh` removed by A1 at 2. The control run
+    /// drops `removal_events` from the bytes: `c` then forgets A1's part and
+    /// revives `d` on b's undo, so the ledger crossing the bytes is what
+    /// keeps the replicas together.
+    #[test]
+    fn replays_keeps_the_ledger_through_a_snapshot_over_proto_bytes() -> Result<(), Box<dyn Error>>
+    {
+        for with_ledger in [true, false] {
+            let (mut a, mut b) = ledger_replicas("abcdefgh")?;
+            delete_text(&mut b, 3, 4)?;
+            delete_text(&mut a, 3, 8)?;
+            send_bytes(&a, &mut [&mut b])?;
+
+            // c loads b's snapshot, where `d` is removed by both deletions;
+            // it must not forget a's part when b's undo arrives.
+            let mut snapshot_vector = VersionVector::new();
+            snapshot_vector.set(A1, 2);
+            snapshot_vector.set(A2, 4);
+            assert_eq!(&snapshot_vector, b.version_vector());
+            let root = ledger_snapshot_root(with_ledger);
+            let pack = api::ChangePack {
+                document_key: "ledger".to_owned(),
+                checkpoint: Some(api::Checkpoint {
+                    server_seq: 1,
+                    client_seq: 0,
+                }),
+                snapshot: snapshot_root_to_bytes(&root, &BTreeMap::new())?,
+                version_vector: Some(to_version_vector(&snapshot_vector)?),
+                ..Default::default()
+            };
+            let mut c = Document::new("ledger");
+            c.set_actor("000000000000000000000003");
+            c.apply_change_pack(&decode_change_pack(&pack.encode_to_vec())?)?;
+            assert_eq!(b.to_sorted_json(), c.to_sorted_json());
+
+            b.history_mut().undo()?;
+            send_bytes(&b, &mut [&mut a, &mut c])?;
+
+            assert_eq!("abc", text_of(&a));
+            assert_eq!("abc", text_of(&b));
+            let want = if with_ledger { "abc" } else { "abcd" };
+            assert_eq!(want, text_of(&c), "with ledger: {with_ledger}");
+        }
+        Ok(())
+    }
+
+    /// The root of `b` in
+    /// `replays_keeps_the_ledger_through_a_snapshot_over_proto_bytes`.
+    fn ledger_snapshot_root(with_ledger: bool) -> WireJsonElement {
+        let inserted = |offset| WireTextNodeId {
+            created_at: TimeTicket::new(1, 2, A1),
+            offset,
+        };
+        let a1_removal = TimeTicket::new(2, 1, A1);
+        let a2_removal = TimeTicket::new(3, 1, A2);
+        let d_events = if with_ledger {
+            vec![a1_removal.clone()]
+        } else {
+            Vec::new()
+        };
+        let text_at = TimeTicket::new(1, 1, A1);
+        let node = |offset, value: &str, removed_at, ins_prev: Option<usize>, removal_events| {
+            WireTextNode {
+                id: inserted(offset),
+                value: value.to_owned(),
+                removed_at,
+                ins_prev_id: ins_prev.map(inserted),
+                attributes: BTreeMap::new(),
+                removal_events,
+            }
+        };
+        WireJsonElement::Object {
+            nodes: vec![rht_node(
+                "t",
+                WireJsonElement::Text {
+                    nodes: vec![
+                        node(0, "abc", None, None, Vec::new()),
+                        node(3, "d", Some(a2_removal), Some(0), d_events),
+                        node(4, "efgh", Some(a1_removal), Some(3), Vec::new()),
+                    ],
+                    created_at: text_at.clone(),
+                    moved_at: Some(text_at),
+                    removed_at: None,
+                },
+            )],
+            created_at: TimeTicket::initial(),
+            moved_at: None,
+            removed_at: None,
+        }
     }
 }

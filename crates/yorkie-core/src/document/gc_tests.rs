@@ -656,3 +656,628 @@ fn text(d: &Document) -> String {
         other => panic!("expected a text at t, got {other:?}"),
     }
 }
+
+/// Counts the removed nodes still in the text at `t`.
+fn text_tombstones(d: &Document) -> usize {
+    match d.crdt_root.object().get("t") {
+        Some(crate::crdt::element::CrdtElement::Text(text)) => {
+            text.nodes().filter(|node| node.is_removed()).count()
+        }
+        other => panic!("expected a text at t, got {other:?}"),
+    }
+}
+
+/// The size of the one tombstone left in the text at `t`, the piece `cd` two
+/// concurrent deletions hold (JS `heldTombstoneSize`).
+fn held_tombstone_size(d: &Document) -> crate::crdt::element::DataSize {
+    match d.crdt_root.object().get("t") {
+        Some(crate::crdt::element::CrdtElement::Text(text)) => text
+            .nodes()
+            .find(|node| node.is_removed())
+            .map(|node| {
+                assert_eq!("cd", node.value().content());
+                node.data_size()
+            })
+            .unwrap_or_default(),
+        other => panic!("expected a text at t, got {other:?}"),
+    }
+}
+
+/// JS `test/unit/document/gc_split_leak_test.ts` "GC tombstone-split leak
+/// (Text)" / `purges pieces split off a tombstoned text node` (`84068f70`):
+/// a piece split off a removed node is born removed, so the split registers
+/// it for collection instead of charging live. `cd` is removed by both
+/// deletions, so it stays until an undo leaves one of them.
+#[test]
+fn purges_pieces_split_off_a_tombstoned_text_node() -> Result<()> {
+    let (mut d1, mut d2) = replicas();
+    d1.update(|root| root.set_text("t")?.edit(0, 0, "abcdef", None).map(|_| ()))?;
+    cross_sync(&mut d1, &mut d2)?;
+
+    // d1 removes the whole node; d2 concurrently removes a middle slice.
+    // When d2's deletion reaches d1, it splits d1's tombstone into three
+    // pieces, and the piece after the removed range is born removed.
+    d1.update(|root| root.get_text_mut("t")?.edit(0, 6, "", None).map(|_| ()))?;
+    d2.update(|root| root.get_text_mut("t")?.edit(2, 4, "", None).map(|_| ()))?;
+    cross_sync(&mut d1, &mut d2)?;
+    assert_eq!("", text(&d1));
+    assert_eq!("", text(&d2));
+
+    let purged1 = collect(&mut d1, &max_vector_of(&[A1, A2]));
+    let purged2 = collect(&mut d2, &max_vector_of(&[A1, A2]));
+    assert_eq!(purged1, purged2, "asymmetric purge for identical state");
+    // Every other piece, the born-removed remainder included, is purged.
+    for (d, name) in [(&d1, "d1"), (&d2, "d2")] {
+        assert_eq!(1, text_tombstones(d), "{name}: tombstones");
+        assert_eq!(1, d.garbage_len(), "{name}: garbage");
+        assert_eq!(held_tombstone_size(d), d.doc_size().gc, "{name}: gc");
+        assert_gc_size_matches_rebuilt(d);
+    }
+    // JS compares the whole docSize across the replicas. Live is left out:
+    // a text removal does not move its size out of the running live size,
+    // and the two replicas split in a different order (see the porting gaps).
+    assert_eq!(d2.doc_size().gc, d1.doc_size().gc);
+    Ok(())
+}
+
+/// JS `test/unit/document/gc_split_leak_test.ts` "GC tombstone-split leak
+/// (Text)" / `keeps GC registration when a newer concurrent delete
+/// overwrites a tombstone` (`84068f70`): d1's whole-range deletion is newer
+/// than d2's slice deletion, so on d2 it overwrites d2's own tombstone by
+/// LWW. That must not register the node a second time, which would cancel
+/// its registration; `cd` is again held by both deletions.
+#[test]
+fn keeps_gc_registration_when_a_newer_concurrent_delete_overwrites_a_tombstone() -> Result<()> {
+    let (mut d1, mut d2) = replicas();
+    d1.update(|root| root.set_text("t")?.edit(0, 0, "abcdef", None).map(|_| ()))?;
+    cross_sync(&mut d1, &mut d2)?;
+
+    d1.update(|root| root.get_text_mut("t")?.edit(6, 6, "!", None).map(|_| ()))?;
+    d1.update(|root| root.get_text_mut("t")?.edit(0, 7, "", None).map(|_| ()))?;
+    d2.update(|root| root.get_text_mut("t")?.edit(2, 4, "", None).map(|_| ()))?;
+    cross_sync(&mut d1, &mut d2)?;
+    assert_eq!("", text(&d1));
+    assert_eq!("", text(&d2));
+
+    let purged1 = collect(&mut d1, &max_vector_of(&[A1, A2]));
+    let purged2 = collect(&mut d2, &max_vector_of(&[A1, A2]));
+    assert_eq!(purged1, purged2, "asymmetric purge for identical state");
+    for (d, name) in [(&d1, "d1"), (&d2, "d2")] {
+        assert_eq!(1, text_tombstones(d), "{name}: tombstones");
+        assert_eq!(1, d.garbage_len(), "{name}: garbage");
+        assert_gc_size_matches_rebuilt(d);
+    }
+    Ok(())
+}
+
+/// JS `4f1f0123` for a style: a style whose boundaries split a removed node
+/// registers the born-removed pieces, as JS `CRDTText.setStyle` drains them
+/// into its pairs.
+#[test]
+fn purges_pieces_a_style_split_off_a_tombstoned_text_node() -> Result<()> {
+    let (mut d1, mut d2) = replicas();
+    d1.update(|root| root.set_text("t")?.edit(0, 0, "abcdef", None).map(|_| ()))?;
+    cross_sync(&mut d1, &mut d2)?;
+
+    d1.update(|root| root.get_text_mut("t")?.edit(0, 6, "", None).map(|_| ()))?;
+    d2.update(|root| {
+        let mut bold = std::collections::BTreeMap::new();
+        bold.insert("b".to_owned(), serde_json::Value::Bool(true));
+        root.get_text_mut("t")?.set_style(2, 4, bold)
+    })?;
+    cross_sync(&mut d1, &mut d2)?;
+    assert_eq!("", text(&d1));
+    assert_eq!("", text(&d2));
+
+    let purged1 = collect(&mut d1, &max_vector_of(&[A1, A2]));
+    let purged2 = collect(&mut d2, &max_vector_of(&[A1, A2]));
+    assert_eq!(purged1, purged2, "asymmetric purge for identical state");
+    for (d, name) in [(&d1, "d1"), (&d2, "d2")] {
+        assert_eq!(0, text_tombstones(d), "{name}: tombstones");
+        assert_eq!(0, d.garbage_len(), "{name}: garbage");
+        assert_gc_size_matches_rebuilt(d);
+    }
+    Ok(())
+}
+
+// The Text removal ledger in collection, at the CRDT level: a root built
+// over a text, edited and restored the way `EditOperation` books it (JS
+// `CRDTRoot.garbageCollect`, `collect`, `pruneLedgers`, `unregisterGCPair`).
+
+mod ledger {
+    use crate::crdt::element::{CrdtElement, DataSize};
+    use crate::crdt::object::CrdtObject;
+    use crate::crdt::rga_tree_split::{RestoreSpan, RgaTreeSplitPosRange};
+    use crate::crdt::root::CrdtRoot;
+    use crate::crdt::text::{CrdtText, TextValue};
+    use crate::{Result, TimeTicket, VersionVector};
+
+    use super::{A1, A2};
+
+    const A3: &str = "000000000000000000000003";
+    const A4: &str = "000000000000000000000004";
+
+    fn a(lamport: i64) -> TimeTicket {
+        TimeTicket::new(lamport, 0, A1)
+    }
+
+    fn b(lamport: i64) -> TimeTicket {
+        TimeTicket::new(lamport, 0, A2)
+    }
+
+    fn c(lamport: i64) -> TimeTicket {
+        TimeTicket::new(lamport, 0, A3)
+    }
+
+    fn d(lamport: i64) -> TimeTicket {
+        TimeTicket::new(lamport, 0, A4)
+    }
+
+    fn vv<const N: usize>(entries: [(&str, i64); N]) -> VersionVector {
+        let mut vector = VersionVector::new();
+        for (actor, lamport) in entries {
+            vector.set(actor, lamport);
+        }
+        vector
+    }
+
+    fn span(
+        created_at: TimeTicket,
+        start: usize,
+        end: usize,
+        content: &str,
+    ) -> RestoreSpan<TextValue> {
+        RestoreSpan {
+            created_at,
+            start,
+            end,
+            value: TextValue::create(content),
+        }
+    }
+
+    /// A text created at a(1) holding `content`, inserted at a(2).
+    fn seeded(content: &str) -> Result<CrdtText> {
+        let mut text = CrdtText::create(a(1));
+        text.edit_by_index(0, 0, content, None, a(2), None)?;
+        Ok(text)
+    }
+
+    /// A root holding `text` at `t`, built the way a snapshot is loaded.
+    fn root_with(text: CrdtText) -> CrdtRoot {
+        CrdtRoot::new(CrdtObject::create_with_members(
+            TimeTicket::initial(),
+            [("t", CrdtElement::text(text))],
+        ))
+    }
+
+    fn text_of(root: &CrdtRoot) -> &CrdtText {
+        root.text_by_created_at(&a(1)).expect("the text at t")
+    }
+
+    fn range(root: &CrdtRoot, from: usize, to: usize) -> Result<RgaTreeSplitPosRange> {
+        text_of(root).index_range_to_pos_range(from, to)
+    }
+
+    /// Removes `range` from the text in `root` and books it as
+    /// `EditOperation` does.
+    fn remove(
+        root: &mut CrdtRoot,
+        range: RgaTreeSplitPosRange,
+        at: TimeTicket,
+        vector: Option<&VersionVector>,
+    ) -> Result<()> {
+        edit(root, range, "", at, vector)
+    }
+
+    /// Replaces `range` with `content` in the text in `root` and books it
+    /// as `EditOperation` does.
+    fn edit(
+        root: &mut CrdtRoot,
+        range: RgaTreeSplitPosRange,
+        content: &str,
+        at: TimeTicket,
+        vector: Option<&VersionVector>,
+    ) -> Result<()> {
+        let result = root
+            .text_by_created_at_mut(&a(1))
+            .expect("the text at t")
+            .edit_by_range(range, content, None, at, vector)?;
+        root.acc(result.diff);
+        for node in result.removed_nodes {
+            if let Some(removed_at) = node.removed_at() {
+                root.register_gc_pair_by_id(node.id_string(), node.data_size(), removed_at.clone());
+            }
+        }
+        for (child_id, child_size, removed_at) in result.split_gc_pairs {
+            root.register_gc_pair_by_id(child_id, child_size, removed_at);
+        }
+        Ok(())
+    }
+
+    /// Restores `spans` in the text in `root` and books it as the JS
+    /// identity path does: the holder, then the pending pairs, then the
+    /// revived pieces unless `unregister` is false, then the live diff.
+    fn restore(
+        root: &mut CrdtRoot,
+        spans: &[RestoreSpan<TextValue>],
+        at: TimeTicket,
+        unregister: bool,
+    ) -> Result<()> {
+        let (result, holds_cancels) = {
+            let text = root.text_by_created_at_mut(&a(1)).expect("the text at t");
+            let result = text.restore(spans, &at, None)?;
+            (result, text.has_cancelled_removals())
+        };
+        if holds_cancels {
+            root.register_ledger_holder(&a(1));
+        }
+        for (child_id, child_size, removed_at) in result.pending_gc_pairs {
+            root.register_gc_pair_by_id(child_id, child_size, removed_at);
+        }
+        if unregister {
+            for node in &result.revived {
+                root.unregister_gc_pair_by_id(&node.id_string(), node.data_size());
+            }
+        }
+        root.acc(result.live_diff);
+        Ok(())
+    }
+
+    fn tombstones(root: &CrdtRoot) -> Vec<String> {
+        text_of(root)
+            .nodes()
+            .filter(|node| node.is_removed())
+            .map(|node| node.value().content().to_owned())
+            .collect()
+    }
+
+    fn tombstone_size(root: &CrdtRoot) -> DataSize {
+        let mut size = DataSize::default();
+        for node in text_of(root).nodes().filter(|node| node.is_removed()) {
+            size.data += node.data_size().data;
+            size.meta += node.data_size().meta;
+        }
+        size
+    }
+
+    /// The running gc size and garbage count match a root rebuilt from the
+    /// same content.
+    fn assert_matches_rebuilt(root: &CrdtRoot, name: &str) {
+        let rebuilt = CrdtRoot::new(root.object().deepcopy());
+        assert_eq!(
+            rebuilt.doc_size().gc,
+            root.doc_size().gc,
+            "{name}: gc vs rebuilt"
+        );
+        assert_eq!(
+            rebuilt.get_garbage_len(),
+            root.get_garbage_len(),
+            "{name}: garbage vs rebuilt"
+        );
+    }
+
+    /// JS `text_undo_removal_ledger_test.ts` `keeps a piece until its
+    /// cancelled removals are known everywhere`, at the CRDT level (Task 6
+    /// ports it end to end): A and B remove `b` concurrently and A undoes.
+    /// The tombstone stays while A's cancel is unknown somewhere, and goes
+    /// once it is known and B's removal alone holds it. The holder comes
+    /// from the snapshot load (JS `registerInternalGCPairs`).
+    #[test]
+    fn holds_a_text_tombstone_until_its_cancel_is_known_everywhere() -> Result<()> {
+        let mut text = seeded("abc")?;
+        let range = text.index_range_to_pos_range(1, 2)?;
+        text.edit_by_range(range.clone(), "", None, a(3), None)?;
+        text.edit_by_range(range, "", None, b(4), Some(&vv([(A1, 2), (A2, 4)])))?;
+        text.restore(&[span(a(2), 1, 2, "b")], &a(5), None)?;
+        let mut root = root_with(text);
+        assert_eq!("ac", text_of(&root).to_string());
+        assert_eq!(1, root.get_garbage_len());
+
+        // B's removal is stable, A's cancel is not.
+        assert_eq!(0, root.garbage_collect(&vv([(A1, 4), (A2, 4)])));
+        assert_eq!(vec!["b"], tombstones(&root));
+        assert_eq!(1, root.get_garbage_len());
+
+        assert_eq!(1, root.garbage_collect(&vv([(A1, 5), (A2, 4)])));
+        assert!(tombstones(&root).is_empty());
+        assert_eq!(0, root.get_garbage_len());
+        assert_eq!("ac", text_of(&root).to_string());
+        assert_matches_rebuilt(&root, "collected");
+        Ok(())
+    }
+
+    /// JS `CRDTRoot.garbageCollect` prunes the registered ledgers first: a
+    /// revived piece drops its removal and cancel once every replica knows
+    /// the cancel, and writes no removal events from then on.
+    #[test]
+    fn prunes_the_ledger_of_a_revived_piece_once_its_cancel_is_known() -> Result<()> {
+        let mut text = seeded("abc")?;
+        text.edit_by_index(1, 2, "", None, a(3), None)?;
+        text.restore(&[span(a(2), 1, 2, "b")], &a(4), None)?;
+        let mut root = root_with(text);
+        let events = |root: &CrdtRoot| {
+            text_of(root)
+                .nodes()
+                .find(|node| node.id().offset() == 1)
+                .expect("the revived piece")
+                .removal_events()
+        };
+        assert_eq!(vec![a(3), a(4)], events(&root));
+
+        root.garbage_collect(&vv([(A1, 3)]));
+        assert_eq!(vec![a(3), a(4)], events(&root));
+
+        root.garbage_collect(&vv([(A1, 4)]));
+        assert!(events(&root).is_empty());
+        assert!(!text_of(&root).has_cancelled_removals());
+        Ok(())
+    }
+
+    /// JS `CRDTRoot.registerElement` books a Text whose ledgers hold
+    /// cancels as a ledger holder (`registerInternalGCPairs`), whichever
+    /// route brings it in: here a set, as an undo re-set or a remote payload
+    /// does. Without the holder the ledger is never pruned and the piece
+    /// keeps writing removal events JS has dropped.
+    #[test]
+    fn prunes_the_ledger_of_a_text_set_into_the_document() -> Result<()> {
+        let mut text = seeded("abc")?;
+        text.edit_by_index(1, 2, "", None, a(3), None)?;
+        text.restore(&[span(a(2), 1, 2, "b")], &a(4), None)?;
+        let mut root = CrdtRoot::create();
+        root.set_object_member(&TimeTicket::initial(), "t", CrdtElement::text(text), a(5))?;
+        let events = |root: &CrdtRoot| {
+            text_of(root)
+                .nodes()
+                .find(|node| node.id().offset() == 1)
+                .expect("the revived piece")
+                .removal_events()
+        };
+        assert_eq!(vec![a(3), a(4)], events(&root));
+
+        root.garbage_collect(&vv([(A1, 5)]));
+        assert!(events(&root).is_empty());
+        assert!(!text_of(&root).has_cancelled_removals());
+        Ok(())
+    }
+
+    /// A Text node never toggles its pair off. A revived node left
+    /// registered and removed again keeps one pair, charged with its new
+    /// removal; before, this panicked in debug builds (Task 3 review), and
+    /// JS would drop the pair and keep the tombstone for good.
+    #[test]
+    fn keeps_the_pair_of_a_revived_text_node_left_registered() -> Result<()> {
+        let mut root = root_with(seeded("abc")?);
+        let b_only = range(&root, 1, 2)?;
+        remove(&mut root, b_only, a(3), None)?;
+        restore(&mut root, &[span(a(2), 1, 2, "b")], a(4), false)?;
+        let b_again = range(&root, 1, 2)?;
+        remove(&mut root, b_again, a(5), None)?;
+
+        assert_eq!(vec!["b"], tombstones(&root));
+        assert_eq!(1, root.stats().gc_pairs);
+        assert_eq!(tombstone_size(&root), root.doc_size().gc);
+        assert_matches_rebuilt(&root, "removed again");
+        Ok(())
+    }
+
+    /// A text `t` whose `abcd` A and B removed concurrently, so the
+    /// tombstone is held for good. A removes `t` and keeps a copy for the
+    /// undo, C (who saw `abcd` live) inserts inside the tombstone and splits
+    /// it at 2, then `purge` either collects `t` or not before A's undo
+    /// re-sets the copy, the way `SetOperation` does. Returns the root and
+    /// the position D, who also saw `abcd` live, inserts at.
+    fn undo_copy_over_a_split_tombstone(purge: bool) -> Result<(CrdtRoot, RgaTreeSplitPosRange)> {
+        let mut root = root_with(seeded("abcd")?);
+        let mid = range(&root, 2, 2)?;
+        let all = range(&root, 0, 4)?;
+        remove(&mut root, all.clone(), a(3), None)?;
+        remove(&mut root, all, b(4), Some(&vv([(A1, 2), (A2, 4)])))?;
+        let copy = CrdtElement::text(text_of(&root).deepcopy());
+        root.remove_object_member(&TimeTicket::initial(), &a(1), a(10))?;
+        edit(
+            &mut root,
+            mid.clone(),
+            "X",
+            c(11),
+            Some(&vv([(A1, 2), (A3, 11)])),
+        )?;
+        assert_eq!(2, root.stats().gc_pairs);
+
+        if purge {
+            assert_eq!(1, root.garbage_collect(&vv([(A1, 10), (A2, 4), (A3, 11)])));
+            assert!(root.text_by_created_at(&a(1)).is_none());
+            assert_eq!(2, root.stats().gc_pairs);
+        }
+
+        if root.find_by_created_at(copy.created_at()).is_some() {
+            root.deregister_element(&copy);
+        }
+        root.set_object_member(&TimeTicket::initial(), "t", copy, a(12))?;
+        assert_eq!("", text_of(&root).to_string());
+        assert_eq!(vec!["abcd"], tombstones(&root));
+        Ok((root, mid))
+    }
+
+    /// D's insert splits the copy's tombstone at 2, the ID C's split left a
+    /// pair under, and the copy's piece takes that pair over. The old
+    /// charge leaves gc as `collect` would take it -- `held`, the frozen
+    /// node's size once its text is purged, or else the size it was
+    /// registered with -- and the split's charge comes in, so the pair
+    /// count stays and gc moves by the difference (final review A, minor 1:
+    /// debug builds panicked, and release builds dropped the old pair and
+    /// left the copy's piece unregistered).
+    fn assert_the_copy_takes_the_pair_over(purge: bool) -> Result<()> {
+        let (mut root, mid) = undo_copy_over_a_split_tombstone(purge)?;
+        let gc = root.doc_size().gc;
+        let before = tombstone_size(&root);
+
+        edit(&mut root, mid, "Y", d(13), Some(&vv([(A1, 2), (A4, 13)])))?;
+        assert_eq!("Y", text_of(&root).to_string());
+        assert_eq!(vec!["ab", "cd"], tombstones(&root));
+        assert_eq!(2, root.stats().gc_pairs);
+
+        let after = tombstone_size(&root);
+        let split = DataSize {
+            data: after.data - before.data,
+            meta: after.meta - before.meta,
+        };
+        // The purged original's `cd` froze as the copy's `cd` is now, and
+        // C's split of the original charged what D's split of the copy does.
+        let held = if purge {
+            text_of(&root)
+                .nodes()
+                .find(|node| node.id().offset() == 2)
+                .expect("the copy's cd")
+                .data_size()
+        } else {
+            split
+        };
+        assert_eq!(
+            DataSize {
+                data: gc.data - held.data + split.data,
+                meta: gc.meta - held.meta + split.meta,
+            },
+            root.doc_size().gc
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replaces_the_detached_pair_of_a_purged_text_on_a_later_split() -> Result<()> {
+        assert_the_copy_takes_the_pair_over(true)
+    }
+
+    #[test]
+    fn replaces_the_pair_a_replaced_text_left_on_a_later_split() -> Result<()> {
+        assert_the_copy_takes_the_pair_over(false)
+    }
+
+    /// A tombstone two uncancelled removals hold is never collected (JS
+    /// `heldFromPurge`).
+    #[test]
+    fn never_collects_a_tombstone_two_removals_hold() -> Result<()> {
+        let mut text = seeded("abc")?;
+        let range = text.index_range_to_pos_range(1, 2)?;
+        text.edit_by_range(range.clone(), "", None, a(3), None)?;
+        text.edit_by_range(range, "", None, b(4), Some(&vv([(A1, 2), (A2, 4)])))?;
+        let mut root = root_with(text);
+
+        assert_eq!(
+            0,
+            root.garbage_collect(&vv([(A1, i64::MAX), (A2, i64::MAX)]))
+        );
+        assert_eq!(vec!["b"], tombstones(&root));
+        assert_eq!(1, root.get_garbage_len());
+        assert_eq!(tombstone_size(&root), root.doc_size().gc);
+        Ok(())
+    }
+
+    /// Restoring part of a deleted node splits its registered tombstone. JS
+    /// reads each pair's size when it collects, so the original's pair gives
+    /// back the size of what is left of it, not the size it was registered
+    /// with. Before, between and after collections, the gc size and garbage
+    /// count match a root rebuilt from the same content. `X`, inserted by B
+    /// after `f`, holds `ef` back on a barrier B's vector does not cover.
+    #[test]
+    fn matches_a_rebuild_after_a_partial_revive() -> Result<()> {
+        let mut text = seeded("abcdef")?;
+        text.edit_by_index(6, 6, "X", None, b(3), None)?;
+        let mut root = root_with(text);
+        let all = range(&root, 0, 6)?;
+        remove(&mut root, all, a(4), None)?;
+        assert_matches_rebuilt(&root, "removed");
+
+        restore(&mut root, &[span(a(2), 2, 4, "cd")], a(5), true)?;
+        assert_eq!("cdX", text_of(&root).to_string());
+        assert_eq!(vec!["ab", "ef"], tombstones(&root));
+        assert_matches_rebuilt(&root, "revived");
+
+        root.garbage_collect(&vv([(A1, 10)]));
+        assert_eq!(vec!["ef"], tombstones(&root));
+        assert_eq!(tombstone_size(&root), root.doc_size().gc);
+        assert_matches_rebuilt(&root, "ab collected");
+
+        root.garbage_collect(&vv([(A1, 10), (A2, 10)]));
+        assert!(tombstones(&root).is_empty());
+        assert_eq!(DataSize::default(), root.doc_size().gc);
+        assert_matches_rebuilt(&root, "all collected");
+        assert!(!text_of(&root).has_cancelled_removals());
+        Ok(())
+    }
+
+    /// JS reads `removedAt` when it collects. A piece split off a tombstone
+    /// is registered with the removal it was born with; B's later removal
+    /// overwrites it, and A's undo then leaves B's removal alone holding the
+    /// piece. It goes only once B's removal is stable, not A's.
+    #[test]
+    fn collects_a_split_off_piece_by_its_current_removal() -> Result<()> {
+        let mut root = root_with(seeded("abcdef")?);
+        let all = range(&root, 0, 6)?;
+        let ef = range(&root, 4, 6)?;
+        remove(&mut root, all, a(3), None)?;
+        remove(&mut root, ef, b(10), Some(&vv([(A1, 2), (A2, 10)])))?;
+        restore(&mut root, &[span(a(2), 0, 6, "abcdef")], a(11), true)?;
+        assert_eq!("abcd", text_of(&root).to_string());
+        assert_eq!(vec!["ef"], tombstones(&root));
+        assert_matches_rebuilt(&root, "revived");
+
+        assert_eq!(0, root.garbage_collect(&vv([(A1, 11), (A2, 9)])));
+        assert_eq!(vec!["ef"], tombstones(&root));
+        assert_matches_rebuilt(&root, "unstable");
+
+        assert_eq!(1, root.garbage_collect(&vv([(A1, 11), (A2, 10)])));
+        assert!(tombstones(&root).is_empty());
+        assert_eq!(DataSize::default(), root.doc_size().gc);
+        assert_matches_rebuilt(&root, "collected");
+        Ok(())
+    }
+
+    /// JS `CRDTRoot.collect` drops the pair of a piece that is live again
+    /// but still registered, moving its size out of gc as
+    /// `unregisterGCPair` does, and counts nothing for it.
+    #[test]
+    fn drops_the_pair_of_a_revived_piece_left_registered() -> Result<()> {
+        let mut root = root_with(seeded("abcdef")?);
+        let all = range(&root, 0, 6)?;
+        remove(&mut root, all, a(3), None)?;
+        restore(&mut root, &[span(a(2), 2, 4, "cd")], a(4), false)?;
+        assert_eq!("cd", text_of(&root).to_string());
+        assert_eq!(3, root.get_garbage_len());
+
+        assert_eq!(0, root.garbage_collect(&vv([(A1, 1)])));
+        assert_eq!(vec!["ab", "ef"], tombstones(&root));
+        assert_matches_rebuilt(&root, "dropped");
+        Ok(())
+    }
+
+    /// A pair whose text was purged is dropped by the size its node has
+    /// when the text goes, as JS purges it through the detached text: here
+    /// the original's pair, registered with the whole node, holds only `ab`
+    /// after a partial revive. `k`, removed by an unstable B change, stays
+    /// in gc to show what is left; its content keeps an over-subtraction
+    /// from saturating to the right answer.
+    #[test]
+    fn drops_the_pairs_of_a_purged_text_by_their_current_size() -> Result<()> {
+        let mut kept = CrdtText::create(b(2));
+        kept.edit_by_index(0, 0, "kept", None, b(3), None)?;
+        let mut root = CrdtRoot::new(CrdtObject::create_with_members(
+            TimeTicket::initial(),
+            [
+                ("t", CrdtElement::text(seeded("abcdef")?)),
+                ("k", CrdtElement::text(kept)),
+            ],
+        ));
+        let all = range(&root, 0, 6)?;
+        remove(&mut root, all, a(3), None)?;
+        restore(&mut root, &[span(a(2), 2, 4, "cd")], a(4), true)?;
+        root.remove_object_member(&TimeTicket::initial(), &a(1), a(20))?;
+        root.remove_object_member(&TimeTicket::initial(), &b(2), b(30))?;
+        assert_matches_rebuilt(&root, "removed");
+
+        root.garbage_collect(&vv([(A1, 20), (A2, 5)]));
+        assert!(root.text_by_created_at(&a(1)).is_none());
+        assert_eq!(1, root.get_garbage_len());
+        assert_matches_rebuilt(&root, "text collected");
+        Ok(())
+    }
+}

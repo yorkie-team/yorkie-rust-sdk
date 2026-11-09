@@ -7,4 +7,5 @@ pub use ticket::{
     TimeTicket, TimeTicketStruct, INITIAL_DELIMITER, INITIAL_LAMPORT, MAX_DELIMITER, MAX_LAMPORT,
     TIME_TICKET_SIZE,
 };
+pub(crate) use version_vector::ticket_known;
 pub use version_vector::VersionVector;

@@ -1,6 +1,6 @@
 # Text and RGATreeSplit Parity
 
-Last reviewed: 2026-05-19
+Last reviewed: 2026-11-09
 
 ## References
 
@@ -37,11 +37,12 @@ behavior, public text facade, and operation info output.
 | Style/remove-style behavior | covered | Tests cover overlap, conflict LWW, concurrent insert formatting, and style removal. |
 | Text GC pairs | covered | Removed text nodes and removed attributes are registered and purged. |
 | Operation execution | partial | Edit/style operations execute and register GC pairs, but operation info shape is not final. |
-| Upstream skipped history cases | blocked | JS skips overlapping-delete undo correctness cases because both clients can converge to duplicated content. Rust must keep these skipped or ignored until upstream unskips them. See `upstream-skipped-tests.md`. |
+| Removal ledger and identity undo | covered | Ports JS `84068f70`: per-node removal ledger, live-in-view remote deletion, `restore`/`retombstone`, ledger pruning and `held_from_purge` in GC, identity undo and redo, and the wire fields. The JS ledger, restore, and fuzz tests are ported; JS vs Go divergences are listed in `docs/current-porting-gaps.md`. |
+| Upstream skipped history cases | divergent | JS still skips the overlapping-delete undo correctness cases with a stale comment; Go runs them live, and Rust runs them live in `integration_history.rs`. See `upstream-skipped-tests.md`. |
 | Public Text facade | missing | No public context-backed text API yet. |
 | Splay/ID lookup optimization | partial | `RgaTreeSplit` now keeps `tree_by_index` and `tree_by_id` equivalents and uses weighted splay lookup for text indexes. Structural mutations still rebuild indexes around the current `Vec` storage instead of using stable linked-node handles. |
 | History and multi-client scenarios | partial | Important integration-style cases still need operation-level replay tests. |
-| Wire conversion | partial | Full text `JSONElement` payloads and edit/style operation bodies convert to/from protobuf-shaped wire values. Rust ports the text composition/style portion of JS's root bytes scenario at core wire level and covers a mixed protocol `ChangePack` replay with text edit/style operations. Public text facade, sync replay fixtures, and external event payload shape are still missing. |
+| Wire conversion | partial | Full text `JSONElement` payloads and edit/style operation bodies convert to/from protobuf-shaped wire values. Rust ports the text composition/style portion of JS's root bytes scenario at core wire level and covers a mixed protocol `ChangePack` replay with text edit/style operations. Restore spans and `removal_events` cross the wire, checked against change-pack and snapshot bytes JS and Go wrote (`crates/yorkie-protocol/tests/text_undo_interop.rs`). Public text facade, sync replay fixtures, and external event payload shape are still missing. |
 
 ## Next Checks
 

@@ -79,7 +79,14 @@ impl StyleOperation {
         let executed_at = self.executed_at()?.clone();
         let range = (self.from_pos.clone(), self.to_pos.clone());
 
-        let (changes, gc_nodes, diff, reverse_attributes, reverse_attributes_to_remove) = {
+        let (
+            changes,
+            gc_nodes,
+            diff,
+            reverse_attributes,
+            reverse_attributes_to_remove,
+            split_gc_pairs,
+        ) = {
             let Some(text) = root.text_by_created_at_mut(self.parent_created_at()) else {
                 return Err(self.text_parent_error(root));
             };
@@ -130,11 +137,15 @@ impl StyleOperation {
                 diff,
                 reverse_attributes,
                 reverse_attributes_to_remove,
+                text.drain_pending_gc_pairs(),
             )
         };
 
         root.acc(diff);
         register_removed_attr_nodes(root, gc_nodes);
+        for (child_id, child_size, removed_at) in split_gc_pairs {
+            root.register_gc_pair_by_id(child_id, child_size, removed_at);
+        }
 
         let reverse_op =
             self.to_reverse_operation(reverse_attributes, reverse_attributes_to_remove);

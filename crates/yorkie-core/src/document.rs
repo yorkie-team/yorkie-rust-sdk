@@ -457,6 +457,12 @@ impl Document {
         self.history.redo_stack()
     }
 
+    /// Returns the CRDT root, for tests that read node identities.
+    #[cfg(test)]
+    pub(crate) fn crdt_root_for_test(&self) -> &CrdtRoot {
+        &self.crdt_root
+    }
+
     /// Returns an immutable view of the document root.
     pub fn get_root(&self) -> &JsonObject {
         &self.root
@@ -1548,9 +1554,15 @@ fn crdt_element_to_json_value(element: &CrdtElement) -> Result<JsonValue> {
 }
 
 #[cfg(test)]
+mod adv_sync;
+#[cfg(test)]
 mod gc_tests;
 #[cfg(test)]
 mod split_link_tests;
+#[cfg(test)]
+mod text_undo_fuzz_tests;
+#[cfg(test)]
+mod text_undo_ledger_tests;
 #[cfg(test)]
 mod update_tests;
 

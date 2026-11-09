@@ -444,3 +444,266 @@ fn content_of(doc: &Document) -> String {
         other => panic!("expected text at t, got {other:?}"),
     }
 }
+
+// --- Identity undo and redo of Text edits ---
+
+/// The text at `t` in `doc`'s CRDT root.
+fn crdt_text(doc: &Document) -> &crate::crdt::text::CrdtText {
+    match doc.crdt_root_for_test().object().get("t") {
+        Some(crate::crdt::element::CrdtElement::Text(text)) => text,
+        other => panic!("expected text at t, got {other:?}"),
+    }
+}
+
+/// The ID of the piece holding `content`, removed or live as asked (JS
+/// `document_test.ts` `idOfNode`).
+fn id_of_node(doc: &Document, content: &str, removed: bool) -> Option<String> {
+    crdt_text(doc)
+        .nodes()
+        .find(|node| node.value().content() == content && node.is_removed() == removed)
+        .map(|node| node.id().to_test_string())
+}
+
+fn text_doc(content: &str) -> Result<Document> {
+    let mut doc = Document::new("test-doc");
+    doc.update(|root| root.set_text("t")?.edit(0, 0, content, None).map(|_| ()))?;
+    Ok(doc)
+}
+
+/// JS `document_test.ts` `should undo/redo deletion via identity-preserving
+/// restore` (`5d5cac63`): the undo revives the removed node itself, and the
+/// redo removes that node again.
+#[test]
+fn undoes_and_redoes_a_deletion_by_identity() -> Result<()> {
+    let mut doc = text_doc("0123456789")?;
+    Pair::edit(&mut doc, 4, 6, "")?;
+    assert_eq!("01236789", content_of(&doc));
+    let deleted = id_of_node(&doc, "45", true).expect("the removed 45");
+
+    doc.history_mut().undo()?;
+    assert_eq!("0123456789", content_of(&doc));
+    assert_eq!(Some(deleted.clone()), id_of_node(&doc, "45", false));
+
+    doc.history_mut().redo()?;
+    assert_eq!("01236789", content_of(&doc));
+    assert_eq!(Some(deleted.clone()), id_of_node(&doc, "45", true));
+
+    doc.history_mut().undo()?;
+    assert_eq!("0123456789", content_of(&doc));
+    assert_eq!(Some(deleted), id_of_node(&doc, "45", false));
+    Ok(())
+}
+
+/// JS `document_test.ts` `should recreate original node identities after GC
+/// on undo` (`5d5cac63`): the undo recreates purged pieces under their
+/// original IDs.
+#[test]
+fn recreates_purged_pieces_under_their_ids_on_undo() -> Result<()> {
+    let mut doc = text_doc("0123456789")?;
+    Pair::edit(&mut doc, 4, 6, "")?;
+    Pair::edit(&mut doc, 1, 3, "")?;
+    assert_eq!("036789", content_of(&doc));
+    let id45 = id_of_node(&doc, "45", true).expect("the removed 45");
+    let id12 = id_of_node(&doc, "12", true).expect("the removed 12");
+
+    let mut vector = crate::VersionVector::new();
+    vector.set(doc.actor_id().clone(), i64::MAX);
+    assert_eq!(2, doc.garbage_collect(&vector));
+    assert_eq!(0, doc.garbage_len());
+    assert_eq!(None, id_of_node(&doc, "45", true));
+    assert_eq!(None, id_of_node(&doc, "12", true));
+
+    doc.history_mut().undo()?;
+    assert_eq!("01236789", content_of(&doc));
+    assert_eq!(Some(id12.clone()), id_of_node(&doc, "12", false));
+
+    doc.history_mut().undo()?;
+    assert_eq!("0123456789", content_of(&doc));
+    assert_eq!(Some(id12), id_of_node(&doc, "12", false));
+    assert_eq!(Some(id45), id_of_node(&doc, "45", false));
+    Ok(())
+}
+
+/// JS `document_test.ts` `should emit opInfos for identity-preserving
+/// undo/redo` (`5d5cac63`): the restore reports an insertion and the
+/// re-removal a deletion, so the change is not dropped as empty.
+#[test]
+fn reports_identity_undo_and_redo_as_edits() -> Result<()> {
+    use crate::event::{DocEvent, OperationInfo};
+    use std::sync::{Arc, Mutex};
+
+    let mut doc = text_doc("0123456789")?;
+    Pair::edit(&mut doc, 4, 6, "")?;
+
+    let ops = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&ops);
+    doc.subscribe(move |event| {
+        if let DocEvent::LocalChange(info) = event {
+            for op in &info.operations {
+                if let OperationInfo::Edit {
+                    from, to, value, ..
+                } = op
+                {
+                    sink.lock()
+                        .unwrap()
+                        .push((*from, *to, value.content.clone()));
+                }
+            }
+        }
+    });
+
+    doc.history_mut().undo()?;
+    assert_eq!(vec![(4, 4, "45".to_owned())], *ops.lock().unwrap());
+
+    ops.lock().unwrap().clear();
+    doc.history_mut().redo()?;
+    assert_eq!(vec![(4, 6, String::new())], *ops.lock().unwrap());
+    Ok(())
+}
+
+/// JS `text_restore_convergence_test.ts` `buildOverlappingDeletes`: d1
+/// removes `45` and d2 the superset `234567`, concurrently.
+fn overlapping_deletes() -> Result<Pair> {
+    let mut pair = Pair::with_text("0123456789")?;
+    Pair::edit(&mut pair.d1, 4, 6, "")?;
+    Pair::edit(&mut pair.d2, 2, 8, "")?;
+    pair.sync()?;
+    assert_eq!("0189", content_of(&pair.d1));
+    Ok(pair)
+}
+
+/// Both replicas undo their overlapping deletes, in the given order, with a
+/// sync between and after (JS `runBothUndos`).
+fn both_undo(d1_first: bool) -> Result<Pair> {
+    let mut pair = overlapping_deletes()?;
+    if d1_first {
+        pair.d1.history_mut().undo()?;
+        pair.sync()?;
+        pair.d2.history_mut().undo()?;
+    } else {
+        pair.d2.history_mut().undo()?;
+        pair.sync()?;
+        pair.d1.history_mut().undo()?;
+    }
+    pair.sync()?;
+    Ok(pair)
+}
+
+/// JS `text_restore_convergence_test.ts` `converges when both replicas undo
+/// overlapping deletes (d1 first)`: the shared characters come back once,
+/// under the same node IDs on both replicas.
+#[test]
+fn converges_when_both_replicas_undo_overlapping_deletes_d1_first() -> Result<()> {
+    let pair = both_undo(true)?;
+    assert_eq!("0123456789", content_of(&pair.d1));
+    assert_eq!(
+        crdt_text(&pair.d1).to_test_string(),
+        crdt_text(&pair.d2).to_test_string()
+    );
+    Ok(())
+}
+
+/// JS `text_restore_convergence_test.ts` `converges to the same state under
+/// the opposite undo order (d2 first)`.
+#[test]
+fn converges_when_both_replicas_undo_overlapping_deletes_d2_first() -> Result<()> {
+    for d1_first in [true, false] {
+        let pair = both_undo(d1_first)?;
+        assert_eq!("0123456789", content_of(&pair.d1), "d1 first: {d1_first}");
+        assert_eq!(
+            crdt_text(&pair.d1).to_test_string(),
+            crdt_text(&pair.d2).to_test_string(),
+            "d1 first: {d1_first}"
+        );
+    }
+    Ok(())
+}
+
+/// JS `text_restore_convergence_test.ts` `purges symmetrically with
+/// docSize.gc drained after both undos`.
+#[test]
+fn purges_symmetrically_after_both_undos() -> Result<()> {
+    let mut pair = both_undo(true)?;
+    let mut vector = crate::VersionVector::new();
+    vector.set(pair.d1.actor_id().clone(), i64::MAX);
+    vector.set(pair.d2.actor_id().clone(), i64::MAX);
+
+    let purged1 = pair.d1.garbage_collect(&vector);
+    let purged2 = pair.d2.garbage_collect(&vector);
+    assert_eq!(purged1, purged2);
+    for doc in [&pair.d1, &pair.d2] {
+        assert_eq!(0, doc.garbage_len());
+        assert_eq!(crate::DataSize::default(), doc.doc_size().gc);
+    }
+    Ok(())
+}
+
+/// JS `text_restore_convergence_test.ts` `reverses GC accounting exactly
+/// across delete/undo/redo/undo`: the revive takes out of gc exactly what
+/// the removal put in, ticket included, cycle after cycle.
+#[test]
+fn reverses_gc_accounting_across_delete_undo_redo_undo() -> Result<()> {
+    let mut doc = text_doc("0123456789")?;
+    Pair::edit(&mut doc, 4, 6, "")?;
+    let deleted = doc.doc_size();
+    assert_ne!(crate::DataSize::default(), deleted.gc);
+
+    doc.history_mut().undo()?;
+    let revived = doc.doc_size();
+    assert_eq!(crate::DataSize::default(), revived.gc);
+
+    doc.history_mut().redo()?;
+    assert_eq!(deleted, doc.doc_size());
+
+    doc.history_mut().undo()?;
+    assert_eq!(revived, doc.doc_size());
+    Ok(())
+}
+
+/// Task 3 review: holders are keyed by the Text's creation time, and an
+/// undo re-sets a copy of a removed Text under the same one. The copy is
+/// what the next collection prunes, so its ledger drops the removal and
+/// cancel every replica knows (JS `pruneLedgers` over `ledgerHolders`).
+#[test]
+fn prunes_the_ledger_of_a_text_an_undo_set_back() -> Result<()> {
+    let mut doc = text_doc("abc")?;
+    Pair::edit(&mut doc, 1, 2, "")?;
+    doc.history_mut().undo()?;
+    assert!(crdt_text(&doc).has_cancelled_removals());
+    doc.update(|root| {
+        root.remove("t");
+        Ok(())
+    })?;
+    doc.history_mut().undo()?;
+    assert_eq!("abc", content_of(&doc));
+    assert!(crdt_text(&doc).has_cancelled_removals());
+
+    let mut vector = crate::VersionVector::new();
+    vector.set(doc.actor_id().clone(), i64::MAX);
+    doc.garbage_collect(&vector);
+    assert!(!crdt_text(&doc).has_cancelled_removals());
+    assert!(crdt_text(&doc)
+        .nodes()
+        .all(|node| node.removal_events().is_empty()));
+    Ok(())
+}
+
+/// JS `execute`, the identity branch, registers the Text as a ledger holder
+/// once the restore leaves a cancel in its ledgers, so the next collection
+/// whose vector covers the cancel prunes the removal and the cancel.
+#[test]
+fn prunes_the_ledger_an_identity_undo_leaves() -> Result<()> {
+    let mut doc = text_doc("abc")?;
+    Pair::edit(&mut doc, 1, 2, "")?;
+    doc.history_mut().undo()?;
+    assert!(crdt_text(&doc).has_cancelled_removals());
+
+    let mut vector = crate::VersionVector::new();
+    vector.set(doc.actor_id().clone(), i64::MAX);
+    doc.garbage_collect(&vector);
+    assert!(!crdt_text(&doc).has_cancelled_removals());
+    assert!(crdt_text(&doc)
+        .nodes()
+        .all(|node| node.removal_events().is_empty()));
+    Ok(())
+}

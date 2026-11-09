@@ -11,7 +11,7 @@ mod tree_style_operation;
 
 pub(crate) use add_operation::AddOperation;
 pub(crate) use array_set_operation::ArraySetOperation;
-pub(crate) use edit_operation::EditOperation;
+pub(crate) use edit_operation::{EditOperation, RestoreMode};
 pub(crate) use increase_operation::IncreaseOperation;
 pub(crate) use move_operation::MoveOperation;
 pub(crate) use remove_operation::RemoveOperation;

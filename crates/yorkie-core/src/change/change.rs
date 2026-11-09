@@ -99,7 +99,9 @@ impl Change {
     /// Each undo edit is first refined against the text as it stands when the
     /// edit runs, and keeps the refined positions: JS refines by mutating the
     /// operation inside `execute`, so those are the positions the change
-    /// carries to other replicas.
+    /// carries to other replicas. As in JS, an identity edit is not refined,
+    /// and an undo edit that inserts nothing moves to the head instead of
+    /// refining (see `EditOperation::refine_undo_positions`).
     pub(crate) fn execute_undo_redo(
         &mut self,
         root: &mut CrdtRoot,
