@@ -45,7 +45,7 @@ fn text_value(op: &Operation) -> Option<&CrdtElement> {
 /// The `(actor, lamport)` of every ticket in a `Debug` rendering, in order.
 /// Scanning the rendering sees every field without going through the walk
 /// under test, as JS `ticketsOf` reflects over the protobuf message.
-fn tickets_in(debug: &str) -> Vec<(String, i64)> {
+pub(crate) fn tickets_in(debug: &str) -> Vec<(String, i64)> {
     const LAMPORT: &str = "TimeTicket { lamport: ";
     const ACTOR: &str = "actor_id: ActorId(\"";
     let mut tickets = Vec::new();
@@ -337,10 +337,12 @@ fn reissues_the_tickets_of_spans_split_tickets_and_removal_events() -> Result<()
 
 /// No JS case: a Tree node's merge tickets come only from a concurrent merge
 /// applied remotely, which a never-synced document cannot hold, so the walk
-/// is checked on a node built by hand.
+/// is checked on a node built by hand. A ticket of a third actor, next to
+/// them, is left alone.
 #[test]
 fn reissues_the_merge_tickets_of_a_tree_node() {
     let ticket = |lamport| TimeTicket::new(lamport, 0, INITIAL_ACTOR_ID);
+    let other = TimeTicket::new(7, 0, ACTOR_B);
     let id = |lamport| WireTreeNodeId {
         created_at: ticket(lamport),
         offset: 0,
@@ -353,18 +355,29 @@ fn reissues_the_merge_tickets_of_a_tree_node() {
         ins_prev_id: Some(id(2)),
         ins_next_id: Some(id(3)),
         depth: 1,
-        attributes: BTreeMap::from([(
-            INITIAL_ACTOR_ID.to_owned(),
-            WireNodeAttr {
-                value: "v".to_owned(),
-                updated_at: ticket(4),
-                is_removed: false,
-            },
-        )]),
+        attributes: BTreeMap::from([
+            (
+                INITIAL_ACTOR_ID.to_owned(),
+                WireNodeAttr {
+                    value: "v".to_owned(),
+                    updated_at: ticket(4),
+                    is_removed: false,
+                },
+            ),
+            (
+                "other".to_owned(),
+                WireNodeAttr {
+                    value: "w".to_owned(),
+                    updated_at: other.clone(),
+                    is_removed: false,
+                },
+            ),
+        ]),
         merged_from: Some(id(0)),
         merged_at: Some(ticket(6)),
     };
     let before = tickets_in(&format!("{node:?}"));
+    assert_eq!(8, before.len(), "{before:?}");
 
     let (from, to) = (initial(), actor_a());
     TicketReissuer {
@@ -372,7 +385,17 @@ fn reissues_the_merge_tickets_of_a_tree_node() {
         to: &to,
     }
     .walk_tree_node(&mut node);
-    assert_reissued(&before, &tickets_in(&format!("{node:?}")));
+    assert_eq!(other, node.attributes["other"].updated_at);
+    let (theirs, mine): (Vec<_>, Vec<_>) = before
+        .iter()
+        .zip(tickets_in(&format!("{node:?}")))
+        .partition(|((actor, _), _)| actor == ACTOR_B);
+    assert_eq!(1, theirs.len());
+    let (before, after): (Vec<_>, Vec<_>) = mine
+        .into_iter()
+        .map(|(before, after)| (before.clone(), after))
+        .unzip();
+    assert_reissued(&before, &after);
     assert!(node.attributes.contains_key(INITIAL_ACTOR_ID));
 }
 

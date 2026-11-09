@@ -475,4 +475,4 @@ impl TicketReissuer<'_> {
 
 #[cfg(test)]
 #[path = "reissue_tests.rs"]
-mod tests;
+pub(crate) mod tests;
