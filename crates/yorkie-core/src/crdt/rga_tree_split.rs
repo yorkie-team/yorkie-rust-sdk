@@ -1495,11 +1495,10 @@ where
             .offset()
             .checked_sub(node_offset)
             .ok_or_else(|| {
-                YorkieError::InvalidTextPosition(format!(
-                    "position {} precedes node {}",
-                    absolute_id.to_test_string(),
-                    self.nodes[node_index].id().to_test_string()
-                ))
+                // JS `splitNode` rejects the negative offset this would be.
+                YorkieError::InvalidTextPosition(
+                    "offset should be between 0 and the length of the node".to_owned(),
+                )
             })?;
 
         let diff = self.split_node(node_index, relative_offset)?;
@@ -1717,7 +1716,18 @@ where
         let offset = if self.nodes[index].is_removed() {
             0
         } else {
-            absolute_id.offset() - self.nodes[index].id().offset()
+            // A position resolved through an `ins_prev` link into a node of
+            // a higher offset, which only a forged link produces, would
+            // underflow here; reject it as JS `splitNode` rejects a negative
+            // offset.
+            absolute_id
+                .offset()
+                .checked_sub(self.nodes[index].id().offset())
+                .ok_or_else(|| {
+                    YorkieError::InvalidTextPosition(
+                        "offset should be between 0 and the length of the node".to_owned(),
+                    )
+                })?
         };
 
         Ok(cursor + offset)
@@ -1757,9 +1767,9 @@ where
         let mut diff = DataSize::default();
         let content_len = self.nodes[index].content_len();
         if offset > content_len {
-            return Err(YorkieError::InvalidTextPosition(format!(
-                "offset {offset} exceeds node length {content_len}"
-            )));
+            return Err(YorkieError::InvalidTextPosition(
+                "offset should be between 0 and the length of the node".to_owned(),
+            ));
         }
 
         if offset == 0 || offset == content_len {

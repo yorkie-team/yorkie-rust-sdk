@@ -20,7 +20,7 @@ use crate::operation::{
 };
 use crate::presence::{Presence, PresenceChange};
 use crate::{ActorId, Result, TimeTicket, VersionVector, YorkieError};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WireValueType {
@@ -975,8 +975,24 @@ fn wire_primitive_from_domain(primitive: &CrdtPrimitive) -> WireJsonElement {
 }
 
 fn wire_text_from_domain(text: &CrdtText) -> WireJsonElement {
+    // The decoder resolves `ins_prev_id` against the nodes it has already
+    // decoded (JS `fromText`; Go rejects a link it cannot find), so a link is
+    // written only when its target was emitted earlier in this very list
+    // (JS `toTextNodes`). A split product's `ins_prev` always precedes it,
+    // so this drops nothing a snapshot or a re-issue needs; what it drops is
+    // a dangling link into a node no longer in this split, which no decoder
+    // could have resolved.
+    let mut emitted = BTreeSet::new();
+    let nodes = text
+        .nodes()
+        .map(|node| {
+            let wire = wire_text_node_from_domain(node, &emitted);
+            emitted.insert(node.id().clone());
+            wire
+        })
+        .collect();
     WireJsonElement::Text {
-        nodes: text.nodes().map(wire_text_node_from_domain).collect(),
+        nodes,
         created_at: text.created_at().clone(),
         moved_at: text.moved_at().cloned(),
         removed_at: text.removed_at().cloned(),
@@ -1296,12 +1312,18 @@ fn restore_spans_from_wire(
         .collect()
 }
 
-fn wire_text_node_from_domain(node: &RgaTreeSplitNode<TextValue>) -> WireTextNode {
+fn wire_text_node_from_domain(
+    node: &RgaTreeSplitNode<TextValue>,
+    emitted: &BTreeSet<RgaTreeSplitNodeId>,
+) -> WireTextNode {
     WireTextNode {
         id: WireTextNodeId::from(node.id()),
         value: node.value().content().to_owned(),
         removed_at: node.removed_at().cloned(),
-        ins_prev_id: node.ins_prev_id().map(WireTextNodeId::from),
+        ins_prev_id: node
+            .ins_prev_id()
+            .filter(|id| emitted.contains(*id))
+            .map(WireTextNodeId::from),
         attributes: text_attrs_from_domain(node.value().attributes()),
         removal_events: node.removal_events(),
     }
@@ -1347,6 +1369,17 @@ fn text_from_wire_nodes(created_at: TimeTicket, nodes: Vec<WireTextNode>) -> Res
     );
     let mut split = RgaTreeSplit::new(initial_head);
     let mut prev_id = split.initial_head().id().clone();
+    // A Text can arrive inside a client-supplied Set/Add/ArraySet payload,
+    // where its links are as untrusted as the tree links
+    // `drop_split_links_in_element` strips. They are kept, since such a
+    // payload can be a copy of real document state whose split pieces a
+    // later Edit targets, but each is resolved by exact ID against the nodes
+    // decoded so far (JS `fromText`). Every producer of a link points it at
+    // an earlier piece of the same insertion, so a link naming another
+    // insertion, or an offset at or above the node's own, is one no local
+    // edit made. Any link that does not resolve is dropped, as JS does; Go
+    // rejects the element instead.
+    let mut decoded = BTreeSet::new();
 
     for node in nodes {
         let mut text_node = RgaTreeSplitNode::new(
@@ -1362,15 +1395,22 @@ fn text_from_wire_nodes(created_at: TimeTicket, nodes: Vec<WireTextNode>) -> Res
         // drop is silent (see the porting gaps).
         let _ = text_node.set_removal_events(node.removal_events);
         let inserted_id = split.insert_after_id(&prev_id, text_node)?;
-        if let Some(ins_prev_id) = node.ins_prev_id {
-            let current = split.find_node_mut_by_id(&inserted_id).ok_or_else(|| {
-                YorkieError::InvalidTextPosition(format!(
-                    "node not found for {}",
-                    inserted_id.to_test_string()
-                ))
-            })?;
-            current.set_ins_prev_id(Some(RgaTreeSplitNodeId::from(ins_prev_id)));
+        let ins_prev_id = node.ins_prev_id.map(RgaTreeSplitNodeId::from).filter(|id| {
+            id.has_same_created_at(&inserted_id)
+                && id.offset() < inserted_id.offset()
+                && decoded.contains(id)
+        });
+        if let Some(ins_prev_id) = ins_prev_id {
+            // JS `setInsPrev` links both ways, so a later split of the
+            // target relinks this node as it does on the encoding replica.
+            if let Some(target) = split.find_node_mut_by_id(&ins_prev_id) {
+                target.set_ins_next_id(Some(inserted_id.clone()));
+            }
+            if let Some(current) = split.find_node_mut_by_id(&inserted_id) {
+                current.set_ins_prev_id(Some(ins_prev_id));
+            }
         }
+        decoded.insert(inserted_id.clone());
         prev_id = inserted_id;
     }
 
@@ -1531,6 +1571,10 @@ fn wire_value_type_to_counter_type(value_type: WireValueType) -> Result<CounterT
         )),
     }
 }
+
+#[cfg(test)]
+#[path = "wire_text_link_tests.rs"]
+mod text_link_tests;
 
 #[cfg(test)]
 mod tests {
