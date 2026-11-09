@@ -4,6 +4,8 @@ mod pos_tests;
 mod text;
 mod tree;
 #[cfg(test)]
+mod tree_event_path_tests;
+#[cfg(test)]
 mod tree_style_path_tests;
 #[cfg(test)]
 mod tree_surrogate_tests;
