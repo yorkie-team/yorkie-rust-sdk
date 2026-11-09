@@ -13,6 +13,9 @@ mod json;
 #[allow(dead_code)]
 mod operation;
 mod presence;
+// Wired into `Document` by the pre-attach re-issue entry point.
+#[allow(dead_code)]
+mod reissue;
 mod schema;
 mod time;
 /// Protocol-shaped projections for `yorkie-protocol`. Public only so that
