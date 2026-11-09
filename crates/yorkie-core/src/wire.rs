@@ -7,7 +7,7 @@ use crate::crdt::object::CrdtObject;
 use crate::crdt::primitive::{CrdtPrimitive, PrimitiveType, PrimitiveValue};
 use crate::crdt::rga_tree_list::RgaTreeList;
 use crate::crdt::rga_tree_split::{
-    RgaTreeSplit, RgaTreeSplitNode, RgaTreeSplitNodeId, RgaTreeSplitPos,
+    RestoreSpan, RgaTreeSplit, RgaTreeSplitNode, RgaTreeSplitNodeId, RgaTreeSplitPos,
 };
 use crate::crdt::rht::Rht;
 use crate::crdt::split_links::drop_split_links_in_element;
@@ -15,7 +15,8 @@ use crate::crdt::text::{CrdtText, TextValue};
 use crate::crdt::tree::{CrdtTree, TreeNode, TreeNodeId, TreePos};
 use crate::operation::{
     AddOperation, ArraySetOperation, EditOperation, IncreaseOperation, MoveOperation, Operation,
-    RemoveOperation, SetOperation, StyleOperation, TreeEditOperation, TreeStyleOperation,
+    RemoveOperation, RestoreMode, SetOperation, StyleOperation, TreeEditOperation,
+    TreeStyleOperation,
 };
 use crate::presence::{Presence, PresenceChange};
 use crate::{ActorId, Result, TimeTicket, VersionVector, YorkieError};
@@ -133,6 +134,33 @@ pub struct WireTextNode {
     pub removed_at: Option<TimeTicket>,
     pub ins_prev_id: Option<WireTextNodeId>,
     pub attributes: BTreeMap<String, WireNodeAttr>,
+    /// The node's removal ledger beyond `removed_at`, in ticket order
+    /// (proto `TextNode.removal_events`). Empty when `removed_at` says it
+    /// all, so such a node encodes to the bytes it did before the ledger.
+    pub removal_events: Vec<TimeTicket>,
+}
+
+/// A run of characters from one insertion, addressed by identity: the
+/// interval `[start, end)`, in UTF-16 code units, of the insertion created at
+/// `created_at`, with a copy of its content and attributes (proto
+/// `RestoreSpan`). The attributes travel as a bare map; the decoder stamps
+/// them with the operation's `executed_at`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireRestoreSpan {
+    pub created_at: TimeTicket,
+    pub start: usize,
+    pub end: usize,
+    pub content: String,
+    pub attributes: BTreeMap<String, String>,
+}
+
+/// The direction of an identity edit (proto `RestoreMode`): `Restore`
+/// revives `restore_spans` and re-removes `retombstone_spans`;
+/// `Retombstone`, the redo, does the opposite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireRestoreMode {
+    Restore,
+    Retombstone,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,6 +221,15 @@ pub enum WireOperation {
         content: String,
         attributes: BTreeMap<String, String>,
         executed_at: TimeTicket,
+        /// The content an undo or redo revives, by identity. With
+        /// `retombstone_spans`, empty on every edit but an identity one, whose
+        /// positional fields are a zero-width, empty-content edit: its
+        /// content travels only in the spans.
+        restore_spans: Vec<WireRestoreSpan>,
+        /// Set exactly when a span list is non-empty.
+        restore_mode: Option<WireRestoreMode>,
+        /// The content an undo or redo re-removes, by identity.
+        retombstone_spans: Vec<WireRestoreSpan>,
     },
     Style {
         parent_created_at: TimeTicket,
@@ -498,14 +535,29 @@ impl TryFrom<&Operation> for WireOperation {
                 created_at: operation.created_at().clone(),
                 executed_at: operation.executed_at()?.clone(),
             }),
-            Operation::Edit(operation) => Ok(Self::Edit {
-                parent_created_at: operation.parent_created_at().clone(),
-                from: WireTextNodePos::from(operation.range_from()),
-                to: WireTextNodePos::from(operation.to_pos()),
-                content: operation.content().to_owned(),
-                attributes: operation.attributes().clone(),
-                executed_at: operation.executed_at()?.clone(),
-            }),
+            Operation::Edit(operation) => {
+                let restore_spans = wire_restore_spans_from_domain(operation.restore_spans());
+                let retombstone_spans =
+                    wire_restore_spans_from_domain(operation.retombstone_spans());
+                // JS `toOperation`: the mode travels only with a span, so an
+                // ordinary edit encodes to the bytes it always did.
+                let restore_mode = (!restore_spans.is_empty() || !retombstone_spans.is_empty())
+                    .then(|| match operation.restore_mode() {
+                        Some(RestoreMode::Retombstone) => WireRestoreMode::Retombstone,
+                        Some(RestoreMode::Restore) | None => WireRestoreMode::Restore,
+                    });
+                Ok(Self::Edit {
+                    parent_created_at: operation.parent_created_at().clone(),
+                    from: WireTextNodePos::from(operation.range_from()),
+                    to: WireTextNodePos::from(operation.to_pos()),
+                    content: operation.content().to_owned(),
+                    attributes: operation.attributes().clone(),
+                    executed_at: operation.executed_at()?.clone(),
+                    restore_spans,
+                    restore_mode,
+                    retombstone_spans,
+                })
+            }
             Operation::Style(operation) => Ok(Self::Style {
                 parent_created_at: operation.parent_created_at().clone(),
                 from: WireTextNodePos::from(operation.range_from()),
@@ -603,14 +655,43 @@ impl TryFrom<WireOperation> for Operation {
                 content,
                 attributes,
                 executed_at,
-            } => Ok(Self::Edit(EditOperation::create(
-                parent_created_at,
-                RgaTreeSplitPos::from(from),
-                RgaTreeSplitPos::from(to),
-                content,
-                attributes,
-                Some(executed_at),
-            ))),
+                restore_spans,
+                restore_mode,
+                retombstone_spans,
+            } => {
+                // JS `fromOperation`: spans are read only when a list is
+                // non-empty, and then the edit is an undo or redo by
+                // identity; a mode other than retombstone means restore.
+                if restore_spans.is_empty() && retombstone_spans.is_empty() {
+                    return Ok(Self::Edit(EditOperation::create(
+                        parent_created_at,
+                        RgaTreeSplitPos::from(from),
+                        RgaTreeSplitPos::from(to),
+                        content,
+                        attributes,
+                        Some(executed_at),
+                    )));
+                }
+
+                let mode = match restore_mode {
+                    Some(WireRestoreMode::Retombstone) => RestoreMode::Retombstone,
+                    Some(WireRestoreMode::Restore) | None => RestoreMode::Restore,
+                };
+                let restore_spans = restore_spans_from_wire(restore_spans, &executed_at)?;
+                let retombstone_spans = restore_spans_from_wire(retombstone_spans, &executed_at)?;
+                Ok(Self::Edit(
+                    EditOperation::new(
+                        parent_created_at,
+                        RgaTreeSplitPos::from(from),
+                        RgaTreeSplitPos::from(to),
+                        content,
+                        attributes,
+                        Some(executed_at),
+                        true,
+                    )
+                    .with_identity(restore_spans, mode, retombstone_spans),
+                ))
+            }
             WireOperation::Style {
                 parent_created_at,
                 from,
@@ -1168,6 +1249,53 @@ impl From<WireTreePos> for TreePos {
     }
 }
 
+fn wire_restore_spans_from_domain(spans: &[RestoreSpan<TextValue>]) -> Vec<WireRestoreSpan> {
+    spans
+        .iter()
+        .map(|span| WireRestoreSpan {
+            created_at: span.created_at.clone(),
+            start: span.start,
+            end: span.end,
+            content: span.value.content().to_owned(),
+            attributes: span.value.get_attributes(),
+        })
+        .collect()
+}
+
+/// Decodes the spans of an identity edit (JS `fromPbSpan`). `restore`
+/// slices a span's content by its offsets, so `[start, end)` has to be an
+/// ordered interval exactly covering the content, in UTF-16 code units; a
+/// span that is not fails the whole operation here instead of deep in the
+/// restore path. The attributes, a bare map on the wire, are stamped with
+/// the operation's `executed_at`, as the server does when it recreates a
+/// node from a span.
+fn restore_spans_from_wire(
+    spans: Vec<WireRestoreSpan>,
+    executed_at: &TimeTicket,
+) -> Result<Vec<RestoreSpan<TextValue>>> {
+    spans
+        .into_iter()
+        .map(|span| {
+            if span.end < span.start || span.end - span.start != span.content.encode_utf16().count()
+            {
+                return Err(YorkieError::InvalidArgument(
+                    "malformed restore span: invalid range".to_owned(),
+                ));
+            }
+            let mut value = TextValue::create(span.content);
+            for (key, attr) in span.attributes {
+                value.set_attr(key, attr, executed_at.clone());
+            }
+            Ok(RestoreSpan {
+                created_at: span.created_at,
+                start: span.start,
+                end: span.end,
+                value,
+            })
+        })
+        .collect()
+}
+
 fn wire_text_node_from_domain(node: &RgaTreeSplitNode<TextValue>) -> WireTextNode {
     WireTextNode {
         id: WireTextNodeId::from(node.id()),
@@ -1175,6 +1303,7 @@ fn wire_text_node_from_domain(node: &RgaTreeSplitNode<TextValue>) -> WireTextNod
         removed_at: node.removed_at().cloned(),
         ins_prev_id: node.ins_prev_id().map(WireTextNodeId::from),
         attributes: text_attrs_from_domain(node.value().attributes()),
+        removal_events: node.removal_events(),
     }
 }
 
@@ -1225,6 +1354,13 @@ fn text_from_wire_nodes(created_at: TimeTicket, nodes: Vec<WireTextNode>) -> Res
             TextValue::new(node.value, text_attrs_to_domain(node.attributes)),
         );
         text_node.set_removed_at(node.removed_at);
+        // JS `fromTextNode` logs a ledger `set_removal_events` refuses and
+        // drops it, leaving the node with `removed_at` alone: failing here
+        // would stop a client from attaching or from draining the pull that
+        // carries one peer's bad node, a document wedged for good rather
+        // than one node decoded coarsely. `yorkie-core` has no logger, so the
+        // drop is silent (see the porting gaps).
+        let _ = text_node.set_removal_events(node.removal_events);
         let inserted_id = split.insert_after_id(&prev_id, text_node)?;
         if let Some(ins_prev_id) = node.ins_prev_id {
             let current = split.find_node_mut_by_id(&inserted_id).ok_or_else(|| {
@@ -1878,6 +2014,340 @@ mod tests {
                 .removed_at()
         );
         Ok(())
+    }
+
+    /// JS `restore_converter_test.ts` "round-trips a restore operation over
+    /// the wire" and "round-trips the companion retombstone_spans of a
+    /// replace reverse", at the wire projection: both span lists and the
+    /// mode come back, and the decoded edit is an undo.
+    #[test]
+    fn carries_an_identity_edit_through_wire_shape() -> Result<()> {
+        let operation = identity_edit(
+            vec![restore_span(2, 4, "CD"), restore_span(4, 6, "45")],
+            RestoreMode::Restore,
+            vec![restore_span(0, 2, "12")],
+        );
+
+        let wire = WireOperation::try_from(&Operation::Edit(operation.clone()))?;
+        let WireOperation::Edit {
+            content,
+            restore_spans,
+            restore_mode,
+            retombstone_spans,
+            ..
+        } = &wire
+        else {
+            panic!("expected an edit");
+        };
+        assert_eq!("", content);
+        assert_eq!(Some(WireRestoreMode::Restore), *restore_mode);
+        assert_eq!(
+            vec![(2, 4, "CD"), (4, 6, "45")],
+            restore_spans
+                .iter()
+                .map(|span| (span.start, span.end, span.content.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(1, retombstone_spans.len());
+        assert_eq!(ticket(1), retombstone_spans[0].created_at);
+
+        let Operation::Edit(decoded) = Operation::try_from(wire)? else {
+            panic!("expected an edit");
+        };
+        assert_eq!(operation, decoded);
+        Ok(())
+    }
+
+    /// JS `restore_converter_test.ts` "round-trips a retombstone operation".
+    #[test]
+    fn carries_a_retombstone_edit_through_wire_shape() -> Result<()> {
+        let operation = identity_edit(
+            vec![restore_span(4, 6, "45")],
+            RestoreMode::Retombstone,
+            Vec::new(),
+        );
+
+        let wire = WireOperation::try_from(&Operation::Edit(operation.clone()))?;
+        assert!(matches!(
+            &wire,
+            WireOperation::Edit {
+                restore_mode: Some(WireRestoreMode::Retombstone),
+                ..
+            }
+        ));
+        let Operation::Edit(decoded) = Operation::try_from(wire)? else {
+            panic!("expected an edit");
+        };
+        assert_eq!(Some(RestoreMode::Retombstone), decoded.restore_mode());
+        assert_eq!(operation, decoded);
+        Ok(())
+    }
+
+    /// JS `restore_converter_test.ts` "keeps span attributes, stamped with
+    /// executedAt": the wire carries a bare map, so the decoder stamps it
+    /// with the operation's `executed_at`.
+    #[test]
+    fn stamps_span_attributes_with_executed_at() -> Result<()> {
+        let mut styled = restore_span(0, 1, "X");
+        styled.value.set_attr("b", "1", ticket(1));
+        let operation = identity_edit(Vec::new(), RestoreMode::Restore, vec![styled]);
+
+        let wire = WireOperation::try_from(&Operation::Edit(operation))?;
+        let Operation::Edit(decoded) = Operation::try_from(wire)? else {
+            panic!("expected an edit");
+        };
+        let value = &decoded.retombstone_spans()[0].value;
+        assert_eq!(
+            BTreeMap::from([("b".to_owned(), "1".to_owned())]),
+            value.get_attributes()
+        );
+        for node in value.attributes().iter() {
+            assert_eq!(&ticket(4), node.updated_at());
+        }
+        Ok(())
+    }
+
+    /// JS `restore_converter_test.ts` "leaves ordinary edits without a
+    /// restore payload": no spans and no mode, so the bytes stay as they
+    /// were, and the decoded edit is no undo.
+    #[test]
+    fn leaves_an_ordinary_edit_without_a_restore_payload() -> Result<()> {
+        let operation = EditOperation::create(
+            TimeTicket::initial(),
+            head_pos(),
+            head_pos(),
+            "hi",
+            BTreeMap::new(),
+            Some(ticket(4)),
+        );
+
+        let wire = WireOperation::try_from(&Operation::Edit(operation.clone()))?;
+        assert!(matches!(
+            &wire,
+            WireOperation::Edit { restore_spans, restore_mode: None, retombstone_spans, .. }
+                if restore_spans.is_empty() && retombstone_spans.is_empty()
+        ));
+        let Operation::Edit(decoded) = Operation::try_from(wire)? else {
+            panic!("expected an edit");
+        };
+        assert_eq!(None, decoded.restore_mode());
+        assert_eq!(operation, decoded);
+        Ok(())
+    }
+
+    /// JS `toOperation` writes the mode only with a span: an identity edit
+    /// left with no spans goes out, and comes back, as a plain edit.
+    #[test]
+    fn writes_no_mode_without_a_span() -> Result<()> {
+        let operation = identity_edit(Vec::new(), RestoreMode::Retombstone, Vec::new());
+
+        let wire = WireOperation::try_from(&Operation::Edit(operation))?;
+        assert!(matches!(
+            &wire,
+            WireOperation::Edit {
+                restore_mode: None,
+                ..
+            }
+        ));
+        let Operation::Edit(decoded) = Operation::try_from(wire)? else {
+            panic!("expected an edit");
+        };
+        assert_eq!(None, decoded.restore_mode());
+        Ok(())
+    }
+
+    /// JS `restore_converter_test.ts` "rejects a malformed span" (inverted
+    /// interval, interval not covering the content). A missing `created_at`
+    /// and a negative start cannot reach the wire projection; the protocol
+    /// converter rejects them. The length is in UTF-16 code units: an emoji
+    /// is two.
+    #[test]
+    fn rejects_a_malformed_span_in_wire_shape() -> Result<()> {
+        let decode = |span: WireRestoreSpan| {
+            Operation::try_from(WireOperation::Edit {
+                parent_created_at: TimeTicket::initial(),
+                from: WireTextNodePos::from(&head_pos()),
+                to: WireTextNodePos::from(&head_pos()),
+                content: String::new(),
+                attributes: BTreeMap::new(),
+                executed_at: ticket(4),
+                restore_spans: vec![span],
+                restore_mode: Some(WireRestoreMode::Restore),
+                retombstone_spans: Vec::new(),
+            })
+        };
+        let span = |start, end, content: &str| WireRestoreSpan {
+            created_at: ticket(1),
+            start,
+            end,
+            content: content.to_owned(),
+            attributes: BTreeMap::new(),
+        };
+
+        assert!(decode(span(0, 2, "\u{1F600}")).is_ok());
+        for malformed in [
+            span(6, 4, "45"),
+            span(4, 9, "45"),
+            span(0, 1, "\u{1F600}"),
+            span(0, 4, "\u{1F600}"),
+        ] {
+            assert!(matches!(
+                decode(malformed.clone()),
+                Err(YorkieError::InvalidArgument(_))
+            ));
+        }
+        Ok(())
+    }
+
+    /// JS `toTextNodes` writes no `removal_events` for a node whose
+    /// `removed_at` says it all, so a character removed once and never
+    /// restored encodes as before.
+    #[test]
+    fn writes_no_removal_events_when_removed_at_says_it_all() -> Result<()> {
+        let mut text = CrdtText::create(ticket(1));
+        text.edit_by_index(0, 0, "abc", None, ticket(2), None)?;
+        text.edit_by_index(1, 2, "", None, ticket(3), None)?;
+
+        let WireJsonElement::Text { nodes, .. } = wire_text_from_domain(&text) else {
+            panic!("expected a text");
+        };
+        assert_eq!(Some(&ticket(3)), nodes[1].removed_at.as_ref());
+        assert!(nodes.iter().all(|node| node.removal_events.is_empty()));
+        Ok(())
+    }
+
+    /// JS `toTextNodes`/`fromTextNode`: a ledger beyond `removed_at` survives
+    /// a snapshot, in ticket order.
+    #[test]
+    fn carries_a_removal_ledger_through_wire_shape() -> Result<()> {
+        let text = ledgered_text()?;
+        let WireJsonElement::Text { nodes, .. } = wire_text_from_domain(&text) else {
+            panic!("expected a text");
+        };
+        assert_eq!(vec![ticket(3), ticket(4)], nodes[1].removal_events);
+
+        let CrdtElement::Text(decoded) = CrdtElement::try_from(wire_text_from_domain(&text))?
+        else {
+            panic!("expected a text");
+        };
+        assert_eq!(
+            text.nodes()
+                .map(|node| node.removal_events())
+                .collect::<Vec<_>>(),
+            decoded
+                .nodes()
+                .map(|node| node.removal_events())
+                .collect::<Vec<_>>()
+        );
+        assert!(decoded.has_cancelled_removals());
+        Ok(())
+    }
+
+    /// JS `fromTextNode`: a ledger `setRemovalEvents` refuses is dropped and
+    /// the node keeps `removed_at` alone; the snapshot still decodes.
+    #[test]
+    fn drops_a_removal_ledger_that_breaks_the_rules() -> Result<()> {
+        let node = |removed_at: Option<TimeTicket>, removal_events: Vec<TimeTicket>| WireTextNode {
+            id: WireTextNodeId {
+                created_at: ticket(2),
+                offset: 0,
+            },
+            value: "a".to_owned(),
+            removed_at,
+            ins_prev_id: None,
+            attributes: BTreeMap::new(),
+            removal_events,
+        };
+        for (removed_at, events) in [
+            // repeats removed_at
+            (Some(ticket(5)), vec![ticket(5)]),
+            // a removal that does not reproduce removed_at
+            (None, vec![ticket(3)]),
+        ] {
+            let wire = WireJsonElement::Text {
+                nodes: vec![node(removed_at.clone(), events)],
+                created_at: ticket(1),
+                moved_at: None,
+                removed_at: None,
+            };
+            let CrdtElement::Text(text) = CrdtElement::try_from(wire)? else {
+                panic!("expected a text");
+            };
+            let decoded = text.nodes().next().expect("the decoded node");
+            assert_eq!(removed_at.as_ref(), decoded.removed_at());
+            assert!(decoded.removal_events().is_empty());
+        }
+        Ok(())
+    }
+
+    /// JS `CRDTRoot` registers every element of a loaded snapshot, ledger
+    /// holders included, so GC prunes a ledger a snapshot carried in.
+    #[test]
+    fn prunes_a_removal_ledger_a_snapshot_carried_in() -> Result<()> {
+        let root = CrdtRoot::new(CrdtObject::create_with_members(
+            TimeTicket::initial(),
+            [("t", CrdtElement::text(ledgered_text()?))],
+        ));
+        let mut root = roundtrip_root_json_element(&root)?;
+        let events = |root: &CrdtRoot| {
+            root.text_by_created_at(&ticket(1))
+                .expect("the text")
+                .nodes()
+                .flat_map(|node| node.removal_events())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(vec![ticket(3), ticket(4)], events(&root));
+
+        let mut vector = VersionVector::new();
+        vector.set("000000000000000000000001", 5);
+        root.garbage_collect(&vector);
+        assert!(events(&root).is_empty());
+        Ok(())
+    }
+
+    /// `abc` whose `b` was removed at 3 and restored at 4.
+    fn ledgered_text() -> Result<CrdtText> {
+        let mut text = CrdtText::create(ticket(1));
+        text.edit_by_index(0, 0, "abc", None, ticket(2), None)?;
+        text.edit_by_index(1, 2, "", None, ticket(3), None)?;
+        let b = RestoreSpan {
+            created_at: ticket(2),
+            start: 1,
+            end: 2,
+            value: TextValue::create("b"),
+        };
+        text.restore(&[b], &ticket(4), None)?;
+        Ok(text)
+    }
+
+    fn identity_edit(
+        restore_spans: Vec<RestoreSpan<TextValue>>,
+        mode: RestoreMode,
+        retombstone_spans: Vec<RestoreSpan<TextValue>>,
+    ) -> EditOperation {
+        EditOperation::new(
+            TimeTicket::initial(),
+            head_pos(),
+            head_pos(),
+            "",
+            BTreeMap::new(),
+            Some(ticket(4)),
+            true,
+        )
+        .with_identity(restore_spans, mode, retombstone_spans)
+    }
+
+    fn restore_span(start: usize, end: usize, content: &str) -> RestoreSpan<TextValue> {
+        RestoreSpan {
+            created_at: ticket(1),
+            start,
+            end,
+            value: TextValue::create(content),
+        }
+    }
+
+    fn head_pos() -> RgaTreeSplitPos {
+        RgaTreeSplitPos::new(RgaTreeSplitNodeId::new(ticket(1), 0), 0)
     }
 
     fn roundtrip_root_json_element(root: &CrdtRoot) -> Result<CrdtRoot> {
