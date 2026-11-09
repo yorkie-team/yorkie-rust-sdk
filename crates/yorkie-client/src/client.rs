@@ -536,19 +536,25 @@ impl Client {
             let _ = ready.await;
         }
 
-        if let Some(initial_root) = initial_root {
-            let entries = initial_root
-                .iter()
-                .map(|(key, value)| (key.to_owned(), value.clone()))
-                .collect::<Vec<_>>();
-            lock_document(&doc).update(|root| {
-                for (key, value) in entries {
-                    if root.get(&key).is_none() {
-                        root.set(key, value)?;
+        {
+            let mut doc = lock_document(&doc);
+            if let Some(initial_root) = initial_root {
+                let entries = initial_root
+                    .iter()
+                    .map(|(key, value)| (key.to_owned(), value.clone()))
+                    .collect::<Vec<_>>();
+                doc.update(|root| {
+                    for (key, value) in entries {
+                        if root.get(&key).is_none() {
+                            root.set(key, value)?;
+                        }
                     }
-                }
-                Ok(())
-            })?;
+                    Ok(())
+                })?;
+            }
+            // As in JS, whether or not there was an initial root: the setup
+            // must not be reachable through undo.
+            doc.clear_history();
         }
 
         Ok(doc)

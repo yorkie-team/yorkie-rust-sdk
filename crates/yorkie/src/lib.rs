@@ -21,10 +21,10 @@ pub use yorkie_client::{
 };
 pub use yorkie_core::{
     ActorId, ChangeInfo, ChangePack, Checkpoint, CounterType, CounterValue, DataSize, DocEvent,
-    DocSize, DocStatus, DocSyncStatus, Document, EditOpValue, ErrorCode, HistoryMut, HistoryRef,
-    JsonArray, JsonArrayElement, JsonCounter, JsonObject, JsonText, JsonTree, JsonValue,
-    OperationInfo, Presence, PresenceChange, PresenceProxy, Result, SchemaRule,
-    StreamConnectionStatus, StyleOpValue, SubscriptionId, TextChunk, TextNodeIdStruct,
+    DocSize, DocStatus, DocSyncStatus, Document, DocumentOptions, EditOpValue, ErrorCode,
+    HistoryMut, HistoryRef, JsonArray, JsonArrayElement, JsonCounter, JsonObject, JsonText,
+    JsonTree, JsonValue, OperationInfo, Presence, PresenceChange, PresenceProxy, Result,
+    SchemaRule, StreamConnectionStatus, StyleOpValue, SubscriptionId, TextChunk, TextNodeIdStruct,
     TextPosStruct, TextPosStructRange, TimeTicket, TimeTicketStruct, TreeNodeIdStruct,
     TreeNodeInput, TreeNodeRule, TreePosStruct, TreePosStructRange, TreeStyleOpValue,
     VersionVector, YorkieError,

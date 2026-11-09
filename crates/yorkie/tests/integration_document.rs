@@ -955,6 +955,30 @@ async fn attaches_with_an_initial_root() {
     }
 }
 
+/// JS `attachDocument` clears the history after the initial-root update
+/// (`client.ts` 1850-1853), so the setup cannot be undone. No JS test checks
+/// it; this one does.
+#[tokio::test]
+async fn an_initial_root_cannot_be_undone() {
+    let Some(addr) = rpc_addr() else { return };
+    let client = active_client(&addr).await;
+    let key = unique_key("document-initial-root-undo");
+
+    let doc = client
+        .attach(shared(&key), initial_root([("k", JsonValue::from(1))]))
+        .await
+        .unwrap();
+
+    assert_eq!(r#"{"k":1}"#, sorted_json(&doc));
+    assert!(!doc.lock().unwrap().history().can_undo());
+    assert!(!doc.lock().unwrap().history().can_redo());
+
+    client
+        .deactivate(DeactivateOptions::default())
+        .await
+        .unwrap();
+}
+
 /// JS "Can handle concurrent attach with InitialRoot" (document_test.ts:1073).
 #[tokio::test]
 async fn handles_concurrent_attaches_with_an_initial_root() {

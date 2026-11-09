@@ -12,7 +12,9 @@ use crate::crdt::split_links::drop_split_links_in_element;
 use crate::crdt::text::CrdtText;
 use crate::crdt::tree::{CrdtTree, TreePos};
 use crate::event::{ChangeInfo, DocEvent, OperationInfo, Subscribers, SubscriptionId};
-use crate::history::{History, HistoryMut, HistoryOperation, HistoryRef};
+use crate::history::{
+    History, HistoryMut, HistoryOperation, HistoryRef, MAX_UNDO_REDO_STACK_DEPTH,
+};
 use crate::json::{counter_operand, JsonEditRecorder, JsonEditRecorderRef, RecordedJsonValue};
 use crate::operation::{
     AddOperation, ArraySetOperation, EditOperation, IncreaseOperation, MoveOperation, OpSource,
@@ -28,6 +30,10 @@ use crate::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
+
+mod options;
+
+pub use options::DocumentOptions;
 
 /// A local Yorkie document.
 #[derive(Debug, Clone, PartialEq)]
@@ -69,8 +75,26 @@ pub enum DocStatus {
 impl Document {
     /// Creates a document with the given Yorkie resource key.
     pub fn new(key: impl Into<String>) -> Self {
+        Self::create(key.into(), MAX_UNDO_REDO_STACK_DEPTH)
+    }
+
+    /// Creates a document with the given Yorkie resource key and options
+    /// (JS `new Document(key, opts)`).
+    ///
+    /// Fails with `InvalidArgument` when `max_undo_depth` is `Some(0)`.
+    pub fn with_options(key: impl Into<String>, options: DocumentOptions) -> Result<Self> {
+        let max_undo_depth = options.max_undo_depth.unwrap_or(MAX_UNDO_REDO_STACK_DEPTH);
+        if max_undo_depth < 1 {
+            return Err(YorkieError::InvalidArgument(format!(
+                "maxUndoDepth must be a positive integer: {max_undo_depth}"
+            )));
+        }
+        Ok(Self::create(key.into(), max_undo_depth))
+    }
+
+    fn create(key: String, max_undo_depth: usize) -> Self {
         Self {
-            key: key.into(),
+            key,
             status: DocStatus::Detached,
             root: JsonObject::new(),
             crdt_root: CrdtRoot::create(),
@@ -82,7 +106,7 @@ impl Document {
             presences: BTreeMap::new(),
             online_clients: BTreeSet::new(),
             subscribers: Subscribers::default(),
-            history: History::default(),
+            history: History::new(max_undo_depth),
             absorbed_remote: false,
             minted_operations: false,
         }
@@ -233,8 +257,7 @@ impl Document {
         // no `executed_at` until the undo runs it, which the wire projection
         // rejects. They are dropped, the state `apply_snapshot` leaves them
         // in too.
-        self.history.clear_undo();
-        self.history.clear_redo();
+        self.clear_history();
         Ok(true)
     }
 
@@ -473,6 +496,14 @@ impl Document {
     /// ```
     pub fn history_mut(&mut self) -> HistoryMut<'_> {
         HistoryMut::new(self)
+    }
+
+    /// Drops both the undo and the redo stack (JS `clearHistory`), so that
+    /// setup changes, such as an attach's initial root, cannot be undone. The
+    /// document, its local changes and its presence stay as they are.
+    pub fn clear_history(&mut self) {
+        self.history.clear_redo();
+        self.history.clear_undo();
     }
 
     pub(crate) fn history_stacks(&self) -> &History {
@@ -1030,8 +1061,7 @@ impl Document {
         self.apply_changes(&local_changes, OpSource::Local)?;
         // The history names elements and positions of the root the snapshot
         // replaced, as in JS `applySnapshot`.
-        self.history.clear_undo();
-        self.history.clear_redo();
+        self.clear_history();
         self.publish(DocEvent::Snapshot);
         Ok(())
     }
