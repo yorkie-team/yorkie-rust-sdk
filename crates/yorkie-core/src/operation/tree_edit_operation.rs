@@ -860,6 +860,7 @@ mod tests {
             from_idx,
             to_idx: from_idx,
             inserted_size,
+            ..Default::default()
         };
 
         // The copy reverse of an insertion ends inside the pair.
