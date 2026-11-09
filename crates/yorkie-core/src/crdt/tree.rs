@@ -835,15 +835,23 @@ impl CrdtTree {
         self.node_ids.len()
     }
 
+    /// Finds the position of `index` for a local edit or style (JS
+    /// `findPos`). It rejects an index inside a UTF-16 surrogate pair: a
+    /// split there leaves different text on different SDKs (Go and Rust
+    /// store U+FFFD for each half, JS the raw code unit).
     pub(crate) fn find_pos(&self, index: usize, prefer_text: bool) -> Result<TreePos> {
-        self.find_pos_unchecked(index, prefer_text)
+        let tree_pos = find_tree_pos(&self.root, Vec::new(), index, prefer_text)?;
+        let node = node_at_visible_path(&self.root, &tree_pos.path)?;
+        if node.is_text() {
+            validate_utf16_boundary(node.value(), tree_pos.offset)?;
+        }
+        tree_pos_to_crdt_pos(&self.root, &tree_pos)
     }
 
-    /// Finds the position of `index` for a selection rather than an edit (JS
-    /// `findPosUnchecked`), so it never rejects an index inside a UTF-16
-    /// surrogate pair. JS `findPos` rejects one for edits; Rust `find_pos`
-    /// does not check yet, so the two agree today, but the call sites keep
-    /// JS's split.
+    /// Finds the position of `index` without the surrogate pair check (JS
+    /// `findPosUnchecked`): for selections, and for indexes the document
+    /// computed itself, such as a reverse operation built for a remote
+    /// change, which can land inside a pair through no fault of the caller.
     pub(crate) fn find_pos_unchecked(&self, index: usize, prefer_text: bool) -> Result<TreePos> {
         let tree_pos = find_tree_pos(&self.root, Vec::new(), index, prefer_text)?;
         tree_pos_to_crdt_pos(&self.root, &tree_pos)
@@ -3366,6 +3374,28 @@ fn collect_merged_children(
 
 fn utf16_len(value: &str) -> usize {
     value.encode_utf16().count()
+}
+
+/// Fails when the UTF-16 `offset` falls between the halves of a surrogate
+/// pair in `value` (JS `CRDTTree.validateUTF16Boundary`). At either end of
+/// the node JS also reads the neighbouring text node, for a pair a local
+/// split left in two nodes. A Rust text node holds a `String`, and a split
+/// inside a pair decodes each half as U+FFFD, so no pair spans two nodes and
+/// the ends of a node are always boundaries.
+fn validate_utf16_boundary(value: &str, offset: usize) -> Result<()> {
+    let mut units = 0;
+    for ch in value.chars() {
+        if units >= offset {
+            break;
+        }
+        units += ch.len_utf16();
+    }
+    if units > offset {
+        return Err(YorkieError::InvalidArgument(
+            "index must not split a UTF-16 surrogate pair".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn split_utf16(value: &str, offset: usize) -> (String, String) {

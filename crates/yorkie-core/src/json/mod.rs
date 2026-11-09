@@ -5,6 +5,8 @@ mod text;
 mod tree;
 #[cfg(test)]
 mod tree_style_path_tests;
+#[cfg(test)]
+mod tree_surrogate_tests;
 
 use crate::crdt::counter::{CounterType, CounterValue, CrdtCounter};
 use crate::crdt::primitive::{CrdtPrimitive, PrimitiveValue};

@@ -172,6 +172,10 @@ impl TreeEditOperation {
         )
     }
 
+    /// Builds the reverse of this edit on the tree after it. The reverse is
+    /// built for remote changes too, from indexes on this replica's tree, so
+    /// it skips the surrogate pair check (JS `findPosUnchecked`): refusing
+    /// one would refuse a change the caller never controlled.
     fn to_reverse_operation(
         &self,
         tree: &crate::crdt::tree::CrdtTree,
@@ -182,8 +186,8 @@ impl TreeEditOperation {
             if result.from_idx + boundary_size > tree.root().len() {
                 return Ok(None);
             }
-            let reverse_from = tree.find_pos(result.from_idx, true)?;
-            let reverse_to = tree.find_pos(result.from_idx + boundary_size, true)?;
+            let reverse_from = tree.find_pos_unchecked(result.from_idx, true)?;
+            let reverse_to = tree.find_pos_unchecked(result.from_idx + boundary_size, true)?;
             return Ok(Some(Operation::TreeEdit(Self::create(
                 self.parent_created_at().clone(),
                 reverse_from,
@@ -195,7 +199,7 @@ impl TreeEditOperation {
         }
 
         if result.merge_level > 0 {
-            let reverse_from = tree.find_pos(result.from_idx, true)?;
+            let reverse_from = tree.find_pos_unchecked(result.from_idx, true)?;
             return Ok(Some(Operation::TreeEdit(Self::create(
                 self.parent_created_at().clone(),
                 reverse_from.clone(),
@@ -207,8 +211,9 @@ impl TreeEditOperation {
         }
 
         if result.inserted_size > 0 {
-            let reverse_from = tree.find_pos(result.from_idx, true)?;
-            let reverse_to = tree.find_pos(result.from_idx + result.inserted_size, true)?;
+            let reverse_from = tree.find_pos_unchecked(result.from_idx, true)?;
+            let reverse_to =
+                tree.find_pos_unchecked(result.from_idx + result.inserted_size, true)?;
             return Ok(Some(Operation::TreeEdit(Self::create(
                 self.parent_created_at().clone(),
                 reverse_from,
@@ -228,7 +233,7 @@ impl TreeEditOperation {
             node.clear_removed_recursively();
         }
 
-        let reverse_from = tree.find_pos(result.from_idx, true)?;
+        let reverse_from = tree.find_pos_unchecked(result.from_idx, true)?;
         Ok(Some(Operation::TreeEdit(Self::create(
             self.parent_created_at().clone(),
             reverse_from.clone(),
@@ -804,6 +809,74 @@ mod tests {
         };
         operation.set_executed_at(executed_at);
         reverse_op.execute(root, OpSource::Remote)?;
+        Ok(())
+    }
+
+    /// JS `surrogate_index_test.ts` "builds reverse operations at indexes
+    /// inside a pair": the reverse is built from the document's own indexes,
+    /// for remote changes too, so it takes the unchecked lookup.
+    #[test]
+    fn builds_reverse_operations_at_indexes_inside_a_pair() -> crate::Result<()> {
+        let tree_at = ticket(1, "a");
+        let tree = CrdtTree::create(
+            TreeNode::create_element(
+                TreeNodeId::new(tree_at.clone(), 0),
+                "r",
+                None,
+                vec![TreeNode::create_element(
+                    TreeNodeId::new(ticket(2, "a"), 0),
+                    "p",
+                    None,
+                    vec![TreeNode::create_text(
+                        TreeNodeId::new(ticket(3, "a"), 0),
+                        "😀",
+                    )],
+                )],
+            ),
+            tree_at.clone(),
+        );
+        assert!(tree.find_pos(2, true).is_err());
+
+        let pos = tree.find_pos(1, true)?;
+        let op = |split_level| {
+            TreeEditOperation::create(
+                tree_at.clone(),
+                pos.clone(),
+                pos.clone(),
+                None,
+                split_level,
+                Some(ticket(10, "a")),
+            )
+        };
+        // A split is reversed first, so the merge reverse needs an edit that
+        // does not split.
+        let (split, merge) = (op(1), op(0));
+        let result = |from_idx, merge_level, inserted_size| crate::crdt::tree::TreeEditResult {
+            changes: Vec::new(),
+            gc_pairs: Vec::new(),
+            diff: crate::DataSize::default(),
+            removed_nodes: Vec::new(),
+            merge_level,
+            from_idx,
+            to_idx: from_idx,
+            inserted_size,
+        };
+
+        // The copy reverse of an insertion ends inside the pair.
+        assert!(split
+            .to_reverse_operation(&tree, &result(1, 0, 1))?
+            .is_some());
+        // A merge reverse (a split) starts inside it.
+        assert!(merge
+            .to_reverse_operation(&tree, &result(2, 1, 0))?
+            .is_some());
+        // A split reverse starts inside it.
+        assert!(split
+            .to_reverse_operation(&tree, &result(2, 0, 0))?
+            .is_some());
+        assert!(split
+            .to_reverse_operation(&tree, &result(1, 0, 0))?
+            .is_some());
         Ok(())
     }
 

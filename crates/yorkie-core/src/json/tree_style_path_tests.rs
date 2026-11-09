@@ -263,14 +263,19 @@ fn surrogate_doc() -> Result<Document> {
 /// start, so an end between the halves of a pair must not refuse a request
 /// that names a whole character.
 ///
-/// JS also asserts `tree.findPos(2)` throws; Rust `find_pos` has no surrogate
-/// check for trees yet, so that line has no port. The JS check that the emoji
-/// survives is `keeps_the_pair_when_a_derived_end_lands_inside_it` below.
+/// The JS check that the emoji survives is the subject of
+/// `splits_the_pair_lossily_when_a_derived_end_lands_inside_it` below.
 #[test]
 fn styles_a_single_path_whose_derived_end_lands_inside_a_pair() -> Result<()> {
     let mut doc = surrogate_doc()?;
     update_tree(&mut doc, |tree| {
         assert_eq!(1, tree.path_to_index(&[0, 0])?);
+        assert_eq!(
+            Err(YorkieError::InvalidArgument(
+                "index must not split a UTF-16 surrogate pair".to_owned()
+            )),
+            tree.crdt_tree()?.find_pos(2, true)
+        );
         tree.style_by_path(&[0, 0], attributes(json!({"bold": "true"})))
     })?;
     Ok(())

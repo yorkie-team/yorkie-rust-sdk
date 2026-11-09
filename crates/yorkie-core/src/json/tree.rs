@@ -492,6 +492,13 @@ impl JsonTree {
         }
     }
 
+    /// The CRDT tree behind this proxy, for tests that check it directly as
+    /// JS tests do through `(root.tree as any).tree`.
+    #[cfg(test)]
+    pub(super) fn crdt_tree(&self) -> Result<&CrdtTree> {
+        self.tree()
+    }
+
     pub(super) fn attach_recorder(&mut self, recorder: JsonEditRecorderRef) {
         self.recorder = Some(recorder);
     }
