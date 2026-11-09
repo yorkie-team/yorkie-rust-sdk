@@ -794,12 +794,23 @@ mod ledger {
 
     use super::{A1, A2};
 
+    const A3: &str = "000000000000000000000003";
+    const A4: &str = "000000000000000000000004";
+
     fn a(lamport: i64) -> TimeTicket {
         TimeTicket::new(lamport, 0, A1)
     }
 
     fn b(lamport: i64) -> TimeTicket {
         TimeTicket::new(lamport, 0, A2)
+    }
+
+    fn c(lamport: i64) -> TimeTicket {
+        TimeTicket::new(lamport, 0, A3)
+    }
+
+    fn d(lamport: i64) -> TimeTicket {
+        TimeTicket::new(lamport, 0, A4)
     }
 
     fn vv<const N: usize>(entries: [(&str, i64); N]) -> VersionVector {
@@ -855,10 +866,22 @@ mod ledger {
         at: TimeTicket,
         vector: Option<&VersionVector>,
     ) -> Result<()> {
+        edit(root, range, "", at, vector)
+    }
+
+    /// Replaces `range` with `content` in the text in `root` and books it
+    /// as `EditOperation` does.
+    fn edit(
+        root: &mut CrdtRoot,
+        range: RgaTreeSplitPosRange,
+        content: &str,
+        at: TimeTicket,
+        vector: Option<&VersionVector>,
+    ) -> Result<()> {
         let result = root
             .text_by_created_at_mut(&a(1))
             .expect("the text at t")
-            .edit_by_range(range, "", None, at, vector)?;
+            .edit_by_range(range, content, None, at, vector)?;
         root.acc(result.diff);
         for node in result.removed_nodes {
             if let Some(removed_at) = node.removed_at() {
@@ -1017,19 +1040,116 @@ mod ledger {
         Ok(())
     }
 
-    /// The pair toggle takes out the registered size, not the node's
-    /// current one as JS does, so a revived Text node that was not
-    /// unregistered must not be registered again (Task 3 review).
+    /// A Text node never toggles its pair off. A revived node left
+    /// registered and removed again keeps one pair, charged with its new
+    /// removal; before, this panicked in debug builds (Task 3 review), and
+    /// JS would drop the pair and keep the tombstone for good.
     #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "re-registered without being unregistered")]
-    fn refuses_to_toggle_a_revived_text_node_left_registered() {
-        let mut root = root_with(seeded("abc").unwrap());
-        let b_only = range(&root, 1, 2).unwrap();
-        remove(&mut root, b_only, a(3), None).unwrap();
-        restore(&mut root, &[span(a(2), 1, 2, "b")], a(4), false).unwrap();
-        let b_again = range(&root, 1, 2).unwrap();
-        let _ = remove(&mut root, b_again, a(5), None);
+    fn keeps_the_pair_of_a_revived_text_node_left_registered() -> Result<()> {
+        let mut root = root_with(seeded("abc")?);
+        let b_only = range(&root, 1, 2)?;
+        remove(&mut root, b_only, a(3), None)?;
+        restore(&mut root, &[span(a(2), 1, 2, "b")], a(4), false)?;
+        let b_again = range(&root, 1, 2)?;
+        remove(&mut root, b_again, a(5), None)?;
+
+        assert_eq!(vec!["b"], tombstones(&root));
+        assert_eq!(1, root.stats().gc_pairs);
+        assert_eq!(tombstone_size(&root), root.doc_size().gc);
+        assert_matches_rebuilt(&root, "removed again");
+        Ok(())
+    }
+
+    /// A text `t` whose `abcd` A and B removed concurrently, so the
+    /// tombstone is held for good. A removes `t` and keeps a copy for the
+    /// undo, C (who saw `abcd` live) inserts inside the tombstone and splits
+    /// it at 2, then `purge` either collects `t` or not before A's undo
+    /// re-sets the copy, the way `SetOperation` does. Returns the root and
+    /// the position D, who also saw `abcd` live, inserts at.
+    fn undo_copy_over_a_split_tombstone(purge: bool) -> Result<(CrdtRoot, RgaTreeSplitPosRange)> {
+        let mut root = root_with(seeded("abcd")?);
+        let mid = range(&root, 2, 2)?;
+        let all = range(&root, 0, 4)?;
+        remove(&mut root, all.clone(), a(3), None)?;
+        remove(&mut root, all, b(4), Some(&vv([(A1, 2), (A2, 4)])))?;
+        let copy = CrdtElement::text(text_of(&root).deepcopy());
+        root.remove_object_member(&TimeTicket::initial(), &a(1), a(10))?;
+        edit(
+            &mut root,
+            mid.clone(),
+            "X",
+            c(11),
+            Some(&vv([(A1, 2), (A3, 11)])),
+        )?;
+        assert_eq!(2, root.stats().gc_pairs);
+
+        if purge {
+            assert_eq!(1, root.garbage_collect(&vv([(A1, 10), (A2, 4), (A3, 11)])));
+            assert!(root.text_by_created_at(&a(1)).is_none());
+            assert_eq!(2, root.stats().gc_pairs);
+        }
+
+        if root.find_by_created_at(copy.created_at()).is_some() {
+            root.deregister_element(&copy);
+        }
+        root.set_object_member(&TimeTicket::initial(), "t", copy, a(12))?;
+        assert_eq!("", text_of(&root).to_string());
+        assert_eq!(vec!["abcd"], tombstones(&root));
+        Ok((root, mid))
+    }
+
+    /// D's insert splits the copy's tombstone at 2, the ID C's split left a
+    /// pair under, and the copy's piece takes that pair over. The old
+    /// charge leaves gc as `collect` would take it -- `held`, the frozen
+    /// node's size once its text is purged, or else the size it was
+    /// registered with -- and the split's charge comes in, so the pair
+    /// count stays and gc moves by the difference (final review A, minor 1:
+    /// debug builds panicked, and release builds dropped the old pair and
+    /// left the copy's piece unregistered).
+    fn assert_the_copy_takes_the_pair_over(purge: bool) -> Result<()> {
+        let (mut root, mid) = undo_copy_over_a_split_tombstone(purge)?;
+        let gc = root.doc_size().gc;
+        let before = tombstone_size(&root);
+
+        edit(&mut root, mid, "Y", d(13), Some(&vv([(A1, 2), (A4, 13)])))?;
+        assert_eq!("Y", text_of(&root).to_string());
+        assert_eq!(vec!["ab", "cd"], tombstones(&root));
+        assert_eq!(2, root.stats().gc_pairs);
+
+        let after = tombstone_size(&root);
+        let split = DataSize {
+            data: after.data - before.data,
+            meta: after.meta - before.meta,
+        };
+        // The purged original's `cd` froze as the copy's `cd` is now, and
+        // C's split of the original charged what D's split of the copy does.
+        let held = if purge {
+            text_of(&root)
+                .nodes()
+                .find(|node| node.id().offset() == 2)
+                .expect("the copy's cd")
+                .data_size()
+        } else {
+            split
+        };
+        assert_eq!(
+            DataSize {
+                data: gc.data - held.data + split.data,
+                meta: gc.meta - held.meta + split.meta,
+            },
+            root.doc_size().gc
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replaces_the_detached_pair_of_a_purged_text_on_a_later_split() -> Result<()> {
+        assert_the_copy_takes_the_pair_over(true)
+    }
+
+    #[test]
+    fn replaces_the_pair_a_replaced_text_left_on_a_later_split() -> Result<()> {
+        assert_the_copy_takes_the_pair_over(false)
     }
 
     /// A tombstone two uncancelled removals hold is never collected (JS

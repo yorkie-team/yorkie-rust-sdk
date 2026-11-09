@@ -307,19 +307,30 @@ impl CrdtRoot {
         removed_at: TimeTicket,
     ) {
         if let Some(pair) = self.gc_pair_by_child_id.remove(&child_id) {
-            // A second registration un-registers a revived child. JS takes a
-            // Text node's current size out of gc here; this takes the size
-            // the pair was registered with, which differs once the node has
-            // been split. So a revived Text node must never come back this
-            // way: every revive unregisters its pair first
-            // (`unregister_gc_pair_by_id`), and only removed attributes and
-            // Array and Tree children toggle.
-            debug_assert!(
-                pair.detached.is_none() && !self.has_text_node(&child_id),
-                "Text node {child_id} re-registered without being unregistered"
-            );
-            sub_data_size(&mut self.doc_size.gc, pair.child_size);
-            return;
+            // A second registration un-registers a revived child (JS
+            // `registerGCPair`), but only removed attributes and Array and
+            // Tree children toggle. A revived Text node never comes back
+            // this way: every revive unregisters its pair first
+            // (`unregister_gc_pair_by_id`), and `collect` drops a revived
+            // pair left behind. So a Text node registered again is another
+            // node under the same ID string -- a piece of an undo's copy of
+            // a Text whose original left its pair behind, purged (`detached`)
+            // or replaced by the copy -- which JS, keying pairs by node and
+            // parent, books as a pair of its own. Here the new pair replaces
+            // the old one: the old charge leaves gc as `collect` would take
+            // it, the new one is booked below (see the porting gaps).
+            let charged = match pair.detached.as_deref() {
+                Some(node) => Some(node.data_size()),
+                None if self.has_text_node(&child_id) => Some(pair.child_size),
+                None => None,
+            };
+            match charged {
+                Some(charged) => sub_data_size(&mut self.doc_size.gc, charged),
+                None => {
+                    sub_data_size(&mut self.doc_size.gc, pair.child_size);
+                    return;
+                }
+            }
         }
 
         let pair = CrdtGcPair::new(child_id.clone(), child_size, removed_at);
@@ -1297,7 +1308,8 @@ impl CrdtRoot {
     }
 
     /// Tells whether a Text in the document holds a node whose ID string is
-    /// `child_id`. Only the toggle's debug assertion asks.
+    /// `child_id`. Only a registration that finds a pair under that ID
+    /// asks, to tell a Text node from a child that toggles.
     fn has_text_node(&self, child_id: &str) -> bool {
         let mut found = false;
         for (_, element) in self.root_object.iter_all() {
