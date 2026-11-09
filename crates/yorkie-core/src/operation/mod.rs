@@ -17,6 +17,8 @@ pub(crate) use move_operation::MoveOperation;
 pub(crate) use remove_operation::RemoveOperation;
 pub(crate) use set_operation::SetOperation;
 pub(crate) use style_operation::StyleOperation;
+#[cfg(test)]
+pub(crate) use tree_edit_operation::force_copy_path;
 pub(crate) use tree_edit_operation::{TreeEditExecution, TreeEditOperation};
 pub(crate) use tree_style_operation::TreeStyleOperation;
 

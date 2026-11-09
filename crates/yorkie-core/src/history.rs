@@ -9,8 +9,9 @@
 //!
 //! A Text edit reverses by identity, as in JS: its undo revives the removed
 //! pieces and re-removes the inserted one under their original IDs (see
-//! `EditOperation`). Tree edits and styles push nothing (see
-//! `docs/current-porting-gaps.md`).
+//! `EditOperation`). A Tree edit reverses by identity where its restore spans
+//! describe it whole, and otherwise by a split, a boundary deletion or a copy
+//! (see `TreeEditOperation`); a Tree style reverses to the previous values.
 
 use crate::operation::Operation;
 use crate::presence::ReversePresence;
@@ -32,17 +33,14 @@ pub(crate) enum HistoryOperation {
 
 impl HistoryOperation {
     /// Builds a history entry from a change's reverse operations and reverse
-    /// presence, as JS `Document.update` does.
-    ///
-    /// Tree undo is not ported, so the reverses of tree edits and styles are
-    /// left out: an undo never replays a tree change.
+    /// presence, as JS `Document.update` does: every reverse, newest first,
+    /// then the presence values.
     pub(crate) fn entry(
         reverse_ops: Vec<Operation>,
         reverse_presence: Option<ReversePresence>,
     ) -> Vec<Self> {
         reverse_ops
             .into_iter()
-            .filter(|op| !matches!(op, Operation::TreeEdit(_) | Operation::TreeStyle(_)))
             .map(|op| Self::Operation(Box::new(op)))
             .chain(reverse_presence.map(Self::Presence))
             .collect()
@@ -180,6 +178,27 @@ impl History {
             if let Operation::Edit(op) = op {
                 if op.parent_created_at() == parent_created_at {
                     op.reconcile_operation(from, to, content_len);
+                }
+            }
+        }
+    }
+
+    /// Shifts the undo tree edits of both stacks on the tree
+    /// `parent_created_at` past an edit that replaced `from..to` with
+    /// `content_size` (JS `reconcileTreeEdit`). Identity edits locate their
+    /// nodes by ID and are left alone (see
+    /// `TreeEditOperation::reconcile_operation`).
+    pub(crate) fn reconcile_tree_edit(
+        &mut self,
+        parent_created_at: &TimeTicket,
+        from: usize,
+        to: usize,
+        content_size: usize,
+    ) {
+        for op in self.operations_mut() {
+            if let Operation::TreeEdit(op) = op {
+                if op.parent_created_at() == parent_created_at {
+                    op.reconcile_operation(from, to, content_size);
                 }
             }
         }

@@ -522,11 +522,9 @@ fn wire_operation_to_proto(operation: &WireOperation) -> Result<api::Operation> 
             parent_created_at: Some(to_time_ticket(parent_created_at)?),
             from: Some(wire_tree_pos_to_proto(from)?),
             to: Some(wire_tree_pos_to_proto(to)?),
-            attributes: if attributes_to_remove.is_empty() {
-                attributes.clone()
-            } else {
-                BTreeMap::new()
-            },
+            // Both maps, as JS and Go write them: the reverse of a style that
+            // overwrote some attributes and added others carries both.
+            attributes: attributes.clone(),
             executed_at: Some(to_time_ticket(executed_at)?),
             attributes_to_remove: attributes_to_remove.clone(),
             created_at_map_by_actor: BTreeMap::new(),
@@ -720,11 +718,7 @@ fn proto_operation_to_wire(operation: &api::Operation) -> Result<WireOperation> 
             )?,
             from: proto_tree_pos_to_wire(required(&operation.from, "operation.tree_style.from")?)?,
             to: proto_tree_pos_to_wire(required(&operation.to, "operation.tree_style.to")?)?,
-            attributes: if operation.attributes_to_remove.is_empty() {
-                operation.attributes.clone()
-            } else {
-                BTreeMap::new()
-            },
+            attributes: operation.attributes.clone(),
             attributes_to_remove: operation.attributes_to_remove.clone(),
             executed_at: proto_required_time_ticket(
                 &operation.executed_at,
@@ -1700,6 +1694,38 @@ mod tests {
                 .map(|ticket| ticket.delimiter)
                 .collect::<Vec<_>>()
         );
+        assert_eq!(operation, proto_operation_to_wire(&proto)?);
+        Ok(())
+    }
+
+    // JS `tree_style_combined_test.ts` "keeps both halves across the
+    // protobuf round trip": the reverse of a style that overwrote `b` and
+    // added `c` restores the one and removes the other in one operation,
+    // and both halves reach the peer.
+    #[test]
+    fn roundtrips_both_halves_of_a_tree_style() -> Result<(), Box<dyn Error>> {
+        let pos = WireTreePos {
+            parent_id: tree_node_id(1, 0),
+            left_sibling_id: tree_node_id(2, 0),
+        };
+        let operation = WireOperation::TreeStyle {
+            parent_created_at: ticket(1),
+            from: pos.clone(),
+            to: pos,
+            attributes: BTreeMap::from([("b".to_owned(), "x".to_owned())]),
+            attributes_to_remove: vec!["c".to_owned()],
+            executed_at: ticket(10),
+        };
+
+        let proto = wire_operation_to_proto(&operation)?;
+        let Some(Body::TreeStyle(tree_style)) = &proto.body else {
+            panic!("expected a tree style");
+        };
+        assert_eq!(
+            BTreeMap::from([("b".to_owned(), "x".to_owned())]),
+            tree_style.attributes
+        );
+        assert_eq!(vec!["c".to_owned()], tree_style.attributes_to_remove);
         assert_eq!(operation, proto_operation_to_wire(&proto)?);
         Ok(())
     }

@@ -214,6 +214,8 @@ impl TreeEditOperation {
                     version_vector,
                 )?
             };
+            #[cfg(test)]
+            let result = force_copy_path::apply(result);
 
             // Both are read off the tree the edit left, and both are kept
             // back until the root has booked what the edit changed, so a
@@ -228,19 +230,13 @@ impl TreeEditOperation {
             root.register_gc_pair_by_id(child_id.clone(), *child_size, removed_at.clone());
         }
 
+        // Unlike the reverse, the measurement keeps no remote exception: it
+        // looks up nodes this edit just marked or stranded on this very
+        // tree, and an edit only tombstones nodes, never detaches them (GC
+        // does, outside `execute`), so every lookup finds its node. JS reads
+        // the same sizes off the node objects themselves, which cannot fail.
         let removed_size = facts?;
-        // JS has no catch here: a reverse that cannot be built fails the
-        // edit, so a local edit never loses its undo entry without notice.
-        // A remote change is the exception. Its reverse is measured on this
-        // replica's tree from indexes taken before the edit, which a
-        // concurrent merge can leave outside it, and is thrown away anyway;
-        // it is dropped rather than refusing a change the caller never
-        // controlled (see the porting gaps).
-        let reverse_op = match reverse_op {
-            Ok(reverse_op) => reverse_op,
-            Err(_) if source == OpSource::Remote => None,
-            Err(error) => return Err(error),
-        };
+        let reverse_op = settle_reverse(reverse_op, source)?;
 
         Ok(Some(ExecutionResult {
             op_infos: changes_to_op_infos(&path, result.changes, None),
@@ -479,7 +475,7 @@ impl TreeEditOperation {
     /// can move inside a surrogate pair, so they resolve without the pair
     /// check. An identity edit is left alone, as in JS.
     pub(crate) fn resolve_undo_positions(&mut self, root: &CrdtRoot) -> Result<()> {
-        if self.restore_mode.is_some() {
+        if !self.is_undo_op || self.restore_mode.is_some() {
             return Ok(());
         }
         let tree = root
@@ -875,6 +871,61 @@ impl TreeEditOperation {
         }
 
         YorkieError::MissingCrdtElement(self.parent_created_at().to_id_string())
+    }
+}
+
+/// Settles what building a reverse returned, by the source of the edit.
+///
+/// JS has no catch here: a reverse that cannot be built fails the edit, so a
+/// local edit never loses its undo entry without notice. A remote change is
+/// the exception. Its reverse is measured on this replica's tree from
+/// indexes taken before the edit, which a concurrent merge can leave outside
+/// it, and is thrown away anyway; it is dropped rather than refusing a
+/// change the caller never controlled (see the porting gaps).
+fn settle_reverse(
+    reverse_op: Result<Option<Operation>>,
+    source: OpSource,
+) -> Result<Option<Operation>> {
+    match reverse_op {
+        Err(_) if source == OpSource::Remote => Ok(None),
+        reverse_op => reverse_op,
+    }
+}
+
+/// A seam for tests that drive an undo through the copy-reinsert reverse
+/// (JS `undo_copy_path_test.ts` `forceCopyPath`). The tree describes every
+/// merge- and split-free edit by spans, so ordinary editing never reaches
+/// the copy path; while forced, an edit reports no spans, as it does for an
+/// edit they cannot describe.
+#[cfg(test)]
+pub(crate) mod force_copy_path {
+    use crate::crdt::tree::TreeEditResult;
+    use std::cell::Cell;
+
+    thread_local! {
+        static FORCED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Forces the copy path on this thread until the guard drops.
+    pub(crate) fn force() -> Guard {
+        FORCED.with(|forced| forced.set(true));
+        Guard
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            FORCED.with(|forced| forced.set(false));
+        }
+    }
+
+    pub(super) fn apply(mut result: TreeEditResult) -> TreeEditResult {
+        if FORCED.with(Cell::get) {
+            result.removed_spans.clear();
+            result.inserted_spans.clear();
+        }
+        result
     }
 }
 
@@ -1902,6 +1953,38 @@ mod tests {
         Ok(())
     }
 
+    /// Review Focus 9, the policy `execute` applies to a reverse it cannot
+    /// build: a local edit and an undo or redo fail with the error, so none
+    /// loses its undo entry without notice, while a remote change applies
+    /// without a reverse. The failure is the one above; ordinary editing
+    /// has no known way to reach one, so the policy is driven directly.
+    #[test]
+    fn fails_a_local_edit_but_applies_a_remote_one_without_its_reverse() -> crate::Result<()> {
+        let tree_at = ticket(1, "a");
+        let root = seeded_root(tree_at.clone(), vec![paragraph_node()]);
+        let tree = root.tree_by_created_at(&tree_at).unwrap();
+        let pos = tree.find_pos(3, true)?;
+        let mut deletion = TreeEditOperation::create(
+            tree_at.clone(),
+            pos.clone(),
+            pos.clone(),
+            None,
+            0,
+            Some(ticket(10, "a")),
+        );
+        deletion.redo_split_level = Some(1);
+        let result = crate::crdt::tree::TreeEditResult {
+            from_idx: 100,
+            ..Default::default()
+        };
+        let reverse = || deletion.reverse_of(tree, &(pos.clone(), pos.clone()), &result);
+
+        assert!(super::settle_reverse(reverse(), OpSource::Local).is_err());
+        assert!(super::settle_reverse(reverse(), OpSource::UndoRedo).is_err());
+        assert_eq!(None, super::settle_reverse(reverse(), OpSource::Remote)?);
+        Ok(())
+    }
+
     /// JS `undo_content_identity_test.ts` "gives copied content a fresh
     /// identity": every node of the copy, in post-order, takes a new ID, and
     /// loses the split chain and merge lineage of the node it copied.
@@ -2413,6 +2496,75 @@ mod tests {
         // A split reverse starts inside it, and one ends inside it.
         assert!(split.to_split_reverse_operation(&tree, 2, 2)?.is_some());
         assert!(split.to_split_reverse_operation(&tree, 0, 2)?.is_some());
+        Ok(())
+    }
+
+    /// JS `surrogate_index_test.ts` "runs a reconciled undo whose index lands
+    /// inside a pair": reconciliation case 5 places the range at the start of
+    /// the remote content without counting it, so the end lands between the
+    /// halves of an emoji. The undo runs instead of being refused, and cuts
+    /// the pair as it did before the check existed: one half is left, and
+    /// "B", which it was meant to delete, stays. Which half is left is not
+    /// pinned; Rust keeps it as U+FFFD (yorkie#2065).
+    #[test]
+    fn runs_a_reconciled_undo_whose_index_lands_inside_a_pair() -> crate::Result<()> {
+        let tree_at = ticket(1, "a");
+        let mut root = seeded_root(
+            tree_at.clone(),
+            vec![TreeNode::create_element(
+                node_id(2),
+                "p",
+                None,
+                vec![TreeNode::create_text(node_id(3), "0123456789")],
+            )],
+        );
+        let pos = |root: &CrdtRoot, index| {
+            root.tree_by_created_at(&tree_at)
+                .unwrap()
+                .find_pos(index, true)
+        };
+        let insert = |root: &mut CrdtRoot, from, to, value: &str, lamport| {
+            let operation = TreeEditOperation::create(
+                tree_at.clone(),
+                pos(root, from)?,
+                pos(root, to)?,
+                Some(vec![TreeNode::create_text(node_id(lamport), value)]),
+                0,
+                Some(ticket(lamport, "a")),
+            );
+            run(root, &operation, OpSource::Local).map(|_| ())
+        };
+
+        // Local: insert "AB" at 5. Its undo deletes [5, 7).
+        insert(&mut root, 5, 5, "AB", 4)?;
+        assert_eq!("<root><p>0123AB456789</p></root>", xml(&root, &tree_at));
+        let mut undo = TreeEditOperation::create(
+            tree_at.clone(),
+            pos(&root, 5)?,
+            pos(&root, 7)?,
+            None,
+            0,
+            Some(ticket(6, "a")),
+        )
+        .into_undo(5, 7);
+
+        // Remote: replace [4, 6) ("3A") with an emoji, overlapping the start
+        // of the undo range (case 5).
+        insert(&mut root, 4, 6, "😀", 5)?;
+        assert_eq!("<root><p>012😀B456789</p></root>", xml(&root, &tree_at));
+
+        undo.reconcile_operation(4, 6, 2);
+        assert_eq!((4, 5), undo.normalize_pos());
+        assert!(pos(&root, 5).is_err(), "5 is inside the pair");
+
+        undo.resolve_undo_positions(&root)?;
+        run(&mut root, &undo, OpSource::UndoRedo)?;
+        let xml = xml(&root, &tree_at);
+        let kept = xml
+            .strip_prefix("<root><p>012")
+            .and_then(|rest| rest.strip_suffix("B456789</p></root>"))
+            .unwrap_or_else(|| panic!("unexpected {xml}"));
+        assert_eq!(1, kept.encode_utf16().count(), "one half is left: {xml}");
         Ok(())
     }
 

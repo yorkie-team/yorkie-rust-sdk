@@ -582,6 +582,29 @@ impl Document {
                     operation.value_mut().set_created_at(ticket.clone());
                     reconciles.push((prev, ticket.clone()));
                 }
+                Operation::TreeEdit(operation) => {
+                    // A reverse that inserts a copy of removed nodes carries
+                    // their original IDs, and inserting them again would put
+                    // two nodes under one ID: the copy takes fresh ones from
+                    // this change. An identity reverse keeps its own. What
+                    // else names the old IDs is re-pointed in a later step
+                    // (JS `repointRest`), not here.
+                    operation.reissue_content_ids(&mut || context.issue_time_ticket())?;
+
+                    // A split reverse (the undo of a merge, or the redo of a
+                    // split) creates one element per level, each under a
+                    // ticket of its own. Rebuilt from its `executed_at`
+                    // instead, they would run over the ticket the next
+                    // operation of this entry was issued. One per level is
+                    // an upper bound: a split that reaches the root stops
+                    // early, and a ticket nobody takes only advances the
+                    // delimiter.
+                    let level = operation.split_level();
+                    if level > 0 {
+                        let tickets = (0..level).map(|_| context.issue_time_ticket()).collect();
+                        operation.set_split_tickets(tickets);
+                    }
+                }
                 _ => {}
             }
             context.push(operation);
@@ -1026,24 +1049,41 @@ impl Document {
             } else {
                 self.change_id.sync_clocks(change.id())
             };
-            // Undo text edits recorded before this change still name the
-            // positions they had then; move them past what this edit changed.
-            // The change has already run, so a range that does not normalize
-            // only skips the reconcile instead of failing the apply.
+            // Undo edits recorded before this change still name the positions
+            // they had then; move them past what this change edited (JS
+            // `applyChangeInternal`). The change has already run, so a text
+            // range that does not normalize only skips the reconcile instead
+            // of failing the apply.
             if self.history.has_undo() || self.history.has_redo() {
                 for operation in &executed.operations {
-                    let Operation::Edit(operation) = operation else {
-                        continue;
-                    };
-                    let Ok((from, to)) = operation.normalize_pos(&self.crdt_root) else {
-                        continue;
-                    };
-                    self.history.reconcile_text_edit(
-                        operation.parent_created_at(),
-                        from,
-                        to,
-                        operation.content_len(),
-                    );
+                    match operation {
+                        Operation::Edit(operation) => {
+                            let Ok((from, to)) = operation.normalize_pos(&self.crdt_root) else {
+                                continue;
+                            };
+                            self.history.reconcile_text_edit(
+                                operation.parent_created_at(),
+                                from,
+                                to,
+                                operation.content_len(),
+                            );
+                        }
+                        // One reconcile per range the edit changed, in the
+                        // order it changed them: an identity edit revives or
+                        // re-removes nodes one at a time, each measured on
+                        // the tree the one before it left.
+                        Operation::TreeEdit(operation) => {
+                            for (from, to, content_size) in operation.executed_ranges() {
+                                self.history.reconcile_tree_edit(
+                                    operation.parent_created_at(),
+                                    from,
+                                    to,
+                                    content_size,
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
 
@@ -1824,6 +1864,8 @@ mod split_link_tests;
 mod text_undo_fuzz_tests;
 #[cfg(test)]
 mod text_undo_ledger_tests;
+#[cfg(test)]
+mod tree_undo_tests;
 #[cfg(test)]
 mod update_tests;
 

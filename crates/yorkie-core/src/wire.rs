@@ -775,24 +775,18 @@ impl TryFrom<WireOperation> for Operation {
                 attributes_to_remove,
                 executed_at,
             } => {
-                let operation = if attributes_to_remove.is_empty() {
-                    TreeStyleOperation::create(
-                        parent_created_at,
-                        TreePos::from(from),
-                        TreePos::from(to),
-                        attributes,
-                        Some(executed_at),
-                    )
-                } else {
-                    TreeStyleOperation::create_tree_remove_style_operation(
-                        parent_created_at,
-                        TreePos::from(from),
-                        TreePos::from(to),
-                        attributes_to_remove,
-                        Some(executed_at),
-                    )
-                };
-                Ok(Self::TreeStyle(operation))
+                // Both maps, as JS and Go decode them: the reverse of a style
+                // that overwrote some attributes and added others carries
+                // both, and a replica that kept only one would run another
+                // operation than the sender did.
+                Ok(Self::TreeStyle(TreeStyleOperation::new(
+                    parent_created_at,
+                    TreePos::from(from),
+                    TreePos::from(to),
+                    attributes,
+                    attributes_to_remove,
+                    Some(executed_at),
+                )))
             }
             WireOperation::ArraySet {
                 parent_created_at,
