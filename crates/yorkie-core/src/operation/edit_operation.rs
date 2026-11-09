@@ -1023,6 +1023,70 @@ mod tests {
         Ok(())
     }
 
+    /// JS `execute`, the identity branch: the undo of an insertion re-removes
+    /// the inserted run, and its reverse, the redo, names only the pieces the
+    /// removal was recorded on: here `x`, as B removed `y` meanwhile, having
+    /// seen it live.
+    #[test]
+    fn names_only_the_recorded_pieces_in_an_insertion_undos_reverse() -> crate::Result<()> {
+        let text_at = ticket(1);
+        let mut root = root_with_text_at(text_at.clone())?;
+        let range = root
+            .text_by_created_at(&text_at)
+            .unwrap()
+            .index_range_to_pos_range(0, 0)?;
+        let result = EditOperation::create(
+            text_at.clone(),
+            range.0,
+            range.1,
+            "xy",
+            BTreeMap::new(),
+            Some(ticket(2)),
+        )
+        .execute(&mut root, OpSource::Local, None)?
+        .unwrap();
+        let Some(Operation::Edit(mut undo)) = result.reverse_op else {
+            panic!("expected an edit reverse");
+        };
+        assert_eq!(
+            vec![(ticket(2), 0, 2, "xy".to_owned())],
+            spans_of(undo.retombstone_spans())
+        );
+
+        // B removes `y`, having seen it live.
+        let y = root
+            .text_by_created_at(&text_at)
+            .unwrap()
+            .index_range_to_pos_range(1, 2)?;
+        EditOperation::create(
+            text_at,
+            y.0,
+            y.1,
+            "",
+            BTreeMap::new(),
+            Some(ticket_actor(3, "b")),
+        )
+        .execute(
+            &mut root,
+            OpSource::Remote,
+            Some(&vector([("a", 2), ("b", 3)])),
+        )?;
+
+        undo.set_executed_at(ticket(4));
+        let result = undo.execute(&mut root, OpSource::UndoRedo, None)?.unwrap();
+        assert_eq!(r#"{"text":[]}"#, root.to_json());
+        let Some(Operation::Edit(redo)) = result.reverse_op else {
+            panic!("expected an edit reverse");
+        };
+        assert_eq!(Some(RestoreMode::Retombstone), redo.restore_mode());
+        assert!(redo.restore_spans().is_empty());
+        assert_eq!(
+            vec![(ticket(2), 0, 1, "x".to_owned())],
+            spans_of(redo.retombstone_spans())
+        );
+        Ok(())
+    }
+
     /// JS `identityReverse`: an identity edit whose spans are both empty
     /// reverses to an empty undo edit at the head, so the stacks stay
     /// paired and the reverse never goes out as an edit of a stale range.
