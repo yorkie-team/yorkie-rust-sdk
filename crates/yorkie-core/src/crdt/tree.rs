@@ -283,8 +283,13 @@ impl TreeNode {
         self.node_type == DEFAULT_TEXT_TYPE
     }
 
+    /// Reports whether this node has visible children and every one is text
+    /// (JS `IndexTreeNode.hasTextChild`). A path into such a parent ends in a
+    /// UTF-16 offset across its texts; into any other parent, in a child
+    /// offset.
     pub(crate) fn has_text_child(&self) -> bool {
-        self.children().any(TreeNode::is_text)
+        let mut children = self.children().peekable();
+        children.peek().is_some() && children.all(TreeNode::is_text)
     }
 
     pub(crate) fn is_removed(&self) -> bool {
@@ -874,12 +879,73 @@ impl CrdtTree {
 
     /// Returns the paths of a position range (JS `posRangeToPathRange`),
     /// splitting like `pos_range_to_index_range`.
+    ///
+    /// Like JS, it goes through `to_path`, not through the index: in a parent
+    /// that is not text-only, a position anchored on an element is a child
+    /// offset, while `index_to_path` of the same index resolves into the text
+    /// that follows and counts sizes.
     pub(crate) fn pos_range_to_path_range(
         &mut self,
         range: &(TreePos, TreePos),
     ) -> Result<(Vec<usize>, Vec<usize>)> {
-        let (from, to) = self.pos_range_to_index_range(range)?;
-        Ok((self.index_to_path(from)?, self.index_to_path(to)?))
+        let ((from_parent, from_left), (to_parent, to_left)) = self.pos_range_to_nodes(range)?;
+        Ok((
+            self.to_path(&from_parent, &from_left)?,
+            self.to_path(&to_parent, &to_left)?,
+        ))
+    }
+
+    /// Returns the path right after `left`, or at the start of the content
+    /// of `parent` when the two are the same (JS `toPath`).
+    fn to_path(&self, parent: &TreeNodeId, left: &TreeNodeId) -> Result<Vec<usize>> {
+        let tree_pos = self.to_tree_pos(parent, left)?;
+        tree_pos_to_path(&self.root, &tree_pos)
+    }
+
+    /// Returns the visible tree position right after `left` in `parent` (JS
+    /// `toTreePos` without removed nodes). A position in a removed parent
+    /// resolves to where its least alive ancestor holds it; one after a
+    /// removed sibling, to where that sibling was.
+    fn to_tree_pos(&self, parent: &TreeNodeId, left: &TreeNodeId) -> Result<IndexTreePos> {
+        let mut parent_path = self.path_of(parent)?;
+        if node_at_path(&self.root, &parent_path)?.is_removed() {
+            let mut child_path = parent_path.clone();
+            while node_at_path(&self.root, &parent_path)?.is_removed() {
+                child_path = parent_path.clone();
+                let Some((grand_parent, _)) = split_parent_path(&parent_path) else {
+                    return Err(YorkieError::InvalidArgument(format!(
+                        "least alive ancestor of {}: node not found",
+                        node_at_path(&self.root, &child_path)?.id().to_id_string()
+                    )));
+                };
+                parent_path = grand_parent;
+            }
+            let offset = visible_offset_of(&self.root, &child_path)?;
+            return Ok(IndexTreePos::new(self.visible_path(&parent_path)?, offset));
+        }
+
+        if parent == left {
+            return Ok(IndexTreePos::new(self.visible_path(&parent_path)?, 0));
+        }
+
+        let left_path = self.path_of(left)?;
+        let mut offset = visible_offset_of(&self.root, &left_path)?;
+        let left_node = node_at_path(&self.root, &left_path)?;
+        if !left_node.is_removed() {
+            if left_node.is_text() {
+                return Ok(IndexTreePos::new(
+                    self.visible_path(&left_path)?,
+                    left_node.padded_size(false),
+                ));
+            }
+            offset += 1;
+        }
+        Ok(IndexTreePos::new(self.visible_path(&parent_path)?, offset))
+    }
+
+    fn visible_path(&self, path: &[usize]) -> Result<Vec<usize>> {
+        physical_to_visible_path(&self.root, path)
+            .ok_or_else(|| YorkieError::InvalidTreePosition("node is removed".to_owned()))
     }
 
     /// Resolves both ends of `range` to the IDs of their parent and left
@@ -909,9 +975,12 @@ impl CrdtTree {
         index_of_tree_pos(&self.root, &tree_pos, false)
     }
 
+    /// Returns the position of `path` (JS `pathToPos`). Like JS, it resolves
+    /// the path through its index: in a parent that is not text-only, a child
+    /// offset that follows a text then lands at the end of that text.
     pub(crate) fn path_to_pos(&self, path: &[usize]) -> Result<TreePos> {
-        let tree_pos = path_to_tree_pos(&self.root, path)?;
-        tree_pos_to_crdt_pos(&self.root, &tree_pos)
+        let index = self.path_to_index(path)?;
+        self.find_pos(index, true)
     }
 
     /// Reports whether a split at `path` would split the root, which has no
@@ -2950,6 +3019,24 @@ fn physical_to_visible_path(root: &TreeNode, path: &[usize]) -> Option<Vec<usize
         node = child;
     }
     Some(visible_path)
+}
+
+/// Returns the offset of the node at the physical `path` among the visible
+/// children of its parent; for a removed node, the number of visible
+/// siblings before it (JS `findOffset` without removed nodes).
+fn visible_offset_of(root: &TreeNode, path: &[usize]) -> Result<usize> {
+    let Some((parent_path, offset)) = split_parent_path(path) else {
+        return Err(YorkieError::InvalidTreePosition(
+            "root has no parent".to_owned(),
+        ));
+    };
+    let parent = node_at_path(root, &parent_path)?;
+    Ok(parent
+        .children
+        .iter()
+        .take(offset)
+        .filter(|sibling| !sibling.is_removed())
+        .count())
 }
 
 fn visible_child(node: &TreeNode, offset: usize) -> Option<&TreeNode> {

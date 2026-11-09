@@ -453,27 +453,25 @@ fn mixed_root() -> TreeNodeInput {
 }
 
 /// JS `posRangeToPathRange` goes through `toPath` (`treePosToPath` of
-/// `toTreePos`), Rust through the index (`index_to_path` of `to_index`).
-/// The values are pinned to JS at `8629993e`, converting each index of the
-/// tree in turn inside one update, as JS did.
+/// `toTreePos`). The values are pinned to JS at `8629993e`, converting each
+/// index of the tree in turn inside one update, as JS did.
 ///
-/// Index 6, right after `</b>`, has no pinned value: JS gives `[0, 3]`
-/// (`[0, 2]` before the earlier conversions split `ab`), Rust `[0, 6]`.
-/// Rust anchors a text reached at offset 0 on the text itself rather than on
-/// its previous sibling (JS #1482 is not ported), so the position means
-/// "after `d`"; and for an element position in a parent with text children
-/// Rust counts sizes where JS, whose `hasTextChild` needs every child to be
-/// text, counts children. Taking JS's route would not change the Rust value.
+/// The conversion of index 2 splits `ab` in two, so the later paths count
+/// one more child: index 4 is `[0, 2, 0]` here and `[0, 1, 0]` on a fresh
+/// tree. Index 6, right after `</b>`, is an element position in a parent
+/// that is not text-only, so JS counts children there (its `hasTextChild`
+/// needs every child to be text) and gives `[0, 3]`.
 #[test]
 fn tree_converts_positions_in_a_mixed_parent_to_js_paths() -> Result<()> {
     let mut doc = tree_doc(mixed_root())?;
-    let expected: [(usize, &[usize]); 8] = [
+    let expected: [(usize, &[usize]); 9] = [
         (0, &[0]),
         (1, &[0, 0]),
         (2, &[0, 1]),
         (3, &[0, 2]),
         (4, &[0, 2, 0]),
         (5, &[0, 2, 1]),
+        (6, &[0, 3]),
         (7, &[0, 6]),
         (8, &[1]),
     ];
@@ -486,6 +484,111 @@ fn tree_converts_positions_in_a_mixed_parent_to_js_paths() -> Result<()> {
         }
         Ok(())
     })
+}
+
+/// The same conversions, each on a fresh tree, next to `index_to_path`
+/// (pinned to JS at `8629993e`). Only index 6 differs between the two
+/// routes: `index_to_path` resolves it into the text `d`, which counts
+/// sizes, while the position anchors on `<b>`, an element position that
+/// counts children.
+#[test]
+fn tree_converts_fresh_positions_in_a_mixed_parent_to_js_paths() -> Result<()> {
+    let expected: [(usize, &[usize], &[usize]); 9] = [
+        (0, &[0], &[0]),
+        (1, &[0, 0], &[0, 0]),
+        (2, &[0, 1], &[0, 1]),
+        (3, &[0, 2], &[0, 2]),
+        (4, &[0, 1, 0], &[0, 1, 0]),
+        (5, &[0, 1, 1], &[0, 1, 1]),
+        (6, &[0, 2], &[0, 5]),
+        (7, &[0, 6], &[0, 6]),
+        (8, &[1], &[1]),
+    ];
+    for (index, via_pos, via_index) in expected {
+        let mut doc = tree_doc(mixed_root())?;
+        doc.update(|root| {
+            let tree = root.get_tree_mut("t")?;
+            let range = tree.index_range_to_pos_range((index, index))?;
+            let (from, to) = tree.pos_range_to_path_range(&range)?;
+            assert_eq!((via_pos, via_pos), (&from[..], &to[..]), "index {index}");
+            assert_eq!(via_index, &tree.index_to_path(index)?[..], "index {index}");
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+/// The path APIs in a parent that is not text-only, pinned to JS at
+/// `8629993e`: the last path element counts children there, not sizes, and
+/// `pathToPos` resolves the path through its index, so `[0, 1]`, the
+/// position of `<b>`, lands at the end of `ab`.
+#[test]
+fn tree_path_apis_count_children_in_a_mixed_parent() -> Result<()> {
+    let doc = tree_doc(mixed_root())?;
+    let tree = tree_of(&doc);
+    for (path, index) in [
+        (&[0, 0][..], 1),
+        (&[0, 1], 3),
+        (&[0, 2], 6),
+        (&[0, 3], 7),
+        (&[0, 1, 0], 4),
+        (&[0, 1, 1], 5),
+    ] {
+        assert_eq!(index, tree.path_to_index(path)?, "path {path:?}");
+    }
+    for path in [&[0, 4][..], &[0, 5], &[0, 1, 2]] {
+        let err = tree.path_to_index(path).unwrap_err();
+        assert_eq!(ErrorCode::ErrInvalidArgument, err.code(), "path {path:?}");
+    }
+
+    let edited = |f: &dyn Fn(&mut JsonTree) -> Result<()>| -> Result<String> {
+        let mut doc = tree_doc(mixed_root())?;
+        doc.update(|root| f(root.get_tree_mut("t")?))?;
+        tree_of(&doc).to_xml()
+    };
+    let x = || vec![text("X")];
+    for (path, xml) in [
+        (&[0, 0][..], "<doc><p>Xab<b>c</b>d</p></doc>"),
+        (&[0, 1], "<doc><p>abX<b>c</b>d</p></doc>"),
+        (&[0, 2], "<doc><p>ab<b>c</b>Xd</p></doc>"),
+        (&[0, 3], "<doc><p>ab<b>c</b>dX</p></doc>"),
+    ] {
+        let got = edited(&|tree| tree.edit_by_path(path, path, x(), 0))?;
+        assert_eq!(xml, got, "insert at {path:?}");
+    }
+    for (from, to, xml) in [
+        (&[0, 0][..], &[0, 1][..], "<doc><p><b>c</b>d</p></doc>"),
+        (&[0, 1], &[0, 2], "<doc><p>abd</p></doc>"),
+        (&[0, 2], &[0, 3], "<doc><p>ab<b>c</b></p></doc>"),
+        (&[0, 0], &[0, 3], "<doc><p></p></doc>"),
+    ] {
+        let got = edited(&|tree| tree.edit_by_path(from, to, Vec::new(), 0))?;
+        assert_eq!(xml, got, "delete {from:?}..{to:?}");
+    }
+
+    let kv = || [("k".to_owned(), serde_json::Value::from("v"))].into();
+    // `[0, 0]` and `[0, 2]` name the texts `ab` and `d`, which take no
+    // style; `[0, 1]` names `<b>`.
+    for (path, xml) in [
+        (&[0, 0][..], "<doc><p>ab<b>c</b>d</p></doc>"),
+        (&[0, 1], r#"<doc><p>ab<b k="v">c</b>d</p></doc>"#),
+        (&[0, 2], "<doc><p>ab<b>c</b>d</p></doc>"),
+        (&[0, 1, 0], "<doc><p>ab<b>c</b>d</p></doc>"),
+    ] {
+        let got = edited(&|tree| tree.style_by_path(path, kv()))?;
+        assert_eq!(xml, got, "style {path:?}");
+    }
+    let got = edited(&|tree| tree.style_by_path_range(&[0, 0], &[0, 2], kv()))?;
+    assert_eq!(r#"<doc><p>ab<b k="v">c</b>d</p></doc>"#, got);
+
+    for (path, xml) in [
+        (&[0, 1][..], "<doc><p>ab</p><p><b>c</b>d</p></doc>"),
+        (&[0, 2], "<doc><p>ab<b>c</b></p><p>d</p></doc>"),
+    ] {
+        let got = edited(&|tree| tree.split_by_path(path))?;
+        assert_eq!(xml, got, "split {path:?}");
+    }
+    Ok(())
 }
 
 /// Positions taken in a parent that is then removed resolve to where the
