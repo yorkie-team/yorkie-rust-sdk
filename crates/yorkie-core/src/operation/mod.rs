@@ -17,7 +17,7 @@ pub(crate) use move_operation::MoveOperation;
 pub(crate) use remove_operation::RemoveOperation;
 pub(crate) use set_operation::SetOperation;
 pub(crate) use style_operation::StyleOperation;
-pub(crate) use tree_edit_operation::TreeEditOperation;
+pub(crate) use tree_edit_operation::{TreeEditExecution, TreeEditOperation};
 pub(crate) use tree_style_operation::TreeStyleOperation;
 
 use crate::crdt::counter::CounterValue;
@@ -326,6 +326,10 @@ impl Operation {
 pub(crate) struct ExecutionResult {
     pub(crate) op_infos: Vec<OpInfo>,
     pub(crate) reverse_op: Option<Operation>,
+    /// What a Tree edit's run measured, for the undo stack. JS keeps these on
+    /// the operation itself, which `execute` mutates; `execute` takes `&self`
+    /// here, so `Change` attaches them to the copy it records.
+    pub(crate) tree_edit: Option<TreeEditExecution>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -554,6 +554,30 @@ impl TreeNode {
         self.merged_into = None;
     }
 
+    /// Gives this node a new identity, for a copy that must not share the
+    /// identity of the node it was copied from (JS `reissueContentIDs`).
+    pub(crate) fn set_id(&mut self, id: TreeNodeId) {
+        self.id = id;
+    }
+
+    /// Drops every descendant `keep` rejects, with its subtree (JS
+    /// `filterChildren`).
+    pub(crate) fn retain_descendants(&mut self, keep: &dyn Fn(&TreeNode) -> bool) {
+        self.children.retain(|child| keep(child));
+        for child in &mut self.children {
+            child.retain_descendants(keep);
+        }
+    }
+
+    /// Calls `visit` on every node of this subtree, children before their
+    /// parent (JS `traverseAll`).
+    pub(crate) fn for_each_post_order_mut(&mut self, visit: &mut dyn FnMut(&mut TreeNode)) {
+        for child in &mut self.children {
+            child.for_each_post_order_mut(visit);
+        }
+        visit(self);
+    }
+
     pub(crate) fn clear_removed_recursively(&mut self) {
         self.removed_at = None;
         for child in self.all_children_mut() {
@@ -844,8 +868,11 @@ pub(crate) struct TreeEditResult {
     pub(crate) from_idx: usize,
     pub(crate) to_idx: usize,
     /// The size of the content the edit inserted, without the content it
-    /// dropped for reusing an ID (JS `insertedContentSize`). Content born
-    /// removed under a removed parent counts as nothing.
+    /// dropped for reusing an ID (JS `insertedContentSize`). As in JS
+    /// (`CRDTTree.edit` step 05), it is measured before the insert, so
+    /// content born removed under a removed parent still counts: the
+    /// reverse's `maxNeededIdx` guard relies on that to see the edit had no
+    /// visible effect.
     pub(crate) inserted_size: usize,
     /// The ID strings of the nodes in the range that were already removed
     /// before the edit (JS `preTombstoned`), which a reverse must not revive.
@@ -866,6 +893,12 @@ pub(crate) struct TreeEditResult {
     /// post-order, each cloned when it was removed (JS `stranded`). They are
     /// not in `removed_nodes`, yet the range the edit consumed holds them.
     pub(crate) stranded_nodes: Vec<TreeNode>,
+    /// Every node the range marked for removal, in traversal order, nodes
+    /// already removed and the split siblings a delete reaches included (JS
+    /// `nodesToBeRemoved`, which `TreeEditOperation` reads as
+    /// `removedNodes`). Unlike `removed_nodes`, these are IDs into the tree
+    /// as the edit left it.
+    pub(crate) removal_targets: Vec<TreeNodeId>,
 }
 
 /// A content change an identity restore or retombstone made, with the
@@ -1694,10 +1727,13 @@ impl CrdtTree {
                     content.merged_from = Some(merged_from.clone());
                     content.merged_at = merged_at.clone();
                 }
+                // Measured while the content is still detached, as JS
+                // measures `insertedContentSize`: born removed, it would
+                // read back as nothing.
+                inserted_size += content.padded_size(false);
                 if parent_removed {
                     content.remove_recursively(edited_at.clone(), &mut gc_pairs, &mut Vec::new());
                 } else {
-                    inserted_size += content.padded_size(false);
                     add_data_size(&mut diff, subtree_data_size(&content));
                 }
                 parent.insert_at(insert_index, content);
@@ -1738,6 +1774,7 @@ impl CrdtTree {
         let changes = attach_insertion_change(changes, from_idx, from_path, inserted_value);
 
         Ok(TreeEditResult {
+            removal_targets: targets.removed,
             changes,
             gc_pairs,
             diff,
@@ -2859,8 +2896,15 @@ impl CrdtTree {
         })
     }
 
-    fn node(&self, id: &TreeNodeId) -> Result<&TreeNode> {
+    /// Returns the node `id` names exactly, removed ones included.
+    pub(crate) fn node(&self, id: &TreeNodeId) -> Result<&TreeNode> {
         node_at_path(&self.root, &self.path_of(id)?)
+    }
+
+    /// Returns how many ancestors the node `id` has, the root none (JS
+    /// `mergedAwayIDs`'s `depth`).
+    pub(crate) fn depth_of(&self, id: &TreeNodeId) -> Option<usize> {
+        self.physical_path_by_node_id(id).map(|path| path.len())
     }
 
     fn node_mut(&mut self, id: &TreeNodeId) -> Result<&mut TreeNode> {
@@ -2869,7 +2913,7 @@ impl CrdtTree {
     }
 
     /// Returns the ID of the parent of `id`, or `None` for the root.
-    fn parent_id(&self, id: &TreeNodeId) -> Option<TreeNodeId> {
+    pub(crate) fn parent_id(&self, id: &TreeNodeId) -> Option<TreeNodeId> {
         let path = self.physical_path_by_node_id(id)?;
         let (parent_path, _) = split_parent_path(&path)?;
         node_at_path(&self.root, &parent_path)
@@ -3173,17 +3217,19 @@ impl CrdtTree {
         }
 
         // The sizes are read once the restore is done, as JS reads the nodes
-        // it returns.
+        // it returns. Every ID names a node this call just revived or
+        // created, so a failed lookup is a bug, not a node to skip: skipping
+        // it would leave its size out of the live and GC accounting.
         let measure = |ids: Vec<TreeNodeId>| {
             ids.into_iter()
-                .filter_map(|id| {
-                    let size = self.node(&id).ok()?.data_size();
-                    Some(TreeRestoredNode { id, size })
+                .map(|id| {
+                    let size = self.node(&id)?.data_size();
+                    Ok(TreeRestoredNode { id, size })
                 })
-                .collect::<Vec<_>>()
+                .collect::<Result<Vec<_>>>()
         };
-        let untombstoned = measure(untombstoned);
-        let recreated = measure(recreated);
+        let untombstoned = measure(untombstoned)?;
+        let recreated = measure(recreated)?;
         Ok(TreeRestoreResult {
             untombstoned,
             recreated,
@@ -5255,7 +5301,9 @@ mod tests {
 
     /// JS `tree_test.ts` "TreeChange: Concurrent delete and insert when parent
     /// removed": the content is inserted removed, counts as garbage, and
-    /// reports no change.
+    /// reports no change. Its size is still reported, measured before the
+    /// insert as JS `CRDTTree.edit` measures `insertedContentSize`: the
+    /// reverse's `maxNeededIdx` guard reads it to tell the edit had no effect.
     #[test]
     fn inserts_into_a_removed_parent_as_removed_content() -> crate::Result<()> {
         let mut tree = text_tree("ab");
@@ -5277,7 +5325,7 @@ mod tests {
 
         assert_eq!("<root></root>", tree.to_xml());
         assert!(result.changes.is_empty());
-        assert_eq!(0, result.inserted_size);
+        assert_eq!(1, result.inserted_size);
         // As in JS: "c", and the "b" split off the removed "ab", which was
         // never live either.
         let ids = result

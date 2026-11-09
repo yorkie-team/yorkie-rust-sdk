@@ -66,6 +66,7 @@ impl AddOperation {
                 self.parent_created_at().clone(),
                 value_created_at,
             ))),
+            tree_edit: None,
         }))
     }
 

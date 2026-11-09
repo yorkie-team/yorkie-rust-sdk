@@ -176,6 +176,9 @@ pub enum YorkieError {
     /// The requested feature is not implemented yet (JS `ErrUnimplemented`).
     Unimplemented(String),
 
+    /// The execution is rejected (JS `ErrRefused`).
+    Refused(String),
+
     /// A local update leaves the document violating its schema rules (JS
     /// code `ErrDocumentSchemaValidationFailed`). Holds one message per
     /// violation.
@@ -221,6 +224,7 @@ impl YorkieError {
             | Self::UnsupportedProtocolConversion(_)
             | Self::Unimplemented(_) => ErrorCode::ErrUnimplemented,
             Self::NotInitialized(_) => ErrorCode::ErrNotInitialized,
+            Self::Refused(_) => ErrorCode::ErrRefused,
             Self::SchemaValidationFailed(_) => ErrorCode::ErrDocumentSchemaValidationFailed,
             Self::DocumentSizeExceedsLimit { .. } => ErrorCode::ErrDocumentSizeExceedsLimit,
         }
@@ -268,6 +272,7 @@ impl Display for YorkieError {
             Self::NotInitialized(message) => write!(f, "not initialized: {message}"),
             Self::InvalidArgument(message) => write!(f, "invalid argument: {message}"),
             Self::Unimplemented(message) => write!(f, "unimplemented: {message}"),
+            Self::Refused(message) => write!(f, "refused: {message}"),
             Self::SchemaValidationFailed(errors) => {
                 write!(f, "schema validation failed: {}", errors.join(", "))
             }

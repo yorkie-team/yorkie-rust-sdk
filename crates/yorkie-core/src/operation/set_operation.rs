@@ -68,6 +68,7 @@ impl SetOperation {
                 key: self.key.clone(),
             }],
             reverse_op: Some(reverse_op),
+            tree_edit: None,
         }))
     }
 

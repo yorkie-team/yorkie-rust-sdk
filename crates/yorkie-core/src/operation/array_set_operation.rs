@@ -67,6 +67,7 @@ impl ArraySetOperation {
         Ok(Some(ExecutionResult {
             op_infos: vec![OpInfo::ArraySet { path }],
             reverse_op: Some(reverse_op),
+            tree_edit: None,
         }))
     }
 

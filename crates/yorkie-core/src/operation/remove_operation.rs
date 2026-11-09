@@ -64,6 +64,7 @@ impl RemoveOperation {
         Ok(Some(ExecutionResult {
             op_infos,
             reverse_op,
+            tree_edit: None,
         }))
     }
 

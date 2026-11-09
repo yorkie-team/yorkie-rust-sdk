@@ -75,6 +75,7 @@ impl IncreaseOperation {
                 value: value.value().clone(),
             }],
             reverse_op,
+            tree_edit: None,
         }))
     }
 
