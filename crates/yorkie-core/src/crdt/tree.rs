@@ -1058,7 +1058,7 @@ impl CrdtTree {
             tree_pos.offset >= visible_child_count(node)
         };
         if past_the_end {
-            return Err(YorkieError::InvalidArgument("unacceptable path".to_owned()));
+            return Err(unacceptable_path());
         }
 
         let from_index = index_of_tree_pos(&self.root, &tree_pos, false)?;
@@ -2827,18 +2827,20 @@ fn tree_pos_to_path(root: &TreeNode, tree_pos: &IndexTreePos) -> Result<Vec<usiz
     Ok(path)
 }
 
+/// The error JS `pathToTreePos` throws for a path that names no position.
+fn unacceptable_path() -> YorkieError {
+    YorkieError::InvalidArgument("unacceptable path".to_owned())
+}
+
 fn path_to_tree_pos(root: &TreeNode, path: &[usize]) -> Result<IndexTreePos> {
     if path.is_empty() {
-        return Err(YorkieError::InvalidTreePosition(
-            "unacceptable path".to_owned(),
-        ));
+        return Err(unacceptable_path());
     }
 
     let mut node = root;
     let mut node_path = Vec::new();
     for path_element in &path[..path.len() - 1] {
-        let child = visible_child(node, *path_element)
-            .ok_or_else(|| YorkieError::InvalidTreePosition("unacceptable path".to_owned()))?;
+        let child = visible_child(node, *path_element).ok_or_else(unacceptable_path)?;
         node_path.push(*path_element);
         node = child;
     }
@@ -2849,9 +2851,7 @@ fn path_to_tree_pos(root: &TreeNode, path: &[usize]) -> Result<IndexTreePos> {
     }
 
     if visible_child_count(node) < last {
-        return Err(YorkieError::InvalidTreePosition(
-            "unacceptable path".to_owned(),
-        ));
+        return Err(unacceptable_path());
     }
 
     Ok(IndexTreePos::new(node_path, last))
@@ -2863,9 +2863,7 @@ fn find_text_pos(
     mut path_element: usize,
 ) -> Result<IndexTreePos> {
     if node.len() < path_element {
-        return Err(YorkieError::InvalidTreePosition(
-            "unacceptable path".to_owned(),
-        ));
+        return Err(unacceptable_path());
     }
 
     for (visible_index, child) in node.children().enumerate() {

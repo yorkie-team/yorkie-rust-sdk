@@ -1161,11 +1161,11 @@ mod tests {
                 tree.to_xml()?
             );
 
-            // JS: 'unacceptable path'.
-            assert!(matches!(
-                tree.edit_by_path(&[0, 0, 4], &[0, 0, 4], vec![element("tn", vec![])], 0),
-                Err(YorkieError::InvalidTreePosition(_))
-            ));
+            // JS: ErrInvalidArgument 'unacceptable path'.
+            assert_eq!(
+                Err(YorkieError::InvalidArgument("unacceptable path".to_owned())),
+                tree.edit_by_path(&[0, 0, 4], &[0, 0, 4], vec![element("tn", vec![])], 0)
+            );
             Ok(())
         })
     }

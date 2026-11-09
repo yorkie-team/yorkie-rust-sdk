@@ -147,16 +147,21 @@ fn rejects_the_top_level_path_one_past_the_last_element() -> Result<()> {
     Ok(())
 }
 
-/// JS bounds test "keeps rejecting paths further out of range".
+/// JS bounds test "keeps rejecting paths further out of range". These fail
+/// in the path lookup itself (JS `pathToTreePos`), with the same error as
+/// the one-past cases.
 #[test]
 fn keeps_rejecting_paths_further_out_of_range() -> Result<()> {
     let mut doc = setup()?;
-    assert_invalid_argument(update_tree(&mut doc, |tree| {
-        tree.style_by_path(&[1, 5], bold())
-    }));
-    assert_invalid_argument(update_tree(&mut doc, |tree| {
-        tree.style_by_path(&[0, 3], bold())
-    }));
+    let unacceptable = || Err(YorkieError::InvalidArgument("unacceptable path".to_owned()));
+    assert_eq!(
+        unacceptable(),
+        update_tree(&mut doc, |tree| tree.style_by_path(&[1, 5], bold()))
+    );
+    assert_eq!(
+        unacceptable(),
+        update_tree(&mut doc, |tree| tree.style_by_path(&[0, 3], bold()))
+    );
     assert_eq!(INITIAL_XML, xml(&doc));
     Ok(())
 }
@@ -208,9 +213,10 @@ fn rejects_the_offset_one_past_the_last_character() -> Result<()> {
 #[test]
 fn rejects_an_offset_further_past_the_last_character() -> Result<()> {
     let mut doc = setup_text()?;
-    assert_invalid_argument(update_tree(&mut doc, |tree| {
-        tree.style_by_path(&[0, 3], bold())
-    }));
+    assert_eq!(
+        Err(YorkieError::InvalidArgument("unacceptable path".to_owned())),
+        update_tree(&mut doc, |tree| tree.style_by_path(&[0, 3], bold()))
+    );
     assert_eq!(INITIAL_TEXT_XML, xml(&doc));
     Ok(())
 }
@@ -281,19 +287,22 @@ fn styles_a_single_path_whose_derived_end_lands_inside_a_pair() -> Result<()> {
     Ok(())
 }
 
-/// The last assertion of the JS case above. The style splits the text node
-/// at the derived end. JS strings keep each half, so the XML still shows the
-/// emoji; Rust strings cannot hold a lone half, and the split decodes each
-/// half as U+FFFD, as Go does (see "Rust strings cannot represent invalid
-/// standalone UTF-16 surrogate halves" in `docs/current-porting-gaps.md`).
+/// The last assertion of the JS case above, `assert.include(xml, '😀')`,
+/// pinned to what Rust does instead. The style splits the text node at the
+/// derived end, between the halves of the emoji. JS strings keep each half,
+/// so the JS XML still shows the emoji. Rust strings cannot hold a lone half,
+/// so the split decodes each one as U+FFFD, as Go does. This is the
+/// representation gap "Rust strings cannot represent invalid standalone
+/// UTF-16 surrogate halves" in `docs/current-porting-gaps.md`. The guard in
+/// `find_pos` does not cover it: the derived end takes the unchecked lookup,
+/// as in JS.
 #[test]
-#[ignore = "a Rust tree split inside a surrogate pair is lossy"]
-fn keeps_the_pair_when_a_derived_end_lands_inside_it() -> Result<()> {
+fn splits_the_pair_lossily_when_a_derived_end_lands_inside_it() -> Result<()> {
     let mut doc = surrogate_doc()?;
     update_tree(&mut doc, |tree| {
         tree.style_by_path(&[0, 0], attributes(json!({"bold": "true"})))
     })?;
-    assert!(xml(&doc).contains('😀'), "{}", xml(&doc));
+    assert_eq!("<r><p>\u{FFFD}\u{FFFD}x</p></r>", xml(&doc));
     Ok(())
 }
 

@@ -242,9 +242,7 @@ async fn keeps_the_text_in_order_when_two_replicas_split_at_different_positions(
     .await;
 }
 
-/// JS "applies a concurrent style change to both halves of a split", with
-/// `removeStyleByPath([0, 0], [0, 1])` as `remove_style` over the indexes of
-/// those paths.
+/// JS "applies a concurrent style change to both halves of a split".
 #[tokio::test]
 async fn applies_a_concurrent_style_change_to_both_halves_of_a_split() {
     let root = element(
@@ -262,10 +260,7 @@ async fn applies_a_concurrent_style_change_to_both_halves_of_a_split() {
         "split-and-remove-style",
         root,
         |tree| tree.split_by_path(&[0, 0, 2]),
-        |tree| {
-            let (from, to) = (tree.path_to_index(&[0, 0])?, tree.path_to_index(&[0, 1])?);
-            tree.remove_style(from, to, ["bold"])
-        },
+        |tree| tree.remove_style_by_path(&[0, 0], &[0, 1], ["bold"]),
         "<doc><p><span>ab</span><span>cde</span></p></doc>",
     )
     .await;
