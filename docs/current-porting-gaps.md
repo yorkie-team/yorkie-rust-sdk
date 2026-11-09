@@ -30,7 +30,6 @@ section of the area they touch.
 | Devtools | `packages/sdk/src/devtools/` | Browser-only inspector protocol. |
 | Revisions API | `packages/sdk/src/api/revision.ts`, `yorkie.ts`; `test/integration/revision_test.ts` | Admin-side document revisions. |
 | Epoch re-anchor | `packages/sdk/src/document/document.ts` (`EpochMismatch`, minting suspension), `client/client.ts` | `ErrEpochMismatch` stops the sync loop without telling the document. |
-| Pre-attach ticket re-issue | `packages/sdk/src/document/document.ts` (`setActor` with `ReissueToken`, `reissueActor`, `neverSynced`), `api/reissue.ts` (`reissueOperations`, `reissueVersionVector`), `client/client.ts` (`claimReissue`, `markReissueClaim`); `docs/design/pre-attach-ticket-reissue.md` | Elements edited before `attach` keep the initial actor's tickets. See Document Editing Model. |
 | Disable-GC attach option | `packages/sdk/src/document/document.ts` (`disableGC`), `client/client.ts` | `AttachOptions` has no such field. |
 | Tree undo and redo | `packages/sdk/src/document/operation/tree_edit_operation.ts`, `tree_style_operation.ts`, `document/crdt/tree.ts`, `document/history.ts`; receive side `api/converter.ts` (`fromOperation` TreeEdit case) | Split and merge reverse machinery, and the `TreeEdit` restore spans: a received `TreeEdit` with `restore_spans`, `retombstone_spans`, or `restore_mode` runs only its positional part, so a Rust replica diverges from a JS peer that undoes a Tree edit. See Undo and Redo. |
 | Auth webhook integration test | `packages/sdk/test/integration/webhook_test.ts` | Needs a server with an auth webhook; the auth path is unit-tested with a mock transport. |
@@ -83,6 +82,26 @@ Current Rust behavior:
   parent object or array is created in the same update callback.
 - The previous clone/diff bridge remains as a fallback only when no public
   mutation method recorded an operation.
+- A document edited before its first attach has its tickets re-issued to
+  the client's actor by the attach, as JS `Client.attach` does with
+  `setActor(actor, { reissue })`. `Client::attach` asks `claim_reissue`
+  (generated client key, and the actor has not minted tickets in the
+  document of that key) and then calls the hidden
+  `Document::set_actor_with_reissue`; otherwise plain `set_actor`, which
+  rewrites only each pending change's ID and each operation's
+  `executed_at`. The re-issue runs only on a never-synced document
+  (`never_synced`, JS `neverSynced`: detached, initial checkpoint, a version
+  vector naming no other actor, and no snapshot or remote change taken in).
+  `reissue_operations` (`reissue.rs`, JS `api/reissue.ts`) rewrites every
+  ticket whose actor is the previous one and whose lamport is not 0, keeping
+  lamports and delimiters; `reissue_version_vector` moves the previous
+  actor's entry to the new one. The root and presences are rebuilt by
+  replaying the rewritten changes on a fresh root, each with the source it
+  first ran with. Everything is built aside and assigned at the end, so a
+  failure leaves the document unchanged and fails the attach before any
+  RPC. The undo and redo stacks are dropped, and no `DocEvent` is
+  published, as in JS. Live-server cases: `integration_pre_attach.rs` (JS
+  `pre_attach_test.ts`).
 
 JS/Go behavior:
 
@@ -105,25 +124,52 @@ Gap:
 - Counter, Text, and Tree public editing methods are connected to the edit
   recorder. Text and Tree hold a copy of their CRDT value and apply each edit
   to it as the callback runs.
-- Pre-attach ticket re-issue is not ported. `Client::attach` calls
-  `Document::set_actor`, which, like JS `setActor` without `reissue`, rewrites
-  only each pending change's ID and each operation's `executed_at` (and moves
-  the self presence). Every other ticket an edit made before `attach` minted
-  keeps the initial actor: element `created_at`s in `crdt_root` and inside the
-  operations, Text and Tree node IDs, and positions. JS `Client.attach`
-  instead calls `setActor(actor, { reissue: ReissueToken })` when
-  `claimReissue` allows it (generated client key, actor has minted nothing in
-  that document key) and the document never synced (`neverSynced`).
-  `reissueActor` then rewrites every ticket of the previous actor in the
-  local changes (`api/reissue.ts`), rebuilds the root and presences by
-  replaying them on a fresh `CRDTRoot`, and clears the undo/redo stacks.
-  Without it, two clients that edit the same document key before attaching
-  push elements with the same `created_at`, so replicas can disagree on the
-  winner, and the local root names Text/Tree nodes by tickets the pushed
-  operations no longer carry. Documents edited only after `attach`, and
-  `AttachOptions::initial_root` (applied after the attach response), are not
-  affected. Porting it needs ticket rewriting for every operation and
-  element payload, the replay, and the per-client claim bookkeeping.
+- Not re-issued, as in JS: a document under an explicit client key keeps
+  the initial actor's tickets (every session of the key shares one stable
+  actor, so a re-issue in a later session would mint the tickets an earlier
+  one pushed); a second pre-attach document of a key whose first document
+  already minted under the actor; and a document that has synced. Two
+  clients with explicit keys that fill the same key before attaching can
+  still push elements with the same `created_at`.
+- A position or element ID taken from the document before the attach
+  (a Text or Tree position, an array element ID) names the old actor and no
+  longer resolves after a re-issue. JS has the same limit.
+- No capability token. JS guards the `reissue` option with a module-private
+  `ReissueToken`; Rust cannot share a crate-private value with
+  `yorkie-client`, so the entry point is a `#[doc(hidden)] pub` method, like
+  the other client-only `Document` methods (`apply_change_pack`,
+  `garbage_collect`), and `has_minted_operations` is hidden public too. JS
+  test "refuses a re-issue asked for without the token" has no counterpart.
+- The ticket walk runs over the `wire` projection, destructuring every
+  struct and variant without `..`, where JS walks the protobuf message by
+  reflection. Coverage is the same and a new field fails to compile until
+  the walk visits it. Nested Object, Array and Tree values are structural in
+  the projection, so there are no `JSONElement` bytes to decode and
+  re-encode (JS `walkNestedElement`). A Text value of `Set`, `Add` or
+  `ArraySet` goes through the full Text encoding (content, ledger, links),
+  as in JS.
+- Rust Tree edits push no undo entry (Tree undo is out of scope), so the
+  port of JS "keeps tree splits, undo/redo, tree style and array set"
+  covers Tree splits and style only. Its Tree undo parts come back with
+  Tree undo.
+- A Text piece recreated after GC records a stand-in removal at lamport 0,
+  followed by its cancel (see Text and RGATreeSplit). The lamport-0 rule
+  leaves the stand-in under the previous actor while its cancel moves to
+  the new one, which breaks the per-actor alternation the ledger pairs by.
+  JS and Go do the same, so Rust follows; it needs GC on a never-synced
+  document before its first attach, and is worth raising upstream.
+- Where JS and Go differ, Rust follows JS:
+  - Go renames every string-keyed map entry whose key is the previous
+    actor in hex or base64 (`rekeyMap` in `api/converter/reissue.go`,
+    meant for actor-keyed maps such as the deprecated
+    `created_at_map_by_actor`), so a Tree or Text attribute named like the
+    actor is renamed too. JS never rewrites map keys, and Rust neither.
+  - Go sets its absorbed flag in `applyChanges` as a whole; JS only for a
+    `Remote` change, because JS also replays local changes through
+    `applyChanges`. Rust replays local changes through `apply_changes`
+    too (`apply_snapshot`), so `absorbed_remote` follows JS.
+  - The claim timing and the per-session ID are client differences (see
+    Client, Sync, and Watch).
 
 Expected direction:
 
@@ -640,6 +686,13 @@ Gap:
   payload, or a re-issue. JS keeps a removed attribute's value on the wire
   and Rust follows it; Go clears that value in `RHT.Remove` and
   `SetInternal`, so Go writes an empty `value` for the same tombstone.
+- `RhtNode::data_size` charges a tombstone's value, and charges the stored
+  string's UTF-16 length. JS `RHTNode.getDataSize` (since
+  yorkie-js-sdk#1392, `8fb5a71c`) charges a tombstone's key only, and the
+  logical value's UTF-8 length, so `doc_size` differs from JS for removed
+  Text and Tree attributes and for non-ASCII or JSON-quoted values. Within
+  Rust a round trip and a live document agree; only the absolute sizes and
+  the size limit allowance differ from JS.
 
 Expected direction:
 
@@ -1187,6 +1240,15 @@ Current Rust behavior:
   repeated ticket, or a result that does not reproduce `removed_at`) is
   dropped and the node keeps `removed_at` alone, without failing the
   snapshot or the pack (JS `fromTextNode`).
+- A Text node's insertion link (`ins_prev_id`) follows JS `toTextNodes`
+  and `fromText` (`ed25355e`). The encoder writes a link only if its target
+  was emitted earlier in the same node list, so a link into a purged
+  tombstone is dropped. The decoder keeps a link only if it names, by exact
+  ID, a node already decoded from the same insertion at a lower offset, and
+  then sets that node's `ins_next_id` too (JS `setInsPrev`); any other link
+  is dropped, never an error. A position resolved through a link to a
+  higher offset fails with `InvalidTextPosition` instead of underflowing.
+  The re-issue's Text value round trip and every snapshot rely on this.
 - `TreeEdit` restore fields, and `restore_mode` on `Set`, `Add`, and
   `ArraySet`, are ignored on decode and unset on encode. For `Set`, `Add`,
   and `ArraySet` this matches the JS converter; for `TreeEdit` it is the
@@ -1223,6 +1285,10 @@ JS/Go behavior:
   - Go rejects an identity span whose `created_at` lies beyond the change's
     version vector (`pkg/document/crdt/text_restore_test.go`
     `TestTextRestoreRejectsForgedIdentity`). JS and Rust do not.
+  - Go `fromJSONText` (`api/converter/from_bytes.go`) fails the element
+    when a Text node's insertion link names no node it has decoded
+    ("insPrevNode should be presence"); JS `fromText` drops the link and
+    keeps the node, and so does Rust.
 
 Gap:
 
@@ -1343,6 +1409,22 @@ Current Rust behavior:
   the watch stream and waits until it is initialized or its first attempt
   ends, as JS awaits `runWatchLoop`. Finally it applies `initial_root` for
   missing keys and returns the same `SharedDocument`.
+- Before stamping the actor, `Client::attach` decides whether to re-issue
+  the document's pre-attach tickets (see Document Editing Model), as JS
+  `claimReissue` and `markReissueClaim` do. `claim_reissue` is a pure
+  query: true only for a generated client key (`key_generated`, JS
+  `keyGenerated`) whose actor has no claim on the document key
+  (`reissue_claims`, JS `reissueClaims`). The claim is taken after
+  `set_actor_with_reissue` if the document re-issued or has minted
+  operations, before the RPC, since a lost response may still have pushed.
+  `remove_attachment` and `deactivate_internal` take it for a dropped
+  attachment whose document minted while attached (JS `detachInternal`).
+  Claims are never released and outlive deactivation, since a later
+  session of the key has the same actor. Option validation runs before
+  either step, so a rejected option neither re-issues nor claims.
+  `AttachingGuard` is taken only while the attach's session is current, so
+  an attach cannot claim a key a deactivation just freed before the
+  deactivation has marked its claims.
 - `Client::detach` clears the presence first (JS `p.clear()` before detach),
   sends client ID, document ID, local `ChangePack`, `remove_if_not_attached`,
   and shard key, applies the returned pack, updates document status, and
@@ -1476,6 +1558,25 @@ Gap:
   browser `fetch` alive during page unload, which has no Rust counterpart.
   `disableGC`, gRPC-web/Connect transport choice, Go TLS options, and Go
   receive-size/logger options are not modeled yet.
+- Re-issue claims follow JS where JS and Go differ. Go records the claim
+  on every attach (`c.minted[k] = actor`) and declines any repeat attach of
+  the key under the same actor; JS records it only when the document
+  re-issued or minted operations, at attach or at detach, so a key whose
+  first document minted nothing can still re-issue. Go also attaches under
+  the per-session client ID and re-issues for any client key; JS and Rust
+  attach under the stable actor of the client key (`response.actor_id`)
+  and re-issue only for a generated key.
+- One theoretical window is left between a loop's `deactivate_internal`
+  and a new session. That function runs outside the task queue: it ends
+  the session and frees every key under the state lock, then marks the
+  freed documents' claims after the lock is released. If `activate`
+  completes a whole RPC round trip, and an attach of a freed key asks
+  `claim_reissue`, while that marking loop (which never awaits) is still
+  running, the attach can re-issue onto an actor that already minted in
+  the key. JS marks synchronously and has no such window. Closing it would
+  need marking under the state lock, which takes the document lock inside
+  it (a lock-order change), or marking every freed key whether or not its
+  document minted, which departs from JS.
 
 Expected direction:
 
