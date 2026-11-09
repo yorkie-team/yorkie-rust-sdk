@@ -1458,15 +1458,6 @@ fn grab(from: &mut Document) -> Result<Vec<Change>> {
     Ok(wire.changes().to_vec())
 }
 
-/// `grab` without the wire, for the cases whose undo is an identity edit:
-/// the wire does not carry restore spans yet (Task 6 adds them and moves
-/// these cases to `grab`, as JS sends them through protobuf).
-fn grab_in_memory(from: &mut Document) -> Result<Vec<Change>> {
-    let pack = from.create_change_pack();
-    ack(from, &pack)?;
-    Ok(pack.changes().to_vec())
-}
-
 /// Acks the changes of `pack`, as the server would.
 fn ack(from: &mut Document, pack: &ChangePack) -> Result<()> {
     let last_seq = pack
@@ -1482,9 +1473,6 @@ fn ack(from: &mut Document, pack: &ChangePack) -> Result<()> {
         None,
     ))
 }
-
-/// How a test hands a replica's changes over.
-type Grab = fn(&mut Document) -> Result<Vec<Change>>;
 
 /// `hello world` in an inline in a paragraph, two levels to split (JS
 /// `seed`).
@@ -1547,31 +1535,19 @@ fn seeded_pair(seed: fn(&mut Document) -> Result<()>) -> Result<(Document, Docum
 fn lets_a_peer_apply_the_redo_of_a_split_and_what_names_it() -> Result<()> {
     // The last row's insert reverses to an identity edit, whose spans name
     // the split-created element as their parent.
-    let cases: [(&str, TreeChange<'_>, Grab); 5] = [
-        (
-            "split in the middle, bold the right piece",
-            &|t| {
-                t.edit_by_path(&[0, 0, 6], &[0, 0, 6], Vec::new(), 1)?;
-                t.style_by_path(&[0, 1], bold())
-            },
-            grab,
-        ),
-        (
-            "split at the end, bold the empty piece",
-            &|t| {
-                t.edit_by_path(&[0, 0, 11], &[0, 0, 11], Vec::new(), 1)?;
-                t.style_by_path(&[0, 1], bold())
-            },
-            grab,
-        ),
-        (
-            "split two levels, bold the new paragraph",
-            &|t| {
-                t.edit_by_path(&[0, 0, 6], &[0, 0, 6], Vec::new(), 2)?;
-                t.style_by_path(&[1], bold())
-            },
-            grab,
-        ),
+    let cases: [(&str, TreeChange<'_>); 5] = [
+        ("split in the middle, bold the right piece", &|t| {
+            t.edit_by_path(&[0, 0, 6], &[0, 0, 6], Vec::new(), 1)?;
+            t.style_by_path(&[0, 1], bold())
+        }),
+        ("split at the end, bold the empty piece", &|t| {
+            t.edit_by_path(&[0, 0, 11], &[0, 0, 11], Vec::new(), 1)?;
+            t.style_by_path(&[0, 1], bold())
+        }),
+        ("split two levels, bold the new paragraph", &|t| {
+            t.edit_by_path(&[0, 0, 6], &[0, 0, 6], Vec::new(), 2)?;
+            t.style_by_path(&[1], bold())
+        }),
         (
             // The style names the inner element the second ticket did not
             // mint, which resolves only if the pairing is innermost first.
@@ -1580,19 +1556,14 @@ fn lets_a_peer_apply_the_redo_of_a_split_and_what_names_it() -> Result<()> {
                 t.edit_by_path(&[0, 0, 6], &[0, 0, 6], Vec::new(), 2)?;
                 t.style_by_path(&[1, 0], bold())
             },
-            grab,
         ),
-        (
-            "split, then insert into the new element",
-            &|t| {
-                t.edit_by_path(&[0, 0, 6], &[0, 0, 6], Vec::new(), 1)?;
-                t.edit_by_path(&[0, 1, 0], &[0, 1, 0], vec![text("X")], 0)
-            },
-            grab_in_memory,
-        ),
+        ("split, then insert into the new element", &|t| {
+            t.edit_by_path(&[0, 0, 6], &[0, 0, 6], Vec::new(), 1)?;
+            t.edit_by_path(&[0, 1, 0], &[0, 1, 0], vec![text("X")], 0)
+        }),
     ];
 
-    for (name, edit, grab) in cases {
+    for (name, edit) in cases {
         for collect in [false, true] {
             let name = format!("{name}{}", if collect { ", after GC" } else { "" });
             let (mut a, mut b) = seeded_pair(seed_inline)?;
@@ -1914,8 +1885,8 @@ fn keeps_de_after_a_span_delete_and_undo_vs_a_split() -> Result<()> {
         edit_tree(r1, |t| t.edit_by_path(&[0, 1], &[0, 2], Vec::new(), 0))?;
         undo(r1)?;
         edit_tree(r2, op)?;
-        let p1 = grab_in_memory(r1)?;
-        let p2 = grab_in_memory(r2)?;
+        let p1 = grab(r1)?;
+        let p2 = grab(r2)?;
         deliver(r2, p1)?;
         deliver(r1, p2)?;
         assert!(
@@ -1940,15 +1911,15 @@ fn converges_after_a_span_delete_and_undo_vs_two_splits_that_drop() -> Result<()
     };
     edit_tree(r1, |t| t.edit_by_path(&[0, 1], &[0, 2], Vec::new(), 0))?;
     undo(r1)?;
-    let p1 = grab_in_memory(r1)?;
+    let p1 = grab(r1)?;
     edit_tree(r2, split_at_0_drop_left)?;
-    let p2 = grab_in_memory(r2)?;
+    let p2 = grab(r2)?;
     deliver(r3, p1.clone())?;
     edit_tree(r3, |t| {
         t.edit_by_path(&[0, 1, 1], &[0, 1, 1], Vec::new(), 1)?;
         t.edit_by_path(&[0, 1], &[0, 2], Vec::new(), 0)
     })?;
-    let p3 = grab_in_memory(r3)?;
+    let p3 = grab(r3)?;
     deliver(r1, p2.clone())?;
     deliver(r1, p3.clone())?;
     deliver(r2, p1)?;

@@ -14,7 +14,7 @@ use crate::operation::Operation;
 use crate::wire::{
     WireJsonElement, WireJsonElementSimple, WireNodeAttr, WireOperation, WireRestoreSpan,
     WireRgaNode, WireRhtNode, WireTextNode, WireTextNodeId, WireTextNodePos, WireTreeNode,
-    WireTreeNodeId, WireTreePos,
+    WireTreeNodeId, WireTreePos, WireTreeRestoreSpan,
 };
 use crate::{ActorId, Result, TimeTicket, VersionVector, INITIAL_LAMPORT};
 use std::collections::BTreeMap;
@@ -221,6 +221,9 @@ impl TicketReissuer<'_> {
                 split_level: _,
                 executed_at,
                 split_tickets,
+                restore_spans,
+                restore_mode: _,
+                retombstone_spans,
             } => {
                 self.ticket(parent_created_at);
                 self.walk_tree_pos(from);
@@ -229,6 +232,9 @@ impl TicketReissuer<'_> {
                     self.walk_tree_node(node);
                 }
                 self.ticket(executed_at);
+                for span in restore_spans.iter_mut().chain(retombstone_spans) {
+                    self.walk_tree_span(span);
+                }
                 for ticket in split_tickets {
                     self.ticket(ticket);
                 }
@@ -424,6 +430,30 @@ impl TicketReissuer<'_> {
             attributes: _,
         } = span;
         self.ticket(created_at);
+    }
+
+    /// Walks a Tree restore span: its identity, its anchors, and the
+    /// attribute snapshot, which keeps each attribute's `updated_at`.
+    fn walk_tree_span(&self, span: &mut WireTreeRestoreSpan) {
+        let WireTreeRestoreSpan {
+            id,
+            node_type: _,
+            is_text: _,
+            length: _,
+            value: _,
+            attributes,
+            parent_id,
+            left_sibling_id,
+            right_sibling_id,
+        } = span;
+        self.walk_tree_node_id(id);
+        self.walk_attrs(attributes);
+        for id in [parent_id, left_sibling_id, right_sibling_id]
+            .into_iter()
+            .flatten()
+        {
+            self.walk_tree_node_id(id);
+        }
     }
 
     /// Walks node attributes. Their keys are names and are left alone (JS),

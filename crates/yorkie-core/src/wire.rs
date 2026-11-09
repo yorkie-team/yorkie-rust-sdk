@@ -12,7 +12,7 @@ use crate::crdt::rga_tree_split::{
 use crate::crdt::rht::Rht;
 use crate::crdt::split_links::drop_split_links_in_element;
 use crate::crdt::text::{CrdtText, TextValue};
-use crate::crdt::tree::{CrdtTree, TreeNode, TreeNodeId, TreePos};
+use crate::crdt::tree::{CrdtTree, TreeNode, TreeNodeId, TreePos, TreeRestoreSpan};
 use crate::operation::{
     AddOperation, ArraySetOperation, EditOperation, IncreaseOperation, MoveOperation, Operation,
     RemoveOperation, RestoreMode, SetOperation, StyleOperation, TreeEditOperation,
@@ -175,6 +175,27 @@ pub struct WireTreePos {
     pub left_sibling_id: WireTreeNodeId,
 }
 
+/// A Tree node an edit removed or inserted, addressed by identity, for the
+/// undo or redo that brings it back or removes it again (proto
+/// `TreeRestoreSpan`). A text span is the UTF-16 interval
+/// `[id.offset, id.offset + length)` of its insertion, `value` its content;
+/// an element span is the whole element, with `length` 0. The anchors place
+/// a node GC purged: `left_sibling_id` and `right_sibling_id` bound the run
+/// it was captured in. `value` mirrors the proto string, which decoding
+/// reads only on a text span, and `attributes` an empty map for none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireTreeRestoreSpan {
+    pub id: WireTreeNodeId,
+    pub node_type: String,
+    pub is_text: bool,
+    pub length: usize,
+    pub value: String,
+    pub attributes: BTreeMap<String, WireNodeAttr>,
+    pub parent_id: Option<WireTreeNodeId>,
+    pub left_sibling_id: Option<WireTreeNodeId>,
+    pub right_sibling_id: Option<WireTreeNodeId>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireTreeNode {
     pub id: WireTreeNodeId,
@@ -255,6 +276,14 @@ pub enum WireOperation {
         /// The tickets issued for the elements the split created, in issue
         /// order; empty when the sender wrote none.
         split_tickets: Vec<TimeTicket>,
+        /// The nodes an undo or redo revives, by identity, parents before
+        /// their children. With `retombstone_spans`, empty on every edit but
+        /// an identity one, which runs by the spans alone.
+        restore_spans: Vec<WireTreeRestoreSpan>,
+        /// Set exactly when a span list is non-empty.
+        restore_mode: Option<WireRestoreMode>,
+        /// The nodes an undo or redo re-removes, by identity.
+        retombstone_spans: Vec<WireTreeRestoreSpan>,
     },
     TreeStyle {
         parent_created_at: TimeTicket,
@@ -542,10 +571,7 @@ impl TryFrom<&Operation> for WireOperation {
                 // JS `toOperation`: the mode travels only with a span, so an
                 // ordinary edit encodes to the bytes it always did.
                 let restore_mode = (!restore_spans.is_empty() || !retombstone_spans.is_empty())
-                    .then(|| match operation.restore_mode() {
-                        Some(RestoreMode::Retombstone) => WireRestoreMode::Retombstone,
-                        Some(RestoreMode::Restore) | None => WireRestoreMode::Restore,
-                    });
+                    .then(|| wire_restore_mode_from_domain(operation.restore_mode()));
                 Ok(Self::Edit {
                     parent_created_at: operation.parent_created_at().clone(),
                     from: WireTextNodePos::from(operation.range_from()),
@@ -572,17 +598,36 @@ impl TryFrom<&Operation> for WireOperation {
                 executed_at: operation.executed_at()?.clone(),
                 actor: (!operation.actor().is_empty()).then(|| operation.actor().to_owned()),
             }),
-            Operation::TreeEdit(operation) => Ok(Self::TreeEdit {
-                parent_created_at: operation.parent_created_at().clone(),
-                from: WireTreePos::from(operation.range_from()),
-                to: WireTreePos::from(operation.to_pos()),
-                contents: operation
-                    .contents()
-                    .map(|contents| contents.iter().map(wire_tree_nodes_from_domain).collect()),
-                split_level: operation.split_level(),
-                executed_at: operation.executed_at()?.clone(),
-                split_tickets: operation.split_tickets().to_vec(),
-            }),
+            Operation::TreeEdit(operation) => {
+                let restore_spans = operation
+                    .restore_spans()
+                    .iter()
+                    .map(WireTreeRestoreSpan::from)
+                    .collect::<Vec<_>>();
+                let retombstone_spans = operation
+                    .retombstone_spans()
+                    .iter()
+                    .map(WireTreeRestoreSpan::from)
+                    .collect::<Vec<_>>();
+                // JS `toOperation`: as for Text, the mode travels only with
+                // a span, so an ordinary edit encodes to the bytes it did.
+                let restore_mode = (!restore_spans.is_empty() || !retombstone_spans.is_empty())
+                    .then(|| wire_restore_mode_from_domain(operation.restore_mode()));
+                Ok(Self::TreeEdit {
+                    parent_created_at: operation.parent_created_at().clone(),
+                    from: WireTreePos::from(operation.range_from()),
+                    to: WireTreePos::from(operation.to_pos()),
+                    contents: operation
+                        .contents()
+                        .map(|contents| contents.iter().map(wire_tree_nodes_from_domain).collect()),
+                    split_level: operation.split_level(),
+                    executed_at: operation.executed_at()?.clone(),
+                    split_tickets: operation.split_tickets().to_vec(),
+                    restore_spans,
+                    restore_mode,
+                    retombstone_spans,
+                })
+            }
             Operation::TreeStyle(operation) => Ok(Self::TreeStyle {
                 parent_created_at: operation.parent_created_at().clone(),
                 from: WireTreePos::from(operation.range_from()),
@@ -673,10 +718,7 @@ impl TryFrom<WireOperation> for Operation {
                     )));
                 }
 
-                let mode = match restore_mode {
-                    Some(WireRestoreMode::Retombstone) => RestoreMode::Retombstone,
-                    Some(WireRestoreMode::Restore) | None => RestoreMode::Restore,
-                };
+                let mode = restore_mode_from_wire(restore_mode);
                 let restore_spans = restore_spans_from_wire(restore_spans, &executed_at)?;
                 let retombstone_spans = restore_spans_from_wire(retombstone_spans, &executed_at)?;
                 Ok(Self::Edit(
@@ -747,6 +789,9 @@ impl TryFrom<WireOperation> for Operation {
                 split_level,
                 executed_at,
                 split_tickets,
+                restore_spans,
+                restore_mode,
+                retombstone_spans,
             } => {
                 let contents = contents
                     .map(|contents| {
@@ -765,6 +810,21 @@ impl TryFrom<WireOperation> for Operation {
                     Some(executed_at),
                 );
                 operation.set_split_tickets(split_tickets);
+                // JS `fromOperation`: the spans are read only when a list is
+                // non-empty, and then the edit is an undo or redo by identity,
+                // in restore mode unless the sender wrote retombstone. A peer
+                // that left the mode at its default still gets one, since an
+                // identity edit is told apart by its mode here.
+                if !restore_spans.is_empty() || !retombstone_spans.is_empty() {
+                    let into_domain = |spans: Vec<WireTreeRestoreSpan>| {
+                        spans.into_iter().map(TreeRestoreSpan::from).collect()
+                    };
+                    operation = operation.with_identity(
+                        into_domain(restore_spans),
+                        restore_mode_from_wire(restore_mode),
+                        into_domain(retombstone_spans),
+                    );
+                }
                 Ok(Self::TreeEdit(operation))
             }
             WireOperation::TreeStyle {
@@ -1259,6 +1319,59 @@ impl From<WireTreePos> for TreePos {
     }
 }
 
+fn wire_restore_mode_from_domain(mode: Option<RestoreMode>) -> WireRestoreMode {
+    match mode {
+        Some(RestoreMode::Retombstone) => WireRestoreMode::Retombstone,
+        Some(RestoreMode::Restore) | None => WireRestoreMode::Restore,
+    }
+}
+
+/// Any mode but retombstone means restore (JS `fromOperation`).
+fn restore_mode_from_wire(mode: Option<WireRestoreMode>) -> RestoreMode {
+    match mode {
+        Some(WireRestoreMode::Retombstone) => RestoreMode::Retombstone,
+        Some(WireRestoreMode::Restore) | None => RestoreMode::Restore,
+    }
+}
+
+/// JS `toPbTreeRestoreSpan`: the value of a text span, and every attribute
+/// node, a removed one with its `is_removed`, as `toRHT` writes them.
+impl From<&TreeRestoreSpan> for WireTreeRestoreSpan {
+    fn from(span: &TreeRestoreSpan) -> Self {
+        Self {
+            id: WireTreeNodeId::from(&span.id),
+            node_type: span.node_type.clone(),
+            is_text: span.is_text,
+            length: span.length,
+            value: span.value.clone().unwrap_or_default(),
+            attributes: tree_attrs_from_domain(span.attrs.as_ref()),
+            parent_id: span.parent_id.as_ref().map(WireTreeNodeId::from),
+            left_sibling_id: span.left_sibling_id.as_ref().map(WireTreeNodeId::from),
+            right_sibling_id: span.right_sibling_id.as_ref().map(WireTreeNodeId::from),
+        }
+    }
+}
+
+/// JS `fromPbTreeRestoreSpan`: `value` is read only on a text span, and an
+/// empty attribute map is no attributes. The kind is not checked against
+/// `node_type`: restore and retombstone skip a span that disagrees, so a
+/// stored change holding one stays loadable.
+impl From<WireTreeRestoreSpan> for TreeRestoreSpan {
+    fn from(span: WireTreeRestoreSpan) -> Self {
+        Self {
+            id: TreeNodeId::from(span.id),
+            node_type: span.node_type,
+            is_text: span.is_text,
+            length: span.length,
+            value: span.is_text.then_some(span.value),
+            attrs: tree_attrs_to_domain(span.attributes),
+            parent_id: span.parent_id.map(TreeNodeId::from),
+            left_sibling_id: span.left_sibling_id.map(TreeNodeId::from),
+            right_sibling_id: span.right_sibling_id.map(TreeNodeId::from),
+        }
+    }
+}
+
 fn wire_restore_spans_from_domain(spans: &[RestoreSpan<TextValue>]) -> Vec<WireRestoreSpan> {
     spans
         .iter()
@@ -1750,6 +1863,110 @@ mod tests {
             panic!("expected a tree edit");
         };
         assert_eq!(split_tickets, decoded.split_tickets());
+        Ok(())
+    }
+
+    /// JS `fromOperation`: a decoded identity Tree edit is an undo
+    /// (`isUndoOp`) in the mode it carries, with no stored indexes, and its
+    /// spans come back as captured. JS reads `value` only on a text span and
+    /// an empty attribute map as none.
+    #[test]
+    fn decodes_an_identity_tree_edit_as_an_undo_by_identity() -> Result<()> {
+        let mut attrs = Rht::new();
+        attrs.set("bold", "true", ticket(1));
+        let element = TreeRestoreSpan {
+            id: tree_node_id(1, 2),
+            node_type: "p".to_owned(),
+            is_text: false,
+            length: 0,
+            value: None,
+            attrs: Some(attrs),
+            parent_id: Some(tree_node_id(1, 0)),
+            left_sibling_id: Some(tree_node_id(1, 1)),
+            right_sibling_id: Some(tree_node_id(1, 3)),
+        };
+        let text = TreeRestoreSpan {
+            id: tree_node_id(1, 5),
+            node_type: "text".to_owned(),
+            is_text: true,
+            length: 5,
+            value: Some("hello".to_owned()),
+            attrs: None,
+            parent_id: Some(tree_node_id(1, 2)),
+            left_sibling_id: None,
+            right_sibling_id: None,
+        };
+        let pos = TreePos::new(tree_node_id(1, 0), tree_node_id(1, 0));
+        let operation = TreeEditOperation::create(
+            TimeTicket::initial(),
+            pos.clone(),
+            pos,
+            None,
+            0,
+            Some(ticket(4)),
+        )
+        .into_undo(3, 3)
+        .with_identity(
+            vec![element.clone()],
+            RestoreMode::Retombstone,
+            vec![text.clone()],
+        );
+
+        let mut wire = WireOperation::try_from(&Operation::TreeEdit(operation.clone()))?;
+        let Operation::TreeEdit(decoded) = Operation::try_from(wire.clone())? else {
+            panic!("expected a tree edit");
+        };
+        assert_eq!(operation, decoded);
+        assert!(decoded.is_undo_op());
+        assert_eq!(None, decoded.undo_indexes());
+        assert_eq!(Some(RestoreMode::Retombstone), decoded.restore_mode());
+        assert_eq!(&[element], decoded.restore_spans());
+        assert_eq!(&[text], decoded.retombstone_spans());
+
+        // A sender may write a value on an element span, or leave the mode
+        // unset; neither changes what runs.
+        let WireOperation::TreeEdit {
+            restore_spans,
+            restore_mode,
+            ..
+        } = &mut wire
+        else {
+            unreachable!();
+        };
+        restore_spans[0].value = "x".to_owned();
+        *restore_mode = None;
+        let Operation::TreeEdit(decoded) = Operation::try_from(wire)? else {
+            panic!("expected a tree edit");
+        };
+        assert_eq!(None, decoded.restore_spans()[0].value);
+        assert_eq!(Some(RestoreMode::Restore), decoded.restore_mode());
+        Ok(())
+    }
+
+    /// JS `toOperation` writes no span and no mode for an ordinary Tree edit,
+    /// and `fromOperation` reads none back.
+    #[test]
+    fn leaves_an_ordinary_tree_edit_without_identity() -> Result<()> {
+        let pos = TreePos::new(tree_node_id(1, 0), tree_node_id(1, 0));
+        let operation =
+            TreeEditOperation::create(ticket(1), pos.clone(), pos, None, 0, Some(ticket(4)));
+        let wire = WireOperation::try_from(&Operation::TreeEdit(operation))?;
+        let WireOperation::TreeEdit {
+            restore_spans,
+            restore_mode,
+            retombstone_spans,
+            ..
+        } = &wire
+        else {
+            panic!("expected a tree edit");
+        };
+        assert!(restore_spans.is_empty() && retombstone_spans.is_empty());
+        assert_eq!(&None, restore_mode);
+        let Operation::TreeEdit(decoded) = Operation::try_from(wire)? else {
+            panic!("expected a tree edit");
+        };
+        assert!(!decoded.is_undo_op());
+        assert_eq!(None, decoded.restore_mode());
         Ok(())
     }
 

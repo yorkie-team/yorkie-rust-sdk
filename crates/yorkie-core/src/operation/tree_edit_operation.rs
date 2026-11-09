@@ -156,13 +156,16 @@ impl TreeEditOperation {
     }
 
     /// Makes this an identity edit in `restore_mode` over the given spans
-    /// (the last three arguments of JS `TreeEditOperation.create`).
+    /// (the last three arguments of JS `TreeEditOperation.create`). An
+    /// identity edit is always an undo or a redo: JS passes `isUndoOp` with
+    /// a mode everywhere, decoding included.
     pub(crate) fn with_identity(
         mut self,
         restore_spans: Vec<TreeRestoreSpan>,
         restore_mode: RestoreMode,
         retombstone_spans: Vec<TreeRestoreSpan>,
     ) -> Self {
+        self.is_undo_op = true;
         self.restore_spans = restore_spans;
         self.restore_mode = Some(restore_mode);
         self.retombstone_spans = retombstone_spans;
@@ -336,7 +339,6 @@ impl TreeEditOperation {
             mode.flipped(),
             self.retombstone_spans.clone(),
         );
-        reverse.is_undo_op = true;
         reverse.from_idx = self.from_idx;
         reverse.to_idx = self.to_idx;
 

@@ -851,13 +851,7 @@ fn check_random_histories(seeds: impl IntoIterator<Item = u32>) -> Result<()> {
 /// that changes at attach. JS runs seeds 1 to 300, which take about 6 s in
 /// a debug build here, so the default run takes the first 50 and
 /// `keeps_the_content_of_300_random_pre_attach_histories` the rest.
-///
-/// Tree edits now push undo entries, and the undo of a plain Tree edit runs
-/// by restore spans, which the wire does not carry yet: the re-issue, which
-/// goes through the wire, loses them. Task 6 of the Tree undo plan carries
-/// them and lifts the `ignore`.
 #[test]
-#[ignore = "Tree restore spans are not on the wire yet (Tree undo plan, Task 6)"]
 fn keeps_the_content_of_random_pre_attach_histories() -> Result<()> {
     check_random_histories(1..=50)
 }
