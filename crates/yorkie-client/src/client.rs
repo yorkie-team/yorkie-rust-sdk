@@ -434,7 +434,7 @@ impl Client {
             }
             doc.key().to_owned()
         };
-        let _attaching = AttachingGuard::claim(&self.inner, &key)?;
+        let _attaching = AttachingGuard::claim(&self.inner, &key, &session)?;
         let (poll_interval, poll_interval_pinned) =
             resolve_document_poll_interval(sync_mode, document_poll_interval)?;
 
@@ -1570,14 +1570,25 @@ impl Drop for PendingPullPause {
 
 /// Marks a key as attaching for the lifetime of one `attach` call, so a
 /// concurrent attach of the same key is rejected (JS `attachingDocs`).
+///
+/// It is taken only while the attach's session is still current. A loop's
+/// `deactivate_internal` runs outside the task queue: it frees every key in
+/// the same state-lock block that ends the session, but takes the re-issue
+/// claims of the freed documents only afterwards. Checking the session here,
+/// under that lock, keeps an attach from claiming a freed key and asking
+/// `claim_reissue` before those claims land (JS `detachInternal` marks
+/// synchronously, so JS has no such window).
 struct AttachingGuard<'a> {
     inner: &'a ClientInner,
     key: String,
 }
 
 impl<'a> AttachingGuard<'a> {
-    fn claim(inner: &'a ClientInner, key: &str) -> ClientResult<Self> {
+    fn claim(inner: &'a ClientInner, key: &str, session: &Session) -> ClientResult<Self> {
         let mut state = inner.state();
+        if !state.is_current(session) {
+            return Err(ClientError::ClientNotActivated(inner.key.clone()));
+        }
         if state.is_taken(key) {
             return Err(ClientError::AlreadyAttached(key.to_owned()));
         }

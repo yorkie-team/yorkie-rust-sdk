@@ -100,6 +100,9 @@ fn actors_of(pack: &ChangePack) -> BTreeMap<String, usize> {
             .collect::<String>();
         *actors.entry(actor).or_default() += 1;
     }
+    // Every pack these tests push carries tickets, so an empty map means the
+    // `Debug` format moved and an absence check would pass vacuously.
+    assert!(!actors.is_empty(), "no ticket found in {debug}");
     actors
 }
 
@@ -360,6 +363,27 @@ fn does_not_reissue_under_an_explicit_client_key() -> ClientResult<()> {
     assert!(count(&actors, INITIAL_ACTOR_ID) > 0, "{actors:?}");
     assert_eq!(ACTOR_A, actor_of(&doc));
     Ok(())
+}
+
+/// An attach that took its session before a deactivation run outside the
+/// task queue (a watch or sync loop's `deactivate_internal`) must not claim
+/// a key that deactivation freed: the claim of the freed document lands
+/// only after the attachments are taken, so asking `claim_reissue` in
+/// between could re-issue onto an actor that document minted under. JS has
+/// no such window, as `detachInternal` marks synchronously. The race itself
+/// needs a thread interleave between `session()` and the guard, so this
+/// checks the guard against a stale session directly.
+#[test]
+fn rejects_an_attach_whose_session_a_deactivation_ended() {
+    let transport = acking_transport();
+    let client = fake_client(ACTOR_A, &transport, None);
+    let session = client.session().unwrap();
+    client.deactivate_internal();
+
+    let claimed = crate::client::AttachingGuard::claim(&client.inner, "k1", &session);
+
+    assert!(matches!(claimed, Err(ClientError::ClientNotActivated(_))));
+    assert!(client.state().attaching.is_empty());
 }
 
 /// JS `claimReissue` and `markReissueClaim`, cross-checked with Go
