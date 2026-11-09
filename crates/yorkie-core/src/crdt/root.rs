@@ -189,6 +189,25 @@ impl CrdtRoot {
 
     pub(crate) fn register_element(&mut self, element: &CrdtElement, parent: Option<&CrdtElement>) {
         self.register_element_internal(element, parent);
+        self.register_ledger_holders(element);
+    }
+
+    /// Registers every Text at or under `element` whose ledgers hold cancels
+    /// as a ledger holder, the ledger part of JS `registerInternalGCPairs`.
+    /// An undo re-sets a copy of a removed Text and a remote payload decodes
+    /// one with its ledgers; unregistered, such a ledger would never be
+    /// pruned. The GC pairs of the tombstones inside are still not booked
+    /// here (see the porting gaps).
+    fn register_ledger_holders(&mut self, element: &CrdtElement) {
+        let mut holders = Vec::new();
+        visit_texts(element, &mut |text: &CrdtText| {
+            if text.has_cancelled_removals() {
+                holders.push(text.created_at().clone());
+            }
+        });
+        for created_at in holders {
+            self.register_ledger_holder(&created_at);
+        }
     }
 
     pub(crate) fn deregister_element(&mut self, element: &CrdtElement) -> usize {
@@ -288,6 +307,17 @@ impl CrdtRoot {
         removed_at: TimeTicket,
     ) {
         if let Some(pair) = self.gc_pair_by_child_id.remove(&child_id) {
+            // A second registration un-registers a revived child. JS takes a
+            // Text node's current size out of gc here; this takes the size
+            // the pair was registered with, which differs once the node has
+            // been split. So a revived Text node must never come back this
+            // way: every revive unregisters its pair first
+            // (`unregister_gc_pair_by_id`), and only removed attributes and
+            // Array and Tree children toggle.
+            debug_assert!(
+                pair.detached.is_none() && !self.has_text_node(&child_id),
+                "Text node {child_id} re-registered without being unregistered"
+            );
             sub_data_size(&mut self.doc_size.gc, pair.child_size);
             return;
         }
@@ -1264,6 +1294,18 @@ impl CrdtRoot {
             visit_texts(element, &mut read);
         }
         children
+    }
+
+    /// Tells whether a Text in the document holds a node whose ID string is
+    /// `child_id`. Only the toggle's debug assertion asks.
+    fn has_text_node(&self, child_id: &str) -> bool {
+        let mut found = false;
+        for (_, element) in self.root_object.iter_all() {
+            visit_texts(element, &mut |text: &CrdtText| {
+                found = found || text.nodes().any(|node| node.id_string() == child_id);
+            });
+        }
+        found
     }
 
     /// Freezes the registered Text nodes under `element`, which is being

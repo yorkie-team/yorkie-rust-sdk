@@ -990,6 +990,48 @@ mod ledger {
         Ok(())
     }
 
+    /// JS `CRDTRoot.registerElement` books a Text whose ledgers hold
+    /// cancels as a ledger holder (`registerInternalGCPairs`), whichever
+    /// route brings it in: here a set, as an undo re-set or a remote payload
+    /// does. Without the holder the ledger is never pruned and the piece
+    /// keeps writing removal events JS has dropped.
+    #[test]
+    fn prunes_the_ledger_of_a_text_set_into_the_document() -> Result<()> {
+        let mut text = seeded("abc")?;
+        text.edit_by_index(1, 2, "", None, a(3), None)?;
+        text.restore(&[span(a(2), 1, 2, "b")], &a(4), None)?;
+        let mut root = CrdtRoot::create();
+        root.set_object_member(&TimeTicket::initial(), "t", CrdtElement::text(text), a(5))?;
+        let events = |root: &CrdtRoot| {
+            text_of(root)
+                .nodes()
+                .find(|node| node.id().offset() == 1)
+                .expect("the revived piece")
+                .removal_events()
+        };
+        assert_eq!(vec![a(3), a(4)], events(&root));
+
+        root.garbage_collect(&vv([(A1, 5)]));
+        assert!(events(&root).is_empty());
+        assert!(!text_of(&root).has_cancelled_removals());
+        Ok(())
+    }
+
+    /// The pair toggle takes out the registered size, not the node's
+    /// current one as JS does, so a revived Text node that was not
+    /// unregistered must not be registered again (Task 3 review).
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "re-registered without being unregistered")]
+    fn refuses_to_toggle_a_revived_text_node_left_registered() {
+        let mut root = root_with(seeded("abc").unwrap());
+        let b_only = range(&root, 1, 2).unwrap();
+        remove(&mut root, b_only, a(3), None).unwrap();
+        restore(&mut root, &[span(a(2), 1, 2, "b")], a(4), false).unwrap();
+        let b_again = range(&root, 1, 2).unwrap();
+        let _ = remove(&mut root, b_again, a(5), None);
+    }
+
     /// A tombstone two uncancelled removals hold is never collected (JS
     /// `heldFromPurge`).
     #[test]

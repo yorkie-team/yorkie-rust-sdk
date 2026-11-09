@@ -7,9 +7,10 @@
 //! `Document::history` and `Document::history_mut` hand out the handles that
 //! JS exposes as `doc.history`.
 //!
-//! Reverse operations are positional, as in JS before identity-preserving
-//! restore: an undone text deletion is inserted again as new content. Tree
-//! edits and styles push nothing (see `docs/current-porting-gaps.md`).
+//! A Text edit reverses by identity, as in JS: its undo revives the removed
+//! pieces and re-removes the inserted one under their original IDs (see
+//! `EditOperation`). Tree edits and styles push nothing (see
+//! `docs/current-porting-gaps.md`).
 
 use crate::operation::Operation;
 use crate::presence::ReversePresence;
