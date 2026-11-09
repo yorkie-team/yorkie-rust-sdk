@@ -3317,6 +3317,20 @@ mod tests {
             );
         }
 
+        // A negative length is not a missing timestamp, but `usize` cannot
+        // hold it, so it fails as a negative offset does everywhere in this
+        // decoder (Go rejects it too; JS does not).
+        assert!(
+            matches!(
+                decode_with(|span| span.length = -1)?,
+                Err(ProtocolError::InvalidOffset {
+                    field: "tree_restore_span.length",
+                    value: -1,
+                })
+            ),
+            "with a negative length"
+        );
+
         let decodes: [(&str, Corrupt); 4] = [
             ("as written", |_| {}),
             ("with a kind that disagrees", |span| span.is_text = true),

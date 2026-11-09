@@ -6,13 +6,15 @@
 //! replica's changes, and each `.json` file the XML JS read after each
 //! change.
 //!
-//! The bytes are compared change by change, from the second change on. The
-//! first change sets the Tree, and Rust does not write a container value
-//! of a Set the way JS does, Tree undo aside: JS writes the value's
-//! `moved_at` inside the nested `JSONElement` bytes only, while Rust writes
-//! it on the `JSONElementSimple` too when it re-encodes a decoded value,
-//! and nowhere when it writes a value of its own. That gap is older than
-//! Tree undo and does not change what a replica builds.
+//! The bytes are compared change by change. The first change sets the Tree,
+//! and Rust does not write the `moved_at` of a container value of a Set the
+//! way JS does, Tree undo aside: JS writes it inside the nested
+//! `JSONElement` bytes only, while Rust writes it on the `JSONElementSimple`
+//! too when it re-encodes a decoded value, and nowhere when it writes a
+//! value of its own. That gap is older than Tree undo and does not change
+//! what a replica builds, so a Set's `moved_at` is cleared in both places,
+//! on both sides, before the bytes are compared; everything else must
+//! match.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -80,20 +82,55 @@ fn text(value: &str) -> TreeNodeInput {
     TreeNodeInput::text(value)
 }
 
+/// Clears the `moved_at` of every Set value of `change`, on the
+/// `JSONElementSimple` and inside its nested `JSONElement` bytes: the one
+/// known gap the module docs describe.
+#[allow(deprecated)]
+fn clear_set_moved_at(change: &mut api::Change) -> TestResult {
+    use api::json_element::Body as Element;
+    for operation in &mut change.operations {
+        let Some(api::operation::Body::Set(set)) = &mut operation.body else {
+            continue;
+        };
+        let Some(value) = &mut set.value else {
+            continue;
+        };
+        value.moved_at = None;
+        if value.value.is_empty() {
+            continue;
+        }
+        let mut element = api::JsonElement::decode(value.value.as_slice())?;
+        match &mut element.body {
+            Some(Element::JsonObject(e)) => e.moved_at = None,
+            Some(Element::JsonArray(e)) => e.moved_at = None,
+            Some(Element::Primitive(e)) => e.moved_at = None,
+            Some(Element::Text(e)) => e.moved_at = None,
+            Some(Element::Counter(e)) => e.moved_at = None,
+            Some(Element::Tree(e)) => e.moved_at = None,
+            None => {}
+        }
+        value.value = element.encode_to_vec();
+    }
+    Ok(())
+}
+
 /// Asserts that the packs `want` (JS) and `got` (Rust) hold the same
-/// number of changes and the same bytes for every change after the first,
-/// which sets the Tree (see the module docs).
+/// number of changes and the same bytes for every change, once the Set
+/// values' `moved_at` is cleared on both sides (see the module docs).
 fn assert_same_edit_changes(name: &str, want: &[u8], got: &[u8]) -> TestResult {
     let changes = |bytes: &[u8]| -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
-        Ok(api::ChangePack::decode(bytes)?
+        api::ChangePack::decode(bytes)?
             .changes
-            .iter()
-            .map(Message::encode_to_vec)
-            .collect())
+            .into_iter()
+            .map(|mut change| {
+                clear_set_moved_at(&mut change)?;
+                Ok(change.encode_to_vec())
+            })
+            .collect()
     };
     let (want, got) = (changes(want)?, changes(got)?);
     assert_eq!(want.len(), got.len(), "{name}: change count");
-    for (index, (want, got)) in want.iter().zip(&got).enumerate().skip(1) {
+    for (index, (want, got)) in want.iter().zip(&got).enumerate() {
         assert_eq!(want, got, "{name}: change {index}");
     }
     Ok(())
