@@ -243,8 +243,16 @@ fn fill_randomly(doc: &mut Document, seed: u32) -> Result<()> {
                 }
                 Ok(())
             }),
-            6 if doc.history().can_undo() => doc.history_mut().undo(),
-            7 if doc.history().can_redo() => doc.history_mut().redo(),
+            // An undo or redo the stack offers must run: its failure is a
+            // bug, not a skipped edit.
+            6 if doc.history().can_undo() => {
+                doc.history_mut().undo()?;
+                Ok(())
+            }
+            7 if doc.history().can_redo() => {
+                doc.history_mut().redo()?;
+                Ok(())
+            }
             _ => Ok(()),
         };
     }
@@ -821,14 +829,6 @@ fn leaves_the_document_untouched_when_the_replay_fails() -> Result<()> {
     Ok(())
 }
 
-/// Seeds whose history removes a Text attribute and then restores the Text
-/// by undo, so the restoring Set carries a removed attribute. The Rust wire
-/// projection drops a Text attribute's `is_removed` (JS and Go carry it
-/// since yorkie-js-sdk#1364), so the re-issued value brings the attribute
-/// back. That is a wire gap of its own, outside the re-issue; these seeds
-/// run in `keeps_the_content_of_a_random_history_with_a_removed_text_attr`.
-const REMOVED_TEXT_ATTR_SEEDS: [u32; 1] = [136];
-
 /// Re-issues each seeded history and checks that its content and tickets
 /// come out as JS `keeps the content of random pre-attach histories` wants.
 fn check_random_histories(seeds: impl IntoIterator<Item = u32>) -> Result<()> {
@@ -855,7 +855,7 @@ fn keeps_the_content_of_random_pre_attach_histories() -> Result<()> {
 }
 
 /// JS `keeps the content of random pre-attach histories` at its full 300
-/// seeds, but `REMOVED_TEXT_ATTR_SEEDS`. Run it with
+/// seeds. Run it with
 ///
 /// ```sh
 /// cargo test -p yorkie-core --lib random_pre_attach -- --ignored
@@ -863,13 +863,15 @@ fn keeps_the_content_of_random_pre_attach_histories() -> Result<()> {
 #[test]
 #[ignore = "300 seeds take about 6 s in a debug build"]
 fn keeps_the_content_of_300_random_pre_attach_histories() -> Result<()> {
-    check_random_histories((1..=300).filter(|seed| !REMOVED_TEXT_ATTR_SEEDS.contains(seed)))
+    check_random_histories(1..=300)
 }
 
-/// The seeds the 300-seed run leaves out. They fail until the wire
-/// projection carries a Text attribute's `is_removed`.
+/// Seed 136 removes a Text attribute by the undo of a style and then
+/// restores the Text by undo, so the restoring Set carries a removed
+/// attribute. It runs by default because the 300-seed run does not: the
+/// re-issued value must keep the attribute removed, as JS and Go carry
+/// `is_removed` on the wire (yorkie-js-sdk#1364).
 #[test]
-#[ignore = "the wire projection drops a Text attribute's is_removed"]
 fn keeps_the_content_of_a_random_history_with_a_removed_text_attr() -> Result<()> {
-    check_random_histories(REMOVED_TEXT_ATTR_SEEDS)
+    check_random_histories([136])
 }

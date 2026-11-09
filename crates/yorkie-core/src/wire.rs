@@ -1329,6 +1329,9 @@ fn wire_text_node_from_domain(
     }
 }
 
+/// JS `toTextNodes` (since yorkie-js-sdk#1364) and Go `toTextNodes`: every
+/// attribute node, a removed one with its `is_removed`, as the tree path
+/// writes them.
 fn text_attrs_from_domain(attrs: &Rht) -> BTreeMap<String, WireNodeAttr> {
     attrs
         .iter()
@@ -1338,7 +1341,7 @@ fn text_attrs_from_domain(attrs: &Rht) -> BTreeMap<String, WireNodeAttr> {
                 WireNodeAttr {
                     value: node.value().to_owned(),
                     updated_at: node.updated_at().clone(),
-                    is_removed: false,
+                    is_removed: node.is_removed(),
                 },
             )
         })
@@ -1417,10 +1420,15 @@ fn text_from_wire_nodes(created_at: TimeTicket, nodes: Vec<WireTextNode>) -> Res
     Ok(CrdtText::new(created_at, split))
 }
 
+/// JS `fromTextNode` (since yorkie-js-sdk#1364): `setInternal` keeps each
+/// attribute as written, a tombstone included, value and all. A tombstone
+/// decoded live would carry the removal's ticket and win LWW against every
+/// older write. Go's `SetInternal` clears a removed attribute's value; JS
+/// keeps it, and so does Rust.
 fn text_attrs_to_domain(attrs: BTreeMap<String, WireNodeAttr>) -> Rht {
     let mut rht = Rht::new();
     for (key, attr) in attrs {
-        rht.set(key, attr.value, attr.updated_at);
+        rht.set_internal(key, attr.value, attr.updated_at, attr.is_removed);
     }
     rht
 }
@@ -2346,6 +2354,72 @@ mod tests {
         vector.set("000000000000000000000001", 5);
         root.garbage_collect(&vector);
         assert!(events(&root).is_empty());
+        Ok(())
+    }
+
+    /// JS `should round-trip a tombstoned text attribute`
+    /// (snapshot_converter_test.ts, yorkie-js-sdk#1364): `toTextNodes` writes
+    /// a text attribute's `isRemoved` and `fromTextNode` restores it, so the
+    /// tombstone an undone style leaves stays a tombstone and a GC pair.
+    ///
+    /// The document is the one of the JS `removed_text_attr_snapshot_pack`
+    /// fixture (`tools/interop/text_undo_fixtures_test.ts`), and its Text
+    /// projects to the attribute JS wrote; `yorkie-protocol` checks that
+    /// this projection encodes to the fixture's bytes.
+    #[test]
+    fn roundtrips_a_tombstoned_text_attribute() -> Result<()> {
+        const A1: &str = "000000000000000000000001";
+        let mut doc = crate::Document::new("text-undo-interop");
+        doc.set_actor(A1);
+        doc.update(|root| root.set_text("t")?.edit(0, 0, "hello", None).map(|_| ()))?;
+        doc.update(|root| {
+            let bold = BTreeMap::from([("bold".to_owned(), serde_json::Value::from("true"))]);
+            root.get_text_mut("t")?.set_style(0, 5, bold)
+        })?;
+
+        // `bold` did not exist before, so the reverse removes it, leaving a
+        // tombstone rather than dropping it.
+        assert!(doc.history().can_undo());
+        doc.history_mut().undo()?;
+
+        let live_root = doc.crdt_root_for_test();
+        assert_eq!(r#"{"t":[{"val":"hello"}]}"#, live_root.to_sorted_json());
+        assert_eq!(1, doc.garbage_len());
+        let baseline = live_root.deepcopy();
+
+        let WireJsonElement::Object { nodes: members, .. } =
+            WireJsonElement::try_from(&live_root.root_element())?
+        else {
+            panic!("expected an object");
+        };
+        let WireJsonElement::Text { nodes, .. } = &members[0].element else {
+            panic!("expected a text");
+        };
+        assert_eq!(
+            vec![BTreeMap::from([(
+                "bold".to_owned(),
+                WireNodeAttr {
+                    value: "\"true\"".to_owned(),
+                    updated_at: TimeTicket::new(3, 1, A1),
+                    is_removed: true,
+                },
+            )])],
+            nodes
+                .iter()
+                .map(|node| node.attributes.clone())
+                .collect::<Vec<_>>()
+        );
+
+        let mut rebuilt = roundtrip_root_json_element(live_root)?;
+        assert_eq!(live_root.to_sorted_json(), rebuilt.to_sorted_json());
+        assert_eq!(doc.garbage_len(), rebuilt.get_garbage_len());
+        assert_eq!(doc.doc_size().gc, rebuilt.doc_size().gc);
+        assert_eq!(baseline.doc_size().live, rebuilt.doc_size().live);
+
+        let mut vector = VersionVector::new();
+        vector.set(A1, i64::MAX);
+        assert_eq!(1, rebuilt.garbage_collect(&vector));
+        assert_eq!(0, rebuilt.get_garbage_len());
         Ok(())
     }
 

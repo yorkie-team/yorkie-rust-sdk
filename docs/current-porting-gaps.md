@@ -632,11 +632,14 @@ Gap:
 - Rust `Rht::to_json` uses deterministic key ordering through `BTreeMap`.
   This matches Go marshaling and text's sorted attribute output, but JS
   `RHT.toJSON` itself follows `Map` insertion order.
-- Wire conversion now maps text and tree attribute `Rht` nodes to protobuf
-  `NodeAttr` payloads. Text attributes follow the JS/Go text-node converter
-  shape where removed attribute flags are not restored through `TextNode`
-  attributes; tree attributes preserve `is_removed` through full `RHT`
-  conversion.
+- Wire conversion maps text and tree attribute `Rht` nodes to protobuf
+  `NodeAttr` payloads and carries `is_removed` both ways, as JS
+  `toTextNodes`/`fromTextNode` (since yorkie-js-sdk#1364) and Go do. A
+  removed text attribute decodes as a tombstone through `set_internal`, so
+  it stays hidden and registers its GC pair after a snapshot, a Text value
+  payload, or a re-issue. JS keeps a removed attribute's value on the wire
+  and Rust follows it; Go clears that value in `RHT.Remove` and
+  `SetInternal`, so Go writes an empty `value` for the same tombstone.
 
 Expected direction:
 
