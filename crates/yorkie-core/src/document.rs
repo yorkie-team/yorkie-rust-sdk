@@ -1963,6 +1963,8 @@ mod text_undo_fuzz_tests;
 #[cfg(test)]
 mod text_undo_ledger_tests;
 #[cfg(test)]
+mod tree_restore_tests;
+#[cfg(test)]
 mod tree_undo_tests;
 #[cfg(test)]
 mod update_tests;
