@@ -3,7 +3,8 @@ use super::element::{CrdtElement, DataSize};
 use super::object::CrdtObject;
 use super::primitive::CrdtPrimitive;
 use super::rga_tree_list::RgaTreeListNode;
-use super::text::CrdtText;
+use super::rga_tree_split::RgaTreeSplitNode;
+use super::text::{CrdtText, TextValue};
 use super::tree::CrdtTree;
 use crate::{Result, TimeTicket, YorkieError, TIME_TICKET_SIZE};
 use std::collections::{BTreeMap, BTreeSet};
@@ -28,11 +29,22 @@ impl CrdtElementPair {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A registered GC pair. `child_size` and `removed_at` are what the pair was
+/// registered with. JS reads a Text node's current size and `removedAt` when
+/// it collects, and a Text node can change under its pair: a split leaves the
+/// original smaller, a later removal overwrites `removed_at`, an undo cancels
+/// it. So `collect` reads a Text node's current state from the text (see
+/// `TextGcChild`), and these two serve only the children whose state cannot
+/// change: removed attributes and the Array and Tree children.
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CrdtGcPair {
     child_id: String,
     child_size: DataSize,
     removed_at: TimeTicket,
+    /// The Text node as it was when its text was purged with an element.
+    /// JS keeps a reference to the detached node and keeps collecting it;
+    /// this is that node, frozen as nothing can change it any more.
+    detached: Option<Box<RgaTreeSplitNode<TextValue>>>,
 }
 
 impl CrdtGcPair {
@@ -41,6 +53,27 @@ impl CrdtGcPair {
             child_id,
             child_size,
             removed_at,
+            detached: None,
+        }
+    }
+}
+
+/// The state of a Text node under a GC pair as `collect` reads it, taken
+/// from the node when it collects (JS `pair.child.getRemovedAt()`,
+/// `getDataSize()` and `heldFromPurge`).
+#[derive(Debug, Clone)]
+struct TextGcChild {
+    removed_at: Option<TimeTicket>,
+    size: DataSize,
+    held: bool,
+}
+
+impl TextGcChild {
+    fn of(node: &RgaTreeSplitNode<TextValue>, vector: &crate::VersionVector) -> Self {
+        Self {
+            removed_at: node.removed_at().cloned(),
+            size: node.data_size(),
+            held: node.held_from_purge(vector),
         }
     }
 }
@@ -84,6 +117,11 @@ pub(crate) struct CrdtRoot {
     /// createdAt; Rust keys it by createdAt (see the porting gaps).
     size_in_gc: BTreeMap<String, DataSize>,
     doc_size: DocSize,
+    /// The Texts, by creation time, whose removal ledgers hold cancels that
+    /// `garbage_collect` may prune once every replica knows them (JS
+    /// `ledgerHolders`). JS holds the Text itself; Rust looks it up, so a
+    /// Text purged since is dropped on the next prune.
+    ledger_holders: BTreeSet<TimeTicket>,
 }
 
 impl CrdtRoot {
@@ -95,6 +133,7 @@ impl CrdtRoot {
             gc_pair_by_child_id: BTreeMap::new(),
             size_in_gc: BTreeMap::new(),
             doc_size: DocSize::default(),
+            ledger_holders: BTreeSet::new(),
         };
         let root_element = root.root_element();
         root.register_element_for_rebuild(&root_element, None, false);
@@ -256,6 +295,48 @@ impl CrdtRoot {
         let pair = CrdtGcPair::new(child_id.clone(), child_size, removed_at);
         add_data_size(&mut self.doc_size.gc, pair.child_size);
         self.gc_pair_by_child_id.insert(child_id, pair);
+    }
+
+    /// Unregisters the GC pair of the Text node `child_id`, revived by an
+    /// identity undo, so a later re-registration (a redo) is not read as the
+    /// toggle in `register_gc_pair_by_id` (JS `unregisterGCPair`).
+    /// `child_size` is the node's size now that its `removed_at` is cleared;
+    /// with the ticket the node was registered with, that is the size its
+    /// removal put in gc, and gc gives it back.
+    ///
+    /// JS also adds `child_size` back to live, mirroring `registerGCPair`,
+    /// which took it out of live. Rust registration leaves live alone -- a
+    /// text removal does not move its size out of live (see the porting
+    /// gaps) -- so live keeps the revived size already, and adding it again
+    /// would count it twice.
+    pub(crate) fn unregister_gc_pair_by_id(&mut self, child_id: &str, child_size: DataSize) {
+        if self.gc_pair_by_child_id.remove(child_id).is_none() {
+            return;
+        }
+
+        sub_data_size(&mut self.doc_size.gc, child_size);
+        self.doc_size.gc.meta = self.doc_size.gc.meta.saturating_sub(TIME_TICKET_SIZE);
+    }
+
+    /// Registers the Text `text_created_at`, whose removal ledgers may be
+    /// pruned (JS `registerLedgerHolder`).
+    pub(crate) fn register_ledger_holder(&mut self, text_created_at: &TimeTicket) {
+        self.ledger_holders.insert(text_created_at.clone());
+    }
+
+    /// Prunes every registered holder and drops the ones with nothing left
+    /// to prune (JS `pruneLedgers`). A removed holder is dropped too: an
+    /// undo that brings it back registers its copy again. So is one no
+    /// longer in the document.
+    fn prune_ledgers(&mut self, vector: &crate::VersionVector) {
+        for created_at in std::mem::take(&mut self.ledger_holders) {
+            let Some(text) = self.text_by_created_at_mut(&created_at) else {
+                continue;
+            };
+            if text.removed_at().is_none() && text.prune_ledgers(vector) > 0 {
+                self.ledger_holders.insert(created_at);
+            }
+        }
     }
 
     pub(crate) fn acc(&mut self, diff: DataSize) {
@@ -569,6 +650,11 @@ impl CrdtRoot {
     /// next vector that covers it.
     pub(crate) fn garbage_collect(&mut self, vector: &crate::VersionVector) -> usize {
         let mut count = 0;
+
+        // Pruning first can release a tombstone whose last pending cancel the
+        // vector now covers.
+        self.prune_ledgers(vector);
+
         loop {
             let (purged, deferred) = self.collect(vector);
             count += purged;
@@ -649,17 +735,53 @@ impl CrdtRoot {
                 continue;
             }
 
+            self.detach_text_gc_pairs(&element);
             count += self.deregister_element(&element);
             self.refresh_element_pair_and_ancestors(&parent_created_at);
         }
 
+        let text_children = self.text_gc_children(vector);
         let gc_pairs = self
             .gc_pair_by_child_id
             .values()
             .cloned()
             .collect::<Vec<_>>();
         for pair in gc_pairs {
-            if !vector.after_or_equal(&pair.removed_at) {
+            // A Text node is read as it is now, or as it was when its text
+            // went (see `CrdtGcPair`); any other child as it was registered.
+            let text_child = text_children.get(&pair.child_id).cloned().or_else(|| {
+                pair.detached
+                    .as_deref()
+                    .map(|node| TextGcChild::of(node, vector))
+            });
+            let (removed_at, size) = match &text_child {
+                Some(TextGcChild {
+                    removed_at: Some(removed_at),
+                    size,
+                    ..
+                }) => (removed_at.clone(), *size),
+                Some(TextGcChild {
+                    removed_at: None,
+                    size,
+                    ..
+                }) => {
+                    // The node was revived but its pair was not unregistered.
+                    // Reverse the gc accounting and drop the stale entry, so
+                    // the toggle in `register_gc_pair_by_id` cannot be
+                    // tripped later (JS `collect`).
+                    self.unregister_gc_pair_by_id(&pair.child_id, *size);
+                    continue;
+                }
+                None => (pair.removed_at.clone(), pair.child_size),
+            };
+            if !vector.after_or_equal(&removed_at) {
+                continue;
+            }
+
+            // A Text node whose removal ledger still matters stays. Unlike a
+            // barrier, holding it back frees nothing else, so it is not
+            // counted as deferred (JS `heldFromPurge`).
+            if text_child.as_ref().is_some_and(|child| child.held) {
                 continue;
             }
 
@@ -670,9 +792,7 @@ impl CrdtRoot {
             // nothing left to purge, so the pair is only dropped, with the
             // same accounting.
             let Some(site) = self.root_object.locate_gc_pair(&pair.child_id) else {
-                if let Some(pair) = self.gc_pair_by_child_id.remove(&pair.child_id) {
-                    sub_data_size(&mut self.doc_size.gc, pair.child_size);
-                }
+                self.drop_gc_pair(&pair.child_id, size);
                 count += 1;
                 continue;
             };
@@ -682,9 +802,7 @@ impl CrdtRoot {
             }
 
             if self.purge_gc_pair_by_child_id(&pair.child_id) {
-                if let Some(pair) = self.gc_pair_by_child_id.remove(&pair.child_id) {
-                    sub_data_size(&mut self.doc_size.gc, pair.child_size);
-                }
+                self.drop_gc_pair(&pair.child_id, size);
                 count += 1;
                 self.refresh_element_pair_and_ancestors(&site.container);
             }
@@ -1098,6 +1216,11 @@ impl CrdtRoot {
                 for (child_id, child_size, removed_at) in text.gc_pair_entries() {
                     self.register_gc_pair_by_id(child_id, child_size, removed_at);
                 }
+                // JS `registerInternalGCPairs`: a Text loaded with cancels in
+                // its ledgers is a holder from the start.
+                if text.has_cancelled_removals() {
+                    self.register_ledger_holder(text.created_at());
+                }
             }
             CrdtElement::Tree(tree) => {
                 for (child_id, child_size, removed_at) in tree.gc_pair_entries() {
@@ -1110,6 +1233,69 @@ impl CrdtRoot {
 
     fn purge_gc_pair_by_child_id(&mut self, child_id: &str) -> bool {
         self.root_object.purge_gc_pair_by_id(child_id)
+    }
+
+    /// Drops the pair of a collected child and takes `size`, the child's
+    /// size when it went, out of gc (JS `collect`).
+    fn drop_gc_pair(&mut self, child_id: &str, size: DataSize) {
+        if self.gc_pair_by_child_id.remove(child_id).is_some() {
+            sub_data_size(&mut self.doc_size.gc, size);
+        }
+    }
+
+    /// Reads the current state of every registered Text node in the
+    /// document, keyed by node ID, in one walk. Nothing a collection pass
+    /// does changes another node's state, so one read serves the pass.
+    fn text_gc_children(&self, vector: &crate::VersionVector) -> BTreeMap<String, TextGcChild> {
+        let mut children = BTreeMap::new();
+        if self.gc_pair_by_child_id.is_empty() {
+            return children;
+        }
+
+        let mut read = |text: &CrdtText| {
+            for node in text.nodes() {
+                let id = node.id_string();
+                if self.gc_pair_by_child_id.contains_key(&id) {
+                    children.insert(id, TextGcChild::of(node, vector));
+                }
+            }
+        };
+        for (_, element) in self.root_object.iter_all() {
+            visit_texts(element, &mut read);
+        }
+        children
+    }
+
+    /// Freezes the registered Text nodes under `element`, which is being
+    /// purged, into their pairs, so later passes still read them as JS reads
+    /// the detached nodes it keeps.
+    fn detach_text_gc_pairs(&mut self, element: &CrdtElement) {
+        let pairs = &mut self.gc_pair_by_child_id;
+        visit_texts(element, &mut |text: &CrdtText| {
+            for node in text.nodes() {
+                if let Some(pair) = pairs.get_mut(&node.id_string()) {
+                    pair.detached = Some(Box::new(node.clone()));
+                }
+            }
+        });
+    }
+}
+
+/// Calls `f` on every Text at or under `element`, removed ones included.
+fn visit_texts(element: &CrdtElement, f: &mut impl FnMut(&CrdtText)) {
+    match element {
+        CrdtElement::Object(object) => {
+            for (_, child) in object.iter_all() {
+                visit_texts(child, f);
+            }
+        }
+        CrdtElement::Array(array) => {
+            for child in array.iter_all() {
+                visit_texts(child, f);
+            }
+        }
+        CrdtElement::Text(text) => f(text),
+        CrdtElement::Primitive(_) | CrdtElement::Counter(_) | CrdtElement::Tree(_) => {}
     }
 }
 
