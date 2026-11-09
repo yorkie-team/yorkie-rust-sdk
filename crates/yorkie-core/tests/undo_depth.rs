@@ -8,6 +8,15 @@
 //! `Infinity`. Rust takes `Option<usize>`, so only `0` is representable; the
 //! other four cannot be written.
 
+// The tests build `DocumentOptions` the way callers do, with
+// `..Default::default()`. While `max_undo_depth` is its only field, that
+// update is needless; this expectation fails once a second field (Task 2's
+// `disable_gc`) lands, and should then be removed.
+#![expect(
+    clippy::needless_update,
+    reason = "DocumentOptions has one field until disable_gc is added"
+)]
+
 use yorkie_core::{Document, DocumentOptions, JsonValue, Result, YorkieError};
 
 /// JS `MaxUndoRedoStackDepth`.
@@ -16,8 +25,10 @@ const DEFAULT_DEPTH: usize = 50;
 /// JS `typed` (29-40): types `count` characters, one `update` each, after an
 /// initial Text whose creation `clear_history` takes off the undo stack.
 fn typed(count: usize, max_undo_depth: Option<usize>) -> Result<Document> {
-    let mut options = DocumentOptions::default();
-    options.max_undo_depth = max_undo_depth;
+    let options = DocumentOptions {
+        max_undo_depth,
+        ..Default::default()
+    };
     let mut doc = Document::with_options("undo-depth", options)?;
     doc.update(|root| root.set_text("t").map(|_| ()))?;
     doc.clear_history();
@@ -102,8 +113,10 @@ fn bounds_the_redo_stack_by_the_same_depth_not_the_default_one() -> Result<()> {
 /// value).
 #[test]
 fn rejects_a_max_undo_depth_of_0() {
-    let mut options = DocumentOptions::default();
-    options.max_undo_depth = Some(0);
+    let options = DocumentOptions {
+        max_undo_depth: Some(0),
+        ..Default::default()
+    };
 
     let err = Document::with_options("undo-depth", options).unwrap_err();
     assert_eq!(
