@@ -1154,16 +1154,19 @@ impl CrdtTree {
                 }
 
                 // A removed node is not part of the rendered document.
+                // JS `styleChangeRange` reports nothing for a node it cannot
+                // place; the style itself still applies.
                 if !affected_attrs.is_empty() && !node.is_removed() {
-                    let (from_path, to_path) = self.style_change_paths(&path)?;
-                    changes.push(TreeStyleChange {
-                        from,
-                        to,
-                        from_path,
-                        to_path,
-                        attributes: affected_attrs,
-                        attributes_to_remove: Vec::new(),
-                    });
+                    if let Ok((from_path, to_path)) = self.style_change_paths(&path) {
+                        changes.push(TreeStyleChange {
+                            from,
+                            to,
+                            from_path,
+                            to_path,
+                            attributes: affected_attrs,
+                            attributes_to_remove: Vec::new(),
+                        });
+                    }
                 }
             }
         }
@@ -1254,15 +1257,16 @@ impl CrdtTree {
                 // attribute store records a tombstone even for a key it did
                 // not hold, so such a removal still reports one, as in JS.
                 if removed_any && !node.is_removed() {
-                    let (from_path, to_path) = self.style_change_paths(&path)?;
-                    changes.push(TreeStyleChange {
-                        from,
-                        to,
-                        from_path,
-                        to_path,
-                        attributes: BTreeMap::new(),
-                        attributes_to_remove: attributes_to_remove.to_vec(),
-                    });
+                    if let Ok((from_path, to_path)) = self.style_change_paths(&path) {
+                        changes.push(TreeStyleChange {
+                            from,
+                            to,
+                            from_path,
+                            to_path,
+                            attributes: BTreeMap::new(),
+                            attributes_to_remove: attributes_to_remove.to_vec(),
+                        });
+                    }
                 }
             }
         }
@@ -1347,8 +1351,12 @@ impl CrdtTree {
         let from_idx = self.to_index(&from_parent, &from_left)?;
         let to_idx = self.to_index(&to_parent, &to_left)?;
         // JS reports the path of the position, not of the index: they differ
-        // right after an element in a parent that is not text-only.
-        let from_path = self.to_path(&from_parent, &from_left)?;
+        // right after an element in a parent that is not text-only. The path
+        // only feeds the change event, so a position the visible path cannot
+        // name falls back to the index's path instead of failing the edit.
+        let from_path = self
+            .to_path(&from_parent, &from_left)
+            .or_else(|_| self.index_to_path(from_idx))?;
 
         // Range narrowing: when a concurrent split put the two ends in
         // different parents, start the traversal at the split sibling of
@@ -1866,18 +1874,24 @@ impl CrdtTree {
                 continue;
             }
             let (to_parent, to_left) = token_position_after(token);
-            let to_path = self.to_path_at(&to_parent, &to_left)?;
+            // Event paths only: fall back to the index's path as in `edit`.
+            let to_path = self
+                .to_path_at(&to_parent, &to_left)
+                .or_else(|_| self.index_to_path(to))?;
             // A run that starts where the previous one ended continues it.
             if let Some(last) = changes.last_mut().filter(|last| last.to == from) {
                 last.to = to;
                 last.to_path = to_path;
                 continue;
             }
-            let (from_parent, from_left) = self.position_before_token(first)?;
+            let from_path = self
+                .position_before_token(first)
+                .and_then(|(parent, left)| self.to_path_at(&parent, &left))
+                .or_else(|_| self.index_to_path(from))?;
             changes.push(TreeEditChange {
                 from,
                 to,
-                from_path: self.to_path_at(&from_parent, &from_left)?,
+                from_path,
                 to_path,
                 value: None,
             });
