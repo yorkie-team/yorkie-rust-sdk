@@ -98,3 +98,18 @@ impl<'a> IntoIterator for &'a VersionVector {
         Box::new(self.iter())
     }
 }
+
+/// Tells whether `ticket` is causally known to an editor whose version
+/// vector is `vector`: the vector covers the ticket's lamport for the same
+/// actor (JS `ticketKnown`). An absent or empty vector is a local change, the
+/// same way the server reads `len(vv) == 0`, and knows every ticket; an actor
+/// missing from a non-empty vector is unknown even at lamport 0.
+pub(crate) fn ticket_known(vector: Option<&VersionVector>, ticket: &TimeTicket) -> bool {
+    let Some(vector) = vector.filter(|vector| !vector.is_empty()) else {
+        return true;
+    };
+
+    vector
+        .get(ticket.actor_id().as_str())
+        .is_some_and(|lamport| lamport >= ticket.lamport())
+}

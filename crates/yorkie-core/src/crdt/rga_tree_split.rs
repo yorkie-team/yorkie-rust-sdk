@@ -1,9 +1,10 @@
 use super::element::DataSize;
 use super::splay::{NodeId as SplayNodeId, SplayTree, SplayValue};
+use crate::time::{ticket_known, ActorId};
 use crate::{Result, TimeTicket, VersionVector, YorkieError, TIME_TICKET_SIZE};
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SplitIndexValue {
@@ -129,9 +130,105 @@ pub(crate) struct ValueChange<V> {
     pub(crate) value: Option<V>,
 }
 
+/// A run of characters from a single original insertion: the absolute-offset
+/// interval `[start, end)` of the insertion created at `created_at` (JS
+/// `RestoreSpan`). `value` is a deep copy of the removed content, carried so
+/// that purged nodes can be recreated.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RestoreSpan<V> {
+    pub(crate) created_at: TimeTicket,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) value: V,
+}
+
+/// An undo that cancelled one deletion of a node (JS `LedgerCancel`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LedgerCancel {
+    pub(crate) deletion: TimeTicket,
+    pub(crate) cancelled_at: TimeTicket,
+}
+
+/// One deletion of a removal ledger beside the cancel that covers it, if an
+/// undo cancelled it (JS `LedgerEntry`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LedgerEntry {
+    removal: TimeTicket,
+    cancelled_at: Option<TimeTicket>,
+}
+
+/// The reading of a removal ledger every walk of it needs (JS `LedgerIndex`):
+/// each deletion with its cancel, those entries by deletion, the deletions no
+/// cancel covers, and the cancels by the deletion each one cancels -- which
+/// covers the cancel of a deletion the ledger itself does not hold.
+///
+/// JS keeps this reading per node because rebuilding it on every walk makes
+/// churning a ledger quadratic. Here it is kept eagerly and is always exactly
+/// `LedgerIndex::build(dels, cancels)`, so two equal ledgers compare equal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LedgerIndex {
+    entries: Vec<LedgerEntry>,
+    by_key: BTreeMap<TimeTicket, usize>,
+    live: Vec<TimeTicket>,
+    cancelled: BTreeMap<TimeTicket, TimeTicket>,
+}
+
+impl LedgerIndex {
+    fn build(dels: &[TimeTicket], cancels: &[LedgerCancel]) -> Self {
+        let mut index = Self::default();
+        for cancel in cancels {
+            index
+                .cancelled
+                .insert(cancel.deletion.clone(), cancel.cancelled_at.clone());
+        }
+        for deletion in dels {
+            index.push_removal(deletion.clone());
+        }
+        index
+    }
+
+    /// Indexes one more deletion, with the cancel already indexed for it.
+    fn push_removal(&mut self, removal: TimeTicket) {
+        if self.by_key.contains_key(&removal) {
+            return;
+        }
+        let cancelled_at = self.cancelled.get(&removal).cloned();
+        if cancelled_at.is_none() {
+            self.live.push(removal.clone());
+        }
+        self.by_key.insert(removal.clone(), self.entries.len());
+        self.entries.push(LedgerEntry {
+            removal,
+            cancelled_at,
+        });
+    }
+}
+
+/// The removal ledger of a node (JS `dels` and `cancels`): the deletions
+/// that removed it while it was live in the deleter's view, and the
+/// deletions undo cancelled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemovalLedger {
+    dels: Vec<TimeTicket>,
+    cancels: Vec<LedgerCancel>,
+    index: LedgerIndex,
+}
+
+impl RemovalLedger {
+    fn new(dels: Vec<TimeTicket>, cancels: Vec<LedgerCancel>) -> Self {
+        let index = LedgerIndex::build(&dels, &cancels);
+        Self {
+            dels,
+            cancels,
+            index,
+        }
+    }
+}
+
 /// Result of `RgaTreeSplit::delete_nodes`: the value changes and the nodes
-/// it tombstoned.
-type DeleteResult<V> = (Vec<ValueChange<V>>, Vec<RgaTreeSplitNode<V>>);
+/// it removed, each with whether it was already removed before (a
+/// concurrent removal it overwrote by LWW).
+type DeleteResult<V> = (Vec<ValueChange<V>>, Vec<(RgaTreeSplitNode<V>, bool)>);
 
 /// Result of `RgaTreeSplit::edit`.
 #[derive(Debug, Clone)]
@@ -141,12 +238,17 @@ where
 {
     /// Where the caret sits after the edit.
     pub(crate) caret_pos: RgaTreeSplitPos,
-    /// Nodes this edit tombstoned.
+    /// Nodes this edit took from live to removed, each needing a GC pair. A
+    /// node whose `removed_at` it overwrote keeps the pair it already has.
     pub(crate) removed_nodes: Vec<RgaTreeSplitNode<V>>,
     pub(crate) diff: DataSize,
     /// One change per affected range, in the order JS reports them.
     pub(crate) changes: Vec<ValueChange<V>>,
+    /// The values of every node this edit removed, in document order.
     pub(crate) removed_values: Vec<V>,
+    /// One span per node this edit removed, in document order (JS
+    /// `removedSpans`).
+    pub(crate) removed_spans: Vec<RestoreSpan<V>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -156,7 +258,10 @@ where
 {
     id: RgaTreeSplitNodeId,
     value: V,
+    /// The latest uncancelled deletion.
     removed_at: Option<TimeTicket>,
+    /// The removal ledger; `None` means the ledger is just `removed_at`.
+    ledger: Option<Box<RemovalLedger>>,
     ins_prev_id: Option<RgaTreeSplitNodeId>,
     ins_next_id: Option<RgaTreeSplitNodeId>,
 }
@@ -170,6 +275,7 @@ where
             id,
             value,
             removed_at: None,
+            ledger: None,
             ins_prev_id: None,
             ins_next_id: None,
         }
@@ -207,8 +313,11 @@ where
         self.ins_next_id.as_ref()
     }
 
+    /// Sets the remove time of this node and drops the ledger (JS
+    /// `setRemovedAt`).
     pub(crate) fn set_removed_at(&mut self, removed_at: Option<TimeTicket>) {
         self.removed_at = removed_at;
+        self.ledger = None;
     }
 
     pub(crate) fn set_ins_prev_id(&mut self, id: Option<RgaTreeSplitNodeId>) {
@@ -271,38 +380,292 @@ where
         )
     }
 
+    /// Creates the split node of the given offset; it carries this node's
+    /// `removed_at` and a copy of its ledger (JS `split`, `copyLedger`).
     fn split(&mut self, offset: usize) -> Self {
         let mut node = Self::new(self.id.split(offset), self.value.split(offset));
         node.removed_at = self.removed_at.clone();
+        node.ledger = self.ledger.clone();
         node
     }
 
-    fn remove(
-        &mut self,
-        removed_at: TimeTicket,
+    /// Returns the removal ledger: whether there is one, the deletions and
+    /// the cancels (JS `getLedger`).
+    pub(crate) fn ledger(&self) -> (bool, &[TimeTicket], &[LedgerCancel]) {
+        match &self.ledger {
+            Some(ledger) => (true, &ledger.dels, &ledger.cancels),
+            None => (false, &[], &[]),
+        }
+    }
+
+    /// Tells whether the ledger holds a cancel, the only thing
+    /// `prune_stable` can drop (JS `hasCancels`).
+    pub(crate) fn has_cancels(&self) -> bool {
+        self.ledger
+            .as_ref()
+            .is_some_and(|ledger| !ledger.cancels.is_empty())
+    }
+
+    /// The deletions no cancel covers. A node without a ledger was removed by
+    /// `removed_at` alone, if at all (JS `ledgerIndex().live`, `removals`).
+    fn live_removals(&self) -> &[TimeTicket] {
+        match &self.ledger {
+            Some(ledger) => &ledger.index.live,
+            None => self.removed_at.as_slice(),
+        }
+    }
+
+    /// Builds the ledger from `removed_at` if there is none yet (JS
+    /// `ledger`).
+    fn ensure_ledger(&mut self) -> &mut RemovalLedger {
+        let removed_at = &self.removed_at;
+        self.ledger.get_or_insert_with(|| {
+            Box::new(RemovalLedger::new(
+                removed_at.iter().cloned().collect(),
+                Vec::new(),
+            ))
+        })
+    }
+
+    /// Sets `removed_at` to the latest uncancelled deletion (JS `recompute`).
+    fn recompute(&mut self) {
+        let mut latest: Option<&TimeTicket> = None;
+        for deletion in self.live_removals() {
+            if latest.is_none_or(|latest| deletion.after(latest)) {
+                latest = Some(deletion);
+            }
+        }
+        self.removed_at = latest.cloned();
+    }
+
+    /// Adds a deletion to the ledger (JS `recordRemoval`). A node's first
+    /// removal is just `removed_at`; the ledger is built only when a second
+    /// removal or a cancel needs it.
+    pub(crate) fn record_removal(&mut self, removed_at: TimeTicket) {
+        if self.ledger.is_none() && self.removed_at.is_none() {
+            self.removed_at = Some(removed_at);
+            return;
+        }
+
+        let ledger = self.ensure_ledger();
+        // An actor removes a piece only while it is live in its view, so it
+        // never holds two uncancelled removals; a change whose vector leaves
+        // out its own earlier removal is not honest, and recording it would
+        // break the pairing `removal_events` relies on and grow the ledger.
+        let mine = ledger
+            .index
+            .live
+            .iter()
+            .find(|deletion| deletion.actor_id() == removed_at.actor_id())
+            .cloned();
+        match mine {
+            Some(mine) if mine != removed_at => return,
+            Some(_) => {}
+            None => {
+                if !ledger.index.by_key.contains_key(&removed_at) {
+                    ledger.dels.push(removed_at.clone());
+                    ledger.index.push_removal(removed_at);
+                }
+            }
+        }
+        self.recompute();
+    }
+
+    /// Cancels one deletion (an undo of it). Returns whether the node is live
+    /// afterwards (JS `cancelRemoval`).
+    pub(crate) fn cancel_removal(&mut self, deletion: &TimeTicket, at: TimeTicket) -> bool {
+        let ledger = self.ensure_ledger();
+        if !ledger.index.cancelled.contains_key(deletion) {
+            ledger.cancels.push(LedgerCancel {
+                deletion: deletion.clone(),
+                cancelled_at: at.clone(),
+            });
+            ledger.index.cancelled.insert(deletion.clone(), at.clone());
+            if let Some(&entry) = ledger.index.by_key.get(deletion) {
+                ledger.index.entries[entry].cancelled_at = Some(at);
+                if let Some(live) = ledger.index.live.iter().position(|d| d == deletion) {
+                    ledger.index.live.remove(live);
+                }
+            }
+        }
+        self.recompute();
+        self.removed_at.is_none()
+    }
+
+    /// Drops each removal whose cancel is known to every replica, with that
+    /// cancel (JS `pruneStable`). A change that arrives later knows both, so
+    /// the pair never decides `is_removed_in_view` again, and dropping it
+    /// keeps an undo-heavy text from carrying every removal it ever had. A
+    /// removal is older than its cancel by the same actor, so the cancel
+    /// being known is enough. What is left is the default ledger once
+    /// `removed_at` alone says it.
+    pub(crate) fn prune_stable(&mut self, vector: &VersionVector) {
+        let Some(ledger) = self.ledger.as_mut() else {
+            return;
+        };
+
+        let mut cancels = Vec::new();
+        let mut dropped = BTreeSet::new();
+        for cancel in std::mem::take(&mut ledger.cancels) {
+            if !vector.after_or_equal(&cancel.cancelled_at) {
+                cancels.push(cancel);
+                continue;
+            }
+            dropped.insert(cancel.deletion);
+        }
+        let mut dels = std::mem::take(&mut ledger.dels);
+        if !dropped.is_empty() {
+            dels.retain(|deletion| !dropped.contains(deletion));
+        }
+
+        if cancels.is_empty()
+            && (dels.is_empty() || (dels.len() == 1 && self.removed_at.as_ref() == Some(&dels[0])))
+        {
+            self.ledger = None;
+            return;
+        }
+        **ledger = RemovalLedger::new(dels, cancels);
+    }
+
+    /// Returns the removal by `actor` no undo cancelled, if any (JS
+    /// `uncancelledRemovalBy`).
+    pub(crate) fn uncancelled_removal_by(&self, actor: &ActorId) -> Option<&TimeTicket> {
+        self.live_removals()
+            .iter()
+            .find(|deletion| deletion.actor_id() == actor)
+    }
+
+    /// Tells whether GC must keep this tombstone under `vector`, the versions
+    /// every replica has seen (JS `heldFromPurge`). A node removed by two or
+    /// more deletions no undo cancelled stays: an undo of one of them must
+    /// find it still held by the others, and a purged node could not say so.
+    /// A node whose ledger is not yet stable stays too: every deletion and
+    /// every cancel in it must be known to all replicas, so any change that
+    /// arrives after the purge already knew them, and a node a restore
+    /// recreates with only the removal it cancels answers
+    /// `is_removed_in_view` as the full ledger would. Once that holds and a
+    /// single removal is left, a restore that finds the piece gone can only
+    /// be cancelling that removal, and recreates it.
+    pub(crate) fn held_from_purge(&self, vector: &VersionVector) -> bool {
+        let Some(ledger) = &self.ledger else {
+            return false;
+        };
+
+        // A cancelled deletion is older than its cancel by the same actor, so
+        // a stable cancel makes it stable too; an uncancelled one is
+        // `removed_at`, which GC checks first, or one of two that keep the
+        // node anyway.
+        if ledger
+            .cancels
+            .iter()
+            .any(|cancel| !vector.after_or_equal(&cancel.cancelled_at))
+        {
+            return true;
+        }
+        ledger.index.live.len() >= 2
+    }
+
+    /// Tells whether the node was removed in the view of `vector`: a deletion
+    /// it knew that no undo it knew cancelled (JS `isRemovedInView`).
+    pub(crate) fn is_removed_in_view(&self, vector: &VersionVector) -> bool {
+        let known = |ticket: &TimeTicket| ticket_known(Some(vector), ticket);
+        match &self.ledger {
+            Some(ledger) => ledger.index.entries.iter().any(|entry| {
+                known(&entry.removal) && !entry.cancelled_at.as_ref().is_some_and(known)
+            }),
+            None => self.removed_at.as_ref().is_some_and(known),
+        }
+    }
+
+    /// Returns the ledger as one list: every removal and every cancel's
+    /// ticket except `removed_at`, in ticket order (JS `getRemovalEvents`).
+    /// Empty when `removed_at` says it all. An actor's events alternate in
+    /// ticket order -- it removes a piece only while the piece is live in its
+    /// view, and its undo cancels its one uncancelled removal -- so
+    /// `set_removal_events` can tell them apart by place.
+    pub(crate) fn removal_events(&self) -> Vec<TimeTicket> {
+        let Some(ledger) = &self.ledger else {
+            return Vec::new();
+        };
+
+        let mut events = ledger
+            .dels
+            .iter()
+            .filter(|deletion| self.removed_at.as_ref() != Some(*deletion))
+            .chain(ledger.cancels.iter().map(|cancel| &cancel.cancelled_at))
+            .cloned()
+            .collect::<Vec<_>>();
+        events.sort();
+        events
+    }
+
+    /// Rebuilds the ledger from `removed_at` and the events `removal_events`
+    /// returned: per actor, in ticket order, a removal then the cancel of it
+    /// (JS `setRemovalEvents`). It fails on a repeated ticket, which would
+    /// pair a cancel with a removal that is not older, and when the result
+    /// does not reproduce `removed_at`, and leaves the node as it was.
+    pub(crate) fn set_removal_events(&mut self, events: Vec<TimeTicket>) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let removed_at = self.removed_at.clone();
+        let mut all = events;
+        all.extend(removed_at.iter().cloned());
+        all.sort();
+        if all.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(YorkieError::InvalidArgument(
+                "removal events repeat a ticket".to_owned(),
+            ));
+        }
+
+        let mut dels = Vec::new();
+        let mut cancels = Vec::new();
+        let mut open: BTreeMap<ActorId, TimeTicket> = BTreeMap::new();
+        for ticket in all {
+            if let Some(deletion) = open.remove(ticket.actor_id()) {
+                cancels.push(LedgerCancel {
+                    deletion,
+                    cancelled_at: ticket,
+                });
+                continue;
+            }
+            dels.push(ticket.clone());
+            open.insert(ticket.actor_id().clone(), ticket);
+        }
+
+        self.ledger = Some(Box::new(RemovalLedger::new(dels, cancels)));
+        self.recompute();
+        if self.removed_at != removed_at {
+            self.removed_at = removed_at;
+            self.ledger = None;
+            return Err(YorkieError::InvalidArgument(
+                "removal events do not reproduce removed_at".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Checks if this node can be removed by a deletion at `edited_at` (JS
+    /// `canRemove`).
+    pub(crate) fn can_remove(
+        &self,
+        edited_at: &TimeTicket,
         creation_known: bool,
         tombstone_known: bool,
     ) -> bool {
+        // Skip if the node's creation was not visible to this operation.
         if !creation_known {
             return false;
         }
 
-        if self.removed_at.is_none() {
-            self.removed_at = Some(removed_at);
+        let Some(removed_at) = &self.removed_at else {
             return true;
-        }
+        };
 
-        if !tombstone_known
-            && removed_at.after(
-                self.removed_at
-                    .as_ref()
-                    .expect("removed_at is checked above"),
-            )
-        {
-            self.removed_at = Some(removed_at);
-        }
-
-        false
+        // Overwrite only if the prior tombstone was not known (concurrent or
+        // unseen) and newer. This enables LWW for concurrent deletions.
+        !tombstone_known && edited_at.after(removed_at)
     }
 }
 
@@ -479,17 +842,34 @@ where
             );
         }
 
-        let removed_values = removed_nodes
-            .iter()
-            .map(|node| node.value().clone())
-            .collect::<Vec<_>>();
+        // 04. Report the removed nodes. A node that was already removed keeps
+        // its GC pair, but its value and span are reported all the same.
+        let mut newly_removed = Vec::new();
+        let mut removed_values = Vec::new();
+        let mut removed_spans = Vec::new();
+        for (node, already_removed) in removed_nodes {
+            removed_values.push(node.value().clone());
+            // The span names the piece by its insertion, so later splits of
+            // the tombstone do not change what it covers; the value is a deep
+            // copy for the same reason.
+            removed_spans.push(RestoreSpan {
+                created_at: node.created_at().clone(),
+                start: node.id().offset(),
+                end: node.id().offset() + node.content_len(),
+                value: node.value().clone(),
+            });
+            if !already_removed {
+                newly_removed.push(node);
+            }
+        }
 
         Ok(SplitEditResult {
             caret_pos,
-            removed_nodes,
+            removed_nodes: newly_removed,
             diff,
             changes,
             removed_values,
+            removed_spans,
         })
     }
 
@@ -805,9 +1185,10 @@ where
         insert_index
     }
 
-    /// Tombstones the removable `candidates` and returns the value changes
-    /// (JS `deleteNodes`). The changes are computed from the indexes before
-    /// the deletion, one per run of removed nodes between the kept ones.
+    /// Removes the removable `candidates` and returns the value changes and
+    /// the removed nodes (JS `deleteNodes`). The changes are computed from
+    /// the indexes before the deletion, one per run of removed nodes between
+    /// the kept ones.
     fn delete_nodes(
         &mut self,
         candidates: Vec<usize>,
@@ -818,13 +1199,7 @@ where
             return Ok((Vec::new(), Vec::new()));
         };
 
-        let is_local = vector.map(VersionVector::is_empty).unwrap_or(true);
-        let known = |ticket: &TimeTicket| {
-            is_local
-                || vector
-                    .and_then(|vector| vector.get(ticket.actor_id().as_str()))
-                    .is_some_and(|lamport| lamport >= ticket.lamport())
-        };
+        let is_local = vector.is_none_or(VersionVector::is_empty);
 
         // 01. Split the candidates into the nodes to remove and the nodes to
         // keep. The edges outside the candidates are kept; `None` on the
@@ -832,12 +1207,30 @@ where
         let mut nodes_to_remove = Vec::new();
         let mut nodes_to_keep = vec![Some(first - 1)];
         for index in candidates {
-            let node = &self.nodes[index];
-            let creation_known = known(node.created_at());
-            let tombstone_known = node.removed_at().is_some_and(known);
-            nodes_to_remove.push((index, creation_known, tombstone_known));
-            // `RgaTreeSplitNode::remove` tombstones exactly these nodes.
-            if !(creation_known && !node.is_removed()) {
+            let node = &mut self.nodes[index];
+            let creation_known = ticket_known(vector, node.created_at());
+            let tombstone_known = node
+                .removed_at()
+                .is_some_and(|removed_at| ticket_known(vector, removed_at));
+
+            // Once a tombstone can be cancelled by an undo, "the deleter knew
+            // the node" is not enough -- the node has to have been LIVE in the
+            // deleter's view. A node the deleter saw removed and an undo
+            // revived here has to survive the deletion on every replica.
+            let live_in_view = match vector {
+                Some(vector) if !is_local => creation_known && !node.is_removed_in_view(vector),
+                _ => !node.is_removed(),
+            };
+            if live_in_view && node.can_remove(&edited_at, creation_known, tombstone_known) {
+                nodes_to_remove.push(index);
+            } else {
+                // A node this deletion saw live but someone else removed
+                // concurrently records the deletion all the same. Otherwise an
+                // undo of the other deletion revives it on replicas that
+                // applied the two in one order and not in the other.
+                if !is_local && live_in_view && node.is_removed() {
+                    node.record_removal(edited_at.clone());
+                }
                 nodes_to_keep.push(Some(index));
             }
         }
@@ -846,12 +1239,16 @@ where
         // 02. Make the value changes with the indexes before the deletion.
         let changes = self.make_changes(&nodes_to_keep)?;
 
-        // 03. Mark the tombstones.
+        // 03. Record the removals. Nodes that were already removed (a
+        // concurrent LWW overwrite of an existing tombstone) are marked: they
+        // already have a registered GC pair, and registering a second one
+        // would toggle the first off.
         let mut removed_nodes = Vec::new();
-        for (index, creation_known, tombstone_known) in nodes_to_remove {
-            if self.nodes[index].remove(edited_at.clone(), creation_known, tombstone_known) {
-                removed_nodes.push(self.nodes[index].clone());
-            }
+        for index in nodes_to_remove {
+            let node = &mut self.nodes[index];
+            let already_removed = node.is_removed();
+            node.record_removal(edited_at.clone());
+            removed_nodes.push((node.clone(), already_removed));
         }
 
         self.rebuild_indexes();
