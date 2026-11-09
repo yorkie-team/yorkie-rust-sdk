@@ -1554,9 +1554,15 @@ fn crdt_element_to_json_value(element: &CrdtElement) -> Result<JsonValue> {
 }
 
 #[cfg(test)]
+mod adv_sync;
+#[cfg(test)]
 mod gc_tests;
 #[cfg(test)]
 mod split_link_tests;
+#[cfg(test)]
+mod text_undo_fuzz_tests;
+#[cfg(test)]
+mod text_undo_ledger_tests;
 #[cfg(test)]
 mod update_tests;
 

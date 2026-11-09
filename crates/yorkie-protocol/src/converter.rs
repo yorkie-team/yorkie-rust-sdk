@@ -1449,7 +1449,8 @@ mod tests {
         WireTreeNode, WireTreeNodeId, WireTreePos, WireValueType,
     };
     use yorkie_core::{
-        Checkpoint, Document, SchemaRule, TimeTicket, TreeNodeRule, VersionVector, YorkieError,
+        Checkpoint, Document, JsonValue, SchemaRule, TimeTicket, TreeNodeRule, VersionVector,
+        YorkieError,
     };
 
     #[test]
@@ -3150,5 +3151,194 @@ mod tests {
     fn operation_through_bytes(operation: &WireOperation) -> super::Result<WireOperation> {
         let bytes = wire_operation_to_proto(operation)?.encode_to_vec();
         proto_operation_to_wire(&api::Operation::decode(bytes.as_slice())?)
+    }
+
+    // --- Text undo ledger replays over protobuf bytes ---
+    //
+    // JS `text_undo_removal_ledger_test.ts` passes every change pack through
+    // protobuf; `yorkie-core` replays it over the wire projection only. These
+    // replay its key cases over the bytes.
+
+    /// JS `send`: delivers `from`'s pending changes to each of `to` as
+    /// change pack bytes, without acking them at `from`.
+    fn send_bytes(from: &Document, to: &mut [&mut Document]) -> Result<(), Box<dyn Error>> {
+        let mut proto = to_change_pack(&from.create_change_pack())?;
+        proto.checkpoint = Some(api::Checkpoint {
+            server_seq: 0,
+            client_seq: 0,
+        });
+        proto.version_vector = Some(to_version_vector(&VersionVector::new())?);
+        let bytes = proto.encode_to_vec();
+        for doc in to {
+            doc.apply_change_pack(&decode_change_pack(&bytes)?)?;
+        }
+        Ok(())
+    }
+
+    /// JS `ack`: drops the changes `doc` has already sent.
+    fn ack_bytes(doc: &mut Document) -> Result<(), Box<dyn Error>> {
+        let sent = to_change_pack(&doc.create_change_pack())?;
+        let last_seq = sent
+            .changes
+            .last()
+            .and_then(|change| change.id.as_ref())
+            .map_or(0, |id| id.client_seq);
+        let proto = api::ChangePack {
+            document_key: doc.key().to_owned(),
+            checkpoint: Some(api::Checkpoint {
+                server_seq: 0,
+                client_seq: last_seq,
+            }),
+            version_vector: Some(to_version_vector(&VersionVector::new())?),
+            ..Default::default()
+        };
+        doc.apply_change_pack(&decode_change_pack(&proto.encode_to_vec())?)?;
+        Ok(())
+    }
+
+    fn exchange_bytes(a: &mut Document, b: &mut Document) -> Result<(), Box<dyn Error>> {
+        send_bytes(a, &mut [b])?;
+        send_bytes(b, &mut [a])?;
+        ack_bytes(a)?;
+        ack_bytes(b)
+    }
+
+    fn ledger_replicas(content: &str) -> Result<(Document, Document), Box<dyn Error>> {
+        let mut a = Document::new("ledger");
+        let mut b = Document::new("ledger");
+        a.set_actor(A1);
+        b.set_actor(A2);
+        a.update(|root| root.set_text("t")?.edit(0, 0, content, None).map(|_| ()))?;
+        exchange_bytes(&mut a, &mut b)?;
+        Ok((a, b))
+    }
+
+    fn delete_text(doc: &mut Document, from: usize, to: usize) -> yorkie_core::Result<()> {
+        doc.update(|root| root.get_text_mut("t")?.edit(from, to, "", None).map(|_| ()))
+    }
+
+    fn text_of(doc: &Document) -> String {
+        match doc.get_root().get("t") {
+            Some(JsonValue::Text(text)) => text.to_string(),
+            other => panic!("expected a text at t, got {other:?}"),
+        }
+    }
+
+    /// JS `does not remove text a concurrent undo revives (yorkie#2237)`,
+    /// every change as protobuf bytes.
+    #[test]
+    fn replays_yorkie_2237_over_proto_bytes() -> Result<(), Box<dyn Error>> {
+        let (mut d1, mut d2) = ledger_replicas("efgh")?;
+        delete_text(&mut d2, 1, 2)?;
+        exchange_bytes(&mut d1, &mut d2)?;
+        assert_eq!("egh", text_of(&d1));
+
+        // d1 deletes `g` while d2 undoes its deletion of `f`.
+        delete_text(&mut d1, 1, 2)?;
+        d2.history_mut().undo()?;
+        exchange_bytes(&mut d1, &mut d2)?;
+
+        // d1 saw `f` removed, so its deletion leaves the revived `f` alone.
+        assert_eq!("efh", text_of(&d1));
+        assert_eq!("efh", text_of(&d2));
+        assert_eq!(d1.to_sorted_json(), d2.to_sorted_json());
+        Ok(())
+    }
+
+    /// JS `keeps the ledger through a snapshot`, every change and the
+    /// snapshot as protobuf bytes.
+    ///
+    /// The protocol crate cannot read a document's root, so the snapshot of
+    /// `b` is written out here: `abcdefgh` inserted by A1 at 1, `d` removed
+    /// by A2 at 3 and by A1 at 2 (its `removal_events`, as `removed_at` is
+    /// the later A2 removal), `efgh` removed by A1 at 2. The control run
+    /// drops `removal_events` from the bytes: `c` then forgets A1's part and
+    /// revives `d` on b's undo, so the ledger crossing the bytes is what
+    /// keeps the replicas together.
+    #[test]
+    fn replays_keeps_the_ledger_through_a_snapshot_over_proto_bytes() -> Result<(), Box<dyn Error>>
+    {
+        for with_ledger in [true, false] {
+            let (mut a, mut b) = ledger_replicas("abcdefgh")?;
+            delete_text(&mut b, 3, 4)?;
+            delete_text(&mut a, 3, 8)?;
+            send_bytes(&a, &mut [&mut b])?;
+
+            // c loads b's snapshot, where `d` is removed by both deletions;
+            // it must not forget a's part when b's undo arrives.
+            let mut snapshot_vector = VersionVector::new();
+            snapshot_vector.set(A1, 2);
+            snapshot_vector.set(A2, 4);
+            assert_eq!(&snapshot_vector, b.version_vector());
+            let root = ledger_snapshot_root(with_ledger);
+            let pack = api::ChangePack {
+                document_key: "ledger".to_owned(),
+                checkpoint: Some(api::Checkpoint {
+                    server_seq: 1,
+                    client_seq: 0,
+                }),
+                snapshot: snapshot_root_to_bytes(&root, &BTreeMap::new())?,
+                version_vector: Some(to_version_vector(&snapshot_vector)?),
+                ..Default::default()
+            };
+            let mut c = Document::new("ledger");
+            c.set_actor("000000000000000000000003");
+            c.apply_change_pack(&decode_change_pack(&pack.encode_to_vec())?)?;
+            assert_eq!(b.to_sorted_json(), c.to_sorted_json());
+
+            b.history_mut().undo()?;
+            send_bytes(&b, &mut [&mut a, &mut c])?;
+
+            assert_eq!("abc", text_of(&a));
+            assert_eq!("abc", text_of(&b));
+            let want = if with_ledger { "abc" } else { "abcd" };
+            assert_eq!(want, text_of(&c), "with ledger: {with_ledger}");
+        }
+        Ok(())
+    }
+
+    /// The root of `b` in
+    /// `replays_keeps_the_ledger_through_a_snapshot_over_proto_bytes`.
+    fn ledger_snapshot_root(with_ledger: bool) -> WireJsonElement {
+        let inserted = |offset| WireTextNodeId {
+            created_at: TimeTicket::new(1, 2, A1),
+            offset,
+        };
+        let a1_removal = TimeTicket::new(2, 1, A1);
+        let a2_removal = TimeTicket::new(3, 1, A2);
+        let d_events = if with_ledger {
+            vec![a1_removal.clone()]
+        } else {
+            Vec::new()
+        };
+        let text_at = TimeTicket::new(1, 1, A1);
+        let node = |offset, value: &str, removed_at, ins_prev: Option<usize>, removal_events| {
+            WireTextNode {
+                id: inserted(offset),
+                value: value.to_owned(),
+                removed_at,
+                ins_prev_id: ins_prev.map(inserted),
+                attributes: BTreeMap::new(),
+                removal_events,
+            }
+        };
+        WireJsonElement::Object {
+            nodes: vec![rht_node(
+                "t",
+                WireJsonElement::Text {
+                    nodes: vec![
+                        node(0, "abc", None, None, Vec::new()),
+                        node(3, "d", Some(a2_removal), Some(0), d_events),
+                        node(4, "efgh", Some(a1_removal), Some(3), Vec::new()),
+                    ],
+                    created_at: text_at.clone(),
+                    moved_at: Some(text_at),
+                    removed_at: None,
+                },
+            )],
+            created_at: TimeTicket::initial(),
+            moved_at: None,
+            removed_at: None,
+        }
     }
 }
