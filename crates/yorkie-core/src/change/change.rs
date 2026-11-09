@@ -44,6 +44,21 @@ impl Change {
         }
     }
 
+    /// Returns a copy of this change under the given ID and operations that
+    /// keeps its presence change, message and undo/redo mark (JS
+    /// `reissueActor` rebuilds a change with `Change.create` from those same
+    /// fields). Without the mark, a replay would run an undo's change as
+    /// `Local`.
+    pub(crate) fn with_id_and_operations(&self, id: ChangeId, operations: Vec<Operation>) -> Self {
+        Self {
+            id,
+            operations,
+            message: self.message.clone(),
+            presence_change: self.presence_change.clone(),
+            undo_redo: self.undo_redo,
+        }
+    }
+
     pub(crate) fn with_presence_change(mut self, presence_change: Option<PresenceChange>) -> Self {
         self.presence_change = presence_change;
         self

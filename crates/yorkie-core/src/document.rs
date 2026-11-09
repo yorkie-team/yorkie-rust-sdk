@@ -20,6 +20,7 @@ use crate::operation::{
     TreeStyleOperation,
 };
 use crate::presence::{Presence, PresenceChange, PresenceProxy};
+use crate::reissue::{reissue_operations, reissue_version_vector};
 use crate::schema::validate_yorkie_ruleset;
 use crate::{
     ActorId, JsonArray, JsonObject, JsonValue, Result, SchemaRule, TimeTicket, VersionVector,
@@ -44,6 +45,17 @@ pub struct Document {
     online_clients: BTreeSet<ActorId>,
     subscribers: Subscribers,
     history: History,
+    /// Whether this document took in state it did not mint itself: a
+    /// snapshot or a remote change (JS `absorbedRemote`). Such a document is
+    /// not "never synced" even when its checkpoint, status and version
+    /// vector still look untouched (a snapshot pack can carry the initial
+    /// checkpoint), so `set_actor_with_reissue` leaves it alone.
+    absorbed_remote: bool,
+    /// Whether this document has produced a local change that ran
+    /// operations, so tickets naming its actor may already be in the
+    /// document its key names (JS `mintedOperations`). It is never cleared:
+    /// a push cannot be taken back.
+    minted_operations: bool,
 }
 
 /// Document attachment state.
@@ -71,6 +83,8 @@ impl Document {
             online_clients: BTreeSet::new(),
             subscribers: Subscribers::default(),
             history: History::default(),
+            absorbed_remote: false,
+            minted_operations: false,
         }
     }
 
@@ -98,8 +112,8 @@ impl Document {
     ///
     /// Like JS `setActor` without `reissue`, it rewrites only each pending
     /// change's ID and each operation's `executed_at`. Elements and nodes an
-    /// earlier edit created keep the actor they were created under: JS
-    /// pre-attach ticket re-issue (`reissueActor`) is not ported.
+    /// earlier edit created keep the actor they were created under; the
+    /// client's attach re-issues them through `set_actor_with_reissue`.
     pub fn set_actor(&mut self, actor_id: impl Into<ActorId>) {
         let actor_id = actor_id.into();
 
@@ -121,6 +135,135 @@ impl Document {
         }
 
         self.change_id = self.change_id.set_actor(actor_id);
+    }
+
+    /// Assigns the actor like `set_actor`, but first re-issues every ticket a
+    /// never-synced document minted under its previous actor to the given
+    /// one, in the local changes and the root alike (JS `setActor` with
+    /// `reissue`). It returns whether it re-issued. A document that has
+    /// synced, has no local changes or already has the actor falls back to
+    /// `set_actor`.
+    ///
+    /// Only the client's attach calls it: whether the re-issue is sound
+    /// depends on what else the actor has minted under the document's key,
+    /// which only the client knows. A position or element ID taken from the
+    /// document before the call no longer resolves after a re-issue, and a
+    /// re-issue clears the undo and redo stacks, as JS does.
+    ///
+    /// An error leaves the document as it was.
+    #[doc(hidden)]
+    pub fn set_actor_with_reissue(&mut self, actor_id: impl Into<ActorId>) -> Result<bool> {
+        let actor_id = actor_id.into();
+        if self.reissue_actor(&actor_id)? {
+            return Ok(true);
+        }
+
+        self.set_actor(actor_id);
+        Ok(false)
+    }
+
+    /// Re-issues the tickets of a never-synced document to the given actor
+    /// and returns `true`, or returns `false` and changes nothing when the
+    /// document has synced, has no local changes or already has the actor
+    /// (JS `reissueActor`).
+    ///
+    /// The local changes go through `reissue_operations`, and the root and
+    /// presences are rebuilt by replaying them on a fresh root: a
+    /// never-synced root is exactly the initial root plus its local changes,
+    /// and the replay is the computation the server performs on the pushed
+    /// changes. Everything is built aside and assigned at the end, so an
+    /// error leaves the document untouched. As in JS, the replay publishes
+    /// no event.
+    fn reissue_actor(&mut self, actor_id: &ActorId) -> Result<bool> {
+        let prev = self.change_id.actor_id().clone();
+        if prev == *actor_id || self.local_changes.is_empty() || !self.never_synced() {
+            return Ok(false);
+        }
+
+        let changes = self
+            .local_changes
+            .iter()
+            .map(|change| {
+                let id = change.id();
+                let id = id
+                    .set_actor(actor_id.clone())
+                    .set_version_vector(reissue_version_vector(
+                        id.version_vector(),
+                        &prev,
+                        actor_id,
+                    ));
+                let operations = reissue_operations(change.operations(), &prev, actor_id)?;
+                Ok(change.with_id_and_operations(id, operations))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Each rebuilt change runs with the source it first ran with: an
+        // undo or a redo ran as `UndoRedo`, which the Set and Remove skip
+        // guards consult, so replaying it as `Local` could run an operation
+        // that never ran.
+        let mut crdt_root = CrdtRoot::create();
+        let mut presences = BTreeMap::new();
+        for change in &changes {
+            change.execute(&mut crdt_root, change.replay_source())?;
+            change.apply_presence_change(&mut presences);
+        }
+        let root = crdt_object_to_json_object(crdt_root.object())?;
+
+        let mut online_clients = self.online_clients.clone();
+        if online_clients.remove(&prev) {
+            online_clients.insert(actor_id.clone());
+        }
+
+        self.local_changes = changes;
+        self.crdt_root = crdt_root;
+        self.root = root;
+        self.presences = presences;
+        self.online_clients = online_clients;
+        self.change_id = self
+            .change_id
+            .set_actor(actor_id.clone())
+            .set_version_vector(reissue_version_vector(
+                self.change_id.version_vector(),
+                &prev,
+                actor_id,
+            ));
+
+        // The undo and redo stacks hold the old tickets, and cannot be
+        // re-issued the way the local changes are: a reverse operation has
+        // no `executed_at` until the undo runs it, which the wire projection
+        // rejects. They are dropped, the state `apply_snapshot` leaves them
+        // in too.
+        self.history.clear_undo();
+        self.history.clear_redo();
+        Ok(true)
+    }
+
+    /// Returns whether this document has produced a local change that ran
+    /// operations, so tickets naming its actor may already be in the
+    /// document its key names (JS `hasMintedOperations`). The client reads
+    /// it to decide whether a re-issue, which starts the actor's lamports
+    /// back at 1, can still be sound for that key.
+    #[doc(hidden)]
+    pub fn has_minted_operations(&self) -> bool {
+        self.minted_operations
+    }
+
+    /// Returns whether every ticket naming this document's actor was minted
+    /// by a local change still in `local_changes`: nothing has been pushed
+    /// and nothing pulled (JS `neverSynced`).
+    fn never_synced(&self) -> bool {
+        if self.absorbed_remote
+            || self.status != DocStatus::Detached
+            || self.checkpoint != Checkpoint::initial()
+        {
+            return false;
+        }
+
+        let actor_id = self.change_id.actor_id();
+        self.change_id
+            .version_vector()
+            .iter()
+            .all(|(id, _)| id == actor_id)
     }
 
     /// Applies a document status transition.
@@ -235,6 +378,7 @@ impl Document {
                 .and_then(|_| self.reconcile_presence(&actor_id, prev));
 
             self.local_changes.push(change);
+            self.minted_operations |= !executed.operations.is_empty();
             self.change_id = context.next_id();
             for event in change_event.into_iter().chain(presence_event) {
                 self.publish(event);
@@ -438,6 +582,7 @@ impl Document {
             .and_then(|_| self.reconcile_presence(&actor_id, prev));
 
         self.local_changes.push(change);
+        self.minted_operations |= !executed.operations.is_empty();
         self.change_id = context.next_id();
         for event in change_event.into_iter().chain(presence_event) {
             self.publish(event);
@@ -806,6 +951,12 @@ impl Document {
             let prev = change
                 .presence_change()
                 .map(|_| self.presence_state(&actor_id, self.online_clients.contains(&actor_id)));
+            // As in JS `applyChangeInternal`, a remote change marks the
+            // document as absorbed before it runs; a replayed local change
+            // does not (`apply_snapshot` replays them through here).
+            if source == OpSource::Remote {
+                self.absorbed_remote = true;
+            }
             // A replayed local change runs with the source it first ran with.
             let execute_source = match source {
                 OpSource::Local => change.replay_source(),
@@ -865,6 +1016,7 @@ impl Document {
 
         self.crdt_root = CrdtRoot::new(snapshot_root);
         self.presences = pack.snapshot_presences().clone();
+        self.absorbed_remote = true;
         self.root = crdt_object_to_json_object(self.crdt_root.object())?;
 
         if let Some(version_vector) = pack.version_vector() {
@@ -1557,6 +1709,8 @@ fn crdt_element_to_json_value(element: &CrdtElement) -> Result<JsonValue> {
 mod adv_sync;
 #[cfg(test)]
 mod gc_tests;
+#[cfg(test)]
+mod reissue_tests;
 #[cfg(test)]
 mod split_link_tests;
 #[cfg(test)]

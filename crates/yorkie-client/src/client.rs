@@ -87,6 +87,11 @@ pub struct Client {
 
 pub(crate) struct ClientInner {
     key: String,
+    /// Whether `key` was generated for this client rather than passed in
+    /// (JS `keyGenerated`). Only a generated key gives the client an actor
+    /// no other session shares, which the pre-attach re-issue rests on. See
+    /// [`Client::claim_reissue`].
+    key_generated: bool,
     options: ClientOptions,
     pub(crate) transport: Arc<dyn ClientTransport>,
     state: Mutex<ClientState>,
@@ -114,6 +119,11 @@ pub(crate) struct ClientState {
     sync_loop: Option<TaskHandle>,
     /// Token refreshes after `ErrUnauthenticated`.
     auth_refresh: AuthRefresh,
+    /// The actor that has minted operation tickets in the document of each
+    /// key (JS `reissueClaims`). It outlives deactivation: a later session
+    /// of a generated key has the same stable actor. See
+    /// [`Client::claim_reissue`].
+    reissue_claims: BTreeMap<String, ActorId>,
 }
 
 /// The IDs an active client sends in requests and stamps into changes.
@@ -178,11 +188,9 @@ impl Client {
     /// Creates a client over the given transport, e.g. a test double.
     pub fn with_transport(options: ClientOptions, transport: Arc<dyn ClientTransport>) -> Self {
         // JS `opts.key || uuid()`: an empty key is generated too.
-        let key = options
-            .key
-            .clone()
-            .filter(|key| !key.is_empty())
-            .unwrap_or_else(generate_client_key);
+        let explicit_key = options.key.clone().filter(|key| !key.is_empty());
+        let key_generated = explicit_key.is_none();
+        let key = explicit_key.unwrap_or_else(generate_client_key);
         let state = ClientState {
             id: None,
             actor_id: None,
@@ -196,11 +204,13 @@ impl Client {
             attaching: BTreeSet::new(),
             sync_loop: None,
             auth_refresh: AuthRefresh::default(),
+            reissue_claims: BTreeMap::new(),
         };
 
         Self {
             inner: Arc::new(ClientInner {
                 key,
+                key_generated,
                 options,
                 transport,
                 state: Mutex::new(state),
@@ -365,7 +375,7 @@ impl Client {
     /// aborts that loop's own task at its next `.await`, so the caller must
     /// return without awaiting anything after it.
     fn deactivate_internal(&self) {
-        let (attachments, channels, sync_loop) = {
+        let (attachments, channels, sync_loop, actor) = {
             let mut state = self.state();
             state.status = ClientStatus::Deactivated;
             state.conditions.insert(ClientCondition::SyncLoop, false);
@@ -374,11 +384,13 @@ impl Client {
                 std::mem::take(&mut state.attachments),
                 std::mem::take(&mut state.channels),
                 state.sync_loop.take(),
+                state.claim_actor(),
             )
         };
         drop(sync_loop);
-        for attachment in attachments.into_values() {
+        for (key, attachment) in attachments {
             let doc = release_attachment(attachment);
+            self.claim_if_minted(actor.as_ref(), &key, &doc);
             lock_document(&doc).apply_status(DocStatus::Detached);
         }
         for attachment in channels.into_values() {
@@ -392,6 +404,14 @@ impl Client {
     /// initial presence is set before the attach request is sent. In a
     /// realtime mode it then opens the watch stream and waits until the
     /// stream is initialized or its first attempt fails.
+    ///
+    /// A document edited before its first attach has minted its tickets
+    /// under the initial actor, which every such document shares. When the
+    /// client key was generated and no earlier document of the key has
+    /// minted under this client's actor, those tickets are re-issued to the
+    /// actor first, so a position or element ID taken from the document
+    /// before the attach no longer resolves after it, and the undo and redo
+    /// stacks are cleared. A failed request leaves the document re-issued.
     pub async fn attach(
         &self,
         doc: SharedDocument,
@@ -414,13 +434,34 @@ impl Client {
             }
             doc.key().to_owned()
         };
-        let _attaching = AttachingGuard::claim(&self.inner, &key)?;
+        let _attaching = AttachingGuard::claim(&self.inner, &key, &session)?;
         let (poll_interval, poll_interval_pinned) =
             resolve_document_poll_interval(sync_mode, document_poll_interval)?;
 
+        // Stamp the actor once the options are known to be valid, so a
+        // rejected option neither re-issues nor takes the claim. The claim is
+        // taken before the round trip, since an attach whose response is
+        // lost may still have pushed: when the re-issue minted tickets under
+        // the actor, or pre-attach edits it declined are about to be pushed
+        // under it. A document that minted nothing leaves the claim alone;
+        // `remove_attachment` takes it if the document mints while attached.
+        let reissue = self.claim_reissue(&session.actor_id, &key);
+        let minted = {
+            let mut doc = lock_document(&doc);
+            let reissued = if reissue {
+                doc.set_actor_with_reissue(session.actor_id.clone())?
+            } else {
+                doc.set_actor(session.actor_id.clone());
+                false
+            };
+            reissued || doc.has_minted_operations()
+        };
+        if minted {
+            self.mark_reissue_claim(session.actor_id.clone(), &key);
+        }
+
         let change_pack = {
             let mut doc = lock_document(&doc);
-            doc.set_actor(session.actor_id.clone());
             doc.update_with_presence(|_, presence| {
                 presence.set(initial_presence);
                 Ok(())
@@ -1345,10 +1386,11 @@ impl Client {
     }
 
     /// Drops the attachment of `key` if it still holds `doc`, which stops its
-    /// watch stream (JS `detachInternal`). The only place attachments are
+    /// watch stream, and takes the re-issue claim if the document minted
+    /// operations (JS `detachInternal`). The only place attachments are
     /// removed one at a time.
     fn remove_attachment(&self, key: &str, doc: &SharedDocument) {
-        let attachment = {
+        let (attachment, actor) = {
             let mut state = self.state();
             if !state
                 .attachments
@@ -1359,10 +1401,58 @@ impl Client {
             }
             let attachment = state.attachments.remove(key);
             state.refresh_watch_loop_condition();
-            attachment
+            (attachment, state.claim_actor())
         };
         if let Some(attachment) = attachment {
-            release_attachment(attachment);
+            let doc = release_attachment(attachment);
+            self.claim_if_minted(actor.as_ref(), key, &doc);
+        }
+    }
+
+    /// Returns whether a document of the given key edited before this attach
+    /// may re-issue its tickets to the given actor (JS `claimReissue`). It
+    /// only asks; `mark_reissue_claim` takes the claim.
+    ///
+    /// A re-issue keeps each ticket's lamport, which starts at 1 in every
+    /// fresh document, so it is sound only for an actor that has minted
+    /// nothing else in the document. An explicit client key gives every
+    /// session of that key one stable actor, so a re-issued ticket could
+    /// equal one an earlier session's first edits carry, and the server
+    /// would keep one of the two elements. Only a generated key makes the
+    /// actor this client's alone, so only then does the re-issue run.
+    ///
+    /// Within this client, a second never-synced document of a key whose
+    /// actor has already minted operation tickets there would mint the
+    /// tickets the first document pushed, so such a repeat is declined. The
+    /// claim records only that: `attach` takes it for a document that
+    /// re-issued or already carries tickets under the actor, and
+    /// `remove_attachment` for one that minted them while attached. A
+    /// taken claim is never released: an attach whose response was lost may
+    /// still have pushed, and a detach does not take pushed tickets back.
+    fn claim_reissue(&self, actor: &ActorId, key: &str) -> bool {
+        if !self.inner.key_generated {
+            return false;
+        }
+        self.state().reissue_claims.get(key) != Some(actor)
+    }
+
+    /// Records that the given actor has minted tickets in the document of
+    /// the given key, so no later document of the key re-issues onto it (JS
+    /// `markReissueClaim`). See [`Self::claim_reissue`].
+    fn mark_reissue_claim(&self, actor: ActorId, key: &str) {
+        self.state().reissue_claims.insert(key.to_owned(), actor);
+    }
+
+    /// Takes the re-issue claim for a document whose attachment was just
+    /// dropped, if it minted operation tickets (JS `detachInternal`). The
+    /// actor is the client's, not the document's, which a detach resets to
+    /// the initial one. Must be called without the client state lock.
+    fn claim_if_minted(&self, actor: Option<&ActorId>, key: &str, doc: &SharedDocument) {
+        let Some(actor) = actor else {
+            return;
+        };
+        if lock_document(doc).has_minted_operations() {
+            self.mark_reissue_claim(actor.clone(), key);
         }
     }
 
@@ -1414,6 +1504,12 @@ impl ClientState {
             }),
             _ => Err(ClientError::ClientNotActivated(client_key.to_owned())),
         }
+    }
+
+    /// The actor a dropped attachment takes the re-issue claim under (JS
+    /// `this.actorID ?? this.id`).
+    fn claim_actor(&self) -> Option<ActorId> {
+        self.actor_id.clone().or_else(|| self.id.clone())
     }
 
     /// Whether a document or channel with the key is attached or attaching.
@@ -1474,14 +1570,25 @@ impl Drop for PendingPullPause {
 
 /// Marks a key as attaching for the lifetime of one `attach` call, so a
 /// concurrent attach of the same key is rejected (JS `attachingDocs`).
+///
+/// It is taken only while the attach's session is still current. A loop's
+/// `deactivate_internal` runs outside the task queue: it frees every key in
+/// the same state-lock block that ends the session, but takes the re-issue
+/// claims of the freed documents only afterwards. Checking the session here,
+/// under that lock, keeps an attach from claiming a freed key and asking
+/// `claim_reissue` before those claims land (JS `detachInternal` marks
+/// synchronously, so JS has no such window).
 struct AttachingGuard<'a> {
     inner: &'a ClientInner,
     key: String,
 }
 
 impl<'a> AttachingGuard<'a> {
-    fn claim(inner: &'a ClientInner, key: &str) -> ClientResult<Self> {
+    fn claim(inner: &'a ClientInner, key: &str, session: &Session) -> ClientResult<Self> {
         let mut state = inner.state();
+        if !state.is_current(session) {
+            return Err(ClientError::ClientNotActivated(inner.key.clone()));
+        }
         if state.is_taken(key) {
             return Err(ClientError::AlreadyAttached(key.to_owned()));
         }
@@ -1774,6 +1881,12 @@ mod tests {
         /// so a reply that is applied moves the document's server seq and one
         /// taken as a push ack does not.
         push_pull_server_seq: Mutex<Option<i64>>,
+        /// Errors for the next attaches, in order; later ones succeed.
+        attach_errors: Mutex<Vec<ClientError>>,
+        /// When set, attach and detach replies carry no changes and only
+        /// acknowledge the pushed ones, as the JS re-issue tests' fake
+        /// `attachDocument` and `detachDocument` do.
+        ack_pushes: bool,
     }
 
     impl Default for MockTransport {
@@ -1805,7 +1918,25 @@ mod tests {
                 push_pull_tokens: Mutex::new(Vec::new()),
                 push_pull_gate: Mutex::new(None),
                 push_pull_server_seq: Mutex::new(None),
+                attach_errors: Mutex::new(Vec::new()),
+                ack_pushes: false,
             }
+        }
+    }
+
+    impl MockTransport {
+        /// The change pack an attach or detach reply carries: the pushed
+        /// pack itself, or with `ack_pushes` one that only acknowledges it
+        /// (JS `attachResponse` in `reissue_claim_test.ts`).
+        fn reply_pack(&self, pushed: &yorkie_core::ChangePack) -> yorkie_core::ChangePack {
+            if !self.ack_pushes {
+                return pushed.clone();
+            }
+            let mut pack = converter::to_change_pack(pushed).unwrap();
+            let server_seq = i64::try_from(pack.changes.len()).unwrap();
+            pack.changes.clear();
+            pack.checkpoint.get_or_insert_default().server_seq = server_seq;
+            converter::from_change_pack(&pack).unwrap()
         }
     }
 
@@ -1838,8 +1969,14 @@ mod tests {
             &self,
             request: AttachDocumentRequest,
         ) -> ClientResult<AttachDocumentResponse> {
-            let change_pack = request.change_pack.clone();
+            let change_pack = self.reply_pack(&request.change_pack);
             self.attach_requests.lock().unwrap().push(request);
+            {
+                let mut errors = self.attach_errors.lock().unwrap();
+                if !errors.is_empty() {
+                    return Err(errors.remove(0));
+                }
+            }
             Ok(AttachDocumentResponse {
                 document_id: "document-id".to_owned(),
                 change_pack,
@@ -1852,7 +1989,7 @@ mod tests {
             &self,
             request: DetachDocumentRequest,
         ) -> ClientResult<DetachDocumentResponse> {
-            let change_pack = request.change_pack.clone();
+            let change_pack = self.reply_pack(&request.change_pack);
             self.detach_requests.lock().unwrap().push(request);
             Ok(DetachDocumentResponse { change_pack })
         }
@@ -1994,6 +2131,8 @@ mod tests {
             .unwrap()
             .block_on(future)
     }
+
+    mod reissue;
 
     fn mock_client(options: ClientOptions, transport: &Arc<MockTransport>) -> Client {
         Client::with_transport(options, transport.clone())

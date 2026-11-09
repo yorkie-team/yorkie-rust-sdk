@@ -13,6 +13,7 @@ mod json;
 #[allow(dead_code)]
 mod operation;
 mod presence;
+mod reissue;
 mod schema;
 mod time;
 /// Protocol-shaped projections for `yorkie-protocol`. Public only so that

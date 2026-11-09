@@ -8,6 +8,12 @@ Checked by `crates/yorkie-protocol/tests/text_undo_interop.rs`.
   `.json` file next to each is the sorted JSON of the document JS built.
   Command, from a scratch copy of yorkie-js-sdk:
   `cp tools/interop/text_undo_fixtures_test.ts <js-sdk>/packages/sdk/test/unit/api/ && cd <js-sdk> && TEXT_UNDO_FIXTURE_DIR=<this directory> pnpm sdk exec vitest run test/unit/api/text_undo_fixtures_test.ts`
+- `removed_text_attr_snapshot_pack.hex`: a snapshot whose Text holds the
+  `bold` tombstone the undo of a style left, written by the same JS
+  checkout under Node 24, with `./node_modules/.bin/vitest run` from
+  `packages/sdk` in place of `pnpm sdk exec` (the other two fixtures came
+  out of that run byte for byte). It has no Go copy: Go clears a removed
+  attribute's value, which JS keeps.
 - `go_ledger_snapshot_pack.hex`: the ledger snapshot written by Go yorkie at
   `54b96762`. Go writes `restore_retombstone_pack.hex` byte for byte, so it
   has no Go copy. Command, from a scratch copy of yorkie:

@@ -342,3 +342,49 @@ fn applies_the_js_and_go_ledger_snapshots() -> TestResult {
     }
     Ok(())
 }
+
+// --- (c) a snapshot holding a removed Text attribute ---
+
+const REMOVED_ATTR_PACK: &str = "removed_text_attr_snapshot_pack";
+
+/// JS `toTextNodes` writes a removed Text attribute with `isRemoved` (since
+/// yorkie-js-sdk#1364): the `bold` the undo of a style tombstoned keeps its
+/// value and the undo's ticket. Rust reads it as written, and the root it
+/// decoded encodes back to the bytes JS wrote.
+#[test]
+fn reencodes_the_js_removed_text_attr_snapshot() -> TestResult {
+    let bytes = fixture_bytes(REMOVED_ATTR_PACK)?;
+    let pack = decode_change_pack(&bytes)?;
+
+    let mut wire = WireChangePack::try_from(&pack)?;
+    assert!(wire.snapshot.is_some());
+    wire.snapshot = None;
+    let nodes = snapshot_text_nodes(&wire);
+    assert_eq!(1, nodes.len());
+    assert_eq!("hello", nodes[0].value);
+    let attr = &nodes[0].attributes["bold"];
+    assert_eq!(
+        ("\"true\"", ticket(3, 1, A1), true),
+        (
+            attr.value.as_str(),
+            attr.updated_at.clone(),
+            attr.is_removed
+        )
+    );
+
+    assert_eq!(bytes, encode_change_pack(&ChangePack::try_from(wire)?)?);
+    Ok(())
+}
+
+/// JS `should round-trip a tombstoned text attribute`: a replica loading
+/// the snapshot does not render the removed attribute and holds its
+/// tombstone as the one GC pair the writer holds.
+#[test]
+fn applies_the_js_removed_text_attr_snapshot() -> TestResult {
+    let mut doc = Document::new(KEY);
+    doc.set_actor(A2);
+    doc.apply_change_pack(&decode_change_pack(&fixture_bytes(REMOVED_ATTR_PACK)?)?)?;
+    assert_eq!(fixture_json(REMOVED_ATTR_PACK)?, doc.to_sorted_json());
+    assert_eq!(1, doc.garbage_len());
+    Ok(())
+}

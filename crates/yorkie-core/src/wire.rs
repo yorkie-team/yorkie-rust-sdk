@@ -20,7 +20,7 @@ use crate::operation::{
 };
 use crate::presence::{Presence, PresenceChange};
 use crate::{ActorId, Result, TimeTicket, VersionVector, YorkieError};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WireValueType {
@@ -975,8 +975,24 @@ fn wire_primitive_from_domain(primitive: &CrdtPrimitive) -> WireJsonElement {
 }
 
 fn wire_text_from_domain(text: &CrdtText) -> WireJsonElement {
+    // The decoder resolves `ins_prev_id` against the nodes it has already
+    // decoded (JS `fromText`; Go rejects a link it cannot find), so a link is
+    // written only when its target was emitted earlier in this very list
+    // (JS `toTextNodes`). A split product's `ins_prev` always precedes it,
+    // so this drops nothing a snapshot or a re-issue needs; what it drops is
+    // a dangling link into a node no longer in this split, which no decoder
+    // could have resolved.
+    let mut emitted = BTreeSet::new();
+    let nodes = text
+        .nodes()
+        .map(|node| {
+            let wire = wire_text_node_from_domain(node, &emitted);
+            emitted.insert(node.id().clone());
+            wire
+        })
+        .collect();
     WireJsonElement::Text {
-        nodes: text.nodes().map(wire_text_node_from_domain).collect(),
+        nodes,
         created_at: text.created_at().clone(),
         moved_at: text.moved_at().cloned(),
         removed_at: text.removed_at().cloned(),
@@ -1296,17 +1312,26 @@ fn restore_spans_from_wire(
         .collect()
 }
 
-fn wire_text_node_from_domain(node: &RgaTreeSplitNode<TextValue>) -> WireTextNode {
+fn wire_text_node_from_domain(
+    node: &RgaTreeSplitNode<TextValue>,
+    emitted: &BTreeSet<RgaTreeSplitNodeId>,
+) -> WireTextNode {
     WireTextNode {
         id: WireTextNodeId::from(node.id()),
         value: node.value().content().to_owned(),
         removed_at: node.removed_at().cloned(),
-        ins_prev_id: node.ins_prev_id().map(WireTextNodeId::from),
+        ins_prev_id: node
+            .ins_prev_id()
+            .filter(|id| emitted.contains(*id))
+            .map(WireTextNodeId::from),
         attributes: text_attrs_from_domain(node.value().attributes()),
         removal_events: node.removal_events(),
     }
 }
 
+/// JS `toTextNodes` (since yorkie-js-sdk#1364) and Go `toTextNodes`: every
+/// attribute node, a removed one with its `is_removed`, as the tree path
+/// writes them.
 fn text_attrs_from_domain(attrs: &Rht) -> BTreeMap<String, WireNodeAttr> {
     attrs
         .iter()
@@ -1316,7 +1341,7 @@ fn text_attrs_from_domain(attrs: &Rht) -> BTreeMap<String, WireNodeAttr> {
                 WireNodeAttr {
                     value: node.value().to_owned(),
                     updated_at: node.updated_at().clone(),
-                    is_removed: false,
+                    is_removed: node.is_removed(),
                 },
             )
         })
@@ -1347,6 +1372,17 @@ fn text_from_wire_nodes(created_at: TimeTicket, nodes: Vec<WireTextNode>) -> Res
     );
     let mut split = RgaTreeSplit::new(initial_head);
     let mut prev_id = split.initial_head().id().clone();
+    // A Text can arrive inside a client-supplied Set/Add/ArraySet payload,
+    // where its links are as untrusted as the tree links
+    // `drop_split_links_in_element` strips. They are kept, since such a
+    // payload can be a copy of real document state whose split pieces a
+    // later Edit targets, but each is resolved by exact ID against the nodes
+    // decoded so far (JS `fromText`). Every producer of a link points it at
+    // an earlier piece of the same insertion, so a link naming another
+    // insertion, or an offset at or above the node's own, is one no local
+    // edit made. Any link that does not resolve is dropped, as JS does; Go
+    // rejects the element instead.
+    let mut decoded = BTreeSet::new();
 
     for node in nodes {
         let mut text_node = RgaTreeSplitNode::new(
@@ -1362,25 +1398,37 @@ fn text_from_wire_nodes(created_at: TimeTicket, nodes: Vec<WireTextNode>) -> Res
         // drop is silent (see the porting gaps).
         let _ = text_node.set_removal_events(node.removal_events);
         let inserted_id = split.insert_after_id(&prev_id, text_node)?;
-        if let Some(ins_prev_id) = node.ins_prev_id {
-            let current = split.find_node_mut_by_id(&inserted_id).ok_or_else(|| {
-                YorkieError::InvalidTextPosition(format!(
-                    "node not found for {}",
-                    inserted_id.to_test_string()
-                ))
-            })?;
-            current.set_ins_prev_id(Some(RgaTreeSplitNodeId::from(ins_prev_id)));
+        let ins_prev_id = node.ins_prev_id.map(RgaTreeSplitNodeId::from).filter(|id| {
+            id.has_same_created_at(&inserted_id)
+                && id.offset() < inserted_id.offset()
+                && decoded.contains(id)
+        });
+        if let Some(ins_prev_id) = ins_prev_id {
+            // JS `setInsPrev` links both ways, so a later split of the
+            // target relinks this node as it does on the encoding replica.
+            if let Some(target) = split.find_node_mut_by_id(&ins_prev_id) {
+                target.set_ins_next_id(Some(inserted_id.clone()));
+            }
+            if let Some(current) = split.find_node_mut_by_id(&inserted_id) {
+                current.set_ins_prev_id(Some(ins_prev_id));
+            }
         }
+        decoded.insert(inserted_id.clone());
         prev_id = inserted_id;
     }
 
     Ok(CrdtText::new(created_at, split))
 }
 
+/// JS `fromTextNode` (since yorkie-js-sdk#1364): `setInternal` keeps each
+/// attribute as written, a tombstone included, value and all. A tombstone
+/// decoded live would carry the removal's ticket and win LWW against every
+/// older write. Go's `SetInternal` clears a removed attribute's value; JS
+/// keeps it, and so does Rust.
 fn text_attrs_to_domain(attrs: BTreeMap<String, WireNodeAttr>) -> Rht {
     let mut rht = Rht::new();
     for (key, attr) in attrs {
-        rht.set(key, attr.value, attr.updated_at);
+        rht.set_internal(key, attr.value, attr.updated_at, attr.is_removed);
     }
     rht
 }
@@ -1531,6 +1579,10 @@ fn wire_value_type_to_counter_type(value_type: WireValueType) -> Result<CounterT
         )),
     }
 }
+
+#[cfg(test)]
+#[path = "wire_text_link_tests.rs"]
+mod text_link_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2302,6 +2354,72 @@ mod tests {
         vector.set("000000000000000000000001", 5);
         root.garbage_collect(&vector);
         assert!(events(&root).is_empty());
+        Ok(())
+    }
+
+    /// JS `should round-trip a tombstoned text attribute`
+    /// (snapshot_converter_test.ts, yorkie-js-sdk#1364): `toTextNodes` writes
+    /// a text attribute's `isRemoved` and `fromTextNode` restores it, so the
+    /// tombstone an undone style leaves stays a tombstone and a GC pair.
+    ///
+    /// The document is the one of the JS `removed_text_attr_snapshot_pack`
+    /// fixture (`tools/interop/text_undo_fixtures_test.ts`), and its Text
+    /// projects to the attribute JS wrote; `yorkie-protocol` checks that
+    /// this projection encodes to the fixture's bytes.
+    #[test]
+    fn roundtrips_a_tombstoned_text_attribute() -> Result<()> {
+        const A1: &str = "000000000000000000000001";
+        let mut doc = crate::Document::new("text-undo-interop");
+        doc.set_actor(A1);
+        doc.update(|root| root.set_text("t")?.edit(0, 0, "hello", None).map(|_| ()))?;
+        doc.update(|root| {
+            let bold = BTreeMap::from([("bold".to_owned(), serde_json::Value::from("true"))]);
+            root.get_text_mut("t")?.set_style(0, 5, bold)
+        })?;
+
+        // `bold` did not exist before, so the reverse removes it, leaving a
+        // tombstone rather than dropping it.
+        assert!(doc.history().can_undo());
+        doc.history_mut().undo()?;
+
+        let live_root = doc.crdt_root_for_test();
+        assert_eq!(r#"{"t":[{"val":"hello"}]}"#, live_root.to_sorted_json());
+        assert_eq!(1, doc.garbage_len());
+        let baseline = live_root.deepcopy();
+
+        let WireJsonElement::Object { nodes: members, .. } =
+            WireJsonElement::try_from(&live_root.root_element())?
+        else {
+            panic!("expected an object");
+        };
+        let WireJsonElement::Text { nodes, .. } = &members[0].element else {
+            panic!("expected a text");
+        };
+        assert_eq!(
+            vec![BTreeMap::from([(
+                "bold".to_owned(),
+                WireNodeAttr {
+                    value: "\"true\"".to_owned(),
+                    updated_at: TimeTicket::new(3, 1, A1),
+                    is_removed: true,
+                },
+            )])],
+            nodes
+                .iter()
+                .map(|node| node.attributes.clone())
+                .collect::<Vec<_>>()
+        );
+
+        let mut rebuilt = roundtrip_root_json_element(live_root)?;
+        assert_eq!(live_root.to_sorted_json(), rebuilt.to_sorted_json());
+        assert_eq!(doc.garbage_len(), rebuilt.get_garbage_len());
+        assert_eq!(doc.doc_size().gc, rebuilt.doc_size().gc);
+        assert_eq!(baseline.doc_size().live, rebuilt.doc_size().live);
+
+        let mut vector = VersionVector::new();
+        vector.set(A1, i64::MAX);
+        assert_eq!(1, rebuilt.garbage_collect(&vector));
+        assert_eq!(0, rebuilt.get_garbage_len());
         Ok(())
     }
 

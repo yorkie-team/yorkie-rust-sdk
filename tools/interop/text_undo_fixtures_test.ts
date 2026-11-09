@@ -176,4 +176,37 @@ describe('Text undo interop fixtures', () => {
     );
     write('ledger_snapshot_pack', pack, d1.toSortedJSON());
   });
+
+  // (c) A snapshot whose text holds the tombstone the undo of a style left
+  // on `bold`: `toTextNodes` writes its `isRemoved` (#1364).
+  it('writes removed_text_attr_snapshot_pack', () => {
+    const doc = new Document<{ t: Text }>(KEY);
+    doc.setActor(A1);
+    doc.update((r) => {
+      r.t = new Text();
+      r.t.edit(0, 0, 'hello');
+    });
+    doc.update((r) => r.t.setStyle(0, 5, { bold: 'true' }));
+    doc.history.undo();
+    assert.equal(doc.toSortedJSON(), '{"t":[{"val":"hello"}]}');
+    assert.equal(doc.getGarbageLen(), 1);
+
+    const pack = ChangePack.create(
+      KEY,
+      Checkpoint.of(1n, 0),
+      false,
+      [],
+      doc.getVersionVector(),
+      converter.snapshotToBytes(doc.getRootObject(), new Map()),
+    );
+    write('removed_text_attr_snapshot_pack', pack, doc.toSortedJSON());
+
+    const peer = new Document<{ t: Text }>(KEY);
+    peer.setActor(A2);
+    peer.applyChangePack(
+      converter.fromChangePack(converter.toChangePack(pack)),
+    );
+    assert.equal(peer.toSortedJSON(), doc.toSortedJSON());
+    assert.equal(peer.getGarbageLen(), 1);
+  });
 });
