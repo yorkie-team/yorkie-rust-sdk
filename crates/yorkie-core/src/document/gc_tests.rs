@@ -656,3 +656,78 @@ fn text(d: &Document) -> String {
         other => panic!("expected a text at t, got {other:?}"),
     }
 }
+
+/// Counts the removed nodes still in the text at `t`.
+fn text_tombstones(d: &Document) -> usize {
+    match d.crdt_root.object().get("t") {
+        Some(crate::crdt::element::CrdtElement::Text(text)) => {
+            text.nodes().filter(|node| node.is_removed()).count()
+        }
+        other => panic!("expected a text at t, got {other:?}"),
+    }
+}
+
+/// JS `test/unit/document/gc_split_leak_test.ts` "GC tombstone-split leak
+/// (Text)" / `purges pieces split off a tombstoned text node`, as written
+/// before `84068f70`: a piece split off a removed node is born removed, so
+/// the split registers it for collection instead of charging live.
+#[test]
+fn purges_pieces_split_off_a_tombstoned_text_node() -> Result<()> {
+    let (mut d1, mut d2) = replicas();
+    d1.update(|root| root.set_text("t")?.edit(0, 0, "abcdef", None).map(|_| ()))?;
+    cross_sync(&mut d1, &mut d2)?;
+
+    // d1 removes the whole node; d2 concurrently removes a middle slice.
+    // When d2's deletion reaches d1, it splits d1's tombstone into three
+    // pieces, and the piece after the removed range is born removed.
+    d1.update(|root| root.get_text_mut("t")?.edit(0, 6, "", None).map(|_| ()))?;
+    d2.update(|root| root.get_text_mut("t")?.edit(2, 4, "", None).map(|_| ()))?;
+    cross_sync(&mut d1, &mut d2)?;
+    assert_eq!("", text(&d1));
+    assert_eq!("", text(&d2));
+
+    let purged1 = collect(&mut d1, &max_vector_of(&[A1, A2]));
+    let purged2 = collect(&mut d2, &max_vector_of(&[A1, A2]));
+    assert_eq!(purged1, purged2, "asymmetric purge for identical state");
+    for (d, name) in [(&d1, "d1"), (&d2, "d2")] {
+        assert_eq!(0, text_tombstones(d), "{name}: tombstones");
+        assert_eq!(0, d.garbage_len(), "{name}: garbage");
+        assert_eq!(
+            crate::crdt::element::DataSize::default(),
+            d.doc_size().gc,
+            "{name}: gc"
+        );
+        assert_gc_size_matches_rebuilt(d);
+    }
+    Ok(())
+}
+
+/// JS `4f1f0123` for a style: a style whose boundaries split a removed node
+/// registers the born-removed pieces, as JS `CRDTText.setStyle` drains them
+/// into its pairs.
+#[test]
+fn purges_pieces_a_style_split_off_a_tombstoned_text_node() -> Result<()> {
+    let (mut d1, mut d2) = replicas();
+    d1.update(|root| root.set_text("t")?.edit(0, 0, "abcdef", None).map(|_| ()))?;
+    cross_sync(&mut d1, &mut d2)?;
+
+    d1.update(|root| root.get_text_mut("t")?.edit(0, 6, "", None).map(|_| ()))?;
+    d2.update(|root| {
+        let mut bold = std::collections::BTreeMap::new();
+        bold.insert("b".to_owned(), serde_json::Value::Bool(true));
+        root.get_text_mut("t")?.set_style(2, 4, bold)
+    })?;
+    cross_sync(&mut d1, &mut d2)?;
+    assert_eq!("", text(&d1));
+    assert_eq!("", text(&d2));
+
+    let purged1 = collect(&mut d1, &max_vector_of(&[A1, A2]));
+    let purged2 = collect(&mut d2, &max_vector_of(&[A1, A2]));
+    assert_eq!(purged1, purged2, "asymmetric purge for identical state");
+    for (d, name) in [(&d1, "d1"), (&d2, "d2")] {
+        assert_eq!(0, text_tombstones(d), "{name}: tombstones");
+        assert_eq!(0, d.garbage_len(), "{name}: garbage");
+        assert_gc_size_matches_rebuilt(d);
+    }
+    Ok(())
+}

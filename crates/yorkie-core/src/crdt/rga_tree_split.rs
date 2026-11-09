@@ -30,6 +30,8 @@ impl SplayValue for SplitIndexValue {
 
 pub(crate) trait RgaTreeSplitValue: Clone + PartialEq {
     fn split(&mut self, offset: usize) -> Self;
+    /// Returns a deep copy of `[from, to)` of this value (JS `substring`).
+    fn substring(&self, from: usize, to: usize) -> Self;
     fn len(&self) -> usize;
     fn data_size(&self) -> DataSize;
     fn to_json(&self) -> String;
@@ -142,6 +144,66 @@ pub(crate) struct RestoreSpan<V> {
     pub(crate) value: V,
 }
 
+/// A GC pair as `CrdtRoot::register_gc_pair_by_id` takes it: the child's ID
+/// string, the size to charge to gc, and the removal ticket.
+pub(crate) type GcPairEntry = (String, DataSize, TimeTicket);
+
+/// Result of `RgaTreeSplit::restore` (JS `restore`'s tuple).
+#[derive(Debug, Clone)]
+pub(crate) struct RestoreResult<V>
+where
+    V: RgaTreeSplitValue,
+{
+    /// Tombstoned pieces this restore took back to live.
+    pub(crate) revived: Vec<RgaTreeSplitNode<V>>,
+    /// Pieces this restore recreated because GC had purged them.
+    pub(crate) recreated: Vec<RgaTreeSplitNode<V>>,
+    /// The revived and recreated content as insertions, in ascending index
+    /// order.
+    pub(crate) changes: Vec<ValueChange<V>>,
+    /// The size of the recreated pieces, which no split accounted.
+    pub(crate) live_diff: DataSize,
+    /// The pieces split off tombstones while isolating the restored ranges,
+    /// born removed. The caller registers them before it unregisters the
+    /// revived pieces: a revived piece may be one of them.
+    pub(crate) pending_gc_pairs: Vec<GcPairEntry>,
+}
+
+/// Result of `RgaTreeSplit::retombstone` (JS `retombstone`'s tuple).
+#[derive(Debug, Clone)]
+pub(crate) struct RetombstoneResult<V>
+where
+    V: RgaTreeSplitValue,
+{
+    /// The pieces this redo took from live to removed, then the pieces split
+    /// off tombstones, born removed.
+    pub(crate) gc_pairs: Vec<GcPairEntry>,
+    /// The removed regions as deletions, each index taken before its
+    /// removal.
+    pub(crate) changes: Vec<ValueChange<V>>,
+    /// The size the splits of live pieces added; the caller accounts it
+    /// before it registers `gc_pairs`.
+    pub(crate) diff: DataSize,
+    /// The pieces the removal was recorded on, which the reverse names.
+    pub(crate) recorded: Vec<RestoreSpan<V>>,
+}
+
+/// The IDs of the nodes whose ledger holds a cancel, the only ones
+/// `prune_ledgers` can drop anything from (JS `cancelled`). `None` until
+/// first needed: a split decoded from a snapshot fills it with one scan.
+///
+/// It is a cache of what the nodes say, so it takes no part in equality:
+/// two splits with the same nodes compare equal whether or not either has
+/// scanned yet.
+#[derive(Debug, Clone, Default)]
+struct CancelledNodes(RefCell<Option<BTreeSet<RgaTreeSplitNodeId>>>);
+
+impl PartialEq for CancelledNodes {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
 /// An undo that cancelled one deletion of a node (JS `LedgerCancel`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LedgerCancel {
@@ -249,6 +311,9 @@ where
     /// One span per node this edit removed, in document order (JS
     /// `removedSpans`).
     pub(crate) removed_spans: Vec<RestoreSpan<V>>,
+    /// The pieces the boundary splits cut off tombstones, born removed (JS
+    /// `drainPendingGCPairs` in `edit`).
+    pub(crate) split_gc_pairs: Vec<GcPairEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -678,6 +743,11 @@ where
     tree_by_index: RefCell<SplayTree<SplitIndexValue>>,
     tree_by_id: BTreeMap<RgaTreeSplitNodeId, usize>,
     splay_node_by_id: BTreeMap<RgaTreeSplitNodeId, SplayNodeId>,
+    /// GC pairs for garbage no removal produced: pieces split off a removed
+    /// node, born removed (JS `pendingGCPairs`). Every caller that splits
+    /// drains it into the pairs it returns.
+    pending_gc_pairs: Vec<GcPairEntry>,
+    cancelled: CancelledNodes,
 }
 
 impl<V> RgaTreeSplit<V>
@@ -690,6 +760,8 @@ where
             tree_by_index: RefCell::new(SplayTree::new()),
             tree_by_id: BTreeMap::new(),
             splay_node_by_id: BTreeMap::new(),
+            pending_gc_pairs: Vec::new(),
+            cancelled: CancelledNodes::default(),
         };
         split.rebuild_indexes();
         split
@@ -870,7 +942,545 @@ where
             changes,
             removed_values,
             removed_spans,
+            split_gc_pairs: self.drain_pending_gc_pairs(),
         })
+    }
+
+    /// Re-establishes the characters `spans` describe under their original
+    /// identities (JS `restore`). Per region of each span:
+    ///   - a live piece is skipped (another undo restored it);
+    ///   - a tombstoned piece is isolated and the undoing actor's own removal
+    ///     cancelled; it revives unless another removal holds it;
+    ///   - a gap (GC purged the piece) is recreated with the original ID.
+    ///
+    /// The caller must, in order, register `pending_gc_pairs`, unregister
+    /// the revived pieces, and account `live_diff` (see `RestoreResult`).
+    pub(crate) fn restore(
+        &mut self,
+        spans: &[RestoreSpan<V>],
+        executed_at: &TimeTicket,
+        fallback_anchor: Option<&RgaTreeSplitPos>,
+    ) -> Result<RestoreResult<V>> {
+        let mut revived = Vec::new();
+        let mut recreated = Vec::new();
+        let mut live_diff = DataSize::default();
+
+        // The last piece placed at the cursor (revived, skipped or
+        // recreated), in document order. A recreated fragment with no
+        // surviving piece of its insertion to anchor it is placed after this,
+        // so a multi-fragment run is rebuilt left to right rather than each
+        // fragment landing at the same fallback, reversed. Spans arrive in
+        // document order, so this is always the fragment's left neighbour.
+        let mut chain_anchor: Option<RgaTreeSplitNodeId> = None;
+        for span in spans {
+            let pieces = self.find_pieces_overlapping(&span.created_at, span.start, span.end);
+
+            let mut cursor = span.start;
+            let mut piece_index = 0;
+            while cursor < span.end {
+                let piece = pieces.get(piece_index).map(|id| {
+                    let index = self.index_of(id);
+                    let start = self.nodes[index].id().offset();
+                    (index, start, start + self.nodes[index].content_len())
+                });
+
+                match piece {
+                    Some((index, piece_start, piece_end)) if piece_start <= cursor => {
+                        // Covered by an existing piece.
+                        let overlap_end = piece_end.min(span.end);
+                        if self.nodes[index].is_removed() {
+                            let (target, _) = self.isolate_range(index, cursor, overlap_end)?;
+                            // An undo reverses its own actor's change, so the
+                            // removal it cancels is the one uncancelled
+                            // removal by that actor: one actor cannot remove
+                            // a piece already removed in its view. No other
+                            // removal holds it if there is none.
+                            let node = &mut self.nodes[target];
+                            let mut live = false;
+                            if let Some(deletion) =
+                                node.uncancelled_removal_by(executed_at.actor_id()).cloned()
+                            {
+                                live = node.cancel_removal(&deletion, executed_at.clone());
+                                let id = node.id().clone();
+                                self.track_cancelled(id);
+                            }
+                            let target_id = self.nodes[target].id().clone();
+                            if live {
+                                // The piece's length went from 0 to its
+                                // content length.
+                                self.rebuild_indexes();
+                                revived.push(target_id.clone());
+                            }
+                            chain_anchor = Some(target_id);
+                        } else {
+                            chain_anchor = Some(self.nodes[index].id().clone());
+                        }
+                        cursor = overlap_end;
+                        if overlap_end >= piece_end {
+                            piece_index += 1;
+                        }
+                    }
+                    _ => {
+                        let gap_end = piece.map_or(span.end, |(_, start, _)| start.min(span.end));
+                        let (id, size) = self.recreate(
+                            span,
+                            cursor,
+                            gap_end,
+                            executed_at,
+                            fallback_anchor,
+                            chain_anchor.as_ref(),
+                        );
+                        add_data_size(&mut live_diff, size);
+                        recreated.push(id.clone());
+                        chain_anchor = Some(id);
+                        cursor = gap_end;
+                    }
+                }
+            }
+        }
+
+        let pending_gc_pairs = self.drain_pending_gc_pairs();
+
+        // Revived content is live now; report each piece as an insertion at
+        // its final index. Ascending order keeps the indexes valid when the
+        // changes are applied in sequence.
+        let revived = revived
+            .iter()
+            .map(|id| self.nodes[self.index_of(id)].clone())
+            .collect::<Vec<_>>();
+        let recreated = recreated
+            .iter()
+            .map(|id| self.nodes[self.index_of(id)].clone())
+            .collect::<Vec<_>>();
+        let mut changes = Vec::new();
+        for node in revived.iter().chain(&recreated) {
+            let (from, _) = self.find_indexes_from_range(&node.create_pos_range())?;
+            changes.push(ValueChange {
+                from,
+                to: from,
+                value: Some(node.value().clone()),
+            });
+        }
+        changes.sort_by_key(|change| change.from);
+
+        Ok(RestoreResult {
+            revived,
+            recreated,
+            changes,
+            live_diff,
+            pending_gc_pairs,
+        })
+    }
+
+    /// Recreates `[start, end)` of `span`, a region GC purged, with its
+    /// original ID, and returns that ID and the size of the recreated piece
+    /// (the gap branch of JS `restore`).
+    fn recreate(
+        &mut self,
+        span: &RestoreSpan<V>,
+        start: usize,
+        end: usize,
+        executed_at: &TimeTicket,
+        fallback_anchor: Option<&RgaTreeSplitPos>,
+        chain_anchor: Option<&RgaTreeSplitNodeId>,
+    ) -> (RgaTreeSplitNodeId, DataSize) {
+        let value = span.value.substring(start - span.start, end - span.start);
+        let id = RgaTreeSplitNodeId::new(span.created_at.clone(), start);
+        let mut node = RgaTreeSplitNode::new(id.clone(), value);
+
+        // A purged piece had a single uncancelled removal, known to every
+        // replica before the purge (see `held_from_purge`), so this restore
+        // can only be cancelling that one, and every change that can arrive
+        // later knows it. A stand-in removal by the same actor at lamport 0,
+        // which every such change's vector covers, keeps that answer for
+        // `is_removed_in_view`, with this cancel. Being cancelled, it is never
+        // `removed_at`. The pair is dropped once the cancel is known
+        // everywhere (`prune_stable`); until then snapshots carry it.
+        let stand_in = TimeTicket::new(0, 0, executed_at.actor_id().clone());
+        node.record_removal(stand_in.clone());
+        node.cancel_removal(&stand_in, executed_at.clone());
+        // JS also books the attribute tombstones the copy duplicated
+        // (`bookCopiedAttrTombstones`). Here the root keys GC pairs by ID
+        // string alone and the copy carries the original's attribute IDs, so
+        // booking them would toggle the original's pairs off; like a split's
+        // copies, they stay uncollected (see the porting gaps).
+        let size = node.data_size();
+
+        let prev = self.find_restore_anchor(
+            &span.created_at,
+            start,
+            end,
+            executed_at,
+            fallback_anchor,
+            chain_anchor,
+        );
+        self.insert_after_index(prev, node);
+        self.track_cancelled(id.clone());
+
+        // The physical insert leaves the insertion chain (`ins_prev_id` /
+        // `ins_next_id`) as it was. Relink it, as a split does, so a later
+        // edit whose boundary lands on this piece does not resolve through a
+        // stale link in `find_floor_node_prefer_to_left` (yorkie-js-sdk#1327).
+        // The neighbours are the nearest surviving pieces, not just the ones
+        // at the adjacent offsets: with the piece before the gap purged too,
+        // the one before that would keep pointing past this piece, and
+        // purging it later would hand the piece after the gap an
+        // `ins_prev_id` that skips it.
+        if start > 0 {
+            let prev_id = RgaTreeSplitNodeId::new(span.created_at.clone(), start - 1);
+            if let Some((ins_prev, _)) = self.floor_entry(&prev_id) {
+                self.link_insertions(&ins_prev, &id);
+            }
+        }
+        let next_id = RgaTreeSplitNodeId::new(span.created_at.clone(), end);
+        if let Some((ins_next, _)) = self.ceiling_entry(&next_id) {
+            self.link_insertions(&id, &ins_next);
+        }
+        (id, size)
+    }
+
+    /// Makes `next` follow `prev` in the insertion chain (JS `setInsNext`,
+    /// `setInsPrev`).
+    fn link_insertions(&mut self, prev: &RgaTreeSplitNodeId, next: &RgaTreeSplitNodeId) {
+        let prev_index = self.index_of(prev);
+        let next_index = self.index_of(next);
+        self.nodes[prev_index].ins_next_id = Some(next.clone());
+        self.nodes[next_index].ins_prev_id = Some(prev.clone());
+    }
+
+    /// Re-deletes the characters `spans` describe, a redo of an identity
+    /// undo (JS `retombstone`). Only pieces live in the redo's view are
+    /// removed: a piece removed in that view, or purged, is skipped, and a
+    /// piece removed here by a deletion the redo never saw records the redo
+    /// without being re-tombstoned. The caller accounts `diff` before it
+    /// registers `gc_pairs`.
+    pub(crate) fn retombstone(
+        &mut self,
+        spans: &[RestoreSpan<V>],
+        executed_at: &TimeTicket,
+        vector: Option<&VersionVector>,
+    ) -> Result<RetombstoneResult<V>> {
+        let mut gc_pairs = Vec::new();
+        let mut changes = Vec::new();
+        let mut diff = DataSize::default();
+        // The pieces the removal was recorded on, which the reverse names: a
+        // restore never reaches a piece that holds no removal by its actor.
+        let mut recorded = Vec::new();
+        let remote = vector.filter(|vector| !vector.is_empty());
+
+        for span in spans {
+            for piece in self.find_pieces_overlapping(&span.created_at, span.start, span.end) {
+                let index = self.index_of(&piece);
+                let piece_start = piece.offset();
+                let piece_end = piece_start + self.nodes[index].content_len();
+                let from = piece_start.max(span.start);
+                let to = piece_end.min(span.end);
+
+                if self.nodes[index].is_removed() {
+                    // A piece live in the redo's view but removed here by a
+                    // deletion the redo never saw still records the redo's
+                    // deletion, so a later undo of that other deletion
+                    // keeps it removed.
+                    if remote.is_some_and(|vector| !self.nodes[index].is_removed_in_view(vector)) {
+                        let (target, _) = self.isolate_range(index, from, to)?;
+                        self.nodes[target].record_removal(executed_at.clone());
+                        recorded.push(recorded_span(span, &self.nodes[target]));
+                    }
+                    continue;
+                }
+                // A piece live here but removed in the redo's view (by a
+                // deletion whose undo the redo never saw) is left alone, as
+                // the redoing replica left it: like a deletion, a redo
+                // removes only what was live in its view.
+                if remote.is_some_and(|vector| self.nodes[index].is_removed_in_view(vector)) {
+                    continue;
+                }
+
+                let (target, split_diff) = self.isolate_range(index, from, to)?;
+                // The piece was live, so the split overhead belongs to the
+                // live diff, as an edit's boundary splits do.
+                add_data_size(&mut diff, split_diff);
+                // The visible range, taken while the target is still live.
+                let (change_from, change_to) =
+                    self.find_indexes_from_range(&self.nodes[target].create_pos_range())?;
+                let node = &mut self.nodes[target];
+                node.record_removal(executed_at.clone());
+                recorded.push(recorded_span(span, node));
+                if let Some(removed_at) = node.removed_at() {
+                    gc_pairs.push((node.id_string(), node.data_size(), removed_at.clone()));
+                }
+                self.rebuild_indexes();
+                if change_from < change_to {
+                    changes.push(ValueChange {
+                        from: change_from,
+                        to: change_to,
+                        value: None,
+                    });
+                }
+            }
+        }
+
+        // Isolating a range inside a tombstone buffers born-removed
+        // remainders. Hand them over with the rest: unregistered, they would
+        // never be purged.
+        gc_pairs.extend(self.drain_pending_gc_pairs());
+
+        Ok(RetombstoneResult {
+            gc_pairs,
+            changes,
+            diff,
+            recorded,
+        })
+    }
+
+    /// Re-snapshots `spans` against the pieces they address as they stand
+    /// now (JS `refreshSpans`): same insertions, same intervals, with the
+    /// current attributes. A span is captured when the edit it reverses
+    /// runs, so a style applied to the run afterwards -- which `can_style`
+    /// admits even on a tombstone -- is missing from it, and a replica that
+    /// purged the run would recreate it with the stale snapshot while one
+    /// that kept the tombstone revives the live attributes.
+    ///
+    /// A region a surviving piece (live or removed) covers is taken from that
+    /// piece, so a span crossing several pieces becomes one span per piece; a
+    /// region with no surviving piece keeps the snapshot. Read-only.
+    pub(crate) fn refresh_spans(&self, spans: &[RestoreSpan<V>]) -> Vec<RestoreSpan<V>> {
+        let mut refreshed = Vec::new();
+        let from_snapshot = |span: &RestoreSpan<V>, start: usize, end: usize| RestoreSpan {
+            created_at: span.created_at.clone(),
+            start,
+            end,
+            value: span.value.substring(start - span.start, end - span.start),
+        };
+
+        for span in spans {
+            let mut cursor = span.start;
+            for piece in self.find_pieces_overlapping(&span.created_at, span.start, span.end) {
+                let node = &self.nodes[self.index_of(&piece)];
+                let piece_start = piece.offset();
+                let start = piece_start.max(cursor);
+                let end = (piece_start + node.content_len()).min(span.end);
+                if end <= start {
+                    continue;
+                }
+                if start > cursor {
+                    refreshed.push(from_snapshot(span, cursor, start));
+                }
+                refreshed.push(RestoreSpan {
+                    created_at: span.created_at.clone(),
+                    start,
+                    end,
+                    value: node
+                        .value()
+                        .substring(start - piece_start, end - piece_start),
+                });
+                cursor = end;
+            }
+            if cursor < span.end {
+                refreshed.push(from_snapshot(span, cursor, span.end));
+            }
+        }
+
+        refreshed
+    }
+
+    /// Tells whether any node's ledger holds a cancel (JS
+    /// `hasCancelledRemovals`).
+    pub(crate) fn has_cancelled_removals(&self) -> bool {
+        self.with_cancelled(|cancelled| !cancelled.is_empty())
+    }
+
+    /// Drops from every ledger the removals whose cancels `vector` covers
+    /// (see `RgaTreeSplitNode::prune_stable`), and returns how many nodes
+    /// still hold a cancel (JS `pruneLedgers`).
+    pub(crate) fn prune_ledgers(&mut self, vector: &VersionVector) -> usize {
+        let mut held = BTreeSet::new();
+        let ids = self.with_cancelled(|cancelled| cancelled.iter().cloned().collect::<Vec<_>>());
+        for id in ids {
+            let Some(index) = self.find_node_index(&id) else {
+                continue;
+            };
+            let node = &mut self.nodes[index];
+            node.prune_stable(vector);
+            if node.has_cancels() {
+                held.insert(id);
+            }
+        }
+        let count = held.len();
+        *self.cancelled.0.borrow_mut() = Some(held);
+        count
+    }
+
+    /// Returns the GC pairs buffered by splits of removed nodes and clears
+    /// the buffer (JS `drainPendingGCPairs`).
+    pub(crate) fn drain_pending_gc_pairs(&mut self) -> Vec<GcPairEntry> {
+        std::mem::take(&mut self.pending_gc_pairs)
+    }
+
+    /// Runs `f` on the IDs of the nodes holding a cancel, scanning the nodes
+    /// the first time (JS `scanCancelled`).
+    fn with_cancelled<R>(&self, f: impl FnOnce(&mut BTreeSet<RgaTreeSplitNodeId>) -> R) -> R {
+        let mut cancelled = self.cancelled.0.borrow_mut();
+        f(cancelled.get_or_insert_with(|| {
+            self.nodes
+                .iter()
+                .filter(|node| node.has_cancels())
+                .map(|node| node.id().clone())
+                .collect()
+        }))
+    }
+
+    /// Records that the ledger of the node `id` holds a cancel (JS
+    /// `trackCancelled`).
+    fn track_cancelled(&mut self, id: RgaTreeSplitNodeId) {
+        self.with_cancelled(|cancelled| cancelled.insert(id));
+    }
+
+    /// Returns the nodes of the insertion `created_at`, live or removed, that
+    /// overlap the absolute offsets `[start, end)`, in ascending offset order
+    /// (JS `findPiecesOverlapping`).
+    fn find_pieces_overlapping(
+        &self,
+        created_at: &TimeTicket,
+        start: usize,
+        end: usize,
+    ) -> Vec<RgaTreeSplitNodeId> {
+        let mut pieces = Vec::new();
+        let mut probe = end.checked_sub(1);
+        while let Some(offset) = probe {
+            let key = RgaTreeSplitNodeId::new(created_at.clone(), offset);
+            let Some((id, index)) = self.floor_entry(&key) else {
+                break;
+            };
+            let node_start = id.offset();
+            let node_end = node_start + self.nodes[index].content_len();
+            if node_end <= start {
+                break;
+            }
+            if node_start < end && node_end > start {
+                pieces.push(id);
+            }
+            if node_start <= start {
+                break;
+            }
+            probe = node_start.checked_sub(1);
+        }
+        pieces.reverse();
+        pieces
+    }
+
+    /// Returns the node of the insertion `created_at` whose offsets cover
+    /// `offset`, if any (JS `findPieceCovering`).
+    fn find_piece_covering(&self, created_at: &TimeTicket, offset: usize) -> Option<usize> {
+        let key = RgaTreeSplitNodeId::new(created_at.clone(), offset);
+        let (id, index) = self.floor_entry(&key)?;
+        let node_start = id.offset();
+        (node_start <= offset && offset < node_start + self.nodes[index].content_len())
+            .then_some(index)
+    }
+
+    /// Returns the index of the node to insert a recreated fragment
+    /// `[gap_start, gap_end)` of the insertion `created_at` after (JS
+    /// `findRestoreAnchor`). Every rule keys on what the operation carries
+    /// and on ID lookups:
+    ///  (a) a piece covering `gap_end`: directly before it, the original
+    ///      slot;
+    ///  (b) the nearest surviving piece of the insertion before `gap_start`:
+    ///      directly after it;
+    ///  (c) the nearest surviving piece of the insertion at or after
+    ///      `gap_end`: directly before it;
+    ///  (d) the chain anchor, the fragment this restore placed just before:
+    ///      after it, so a purged run is rebuilt left to right;
+    ///  (e) the operation's fallback anchor, refined;
+    ///  (f) the head.
+    fn find_restore_anchor(
+        &mut self,
+        created_at: &TimeTicket,
+        gap_start: usize,
+        gap_end: usize,
+        executed_at: &TimeTicket,
+        fallback_anchor: Option<&RgaTreeSplitPos>,
+        chain_anchor: Option<&RgaTreeSplitNodeId>,
+    ) -> usize {
+        if let Some(succ) = self.find_piece_covering(created_at, gap_end) {
+            return succ - 1;
+        }
+
+        if gap_start > 0 {
+            let key = RgaTreeSplitNodeId::new(created_at.clone(), gap_start - 1);
+            if let Some((_, index)) = self.floor_entry(&key) {
+                return index;
+            }
+        }
+
+        // The nearest surviving piece of the insertion after the gap, not the
+        // rightmost one: anchoring before a later piece would place the gap
+        // after the pieces in between, and a deletion that later spans from
+        // the gap to one of them would run from its start to the end of the
+        // text.
+        let after = RgaTreeSplitNodeId::new(created_at.clone(), gap_end);
+        if let Some((_, index)) = self.ceiling_entry(&after) {
+            return index - 1;
+        }
+
+        if let Some(chain_anchor) = chain_anchor {
+            return self.index_of(chain_anchor);
+        }
+
+        // As in JS and Go, the size a split of a live node adds here is not
+        // reported; a split of a removed node is buffered as usual.
+        if let Some(fallback_anchor) = fallback_anchor {
+            let left = self.refine_pos(fallback_anchor).and_then(|refined| {
+                self.find_node_with_split(&refined, executed_at)
+                    .map(|(left, _, _)| left)
+            });
+            if let Ok(left) = left {
+                return left;
+            }
+        }
+
+        0
+    }
+
+    /// Splits the node at `index` so that a node covering exactly the
+    /// absolute offsets `[from, to)` exists, and returns its index and the
+    /// size the splits added (JS `isolateRange`). A split of a removed node
+    /// buffers its born-removed piece and adds nothing to the diff.
+    ///
+    /// Requires `node start <= from < to <= node end`.
+    fn isolate_range(&mut self, index: usize, from: usize, to: usize) -> Result<(usize, DataSize)> {
+        let mut diff = DataSize::default();
+        let mut node = index;
+        let node_start = self.nodes[node].id().offset();
+        if from > node_start {
+            add_data_size(&mut diff, self.split_node(node, from - node_start)?);
+            node += 1;
+        }
+        let new_start = self.nodes[node].id().offset();
+        if to < new_start + self.nodes[node].content_len() {
+            add_data_size(&mut diff, self.split_node(node, to - new_start)?);
+        }
+        Ok((node, diff))
+    }
+
+    /// The greatest node ID at or below `key` with the same insertion (JS
+    /// `treeByID.floorEntry` checked with `hasSameCreatedAt`).
+    fn floor_entry(&self, key: &RgaTreeSplitNodeId) -> Option<(RgaTreeSplitNodeId, usize)> {
+        let (id, index) = self.tree_by_id.range(..=key.clone()).next_back()?;
+        id.has_same_created_at(key).then(|| (id.clone(), *index))
+    }
+
+    /// The least node ID at or above `key` with the same insertion (JS
+    /// `treeByID.ceilingEntry` checked with `hasSameCreatedAt`).
+    fn ceiling_entry(&self, key: &RgaTreeSplitNodeId) -> Option<(RgaTreeSplitNodeId, usize)> {
+        let (id, index) = self.tree_by_id.range(key.clone()..).next()?;
+        id.has_same_created_at(key).then(|| (id.clone(), *index))
+    }
+
+    /// The index of a node known to exist.
+    fn index_of(&self, id: &RgaTreeSplitNodeId) -> usize {
+        self.find_node_index(id)
+            .expect("the node was found in this split")
     }
 
     pub(crate) fn find_node_with_split(
@@ -1024,6 +1634,9 @@ where
         }
 
         let child_id = self.nodes[index].id().clone();
+        if let Some(cancelled) = self.cancelled.0.borrow_mut().as_mut() {
+            cancelled.remove(&child_id);
+        }
         let ins_prev_id = self.nodes[index].ins_prev_id.clone();
         let ins_next_id = self.nodes[index].ins_next_id.clone();
         self.nodes.remove(index);
@@ -1165,15 +1778,31 @@ where
 
         if let Some(old_ins_next_id) = old_ins_next_id {
             if let Some(old_ins_next_index) = self.find_node_index(&old_ins_next_id) {
-                self.nodes[old_ins_next_index].ins_prev_id = Some(split_id);
+                self.nodes[old_ins_next_index].ins_prev_id = Some(split_id.clone());
             }
         }
 
+        if split_node.has_cancels() {
+            if let Some(cancelled) = self.cancelled.0.borrow_mut().as_mut() {
+                cancelled.insert(split_id.clone());
+            }
+        }
         self.insert_after_index(index, split_node);
 
         add_data_size(&mut diff, self.nodes[index].data_size());
         add_data_size(&mut diff, self.nodes[index + 1].data_size());
         sub_data_size(&mut diff, prev_size);
+
+        // A piece split off a removed node inherits `removed_at` without a
+        // removal, so no removal registers a GC pair for it. Buffer one here,
+        // or it stays in the text forever. It was never live, so the size
+        // the split added goes to gc with it, and the caller's live diff gets
+        // nothing.
+        if let Some(removed_at) = self.nodes[index + 1].removed_at() {
+            self.pending_gc_pairs
+                .push((split_id.to_id_string(), diff, removed_at.clone()));
+            return Ok(DataSize::default());
+        }
 
         Ok(diff)
     }
@@ -1305,6 +1934,22 @@ where
         self.tree_by_index = RefCell::new(tree_by_index);
         self.tree_by_id = tree_by_id;
         self.splay_node_by_id = splay_node_by_id;
+    }
+}
+
+/// The part of `span` that `node` covers, with the span's own content (the
+/// `record` closure of JS `retombstone`).
+fn recorded_span<V: RgaTreeSplitValue>(
+    span: &RestoreSpan<V>,
+    node: &RgaTreeSplitNode<V>,
+) -> RestoreSpan<V> {
+    let start = node.id().offset();
+    let end = start + node.content_len();
+    RestoreSpan {
+        created_at: span.created_at.clone(),
+        start,
+        end,
+        value: span.value.substring(start - span.start, end - span.start),
     }
 }
 

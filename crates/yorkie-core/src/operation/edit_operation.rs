@@ -100,6 +100,9 @@ impl EditOperation {
 
         root.acc(result.diff);
         register_removed_text_nodes(root, result.removed_nodes);
+        for (child_id, child_size, removed_at) in result.split_gc_pairs {
+            root.register_gc_pair_by_id(child_id, child_size, removed_at);
+        }
 
         // As in JS, one op info per range the edit changed: a removal reports
         // empty content, an insertion its value and attributes.

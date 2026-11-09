@@ -1,7 +1,7 @@
 use super::element::{CrdtElementMeta, DataSize, GcPairSite};
 use super::rga_tree_split::{
-    RgaTreeSplit, RgaTreeSplitNode, RgaTreeSplitNodeId, RgaTreeSplitPos, RgaTreeSplitPosRange,
-    RgaTreeSplitValue, SplitEditResult,
+    GcPairEntry, RestoreResult, RestoreSpan, RetombstoneResult, RgaTreeSplit, RgaTreeSplitNode,
+    RgaTreeSplitNodeId, RgaTreeSplitPos, RgaTreeSplitPosRange, RgaTreeSplitValue, SplitEditResult,
 };
 use super::rht::{Rht, RhtNode};
 use crate::event::parse_attrs;
@@ -89,6 +89,16 @@ impl RgaTreeSplitValue for TextValue {
         let (left, right) = split_utf16(&self.content, offset);
         self.content = left;
         Self::new(right, self.attributes.deepcopy())
+    }
+
+    fn substring(&self, from: usize, to: usize) -> Self {
+        let units = self.content.encode_utf16().collect::<Vec<_>>();
+        let to = to.min(units.len());
+        let from = from.min(to);
+        Self::new(
+            String::from_utf16_lossy(&units[from..to]),
+            self.attributes.deepcopy(),
+        )
     }
 
     fn len(&self) -> usize {
@@ -362,6 +372,59 @@ impl CrdtText {
             .edit(range, edited_at, value, version_vector)
     }
 
+    /// Re-establishes removed characters under their original identities,
+    /// the identity undo of a deletion (JS `CRDTText.restore`).
+    pub(crate) fn restore(
+        &mut self,
+        spans: &[RestoreSpan<TextValue>],
+        executed_at: &TimeTicket,
+        fallback_anchor: Option<&RgaTreeSplitPos>,
+    ) -> Result<RestoreResult<TextValue>> {
+        self.rga_tree_split
+            .restore(spans, executed_at, fallback_anchor)
+    }
+
+    /// Re-removes restored characters, the redo of an identity undo (JS
+    /// `CRDTText.retombstone`).
+    pub(crate) fn retombstone(
+        &mut self,
+        spans: &[RestoreSpan<TextValue>],
+        executed_at: &TimeTicket,
+        version_vector: Option<&VersionVector>,
+    ) -> Result<RetombstoneResult<TextValue>> {
+        self.rga_tree_split
+            .retombstone(spans, executed_at, version_vector)
+    }
+
+    /// Re-snapshots `spans` against the current pieces (JS
+    /// `RGATreeSplit.refreshSpans`).
+    pub(crate) fn refresh_spans(
+        &self,
+        spans: &[RestoreSpan<TextValue>],
+    ) -> Vec<RestoreSpan<TextValue>> {
+        self.rga_tree_split.refresh_spans(spans)
+    }
+
+    /// Tells whether any piece's ledger holds a cancel that `prune_ledgers`
+    /// may drop later (JS `CRDTText.hasCancelledRemovals`).
+    pub(crate) fn has_cancelled_removals(&self) -> bool {
+        self.rga_tree_split.has_cancelled_removals()
+    }
+
+    /// Drops the removals whose cancels `vector` covers from the pieces'
+    /// ledgers, and returns how many pieces still hold a cancel (JS
+    /// `CRDTText.pruneLedgers`).
+    pub(crate) fn prune_ledgers(&mut self, vector: &VersionVector) -> usize {
+        self.rga_tree_split.prune_ledgers(vector)
+    }
+
+    /// Returns the GC pairs of the pieces a style's boundary splits cut off
+    /// removed nodes, born removed (JS `setStyle` and `removeStyle` drain
+    /// them into their pairs).
+    pub(crate) fn drain_pending_gc_pairs(&mut self) -> Vec<GcPairEntry> {
+        self.rga_tree_split.drain_pending_gc_pairs()
+    }
+
     pub(crate) fn set_style_by_index(
         &mut self,
         from_idx: usize,
@@ -383,6 +446,10 @@ impl CrdtText {
     ) -> Result<(Vec<RhtNode>, DataSize)> {
         let (gc_nodes, diff, _, _, _) =
             self.set_style_by_range_with_changes(range, attributes, edited_at, version_vector)?;
+        // This form registers no GC pairs (the JSON facade styles a copy of
+        // the text; the operation styles the root and drains them there), so
+        // it leaves nothing buffered behind either.
+        self.drain_pending_gc_pairs();
         Ok((gc_nodes, diff))
     }
 
@@ -531,6 +598,8 @@ impl CrdtText {
             edited_at,
             version_vector,
         )?;
+        // As in `set_style_by_range`, this form registers no GC pairs.
+        self.drain_pending_gc_pairs();
         Ok((gc_nodes, diff))
     }
 
