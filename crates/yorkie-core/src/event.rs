@@ -4,6 +4,7 @@
 
 use crate::crdt::counter::CounterValue;
 use crate::document::DocStatus;
+use crate::operation::OpSource;
 use crate::presence::Presence;
 use crate::time::ActorId;
 use crate::TreeNodeInput;
@@ -68,6 +69,12 @@ pub struct ChangeInfo {
     pub actor: ActorId,
     pub message: Option<String>,
     pub operations: Vec<OperationInfo>,
+    /// Where the change came from (JS `LocalChangeEvent.source` and
+    /// `RemoteChangeEvent.source`): `Local` or `UndoRedo` on a
+    /// `DocEvent::LocalChange`, always `Remote` on a `DocEvent::RemoteChange`.
+    /// A local change replayed after a snapshot keeps the source it first ran
+    /// with.
+    pub source: OpSource,
 }
 
 /// What an executed operation did (JS `OpInfo`). `path` is the JSON path of
@@ -270,6 +277,7 @@ fn filter_by_path(event: &DocEvent, target: &str) -> Option<DocEvent> {
         actor: info.actor.clone(),
         message: info.message.clone(),
         operations,
+        source: info.source,
     };
     Some(if remote {
         DocEvent::RemoteChange(info)
@@ -315,8 +323,9 @@ pub(crate) fn parse_attrs(attributes: BTreeMap<String, String>) -> BTreeMap<Stri
 mod tests {
     use super::*;
     use crate::change::ChangePack;
+    use crate::crdt::object::CrdtObject;
     use crate::operation::OpInfo;
-    use crate::{Checkpoint, Document, JsonArray, JsonObject, Result};
+    use crate::{Checkpoint, Document, JsonArray, JsonObject, Result, TimeTicket};
     use serde_json::json;
     use std::sync::{Arc, Mutex};
 
@@ -488,8 +497,88 @@ mod tests {
                 actor: actor(2),
                 message: None,
                 operations: vec![set("$", "title")],
+                source: OpSource::Remote,
             })],
             take(&events)
+        );
+        Ok(())
+    }
+
+    /// The `source` of the change events, kind and source in publish order.
+    fn sources(events: &Events) -> Vec<(&'static str, OpSource)> {
+        take(events)
+            .into_iter()
+            .filter_map(|event| match event {
+                DocEvent::LocalChange(info) => Some(("local", info.source)),
+                DocEvent::RemoteChange(info) => Some(("remote", info.source)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// JS `LocalChangeEvent.source` and `RemoteChangeEvent.source`
+    /// (`src/document/document.ts` 414-435): an update publishes `Local`, an
+    /// undo and a redo publish `UndoRedo` (`executeUndoRedo`), and a remote
+    /// change publishes `Remote` (`applyChangeInternal`).
+    #[test]
+    fn change_events_report_their_source() -> Result<()> {
+        let mut source = attached_doc(2);
+        let mut target = attached_doc(1);
+        let (_, events) = collect(&mut target);
+        let path_events = collect_path(&mut target, "$");
+
+        target.update(|root| root.set("title", "a").map(|_| ()))?;
+        target.history_mut().undo()?;
+        target.history_mut().redo()?;
+        source.update(|root| root.set("title", "b").map(|_| ()))?;
+        deliver(&mut source, &mut 0, &mut target)?;
+
+        let want = vec![
+            ("local", OpSource::Local),
+            ("local", OpSource::UndoRedo),
+            ("local", OpSource::UndoRedo),
+            ("remote", OpSource::Remote),
+        ];
+        assert_eq!(want, sources(&events));
+        // `subscribe_path` delivers the same source.
+        assert_eq!(want, sources(&path_events));
+        Ok(())
+    }
+
+    /// JS `set_actor_reissue_test.ts` `replays an undone change under its own
+    /// source after a snapshot`: `applySnapshot` replays the queued local
+    /// changes through `replayLocalChanges`, each under `replaySourceOf`, and
+    /// `applyChangeInternal` publishes the change with that source. The undo's
+    /// change is reported as `UndoRedo`, not `Local`.
+    #[test]
+    fn replayed_undo_keeps_its_source_after_a_snapshot() -> Result<()> {
+        let mut doc = attached_doc(1);
+        doc.update(|root| {
+            let mut obj = JsonObject::new();
+            obj.set("k", "v")?;
+            root.set("obj", obj).map(|_| ())
+        })?;
+        doc.update(|root| root.get_object_mut("obj")?.set("k", "w").map(|_| ()))?;
+        doc.history_mut().undo()?;
+        let (_, events) = collect(&mut doc);
+
+        doc.apply_change_pack(&ChangePack::create_with_snapshot_root(
+            "doc-key",
+            Checkpoint::new(1, 0),
+            false,
+            Vec::new(),
+            Some(doc.version_vector().clone()),
+            None,
+            Some(CrdtObject::create(TimeTicket::initial())),
+        ))?;
+
+        assert_eq!(
+            vec![
+                ("local", OpSource::Local),
+                ("local", OpSource::Local),
+                ("local", OpSource::UndoRedo),
+            ],
+            sources(&events)
         );
         Ok(())
     }

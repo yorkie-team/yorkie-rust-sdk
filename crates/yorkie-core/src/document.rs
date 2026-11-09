@@ -404,8 +404,9 @@ impl Document {
 
             // As in JS, the change event is gated on the operations that ran,
             // not on the op infos they produced.
-            let change_event = (!executed.operations.is_empty())
-                .then(|| DocEvent::LocalChange(change_info(&change, executed.op_infos)));
+            let change_event = (!executed.operations.is_empty()).then(|| {
+                DocEvent::LocalChange(change_info(&change, executed.op_infos, OpSource::Local))
+            });
             let presence_event = change
                 .presence_change()
                 .and_then(|_| self.reconcile_presence(&actor_id, prev));
@@ -616,8 +617,9 @@ impl Document {
             return Ok(());
         }
 
-        let change_event = (!executed.operations.is_empty())
-            .then(|| DocEvent::LocalChange(change_info(&change, executed.op_infos)));
+        let change_event = (!executed.operations.is_empty()).then(|| {
+            DocEvent::LocalChange(change_info(&change, executed.op_infos, OpSource::UndoRedo))
+        });
         let presence_event = change
             .presence_change()
             .and_then(|_| self.reconcile_presence(&actor_id, prev));
@@ -1046,7 +1048,9 @@ impl Document {
             }
 
             if !executed.operations.is_empty() {
-                let info = change_info(change, executed.op_infos);
+                // As in JS `applyChangeInternal`, the event carries the source
+                // the change ran with.
+                let info = change_info(change, executed.op_infos, execute_source);
                 self.publish(if source == OpSource::Remote {
                     DocEvent::RemoteChange(info)
                 } else {
@@ -1120,11 +1124,16 @@ struct StagedRoot {
     root: JsonObject,
 }
 
-fn change_info(change: &Change, op_infos: Vec<crate::operation::OpInfo>) -> ChangeInfo {
+fn change_info(
+    change: &Change,
+    op_infos: Vec<crate::operation::OpInfo>,
+    source: OpSource,
+) -> ChangeInfo {
     ChangeInfo {
         actor: change.id().actor_id().clone(),
         message: change.message().map(str::to_owned),
         operations: op_infos.into_iter().map(OperationInfo::from).collect(),
+        source,
     }
 }
 

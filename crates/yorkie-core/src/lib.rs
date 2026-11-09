@@ -40,6 +40,7 @@ pub use json::{
     TextNodeIdStruct, TextPosStruct, TextPosStructRange, TreeNodeIdStruct, TreeNodeInput,
     TreePosStruct, TreePosStructRange,
 };
+pub use operation::OpSource;
 pub use presence::{Presence, PresenceChange, PresenceProxy};
 pub use schema::{SchemaRule, TreeNodeRule};
 pub use time::{
