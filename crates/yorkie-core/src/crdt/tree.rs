@@ -5768,9 +5768,6 @@ mod tests {
         Ok(())
     }
 
-    /// JS `CRDTTree.Merge` "Can merge different levels with edit", skipped
-    /// upstream (`test/unit/document/crdt/tree_test.ts:1700`, `it.skip` with a
-    /// TODO to fix the test). See `docs/crdt-parity/upstream-skipped-tests.md`.
     /// JS `mergeSourceOf`: a split that takes the children of a merged-away
     /// element back whole re-creates that element, and reports it with its
     /// replacement; a split that leaves some of them in the merge target, or
@@ -5858,6 +5855,9 @@ mod tests {
         Ok(())
     }
 
+    /// JS `CRDTTree.Merge` "Can merge different levels with edit", skipped
+    /// upstream (`test/unit/document/crdt/tree_test.ts:1700`, `it.skip` with a
+    /// TODO to fix the test). See `docs/crdt-parity/upstream-skipped-tests.md`.
     #[test]
     #[ignore = "skipped upstream: JS tree_test.ts:1700 it.skip"]
     fn merges_different_levels_with_edit() -> crate::Result<()> {
