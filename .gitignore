@@ -1,2 +1,3 @@
 /target/
-
+# The agent harness installs its own dependencies (scripts/agent/package.json).
+scripts/agent/node_modules/
