@@ -30,6 +30,12 @@
 #     variable win over a toolchain file and over a directory override, so
 #     `cargo` and `rustc` in the later steps are this toolchain whatever the
 #     workspace says.
+#   - the script finds its own commands through a fixed PATH (the system's
+#     directories and rustup's), and drops the variables that tell rustup
+#     where to download from and where to install to. Nothing an earlier
+#     step exported, and no file in the workspace, is consulted. The two
+#     install directories are then exported with the toolchain, so the later
+#     steps read the toolchain this step installed.
 #
 # NO CACHE: no Swatinem/rust-cache, no actions/cache, no sccache. A cache post
 # step would save `target/` and `~/.cargo` after the agent ran, with whatever
@@ -67,54 +73,79 @@ runs:
           exit 1
         }
 
+        # THE SYSTEM'S COMMANDS AND RUSTUP'S, and no others: whatever an
+        # earlier step put on PATH, nothing below is looked up there. The
+        # variables that choose rustup's download server and its install
+        # directories are dropped for the same reason, so rustup lives in
+        # `$HOME/.cargo/bin` and fetches from static.rust-lang.org.
+        PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$HOME/.cargo/bin"
+        export PATH
+        unset RUSTUP_TOOLCHAIN RUSTUP_DIST_SERVER RUSTUP_UPDATE_ROOT RUSTUP_HOME CARGO_HOME
+        scratch=""
+        trap 'rm -rf -- "$scratch"' EXIT
+
         # OUTSIDE THE WORKSPACE, for everything below. rustup looks for a
         # toolchain file from the working directory upwards, and the
-        # workspace's is the branch's.
+        # workspace's is the branch's. The home directory rustup installs
+        # into must be outside it too.
         workspace="$(cd -- "$GITHUB_WORKSPACE" && pwd -P)"
         cd -- "$RUNNER_TEMP"
         here="$(pwd -P)"
+        home="$(cd -- "$HOME" && pwd -P)"
         case "$here/" in
           "$workspace"/*) refuse "the runner's temporary directory ($here) is inside the workspace" ;;
         esac
-        # Nothing set earlier in the job may choose the toolchain either.
-        unset RUSTUP_TOOLCHAIN
+        case "$home/" in
+          "$workspace"/*) refuse "the home directory ($home) is inside the workspace" ;;
+        esac
 
+        installed_here=no
         if ! command -v rustup >/dev/null; then
           case "$(uname -s)-$(uname -m)" in
             Linux-x86_64) triple=x86_64-unknown-linux-gnu sum="$RUSTUP_INIT_SHA256_X86_64" ;;
             Linux-aarch64) triple=aarch64-unknown-linux-gnu sum="$RUSTUP_INIT_SHA256_AARCH64" ;;
-            *) refuse "no rustup on this runner, and no pinned rustup-init for $(uname -s) $(uname -m)" ;;
+            *) refuse "no rustup on this runner, and no pinned rustup-init for this platform" ;;
           esac
           command -v curl >/dev/null || refuse "no rustup on this runner, and no curl to fetch it with"
-          dir="$(mktemp -d)"
-          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$dir/rustup-init" \
+          scratch="$(mktemp -d "$here/rustup-init.XXXXXX")"
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$scratch/rustup-init" \
             "https://static.rust-lang.org/rustup/archive/$RUSTUP_INIT_VERSION/$triple/rustup-init"
-          echo "$sum  $dir/rustup-init" | sha256sum -c - >/dev/null ||
+          echo "$sum  $scratch/rustup-init" | sha256sum -c - >/dev/null ||
             refuse "rustup-init $RUSTUP_INIT_VERSION for $triple does not have the pinned checksum"
-          chmod +x "$dir/rustup-init"
-          "$dir/rustup-init" -y --no-modify-path --profile minimal --default-toolchain none
-          rm -rf "$dir"
-          export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
-          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
+          chmod +x "$scratch/rustup-init"
+          "$scratch/rustup-init" -y --no-modify-path --profile minimal --default-toolchain none
+          installed_here=yes
         fi
-        case "$(command -v rustup)" in
+
+        # WHERE RUSTUP IS, before anything is said about it to later steps.
+        rustup_bin="$(command -v rustup)" || refuse "rustup is not on PATH"
+        rustup_dir="$(cd -- "$(dirname -- "$rustup_bin")" && pwd -P)"
+        case "$rustup_dir/" in
           "$workspace"/*) refuse "rustup resolves to a file inside the workspace" ;;
         esac
+        if [ "$installed_here" = yes ]; then
+          echo "$home/.cargo/bin" >> "$GITHUB_PATH"
+        fi
 
         rustup toolchain install "$PINNED_TOOLCHAIN" \
           --profile minimal --component rustfmt --component clippy --no-self-update
         rustup default "$PINNED_TOOLCHAIN"
 
-        # The rest of the job: this toolchain, whatever the workspace says.
+        # The rest of the job: this toolchain, whatever the workspace says,
+        # read from where it was just installed, whatever the job inherited.
         echo "RUSTUP_TOOLCHAIN=$PINNED_TOOLCHAIN" >> "$GITHUB_ENV"
+        echo "RUSTUP_HOME=$home/.rustup" >> "$GITHUB_ENV"
+        echo "CARGO_HOME=$home/.cargo" >> "$GITHUB_ENV"
 
         installed="$(rustup component list --toolchain "$PINNED_TOOLCHAIN" --installed)"
-        for component in rustfmt clippy; do
-          case "$installed" in
-            *"$component"*) ;;
-            *) refuse "the $component component is not installed for $PINNED_TOOLCHAIN" ;;
-          esac
-        done
+        case "$installed" in
+          *rustfmt*) ;;
+          *) refuse "the rustfmt component is not installed for $PINNED_TOOLCHAIN" ;;
+        esac
+        case "$installed" in
+          *clippy*) ;;
+          *) refuse "the clippy component is not installed for $PINNED_TOOLCHAIN" ;;
+        esac
         version="$(rustc "+$PINNED_TOOLCHAIN" --version)"
         case "$version" in
           "rustc $PINNED_TOOLCHAIN "*) echo "$version" ;;

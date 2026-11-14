@@ -12,8 +12,9 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { execFileSync as run, spawnSync } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -44,7 +45,7 @@ const CONFIG = loadConfig();
 const read = (...parts) => readFileSync(path.join(ROOT, ...parts), "utf8");
 /** A file's lines that are not comments: prose does not run. */
 const codeOf = (text) => text.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n");
-const TRACKED = execFileSync("git", ["ls-files"], { cwd: ROOT, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 })
+const TRACKED = run("git", ["ls-files"], { cwd: ROOT, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 })
   .split("\n")
   .filter(Boolean);
 const isTracked = (file) => TRACKED.includes(file);
@@ -108,7 +109,7 @@ test("every file the issue-to-PR prompt names exists here", async () => {
   assert.deepEqual(missingImplementPaths(ROOT), []);
   // …and each is TRACKED, not merely on this machine's disk.
   for (const entry of IMPLEMENT_PROMPT_PATHS) {
-    const hit = execFileSync("git", ["ls-files", "--", entry.path], { cwd: ROOT, encoding: "utf8" }).trim();
+    const hit = run("git", ["ls-files", "--", entry.path], { cwd: ROOT, encoding: "utf8" }).trim();
     assert.ok(hit !== "", `${entry.path} exists here but git does not track it`);
   }
 });
@@ -121,7 +122,7 @@ test("no checkout converts the shared files' line endings", () => {
   for (const line of manifest.GITATTRIBUTES_LINES) assert.ok(lines.includes(line), `.gitattributes must contain \`${line}\``);
   if (!existsSync(path.join(ROOT, ".git"))) return;
   for (const rel of ["scripts/agent/config.mjs", "scripts/agent/lenses/lenses.json", ".github/workflows/agent-fix.yml"]) {
-    const out = execFileSync("git", ["check-attr", "text", "--", rel], { cwd: ROOT, encoding: "utf8" });
+    const out = run("git", ["check-attr", "text", "--", rel], { cwd: ROOT, encoding: "utf8" });
     assert.match(out, /: text: unset\s*$/, `${rel}: ${out.trim()}`);
   }
   // The package's own dependencies are installed beside it and never tracked.
@@ -298,7 +299,7 @@ test("every configured path and glob matches a tracked file, or is reserved with
   // `review.diffExcludes` are git pathspecs, so git is asked.
   for (const spec of CONFIG.review.diffExcludes) {
     checked++;
-    const hit = execFileSync("git", ["ls-files", "--", spec], { cwd: ROOT, encoding: "utf8" }).trim();
+    const hit = run("git", ["ls-files", "--", spec], { cwd: ROOT, encoding: "utf8" }).trim();
     assert.ok(hit !== "", `review.diffExcludes: ${spec} matches no tracked file`);
   }
   // Guards on the guard: the lists were walked, and RESERVED holds nothing stale.
@@ -342,7 +343,7 @@ test("the toolchain action runs nothing the branch wrote, uses no other action a
   // `.cargo/config.toml`. So the action never invokes cargo, under any name.
   const cargoCall = /(^|[\s;&|(`"'])cargo(-[a-z-]+)?(\s|$)/m;
   assert.ok(cargoCall.test("  run: cargo fetch") && cargoCall.test('x="$(cargo --version)"') && cargoCall.test("a && cargo-clippy"), "the pattern must find a cargo call");
-  assert.ok(!cargoCall.test('export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"'), "…and not the directory rustup lives in");
+  assert.ok(!cargoCall.test('PATH="/usr/bin:$HOME/.cargo/bin"') && !cargoCall.test('echo "$home/.cargo/bin"'), "…and not the directory rustup lives in");
   assert.ok(!cargoCall.test(ACTION_CODE), "the toolchain action invokes cargo");
   assert.ok(!/\bmake\b/.test(ACTION_CODE), "the toolchain action runs make, which is the branch's Makefile");
 
@@ -364,68 +365,395 @@ test("the toolchain action runs nothing the branch wrote, uses no other action a
   assert.ok(!ACTION_CODE.includes("${{"), "the toolchain action interpolates an expression into its script");
 });
 
-test("the toolchain action cannot be redirected by the workspace, and neither can the steps after it", () => {
-  const script = ACTION_CODE.slice(ACTION_CODE.indexOf("      run: |"));
+/** The action's one script, as bash would read it, and the `env:` it runs with. */
+const ACTION_SCRIPT = ACTION.slice(ACTION.indexOf("      run: |\n") + "      run: |\n".length).split("\n").map((l) => l.replace(/^ {8}/, "")).join("\n");
+const ACTION_ENV = Object.fromEntries([...ACTION_CODE.matchAll(/^ {8}([A-Z_0-9]+): "([^"]*)"$/gm)].map((m) => [m[1], m[2]]));
+
+/**
+ * The command each simple command of a shell script starts with. Line
+ * continuations are joined, comments dropped, a `case` arm's pattern dropped,
+ * and each line split where a new command can begin (`;`, `&&`, `||`, `|`,
+ * `$(`); leading keywords and assignments are skipped. It reads the shapes
+ * this script uses, which is what an allow-list needs: a command in a shape
+ * it does not read is a word it does not know.
+ */
+function commandWords(script) {
+  const words = [];
+  const SKIP = new Set(["if", "then", "else", "elif", "do", "!", "{", "}", "fi", "esac", "done", ";;", "in"]);
+  for (let line of script.replace(/\\\n/g, " ").split("\n")) {
+    line = line.trim();
+    if (line === "" || line.startsWith("#")) continue;
+    if (/;;$/.test(line)) line = line.replace(/^[^)]*\)/, "");
+    // What a `trap` runs is a command too.
+    line = line.replace(/^trap '([^']*)' .*$/, "trap ; $1");
+    for (const segment of line.split(/;;|;|&&|\|\||\||\$\(/)) {
+      const parts = segment.trim().split(/\s+/).filter(Boolean);
+      while (parts.length > 0 && (SKIP.has(parts[0]) || /^[A-Za-z_]\w*=/.test(parts[0]))) parts.shift();
+      if (parts.length > 0) words.push(parts[0].replace(/\(\)$/, ""));
+    }
+  }
+  return words;
+}
+
+test("the toolchain action's script calls only the commands on its list, and names the workspace only to leave it", () => {
+  const script = ACTION_SCRIPT;
+  const lines = script.split("\n").map((l) => l.trim());
   const at = (needle) => {
     const i = script.indexOf(needle);
     assert.ok(i >= 0, `the toolchain action no longer contains \`${needle}\``);
     return i;
   };
-  assert.match(script, /^\s+set -euo pipefail$/m);
-  // rustup looks for a toolchain file from the working directory upwards, so
-  // it leaves the workspace before the first rustup or rustc command, and
-  // refuses a temporary directory that is inside the workspace.
-  const leave = at('cd -- "$RUNNER_TEMP"');
-  const firstTool = script.search(/^\s+(?:if ! )?(?:command -v )?(rustup|rustc|"\$dir\/rustup-init")\b/m);
-  assert.ok(firstTool > leave, "the toolchain action touches rustup before it has left the workspace");
-  assert.ok(at("is inside the workspace") > leave && at("is inside the workspace") < firstTool);
-  // …and never goes back: the only other `cd` is the subshell that resolves
-  // the workspace's real path.
-  assert.deepEqual([...script.matchAll(/\bcd [^\n;&)]*/g)].map((m) => m[0].trim()), ['cd -- "$GITHUB_WORKSPACE"', 'cd -- "$RUNNER_TEMP"']);
-  assert.ok(at("unset RUSTUP_TOOLCHAIN") < firstTool);
+  assert.equal(lines[0], "set -euo pipefail");
+  assert.deepEqual(ACTION_ENV.PINNED_TOOLCHAIN, RUST_VERSION);
+  assert.deepEqual(Object.keys(ACTION_ENV), ["PINNED_TOOLCHAIN", "RUSTUP_INIT_VERSION", "RUSTUP_INIT_SHA256_X86_64", "RUSTUP_INIT_SHA256_AARCH64"]);
+
+  // EVERY COMMAND THE SCRIPT STARTS. A new one — a script from the
+  // workspace, a package manager, a second download — is not on the list.
+  const parser = commandWords('a=1 b "$(c -x)" | d || e\nif ! f; then g; fi\n  "$w"/*) h "x" ;;\ntrap \'i -r\' EXIT\nbash "$GITHUB_WORKSPACE/x.sh"');
+  assert.deepEqual(parser, ["b", "c", "d", "e", "f", "g", "h", "trap", "i", "bash"], "the command reader no longer reads these shapes");
+  const ALLOWED = [
+    // the shell's own
+    "set", "refuse", "echo", "exit", "export", "unset", "trap", "cd", "pwd", "case", "command", "[",
+    // the system's, found through the fixed PATH
+    "rm", "uname", "mktemp", "curl", "sha256sum", "chmod", "dirname",
+    // the one download, after its checksum matched
+    '"$scratch/rustup-init"',
+    // rustup's
+    "rustup", "rustc",
+  ];
+  assert.deepEqual([...new Set(commandWords(script))].sort(), [...ALLOWED].sort(), "the toolchain action starts a command that is not on its list (or no longer starts one that is)");
+
+  // THE WORKSPACE IS NAMED ONCE, to learn its real path, and that path is
+  // used only to refuse something that turned out to be inside it.
+  assert.deepEqual(lines.filter((l) => l.includes("GITHUB_WORKSPACE")), ['workspace="$(cd -- "$GITHUB_WORKSPACE" && pwd -P)"']);
+  assert.deepEqual(lines.filter((l) => /\$\{?workspace\b/.test(l)), [
+    `"$workspace"/*) refuse "the runner's temporary directory ($here) is inside the workspace" ;;`,
+    '"$workspace"/*) refuse "the home directory ($home) is inside the workspace" ;;',
+    '"$workspace"/*) refuse "rustup resolves to a file inside the workspace" ;;',
+  ]);
+  assert.deepEqual([...script.matchAll(/\bcd [^\n;&)]*/g)].map((m) => m[0].trim()), ['cd -- "$GITHUB_WORKSPACE"', 'cd -- "$RUNNER_TEMP"', 'cd -- "$HOME"', 'cd -- "$(dirname -- "$rustup_bin"']);
+
+  // ITS OWN COMMANDS COME FROM A FIXED PATH, and nothing an earlier step
+  // exported tells rustup where to download from or install to. Both before
+  // the first command that is not the shell's own.
+  const firstExternal = script.search(/^\s*(?:.*\$\()?(?:rm|uname|mktemp|curl|sha256sum|chmod|dirname|rustup|rustc)\b/m);
+  const fixedPath = at('PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$HOME/.cargo/bin"\nexport PATH\n');
+  const dropped = at("unset RUSTUP_TOOLCHAIN RUSTUP_DIST_SERVER RUSTUP_UPDATE_ROOT RUSTUP_HOME CARGO_HOME\n");
+  assert.ok(fixedPath < dropped && dropped < firstExternal, "the fixed PATH and the unset must come before the first external command");
+  assert.equal([...script.matchAll(/\bPATH=/g)].length, 1, "the toolchain action sets PATH a second time");
+  assert.ok(at("trap 'rm -rf -- \"$scratch\"' EXIT\n") < at("mktemp -d"), "the download directory must be removed on every way out");
+  assert.ok(at('scratch="$(mktemp -d "$here/rustup-init.XXXXXX")"') > 0);
+
+  // WHAT IT TELLS THE REST OF THE JOB: one line to each file, and only after
+  // it knows where rustup is and that it is not in the workspace.
+  assert.deepEqual(lines.filter((l) => l.includes("GITHUB_PATH")), ['echo "$home/.cargo/bin" >> "$GITHUB_PATH"']);
+  assert.deepEqual(lines.filter((l) => l.includes("GITHUB_ENV")), [
+    'echo "RUSTUP_TOOLCHAIN=$PINNED_TOOLCHAIN" >> "$GITHUB_ENV"',
+    'echo "RUSTUP_HOME=$home/.rustup" >> "$GITHUB_ENV"',
+    'echo "CARGO_HOME=$home/.cargo" >> "$GITHUB_ENV"',
+  ]);
+  assert.deepEqual([...new Set([...script.matchAll(/\d?>>?&?\s*[^\s;]+/g)].map((m) => m[0]))].sort(), [">&2", ">/dev/null", '>> "$GITHUB_ENV"', '>> "$GITHUB_PATH"'], "the toolchain action writes somewhere else");
+  assert.ok(at("rustup resolves to a file inside the workspace") < at('>> "$GITHUB_PATH"'));
+  assert.ok(at('>> "$GITHUB_PATH"') < at("rustup toolchain install"));
+
   // Every rustup and rustc command that chooses a toolchain names the pin.
-  for (const line of script.split("\n").map((l) => l.trim()).filter((l) => /\brustup (toolchain|default|component|run|show|which)\b|\brustc /.test(l))) {
+  for (const line of lines.filter((l) => /\brustup (toolchain|default|component|run|show|which|override)\b|\brustc /.test(l))) {
     assert.ok(line.includes("$PINNED_TOOLCHAIN"), `this line lets rustup choose the toolchain: ${line}`);
   }
-  assert.ok(!/rustup override/.test(script));
-  // The rest of the job: rustup lets RUSTUP_TOOLCHAIN win over a toolchain
-  // file and over a directory override, so the branch's file cannot choose
-  // the compiler the agent's `make verify` runs.
-  at('echo "RUSTUP_TOOLCHAIN=$PINNED_TOOLCHAIN" >> "$GITHUB_ENV"');
-  // It ends by checking what it installed.
-  assert.ok(at('"rustc $PINNED_TOOLCHAIN "*)') > at("rustup toolchain install"));
+  assert.ok(at('"rustc $PINNED_TOOLCHAIN "*)') > at("rustup toolchain install"), "it ends by checking what it installed");
 
   // WHERE THE RUNNER HAS NO RUSTUP: one binary, from rust-lang.org, at a
   // pinned version, executed only after its checksum matched. Never a script
-  // piped into a shell.
-  assert.match(ACTION_CODE, /^\s+RUSTUP_INIT_VERSION: "\d+\.\d+\.\d+"$/m);
-  for (const arch of ["X86_64", "AARCH64"]) assert.match(ACTION_CODE, new RegExp(`^\\s+RUSTUP_INIT_SHA256_${arch}: "[0-9a-f]{64}"$`, "m"));
+  // piped into a shell, and a failed check stops the step.
+  assert.match(ACTION_ENV.RUSTUP_INIT_VERSION, /^\d+\.\d+\.\d+$/);
+  for (const arch of ["X86_64", "AARCH64"]) assert.match(ACTION_ENV[`RUSTUP_INIT_SHA256_${arch}`], /^[0-9a-f]{64}$/);
   at('"https://static.rust-lang.org/rustup/archive/$RUSTUP_INIT_VERSION/$triple/rustup-init"');
   assert.equal([...script.matchAll(/https?:\/\//g)].length, 1, "the toolchain action fetches from somewhere else too");
-  assert.ok(at("sha256sum -c -") < at('"$dir/rustup-init" -y'), "rustup-init must be checked before it is run");
+  assert.match(script, /^\s+echo "\$sum {2}\$scratch\/rustup-init" \| sha256sum -c - >\/dev\/null \|\|\n\s+refuse "rustup-init \$RUSTUP_INIT_VERSION for \$triple does not have the pinned checksum"\n/m, "a failed checksum must stop the step, on the same command");
+  assert.ok(at("sha256sum -c -") < at('"$scratch/rustup-init" -y'), "rustup-init must be checked before it is run");
+  assert.ok(!/\|\|\s*(true|:)(\s|$)/m.test(script), "a failure is swallowed with `|| true`");
   assert.ok(!/\|\s*(ba)?sh\b/.test(script), "the toolchain action pipes a download into a shell");
-  assert.match(script, /"\$dir\/rustup-init" -y --no-modify-path --profile minimal --default-toolchain none\n/);
+  at('"$scratch/rustup-init" -y --no-modify-path --profile minimal --default-toolchain none\n');
+});
+
+// --- the toolchain action, run -------------------------------------------------------
+//
+// The assertions above read the script. These run it: against a temporary
+// "runner" whose workspace is hostile, with rustup, rustc and — where the
+// fallback is exercised — curl, sha256sum, uname and the downloaded
+// rustup-init replaced by stubs that record how they were called. No network,
+// nothing installed. What is asserted is what the step DID.
+
+/** A stub rustup and rustc: each call is one line in `$LOG/calls`, with where it ran and what it could see. */
+const STUB_RUSTUP = [
+  "#!/bin/sh",
+  'printf \'rustup %s|cwd=%s|toolchain=%s|dist=%s|root=%s|cargo_home=%s|rustup_home=%s\\n\' "$*" "$(pwd -P)" "${RUSTUP_TOOLCHAIN-}" "${RUSTUP_DIST_SERVER-}" "${RUSTUP_UPDATE_ROOT-}" "${CARGO_HOME-}" "${RUSTUP_HOME-}" >> "$LOG/calls"',
+  'case "$1 $2" in "component list") printf \'rustfmt-stub (installed)\\nclippy-stub (installed)\\n\' ;; esac',
+  "",
+].join("\n");
+const STUB_RUSTC = ["#!/bin/sh", 'printf \'rustc %s|cwd=%s\\n\' "$*" "$(pwd -P)" >> "$LOG/calls"', 'echo "rustc ${1#+} (stub)"', ""].join("\n");
+/** A file in the workspace that says so if anything runs it. */
+const WORKSPACE_SHIM = ["#!/bin/sh", 'echo "$0 $*" >> "$LOG/ran-from-workspace"', "exit 0", ""].join("\n");
+/** Shell functions standing in for the system's commands on the fallback path. */
+const FALLBACK_STUBS = [
+  'uname() { case "$1" in -s) echo Linux ;; -m) echo x86_64 ;; esac; }',
+  'curl() { echo "curl $*" >> "$LOG/calls"; while [ $# -gt 1 ]; do if [ "$1" = -o ]; then cat "$FAKE_RUSTUP_INIT" > "$2"; fi; shift; done; }',
+  'sha256sum() { echo "sha256sum $*|stdin=$(cat)" >> "$LOG/calls"; return "$CHECKSUM_STATUS"; }',
+].join("\n");
+
+function toolchainRunner(t) {
+  const root = realpathSync(mkdtempSync(path.join(tmpdir(), "agent-toolchain-")));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const d = { root, ws: `${root}/work/repo`, temp: `${root}/_temp`, home: `${root}/home`, log: `${root}/log`, stubs: `${root}/stubs`, env: `${root}/github_env`, path: `${root}/github_path` };
+  for (const dir of [`${d.ws}/bin`, `${d.ws}/scripts`, `${d.ws}/.cargo`, d.temp, d.home, d.log, d.stubs]) mkdirSync(dir, { recursive: true });
+  const exe = (file, text) => {
+    writeFileSync(file, text);
+    chmodSync(file, 0o755);
+  };
+  // THE HOSTILE WORKSPACE: a toolchain file naming its own binaries, cargo
+  // configuration, a setup script, and a `bin/` that shadows every command
+  // the action uses and is FIRST on the PATH the step inherits.
+  writeFileSync(`${d.ws}/rust-toolchain.toml`, `[toolchain]\npath = "${d.ws}"\n`);
+  writeFileSync(`${d.ws}/.cargo/config.toml`, `[build]\nrustc-wrapper = "${d.ws}/bin/rustc"\n`);
+  for (const name of ["rustup", "rustc", "cargo", "uname", "curl", "sha256sum", "mktemp", "chmod", "rm", "dirname", "rustup-init"]) exe(`${d.ws}/bin/${name}`, WORKSPACE_SHIM);
+  exe(`${d.ws}/scripts/setup-rust.sh`, WORKSPACE_SHIM);
+  exe(`${d.stubs}/rustup`, STUB_RUSTUP);
+  exe(`${d.stubs}/rustc`, STUB_RUSTC);
+  // What the downloaded rustup-init "installs": the stubs, where rustup-init puts rustup.
+  exe(`${d.stubs}/rustup-init`, ["#!/bin/sh", 'printf \'rustup-init %s|cargo_home=%s\\n\' "$*" "${CARGO_HOME-}" >> "$LOG/calls"', 'mkdir -p "$HOME/.cargo/bin" && cp "$STUBS/rustup" "$STUBS/rustc" "$HOME/.cargo/bin/"', ""].join("\n"));
+  writeFileSync(`${root}/step.sh`, ACTION_SCRIPT);
+  for (const f of [d.env, d.path]) writeFileSync(f, "");
+  const listing = () => run("find", [d.ws, "-print"], { encoding: "utf8" }).split("\n").sort().join("\n");
+  const before = listing();
+  d.installRustup = (dir = `${d.home}/.cargo/bin`) => {
+    mkdirSync(dir, { recursive: true });
+    exe(`${dir}/rustup`, STUB_RUSTUP);
+    exe(`${dir}/rustc`, STUB_RUSTC);
+  };
+  d.run = ({ stubs = "", env = {} } = {}) => {
+    const r = spawnSync("bash", ["-c", `${stubs}\nsource "$STEP"`], {
+      cwd: d.ws, // a composite step starts in the workspace
+      encoding: "utf8",
+      env: {
+        ...ACTION_ENV,
+        PATH: `${d.ws}/bin:${process.env.PATH}`,
+        HOME: d.home,
+        GITHUB_WORKSPACE: d.ws,
+        RUNNER_TEMP: d.temp,
+        GITHUB_ENV: d.env,
+        GITHUB_PATH: d.path,
+        STEP: `${root}/step.sh`,
+        LOG: d.log,
+        STUBS: d.stubs,
+        FAKE_RUSTUP_INIT: `${d.stubs}/rustup-init`,
+        CHECKSUM_STATUS: "0",
+        // What an earlier step, or the runner's own environment, might carry.
+        RUSTUP_TOOLCHAIN: "nightly",
+        RUSTUP_DIST_SERVER: "https://dist.example.invalid",
+        RUSTUP_UPDATE_ROOT: "https://update.example.invalid",
+        CARGO_HOME: `${d.ws}/cargo-home`,
+        RUSTUP_HOME: `${d.ws}/rustup-home`,
+        ...env,
+      },
+    });
+    const text = (f) => (existsSync(f) ? readFileSync(f, "utf8") : "");
+    return {
+      status: r.status,
+      stderr: r.stderr,
+      calls: text(`${d.log}/calls`).split("\n").filter(Boolean),
+      githubEnv: text(d.env),
+      githubPath: text(d.path),
+      ranFromWorkspace: text(`${d.log}/ran-from-workspace`),
+      workspaceUntouched: listing() === before,
+      leftInTemp: readdirSync(d.temp),
+    };
+  };
+  return d;
+}
+const PIN = () => ACTION_ENV.PINNED_TOOLCHAIN;
+/** What later steps are told: the pin, and the directories it was installed under. */
+const exported = (home) => `RUSTUP_TOOLCHAIN=${PIN()}\nRUSTUP_HOME=${home}/.rustup\nCARGO_HOME=${home}/.cargo\n`;
+const rustupCalls = (temp) => {
+  const seen = `|cwd=${temp}|toolchain=|dist=|root=|cargo_home=|rustup_home=`;
+  return [
+    `rustup toolchain install ${PIN()} --profile minimal --component rustfmt --component clippy --no-self-update${seen}`,
+    `rustup default ${PIN()}${seen}`,
+    `rustup component list --toolchain ${PIN()} --installed${seen}`,
+    `rustc +${PIN()} --version|cwd=${temp}`,
+  ];
+};
+
+test("run: with rustup on the runner, the action installs the pin from outside a hostile workspace and runs nothing in it", (t) => {
+  const d = toolchainRunner(t);
+  d.installRustup();
+  const r = d.run();
+  assert.equal(r.status, 0, r.stderr);
+  // Exactly these commands, each from the temporary directory, none of them
+  // seeing a toolchain, a download server or an install directory that the
+  // step inherited.
+  assert.deepEqual(r.calls, rustupCalls(d.temp));
+  // What later steps are told: the pin, rustup's own directories in place of
+  // the inherited ones, and no new PATH entry.
+  assert.equal(r.githubEnv, exported(d.home));
+  assert.equal(r.githubPath, "");
+  // Nothing from the workspace ran — its `bin/` was first on PATH — and
+  // nothing in it was created, changed or removed.
+  assert.equal(r.ranFromWorkspace, "");
+  assert.equal(r.workspaceUntouched, true, "the toolchain action wrote into the workspace");
+  assert.deepEqual(r.leftInTemp, []);
+});
+
+test("run: without rustup, the action runs the pinned rustup-init only after its checksum matched", (t) => {
+  const d = toolchainRunner(t);
+  const r = d.run({ stubs: FALLBACK_STUBS });
+  assert.equal(r.status, 0, r.stderr);
+  const scratch = /-o (\S+)\/rustup-init /.exec(r.calls[0])?.[1];
+  assert.match(String(scratch), new RegExp(`^${d.temp}/rustup-init\\.\\w{6}$`), "the download goes into the runner's temporary directory");
+  assert.deepEqual(r.calls, [
+    `curl --proto =https --tlsv1.2 -fsSL --retry 3 -o ${scratch}/rustup-init https://static.rust-lang.org/rustup/archive/${ACTION_ENV.RUSTUP_INIT_VERSION}/x86_64-unknown-linux-gnu/rustup-init`,
+    `sha256sum -c -|stdin=${ACTION_ENV.RUSTUP_INIT_SHA256_X86_64}  ${scratch}/rustup-init`,
+    // Installed under the home directory, not where an inherited CARGO_HOME pointed.
+    "rustup-init -y --no-modify-path --profile minimal --default-toolchain none|cargo_home=",
+    ...rustupCalls(d.temp),
+  ]);
+  assert.equal(r.githubPath, `${d.home}/.cargo/bin\n`);
+  assert.equal(r.githubEnv, exported(d.home));
+  assert.equal(r.ranFromWorkspace, "");
+  assert.equal(r.workspaceUntouched, true, "the toolchain action wrote into the workspace");
+  assert.deepEqual(r.leftInTemp, [], "the download directory was left behind");
+});
+
+test("run: a download whose checksum does not match is never executed", (t) => {
+  const d = toolchainRunner(t);
+  const r = d.run({ stubs: FALLBACK_STUBS, env: { CHECKSUM_STATUS: "1" } });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /::error::agent-toolchain: rustup-init \d+\.\d+\.\d+ for x86_64-unknown-linux-gnu does not have the pinned checksum/);
+  assert.deepEqual(r.calls.map((c) => c.split(" ")[0]), ["curl", "sha256sum"], "something ran after the checksum failed");
+  assert.equal(r.githubPath, "");
+  assert.equal(r.githubEnv, "");
+  assert.equal(existsSync(`${d.home}/.cargo`), false);
+  assert.deepEqual(r.leftInTemp, [], "the refused download was left behind");
+  assert.equal(r.workspaceUntouched, true);
+});
+
+test("run: the action refuses a rustup, a home or a temporary directory that is inside the workspace", (t) => {
+  // rustup's directory resolves into the workspace: the branch's file would
+  // be the `rustup` every later step runs.
+  let d = toolchainRunner(t);
+  mkdirSync(`${d.home}/.cargo`);
+  mkdirSync(`${d.ws}/tools`);
+  symlinkSync(`${d.ws}/tools`, `${d.home}/.cargo/bin`);
+  for (const name of ["rustup", "rustc"]) {
+    writeFileSync(`${d.ws}/tools/${name}`, WORKSPACE_SHIM);
+    chmodSync(`${d.ws}/tools/${name}`, 0o755);
+  }
+  let r = d.run();
+  assert.equal(r.status, 1, "a rustup that resolves into the workspace was accepted");
+  assert.match(r.stderr, /::error::agent-toolchain: rustup resolves to a file inside the workspace/);
+  assert.equal(r.ranFromWorkspace, "");
+  assert.equal(r.githubPath, "", "the workspace's directory was put on PATH before the refusal");
+  assert.equal(r.githubEnv, "");
+
+  // …the same when the fallback installed it there.
+  d = toolchainRunner(t);
+  mkdirSync(`${d.home}/.cargo`);
+  mkdirSync(`${d.ws}/tools`);
+  symlinkSync(`${d.ws}/tools`, `${d.home}/.cargo/bin`);
+  r = d.run({ stubs: FALLBACK_STUBS });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /rustup resolves to a file inside the workspace/);
+  assert.equal(r.githubPath, "", "the workspace's directory was put on PATH before the refusal");
+  assert.equal(r.githubEnv, "");
+
+  // A home directory inside the workspace: rustup would install into it.
+  d = toolchainRunner(t);
+  mkdirSync(`${d.ws}/home`);
+  r = d.run({ stubs: FALLBACK_STUBS, env: { HOME: `${d.ws}/home` } });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /home directory .* is inside the workspace/);
+  assert.deepEqual(r.calls, [], "something was downloaded or run before the refusal");
+
+  // A temporary directory inside the workspace: a toolchain file above it would be read.
+  d = toolchainRunner(t);
+  d.installRustup();
+  mkdirSync(`${d.ws}/_temp`);
+  r = d.run({ env: { RUNNER_TEMP: `${d.ws}/_temp` } });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /temporary directory .* is inside the workspace/);
+  assert.deepEqual(r.calls, []);
+  assert.equal(r.githubEnv, "");
 });
 
 // --- the commands the prompts name --------------------------------------------------
+
+/** A job's steps: what each `uses` or runs, with its name and any `if:` or `continue-on-error:`. */
+function ciSteps(id) {
+  const job = codeOf(ciJob(id));
+  const body = job.slice(job.indexOf("\n    steps:\n") + "\n    steps:\n".length);
+  return body.split(/^ {6}- /m).filter((s) => s.trim() !== "").map((step) => {
+    const key = (k) => new RegExp(`^(?: {8})?${k}: (.*)$`, "m").exec(step)?.[1];
+    const out = {};
+    for (const k of ["name", "uses", "run", "if", "continue-on-error"]) if (key(k) !== undefined) out[k] = key(k);
+    return out;
+  });
+}
 
 test("make verify is exactly what ci.yml's check job runs", () => {
   // `fixer.verifyCommand` is the whole of what a fixer verifies with. A
   // hand-written subset would let a fixer push something CI then refuses, so
   // the check job calls the same targets and nothing else.
   assert.equal(CONFIG.fixer.verifyCommand, "make verify");
+
+  // THE MAKEFILE, WHOLE. make takes the LAST recipe for a target and applies
+  // every variable it is given, so a second `test:` further down, an
+  // `export RUSTFLAGS=…` at the top or an included file would change what
+  // the targets run while each recipe above still read the same. There is
+  // little enough of it to pin every line that is not a comment.
+  assert.deepEqual(MAKEFILE.split("\n").filter((l) => l.trim() !== "" && !l.startsWith("#")), [
+    ".PHONY: verify fmt-check clippy test doc",
+    "verify: fmt-check clippy test doc",
+    "fmt-check:",
+    "\tcargo fmt --all --check",
+    "clippy:",
+    "\tcargo clippy --workspace --all-targets -- -D warnings",
+    "test:",
+    "\tcargo test --workspace",
+    "doc:",
+    '\tRUSTDOCFLAGS="-D warnings" cargo doc -p yorkie --no-deps',
+  ]);
+  // No other makefile is picked up first: GNU make prefers `GNUmakefile`.
+  assert.deepEqual(TRACKED.filter((f) => /^(GNUmakefile|makefile|Makefile|.*\.mk)$/.test(f)), ["Makefile"]);
   const verify = makeTarget("verify");
   assert.deepEqual(verify.needs, ["fmt-check", "clippy", "test", "doc"]);
-  assert.deepEqual(verify.recipe, []);
-  assert.deepEqual(runLines(ciJob("check")), verify.needs.map((t) => `make ${t}`));
-  // The four commands, as the prompts and the coverage note describe them.
-  assert.deepEqual(makeTarget("fmt-check").recipe, ["cargo fmt --all --check"]);
-  assert.deepEqual(makeTarget("clippy").recipe, ["cargo clippy --workspace --all-targets -- -D warnings"]);
-  assert.deepEqual(makeTarget("test").recipe, ["cargo test --workspace"]);
-  assert.deepEqual(makeTarget("doc").recipe, ['RUSTDOCFLAGS="-D warnings" cargo doc -p yorkie --no-deps']);
-  for (const t of verify.needs) assert.deepEqual(makeTarget(t).needs, [], `make ${t} runs another target first`);
-  // Nothing in the check job's environment changes what those commands do.
-  assert.ok(!/RUSTFLAGS|RUSTDOCFLAGS|CARGO_(?!TERM_COLOR)/.test(codeOf(CI)), "ci.yml sets a cargo or rustc variable the Makefile does not");
+
+  // THE CHECK JOB, STEP BY STEP: the setup, then the four targets in
+  // `verify`'s order. No step may be skipped (`if:`) or allowed to fail
+  // (`continue-on-error:`): either leaves the lane green without having
+  // checked anything.
+  assert.deepEqual(ciSteps("check"), [
+    { uses: "actions/checkout@v4" },
+    { uses: "dtolnay/rust-toolchain@master" },
+    { uses: "Swatinem/rust-cache@v2" },
+    ...verify.needs.map((t) => ({ run: `make ${t}` })),
+  ]);
+  // The integration job likewise. Its one conditional step prints the
+  // server's log after a failure and decides nothing.
+  assert.deepEqual(ciSteps("integration"), [
+    { uses: "actions/checkout@v4" },
+    { uses: "dtolnay/rust-toolchain@master" },
+    { uses: "Swatinem/rust-cache@v2" },
+    { name: "Start Yorkie server", run: "|" },
+    { run: "cargo test -p yorkie" },
+    { name: "Smoke-run the quickstart example", run: "cargo run -p yorkie --example quickstart" },
+    { name: "Server logs", run: "docker logs yorkie", if: "failure()" },
+  ]);
+  const ciCode = codeOf(CI);
+  assert.ok(!/continue-on-error/.test(ciCode), "a ci.yml step may fail without failing the lane");
+  assert.deepEqual([...ciCode.matchAll(/^\s+if: .*$/gm)].map((m) => m[0].trim()), ["if: failure()"], "a ci.yml job or step is conditional");
+  assert.ok(!/\|\|\s*(true|:)(\s|$)/m.test(ciCode), "a ci.yml command's failure is swallowed");
+  assert.ok(!/^\s+(needs|strategy|defaults|container|services):/m.test(ciCode), "a ci.yml job gained a key that changes how its steps run");
+  // Nothing in the environment changes what those commands do.
+  assert.deepEqual([...ciCode.matchAll(/^ {2,}([A-Z][A-Z_0-9]*): /gm)].map((m) => m[1]).sort(), ["CARGO_TERM_COLOR", "YORKIE_IMAGE", "YORKIE_RPC_ADDR", "YORKIE_TEST_RPC_ADDR"], "ci.yml sets a variable the Makefile does not");
   assert.match(CONFIG.fixer.verifyDescription, /`cargo fmt --all --check`.*clippy.*warnings denied.*`cargo test --workspace`.*rustdoc/);
 });
 
@@ -476,6 +804,26 @@ test("the fixer is told this repository's Rust conventions, and nothing a runner
   assert.match(CONFIG.fixer.commitNote, /inside a top-level `#\[cfg\(test\)\] mod` of the file it tests/);
   assert.match(CONFIG.fixer.commitNote, /a new `\*_tests\.rs` file declared by a `#\[cfg\(test\)\] mod <name>;` line in its parent module/);
   assert.match(CONFIG.fixer.commitNote, /the scope hook refuses any other change to a Rust file outside the pull request's diff\.$/);
+  // THE FIXTURES ARE GROUND TRUTH. They are bytes the JS SDK and the Go
+  // server wrote; a fixer that edits one to make an interop test pass has
+  // changed the question. They are test files by path, so the scope hook
+  // does not refuse them: the prompt has to say it.
+  assert.match(CONFIG.fixer.generatedCodeNote, /Never edit the files under `crates\/yorkie-protocol\/tests\/fixtures\/` either: they are written by the JS SDK and the Go server/);
+  assert.ok(matching("crates/yorkie-protocol/tests/fixtures/**").length >= 10, "the fixtures moved; the note names the old directory");
+  assert.equal(fixGuard.inScope("crates/yorkie-protocol/tests/fixtures/text_undo/ledger_snapshot_pack.hex", new Set()), true, "the scope hook refuses the fixtures now; the note can say so");
+  assert.match(read("CLAUDE.md"), /Never edit the files under `crates\/yorkie-protocol\/tests\/fixtures\/`/);
+  // One cold dev build is most of the disk a job can spare.
+  for (const key of ["verifyFailureHint", "implementVerifyStep"]) assert.match(CONFIG.fixer[key], /do not build with `--release` or into a second target directory/, key);
+  // NOT EVERY TEST IN AN `integration_*.rs` FILE NEEDS A SERVER: some build
+  // documents locally and run under `make verify`. The prompts say "the
+  // tests that need a server", never "the integration tests return early".
+  const counter = read("crates/yorkie/tests/integration_counter.rs");
+  const cases = (counter.match(/^#\[(?:tokio::)?test\]/gm) ?? []).length;
+  const guarded = (counter.match(/rpc_addr\(\)/g) ?? []).length;
+  assert.ok(guarded > 0 && guarded < cases, "integration_counter.rs no longer mixes tests that need a server with tests that do not");
+  assert.match(CONFIG.fixer.integrationWarning, /the tests in `crates\/yorkie\/tests\/integration_\*\.rs` that need a server return early and pass/);
+  assert.match(CONFIG.fixer.implementVerifyStep, /the integration tests that need a server return early and pass without one/);
+  assert.match(CONFIG.fixer.ciFailureNote, /A test in that lane that needs no server fails under `make verify` too\.$/);
   // No licence header and no tracking line: there is no convention to state.
   assert.equal(CONFIG.fixer.licenceScope, "");
   assert.equal(CONFIG.fixer.todoTrackingLine, "");
@@ -644,17 +992,58 @@ test("testOnlyFileGlobs lists exactly the test-only files the declaration check 
 
 // --- the fix guard ------------------------------------------------------------------
 
-test("the fix guard's replicated rules are the CRDT and clock modules, and both other homes silence it", () => {
-  // `crdt/` and `time/` hold the rules every replica must apply identically:
-  // the same pair the JS SDK lists (`document/crdt/*.ts`, `document/time/*.ts`)
-  // and the directory the server lists (`pkg/document/crdt/*.go`).
-  assert.deepEqual([...CONFIG.fixGuard.replicatedRuleGlobs], ["crates/yorkie-core/src/crdt/*.rs", "crates/yorkie-core/src/time/*.rs"]);
-  for (const f of ["crates/yorkie-core/src/crdt/tree.rs", "crates/yorkie-core/src/crdt/rga_tree_split.rs", "crates/yorkie-core/src/time/ticket.rs"]) {
+test("the fix guard's replicated rules are what every replica must apply identically, and both other homes silence it", () => {
+  // A change to one of these, made here alone, is a replica that disagrees.
+  // The JS SDK lists `document/crdt/*.ts` and `document/time/*.ts`, and the
+  // server `pkg/document/crdt/*.go`; this port keeps more of the rule
+  // outside those two directories than either, so it lists more:
+  const RULES = {
+    // The CRDTs and the logical clocks: the pair the JS SDK lists.
+    "crates/yorkie-core/src/crdt/*.rs": "crates/yorkie-core/src/crdt/rga_tree_split.rs",
+    "crates/yorkie-core/src/time/*.rs": "crates/yorkie-core/src/time/ticket.rs",
+    // How each operation executes against the CRDTs. In JS an operation is a
+    // thin call into the CRDT; here `tree_edit_operation.rs` alone is 2,500
+    // lines that decide the order of removal, restore and split, and what a
+    // remote replica's undo re-creates.
+    "crates/yorkie-core/src/operation/*.rs": "crates/yorkie-core/src/operation/tree_edit_operation.rs",
+    // The change clock: how a change's lamport and version vector advance
+    // past another's (JS `ChangeID.syncClocks`, `syncLamport`).
+    "crates/yorkie-core/src/change/id.rs": "crates/yorkie-core/src/change/id.rs",
+    // The projection every change and snapshot is encoded to and decoded
+    // from: which fields travel, and what a decoded element is rebuilt as.
+    "crates/yorkie-core/src/wire.rs": "crates/yorkie-core/src/wire.rs",
+    // Ticket re-issue on first attach, which names its JS and Go twins
+    // (`src/api/reissue.ts`, `api/converter/reissue.go`) in its header.
+    "crates/yorkie-core/src/reissue.rs": "crates/yorkie-core/src/reissue.rs",
+  };
+  // Left out on purpose: `document.rs`, `json/**`, `event.rs`, `history.rs`
+  // and `schema/**` are the local API over those rules — proxies, events,
+  // the undo stack, validation — and a change there is not, by itself, a
+  // change to what replicas converge on.
+  assert.deepEqual([...CONFIG.fixGuard.replicatedRuleGlobs].sort(), Object.keys(RULES).sort());
+  for (const f of [...Object.values(RULES), "crates/yorkie-core/src/crdt/tree.rs", "crates/yorkie-core/src/operation/mod.rs", "crates/yorkie-core/src/operation/edit_operation.rs"]) {
     assert.ok(isTracked(f), f);
     assert.equal(fixGuard.crdtRuleChanges([{ filename: f }]).length, 1, f);
   }
-  // A test file in those directories is not a rule, and neither is the code around them.
-  for (const f of ["crates/yorkie-core/src/crdt/tree_undo_tests.rs", "crates/yorkie-core/src/document.rs", "crates/yorkie-core/tests/time.rs", "docs/crdt-parity/tree.md"]) {
+  // What each listed file is still about.
+  assert.match(read("crates/yorkie-core/src/operation/tree_edit_operation.rs"), /pub\(crate\) fn execute\(/);
+  assert.match(read("crates/yorkie-core/src/change/id.rs"), /pub\(crate\) fn sync_clocks\(/);
+  assert.match(read("crates/yorkie-core/src/wire.rs"), /impl TryFrom<WireChangePack> for ChangePack/);
+  assert.match(read("crates/yorkie-core/src/reissue.rs"), /JS `src\/api\/reissue\.ts`, Go `api\/converter\/reissue\.go`/);
+  // A test file beside a rule is not a rule, and neither is the API over them.
+  for (const f of [
+    "crates/yorkie-core/src/crdt/tree_undo_tests.rs",
+    "crates/yorkie-core/src/reissue_tests.rs",
+    "crates/yorkie-core/src/wire_text_link_tests.rs",
+    "crates/yorkie-core/src/document.rs",
+    "crates/yorkie-core/src/history.rs",
+    "crates/yorkie-core/src/event.rs",
+    "crates/yorkie-core/src/json/tree.rs",
+    "crates/yorkie-core/src/schema.rs",
+    "crates/yorkie-core/src/change/change.rs",
+    "crates/yorkie-core/tests/time.rs",
+    "docs/crdt-parity/tree.md",
+  ]) {
     assert.ok(isTracked(f), f);
     assert.equal(fixGuard.crdtRuleChanges([{ filename: f }]).length, 0, f);
   }
@@ -669,7 +1058,7 @@ test("the fix guard's replicated rules are the CRDT and clock modules, and both 
   for (const body of ["", "Fixes #12", "Fixes yorkie-team/yorkie-rust-sdk#12", "the yorkie server does the same"]) {
     assert.equal(fixGuard.lintRound({ files, prBody: body }).crdt.length, 1, body);
   }
-  assert.match(CONFIG.fixGuard.replicatedRuleNotice, /^\*\*Replicated CRDT rule changed in Rust only \(warning\)\.\*\*/);
+  assert.match(CONFIG.fixGuard.replicatedRuleNotice, /^\*\*Replicated rule changed in Rust only \(warning\)\.\*\* These files hold the CRDTs, how each operation executes, the clocks, the wire format and ticket re-issue\./);
   assert.match(CONFIG.fixGuard.replicatedRuleNotice, /yorkie-js-sdk or yorkie change/);
 });
 
@@ -758,7 +1147,7 @@ test("the reviewed diff leaves out the generated protobuf code, and only that", 
   // regenerates it and fails when the checked-in file differs.
   assert.deepEqual([...CONFIG.review.diffExcludes], ["crates/yorkie-protocol/src/generated/*"]);
   const excluded = CONFIG.review.diffExcludes.flatMap((spec) =>
-    execFileSync("git", ["ls-files", "--", spec], { cwd: ROOT, encoding: "utf8" }).split("\n").filter(Boolean));
+    run("git", ["ls-files", "--", spec], { cwd: ROOT, encoding: "utf8" }).split("\n").filter(Boolean));
   assert.deepEqual(excluded, ["crates/yorkie-protocol/src/generated/yorkie.v1.rs"]);
   assert.equal(workflowValues.values(["diff_pathspecs"])[0][1], ".\n:(exclude)crates/yorkie-protocol/src/generated/*");
   // The generator writes that file…
@@ -838,7 +1227,7 @@ test("the coverage note names every CI lane, and claims only what this repositor
   // THE GAP MOST LIKELY TO BE MISSED: the integration tests pass without
   // running. Each returns early when the variable is unset, and the
   // workspace lane runs them that way.
-  assert.ok(notEnforced.includes("returns early, and passes, when `YORKIE_TEST_RPC_ADDR` is unset"));
+  assert.ok(notEnforced.includes("Each test in `integration_*.rs` that needs a server returns early, and passes, when `YORKIE_TEST_RPC_ADDR` is unset"));
   assert.match(read("crates", "yorkie", "tests", "integration_support", "mod.rs"), /std::env::var\("YORKIE_TEST_RPC_ADDR"\)[\s\S]{0,200}eprintln!\("skipping: /);
   // Ignored tests exist and no lane runs them.
   assert.ok(notEnforced.includes("Any test marked `#[ignore]`. No lane passes `--ignored`"));
@@ -850,6 +1239,36 @@ test("the coverage note names every CI lane, and claims only what this repositor
   for (const tool of ["cargo-audit", "cargo audit", "cargo-deny", "cargo deny", "miri", "llvm-cov", "tarpaulin", "semver-checks", "udeps", "machete"]) {
     assert.ok(!(MAKEFILE + CI).toLowerCase().includes(tool), `${tool} runs now; the note says it does not`);
   }
+
+  // EVERY BULLET, by how it opens. The assertions above pin what each says
+  // against the repository; this pins that none was dropped or added
+  // without this test being read. A deleted NOT ENFORCED bullet is a
+  // finding class the lenses stop being told is theirs.
+  const bullets = (half) => half.split(" - ").slice(1).map((b) => b.split(/[:.](?: |$)/)[0]);
+  assert.deepEqual(bullets(enforced), [
+    `\`cargo fmt --all --check\` on Rust ${RUST_VERSION}`,
+    "`cargo clippy --workspace --all-targets -- -D warnings`",
+    "`cargo test --workspace`",
+    "`cargo doc -p yorkie --no-deps` with `RUSTDOCFLAGS=-D warnings`",
+    "The `integration tests` lane",
+    "No path filter",
+  ]);
+  assert.deepEqual(bullets(notEnforced), [
+    "That a test ran at all",
+    "Any test marked `#[ignore]`",
+    `Anything that needs a MongoDB-backed server, or any server but \`${image}\``,
+    "A lint silenced in the diff",
+    "Rustdoc for any crate but `yorkie`",
+    `Any Rust but ${RUST_VERSION}, any platform but Linux x86_64, and any feature set but the default`,
+    "Dependency audit, licence headers, unused dependencies, semver checks, Miri, sanitizers and coverage",
+    "Parity with the JS SDK and the Go server beyond the checked-in fixtures",
+    "Whether a passing test asserts anything",
+  ]);
+  // …and the facts behind the ones not pinned above.
+  assert.ok(notEnforced.includes("`#[allow(...)]` passes `-D warnings`"));
+  assert.ok(notEnforced.includes("`docs/crdt-parity/**` and `docs/current-porting-gaps.md` are maintained by hand, and `tools/interop/` is run by hand in the other repositories"));
+  assert.ok(matching("docs/crdt-parity/**").length > 0 && isTracked("docs/current-porting-gaps.md") && matching("tools/interop/*").length > 0);
+  assert.ok(notEnforced.includes("The lanes prove the suite is GREEN, never that it is ADEQUATE"));
 
   // MECHANISMS, NEVER CATEGORIES: named tools and named lanes only.
   for (const category of [/\btype problems\b/i, /\btype issues\b/i, /\blint issues are\b/i, /\bstyle problems\b/i]) {

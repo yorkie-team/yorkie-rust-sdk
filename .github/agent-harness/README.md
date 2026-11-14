@@ -31,7 +31,7 @@ are not copied here. Where a message links to that one, it is by URL
 | `repo.test.mjs` | Grades the two files above, and the toolchain action, against this repository (`npm run test:repo` in `scripts/agent`). The reason each configured entry exists is written there, beside the assertion that pins it |
 | `repo.snapshot.json` | Every value the workflows read and every prompt as rendered here, recorded. A change to a prompt or a gate shows its before and after in this file's diff |
 | `upstream.json` | Written by `sync.mjs`: where the shared half came from |
-| `../actions/agent-toolchain/action.yml` | Rust at the version `rust-toolchain.toml` pins, with rustfmt and clippy, installed by rustup from outside the workspace. It never invokes cargo, uses no other action and saves no cache, and it exports `RUSTUP_TOOLCHAIN` so the workspace's toolchain file does not choose the compiler for the rest of the job |
+| `../actions/agent-toolchain/action.yml` | Rust at the version `rust-toolchain.toml` pins, with rustfmt and clippy, installed by rustup from outside the workspace. It never invokes cargo, uses no other action and saves no cache, finds its own commands through a fixed PATH, and it exports `RUSTUP_TOOLCHAIN` (with rustup's two install directories) so the workspace's toolchain file does not choose the compiler for the rest of the job. `repo.test.mjs` both reads the script and runs it against a hostile workspace with stubbed tools |
 
 Where upstream's text assumes something this repository does not have:
 
@@ -45,9 +45,9 @@ Where upstream's text assumes something this repository does not have:
   dependency boundaries, the parity checklists, the known-gaps list and the
   milestone plans are listed under `review.classRules.design-spec`, so the
   design-fit lens reads them.
-- `make verify` passes the integration tests without running them: each
-  returns early unless `YORKIE_TEST_RPC_ADDR` is set, and no agent job starts
-  a server. The prompts and the coverage note both say so. Only CI's
+- `make verify` passes the integration tests that need a server without
+  running them: each returns early unless `YORKIE_TEST_RPC_ADDR` is set, and
+  no agent job starts a server. The prompts and the coverage note both say so. Only CI's
   `integration tests` lane exercises them.
 
 ## Compiling is executing
@@ -103,8 +103,10 @@ a pull request that touches one is never promoted automatically.
   a directory that is itself a test module, a test-only module whose name does
   not end in `_tests`): `tests.cargo.testOnlyFileGlobs`. `repo.test.mjs`
   derives the list from the `mod` declarations and fails until it matches.
-- A new directory whose rules the JS SDK and the server must apply
-  identically: `fixGuard.replicatedRuleGlobs`.
+- A new file or directory whose rules the JS SDK and the server must apply
+  identically (a CRDT, an operation's execution, the wire format, a clock):
+  `fixGuard.replicatedRuleGlobs`, with the reason beside the pin in
+  `repo.test.mjs`.
 - A workflow that publishes or reads a secret: it must refuse the agent App as
   the author of the release or push that starts it. `repo.test.mjs` fails on
   the first such workflow to say so.

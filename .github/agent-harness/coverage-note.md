@@ -28,8 +28,8 @@ ENFORCED — you may rely on these:
 
 NOT ENFORCED BY ANYTHING — a real finding here is worth MORE than one the lanes
 above would have caught, because nothing else in the pipeline will catch it:
-- That an integration test ran at all. Each `integration_*.rs` test returns
-  early, and passes, when `YORKIE_TEST_RPC_ADDR` is unset, and the
+- That a test ran at all. Each test in `integration_*.rs` that needs a server
+  returns early, and passes, when `YORKIE_TEST_RPC_ADDR` is unset, and the
   `cargo test --workspace` lane runs them that way. A test that returns before
   its assertions is green in both lanes.
 - Any test marked `#[ignore]`. No lane passes `--ignored`, so an ignored
