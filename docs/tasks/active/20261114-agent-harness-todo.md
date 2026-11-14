@@ -44,6 +44,10 @@ Verification:
 - [x] The toolchain action's script in a clean `ubuntu:24.04` container
       against a hostile workspace
 - [x] The scope hook on hand-made fix rounds
+- [x] Review round: the toolchain script takes a fixed PATH and drops the
+      inherited rustup variables; `repo.test.mjs` runs it; the Makefile and
+      the CI steps are pinned whole; operations, the wire format, the change
+      clock and re-issue join the replicated rules
 
 ## Before merge
 
@@ -59,6 +63,9 @@ Merging is inert: every agent job is gated on the repository variable
 secrets and the model token pool, create the `agent` environment and the
 `agent:*` labels, then set the variable. The issue-to-PR verb also needs a
 required approving review on `main`. The pull request body has the checklist.
+
+A `LICENSE` file is also missing: the Cargo metadata declares Apache-2.0 and
+nothing else in the repository carries the licence text. Add one.
 
 ## Not verified
 

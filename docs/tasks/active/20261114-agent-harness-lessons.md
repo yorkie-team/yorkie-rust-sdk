@@ -19,6 +19,17 @@ branch ships. `RUSTUP_TOOLCHAIN` wins over the file. Checked in a container:
 with a hostile toolchain file, `rustc --version` reported the branch's binary
 without the variable and 1.99.1 with it.
 
+## A test's title is not what it pins
+
+The first `repo.test.mjs` said "the toolchain action runs nothing the branch
+wrote" and passed with a line added that ran a script from the workspace, with
+the checksum failure swallowed, and with the workspace put on `GITHUB_PATH`.
+It matched text it expected and never asked what else was there. It now holds
+an allow-list of every command the script starts, and runs the script against
+a temporary runner with a hostile workspace and stubbed tools. The same went
+for `make verify`: reading the first `test:` recipe says nothing when make
+uses the last, so the whole Makefile and each CI step are pinned.
+
 ## The `rust` Docker image is not the toolchain file
 
 `rust:1.99.1` installs the minimal profile, without rustfmt or clippy. Run
@@ -26,10 +37,10 @@ inside the workspace, rustup then installs them because
 `rust-toolchain.toml` lists them. That download is not part of the build time
 measured.
 
-## `make verify` is green without running the integration tests
+## `make verify` is green without running the tests that need a server
 
-Each `integration_*.rs` test returns early when `YORKIE_TEST_RPC_ADDR` is
-unset. A fixer's `make verify` therefore says nothing about client and server
+Each test in `integration_*.rs` that needs a server returns early when
+`YORKIE_TEST_RPC_ADDR` is unset. A fixer's `make verify` therefore says nothing about client and server
 behavior. The prompts and the coverage note say so; only CI's
 `integration tests` lane runs them.
 
