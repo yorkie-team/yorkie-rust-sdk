@@ -1,7 +1,7 @@
 # Contributing
 
-Yorkie is Apache 2.0 licensed and accepts contributions via GitHub pull
-requests.
+This repository accepts contributions via GitHub pull requests. Its Cargo
+metadata declares the Apache-2.0 licence; there is no `LICENSE` file yet.
 
 If you have questions along the way, ask on the
 [Yorkie Discord](https://discord.com/invite/MVEAwz9sBy).
@@ -13,10 +13,11 @@ If you have questions along the way, ask on the
 - Run `make verify`.
 - Push the branch and open a pull request against `main`, following
   `.github/PULL_REQUEST_TEMPLATE.md`.
-- A maintainer reviews the pull request and squash-merges it.
+- By convention a maintainer reviews the pull request and squash-merges it.
+  Branch protection does not require the review today.
 
-The repository refuses force pushes on every branch, so answer a review with
-new commits rather than by rewriting the branch.
+The one rule GitHub enforces here is that no branch takes a force push, so
+answer a review with new commits rather than by rewriting the branch.
 
 This SDK is a port. A change to behavior starts from the JS SDK: read
 [docs/porting-from-js-sdk.md](docs/porting-from-js-sdk.md), and say in the pull
@@ -34,8 +35,8 @@ make verify   # format check, clippy, unit tests, rustdoc: what CI checks withou
 `make verify` runs `make fmt-check`, `make clippy`, `make test` and `make doc`.
 `cargo fmt --all` fixes formatting.
 
-The integration tests need a Yorkie server. Without one they return early and
-pass, so `make verify` does not exercise them:
+The tests under `crates/yorkie/tests/` that need a Yorkie server return early
+and pass without one, so `make verify` does not exercise them:
 
 ```sh
 yorkie server --rpc-port 18080 --profiling-port 18081 &

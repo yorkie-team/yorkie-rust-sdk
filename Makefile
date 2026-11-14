@@ -1,8 +1,8 @@
 # The local gate. `make verify` runs exactly what the `check` job of
 # .github/workflows/ci.yml runs, because that job calls these targets. None of
-# them needs a Yorkie server: the integration tests under crates/yorkie/tests
+# them needs a Yorkie server: the tests under crates/yorkie/tests that need one
 # return early (and pass) unless YORKIE_TEST_RPC_ADDR is set, and CI's
-# `integration` job is where they run against one.
+# `integration` job is where those run against one.
 
 .PHONY: verify fmt-check clippy test doc
 

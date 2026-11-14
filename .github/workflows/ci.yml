@@ -26,7 +26,8 @@ jobs:
       # The four targets `make verify` runs, one step each for the timing.
       - run: make fmt-check
       - run: make clippy
-      # Integration tests skip themselves when YORKIE_TEST_RPC_ADDR is unset.
+      # The tests that need a server skip themselves when YORKIE_TEST_RPC_ADDR
+      # is unset.
       - run: make test
       - run: make doc
 

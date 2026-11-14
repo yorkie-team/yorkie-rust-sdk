@@ -41,9 +41,10 @@ cargo run -p protogen                        # regenerate the protobuf code
 
 Run `make verify` before every push.
 
-The integration tests (`crates/yorkie/tests/integration_*.rs`) return early,
-and pass, unless `YORKIE_TEST_RPC_ADDR` is set. To run them, start a server
-with an in-memory database and point the tests at it:
+The tests in `crates/yorkie/tests/integration_*.rs` that need a server return
+early, and pass, unless `YORKIE_TEST_RPC_ADDR` is set; the rest of those files
+runs under `make test`. To run them all, start a server with an in-memory
+database and point the tests at it:
 
 ```sh
 yorkie server --rpc-port 18080 --profiling-port 18081 &
@@ -72,11 +73,14 @@ CI runs them against the `yorkieteam/yorkie` image pinned in
 - The subject starts with a verb and says what changed, in 70 characters or
   less. No type prefix (`feat:`, `docs:`).
 - A blank line, then a body wrapped at 80 columns that says why.
-- Pull requests are squash-merged, so `main` carries one commit per PR, with
-  the PR number at the end of the subject.
+- By convention pull requests are squash-merged, so `main` carries one commit
+  per PR, with the PR number at the end of the subject. Nothing enforces it.
 
 ## Gotchas
 
+- Never edit the files under `crates/yorkie-protocol/tests/fixtures/`. They
+  are written by the JS SDK and the Go server (`tools/interop/`) and are the
+  ground truth the interop tests decode.
 - Never hand-edit `crates/yorkie-protocol/src/generated/yorkie.v1.rs`.
   Regenerate it with `cargo run -p protogen`; the test
   `protogen_output_is_up_to_date` fails when it is stale.
