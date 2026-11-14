@@ -1,0 +1,141 @@
+{
+  "repo": {
+    "name": "yorkie-rust-sdk",
+    "appSlug": "yorkie-team-agent",
+    "botLogins": [
+      "github-actions[bot]",
+      "yorkie-team-agent[bot]"
+    ],
+    "appLogins": [
+      "yorkie-team-agent[bot]",
+      "app/yorkie-team-agent"
+    ]
+  },
+  "docs": {
+    "commandVerbsRef": "https://github.com/yorkie-team/yorkie/blob/main/docs/design/agent-command-verbs.md"
+  },
+  "ci": {
+    "definingPaths": [
+      "Makefile",
+      "Cargo.toml",
+      "crates/*/Cargo.toml",
+      "tools/*/Cargo.toml",
+      "Cargo.lock",
+      "rust-toolchain.toml",
+      "rust-toolchain",
+      "tools/protogen/**",
+      ".cargo/**",
+      "**/build.rs",
+      "rustfmt.toml",
+      ".rustfmt.toml",
+      "clippy.toml",
+      ".clippy.toml"
+    ],
+    "gateLabel": "fmt, clippy, unit and integration tests, rustdoc",
+    "handoffSummary": [
+      "- ✅ CI is green (`cargo fmt --check`, clippy over every target with warnings",
+      "  denied, the workspace's unit, doc and generated-code freshness tests, the",
+      "  `yorkie` rustdoc build with warnings denied, and the `yorkie` crate's",
+      "  integration tests and quickstart example against a real Yorkie server) for",
+      "  this exact head SHA, on a PR based on the default branch — and the branch",
+      "  changes none of the paths that define what CI does (the workflows, the",
+      "  Makefile, every `Cargo.toml`, `Cargo.lock`, the toolchain file,",
+      "  `tools/protogen/**`, and any `.cargo/**`, `build.rs`, rustfmt or clippy",
+      "  configuration), so the CI definition that run executed came from `main`",
+      "  rather than from the branch."
+    ],
+    "laneReports": false
+  },
+  "review": {
+    "classRules": {
+      "code-adjacent": [
+        "**/fixtures/**"
+      ],
+      "policy": [
+        "Makefile",
+        "Cargo.toml",
+        "crates/*/Cargo.toml",
+        "tools/*/Cargo.toml",
+        "Cargo.lock",
+        "rust-toolchain.toml",
+        "rust-toolchain",
+        ".cargo/**",
+        "rustfmt.toml",
+        ".rustfmt.toml",
+        "clippy.toml",
+        ".clippy.toml",
+        "scripts/agent/package.json",
+        "scripts/agent/package-lock.json"
+      ],
+      "design-spec": [
+        "docs/plans/**",
+        "docs/crdt-parity/**",
+        "docs/dependency-boundaries.md",
+        "docs/porting-from-js-sdk.md",
+        "docs/current-porting-gaps.md"
+      ]
+    },
+    "sourceGlobs": [
+      "crates/**",
+      "tools/**"
+    ],
+    "sharedPrimitivesNote": "This\n  repo layers yorkie → yorkie-client → yorkie-protocol → yorkie-core\n  (`docs/dependency-boundaries.md`), and the shared primitives live in\n  `crates/yorkie-core/src/` (`crdt/`, `json/`, `time/`, `change/`, `operation/`).",
+    "diffExcludes": [
+      "crates/yorkie-protocol/src/generated/*"
+    ]
+  },
+  "fixer": {
+    "verifyCommand": "make verify",
+    "verifyDescription": "`cargo fmt --all --check`, clippy over every target with warnings denied, `cargo test --workspace` and the rustdoc build of the `yorkie` crate with warnings denied",
+    "verifyFailureHint": "It builds every dependency from nothing, which takes a few minutes: run it in the foreground and let it finish. If the format check fails, run `cargo fmt --all` rather than reformatting by hand. If `protogen_output_is_up_to_date` fails, regenerate with `cargo run -p protogen`.",
+    "integrationWarning": "Do NOT start a Yorkie server or set `YORKIE_TEST_RPC_ADDR`: without one the tests in `crates/yorkie/tests/integration_*.rs` return early and pass, so a green run here says nothing about them",
+    "integrationRerunBy": "them against a real server in CI's `integration tests` lane",
+    "ciFailureNote": "A failure in the `integration tests` lane cannot be reproduced in this job: fix it from the log, and let the push confirm.",
+    "generatedCodeNote": "Never hand-edit `crates/yorkie-protocol/src/generated/yorkie.v1.rs`: it is generated from the `.proto` files under `crates/yorkie-protocol/proto/` by `cargo run -p protogen`. Those `.proto` files are copies whose source of truth is the server repository, yorkie-team/yorkie, so change one only to match the server's.",
+    "apiChangeNote": "If the issue requires a protocol change the server does not have, say so on the issue and stop rather than working around it.",
+    "keepReproducerAs": "Rust has no `it.fails`, so keep the test and put `#[ignore = \"still reproduces: <finding>\"]` directly under its test attribute, with a comment naming the finding",
+    "disabledTestForms": "switches off with `#[ignore]`, `#[should_panic]` or a `#[cfg(...)]` gate",
+    "commitNote": "Commit messages follow this repository's convention: a subject of 70 characters or less that starts with a verb, a blank line, a body wrapped at 80. A new test goes inside a top-level `#[cfg(test)] mod` of the file it tests, or in a new `*_tests.rs` file declared by a `#[cfg(test)] mod <name>;` line in its parent module; the scope hook refuses any other change to a Rust file outside the pull request's diff.",
+    "licenceScope": "",
+    "todoTrackingLine": "",
+    "implementVerifyStep": "VERIFY WITH `make verify`, in the foreground, once the push in step 4 has landed: the format check, clippy with warnings denied, the workspace tests and the rustdoc build. It builds every dependency from nothing, which takes a few minutes, and it needs no server. Do NOT start a Yorkie server or set `YORKIE_TEST_RPC_ADDR`: the integration tests return early and pass without one, and the PR's CI runs them against a real server. Fix what it finds, commit and push again. A TARGETED `cargo test -p <crate> <name>` while you work is fine. If you are out of time, skip it and say so in __PR_FILE__: CI runs the same checks.",
+    "replyVerifyInstruction": "run `make verify`",
+    "toolchainSteps": "the Rust toolchain install",
+    "lastResortDiagnosis": "Re-run the failing lane locally: `make verify` is the whole of the `fmt, clippy, unit tests` lane. The `integration tests` lane needs a Yorkie server, which this job does not have."
+  },
+  "tests": {
+    "rules": [
+      "cargo",
+      "vitest"
+    ],
+    "cargo": {
+      "integrationTestDirs": [
+        "crates/*/tests",
+        "tools/*/tests"
+      ],
+      "testOnlyFileGlobs": [
+        "crates/yorkie-core/src/document/adv_sync.rs",
+        "crates/yorkie-client/src/client/tests/*.rs",
+        "crates/yorkie-core/src/reissue_tests.rs",
+        "crates/yorkie-core/src/wire_text_link_tests.rs"
+      ]
+    }
+  },
+  "fixGuard": {
+    "replicatedRuleGlobs": [
+      "crates/yorkie-core/src/crdt/*.rs",
+      "crates/yorkie-core/src/time/*.rs"
+    ],
+    "replicatedRuleNotice": "**Replicated CRDT rule changed in Rust only (warning).** The JS SDK is this SDK's source of truth and the Go server must apply the same rule, or replicas diverge. Link the yorkie-js-sdk or yorkie change this follows in the PR body, or say why there is none:",
+    "counterpartRepos": [
+      "yorkie-team/yorkie-js-sdk",
+      "yorkie-team/yorkie"
+    ]
+  },
+  "redact": {
+    "extraPatterns": []
+  },
+  "ask": {
+    "permittedMcpTools": []
+  }
+}

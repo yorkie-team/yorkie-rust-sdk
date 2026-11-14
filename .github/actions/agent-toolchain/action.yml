@@ -1,0 +1,122 @@
+# The toolchain an agent job needs before it can verify a change in THIS
+# repository. One of the per-repository files of the agent harness: the
+# `agent-*.yml` workflows are the same in every repository that runs the
+# harness, and each calls this action for its setup
+# (scripts/agent/README.md, "The toolchain action").
+#
+# IT RUNS WITH A TOKEN IN THE ENVIRONMENT AND AN UNTRUSTED BRANCH IN THE
+# WORKSPACE. In the fix jobs the workspace is the pull request's branch and an
+# App token is already minted, so nothing here may execute what the branch
+# wrote. With cargo, COMPILING IS EXECUTING: `cargo build`, `check`, `clippy`,
+# `test` and `doc` all run the build script and the procedural macros of every
+# crate the branch's `Cargo.lock` names, and cargo has no way to install
+# dependencies without them. Any cargo command started inside the workspace
+# also reads the branch's `.cargo/config.toml`, which can name a compiler
+# wrapper, an alias or another registry. So this action installs the compiler
+# and NEVER INVOKES CARGO. Dependencies are fetched and built later, by the
+# agent's own `make verify`.
+#
+# This does not stop the AGENT running branch code: it has to, to verify, and
+# it holds the token by design because it has to push. What must not happen is
+# the job reaching the agent having already run the branch's code for its own
+# convenience.
+#
+# THE TOOLCHAIN IS PINNED HERE, not read from the branch. `rust-toolchain.toml`
+# in the workspace is the branch's file: it may name any channel, or a `path`
+# to a directory of binaries the branch supplies. So:
+#   - rustup is run from the runner's temporary directory, which is outside
+#     the workspace, with the toolchain named on every command line;
+#   - RUSTUP_TOOLCHAIN is exported for the rest of the job. rustup lets that
+#     variable win over a toolchain file and over a directory override, so
+#     `cargo` and `rustc` in the later steps are this toolchain whatever the
+#     workspace says.
+#
+# NO CACHE: no Swatinem/rust-cache, no actions/cache, no sccache. A cache post
+# step would save `target/` and `~/.cargo` after the agent ran, with whatever
+# the agent left there, under a key the agent controls through `Cargo.lock`,
+# and `ci.yml` restores rust-cache on `main`. The price is a cold build in
+# every agent job.
+#
+# NO OTHER ACTION. `ci.yml` installs Rust with dtolnay/rust-toolchain@master, a
+# moving ref; here it would run with this job's tokens. rustup is on GitHub's
+# Ubuntu images (actions/runner-images lists it under "Rust Tools", installed
+# to `$HOME/.cargo/bin`, which is on PATH). Where it is missing, this installs
+# rustup-init at the version and checksum below and nothing newer.
+#
+# Keep PINNED_TOOLCHAIN equal to `channel` in rust-toolchain.toml and to both
+# `toolchain:` inputs in ci.yml. `.github/agent-harness/repo.test.mjs` pins
+# all of this.
+name: Agent toolchain
+description: The pinned Rust toolchain an agent job verifies with, installed without running anything from the working tree.
+runs:
+  using: composite
+  steps:
+    - name: Install Rust (pinned here, not read from the branch)
+      shell: bash
+      env:
+        PINNED_TOOLCHAIN: "1.99.1"
+        # Used only where the runner has no rustup. The checksums are the ones
+        # static.rust-lang.org publishes beside each binary.
+        RUSTUP_INIT_VERSION: "1.29.3"
+        RUSTUP_INIT_SHA256_X86_64: "b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55"
+        RUSTUP_INIT_SHA256_AARCH64: "9f608c142e0e38a78957d0661ba1dfaf0b6fb37184cfaa4b9a0aa57af6184282"
+      run: |
+        set -euo pipefail
+        refuse() {
+          echo "::error::agent-toolchain: $1" >&2
+          exit 1
+        }
+
+        # OUTSIDE THE WORKSPACE, for everything below. rustup looks for a
+        # toolchain file from the working directory upwards, and the
+        # workspace's is the branch's.
+        workspace="$(cd -- "$GITHUB_WORKSPACE" && pwd -P)"
+        cd -- "$RUNNER_TEMP"
+        here="$(pwd -P)"
+        case "$here/" in
+          "$workspace"/*) refuse "the runner's temporary directory ($here) is inside the workspace" ;;
+        esac
+        # Nothing set earlier in the job may choose the toolchain either.
+        unset RUSTUP_TOOLCHAIN
+
+        if ! command -v rustup >/dev/null; then
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64) triple=x86_64-unknown-linux-gnu sum="$RUSTUP_INIT_SHA256_X86_64" ;;
+            Linux-aarch64) triple=aarch64-unknown-linux-gnu sum="$RUSTUP_INIT_SHA256_AARCH64" ;;
+            *) refuse "no rustup on this runner, and no pinned rustup-init for $(uname -s) $(uname -m)" ;;
+          esac
+          command -v curl >/dev/null || refuse "no rustup on this runner, and no curl to fetch it with"
+          dir="$(mktemp -d)"
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$dir/rustup-init" \
+            "https://static.rust-lang.org/rustup/archive/$RUSTUP_INIT_VERSION/$triple/rustup-init"
+          echo "$sum  $dir/rustup-init" | sha256sum -c - >/dev/null ||
+            refuse "rustup-init $RUSTUP_INIT_VERSION for $triple does not have the pinned checksum"
+          chmod +x "$dir/rustup-init"
+          "$dir/rustup-init" -y --no-modify-path --profile minimal --default-toolchain none
+          rm -rf "$dir"
+          export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
+        fi
+        case "$(command -v rustup)" in
+          "$workspace"/*) refuse "rustup resolves to a file inside the workspace" ;;
+        esac
+
+        rustup toolchain install "$PINNED_TOOLCHAIN" \
+          --profile minimal --component rustfmt --component clippy --no-self-update
+        rustup default "$PINNED_TOOLCHAIN"
+
+        # The rest of the job: this toolchain, whatever the workspace says.
+        echo "RUSTUP_TOOLCHAIN=$PINNED_TOOLCHAIN" >> "$GITHUB_ENV"
+
+        installed="$(rustup component list --toolchain "$PINNED_TOOLCHAIN" --installed)"
+        for component in rustfmt clippy; do
+          case "$installed" in
+            *"$component"*) ;;
+            *) refuse "the $component component is not installed for $PINNED_TOOLCHAIN" ;;
+          esac
+        done
+        version="$(rustc "+$PINNED_TOOLCHAIN" --version)"
+        case "$version" in
+          "rustc $PINNED_TOOLCHAIN "*) echo "$version" ;;
+          *) refuse "expected rustc $PINNED_TOOLCHAIN, found: $version" ;;
+        esac
