@@ -1,0 +1,4 @@
+# The agent harness core is checked against a manifest of bytes
+# (scripts/agent/MANIFEST.sha256), so no checkout may convert its line endings.
+scripts/agent/** -text
+.github/workflows/agent-*.yml -text

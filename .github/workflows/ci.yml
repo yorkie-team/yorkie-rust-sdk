@@ -1,4 +1,4 @@
-name: ci
+name: CI
 
 on:
   push:
@@ -23,13 +23,13 @@ jobs:
           toolchain: 1.99.1
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      # Integration tests skip themselves when YORKIE_TEST_RPC_ADDR is unset.
-      - run: cargo test --workspace
-      - run: cargo doc -p yorkie --no-deps
-        env:
-          RUSTDOCFLAGS: -D warnings
+      # The four targets `make verify` runs, one step each for the timing.
+      - run: make fmt-check
+      - run: make clippy
+      # The tests that need a server skip themselves when YORKIE_TEST_RPC_ADDR
+      # is unset.
+      - run: make test
+      - run: make doc
 
   integration:
     name: integration tests

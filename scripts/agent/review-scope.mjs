@@ -1,0 +1,445 @@
+// Decide whether THIS review round may look at only the delta, and hand the
+// answer to the workflow as step outputs.
+//
+// This is the caller `review-state.mjs` was written for. It owns the two things
+// that module deliberately cannot do: read each lens's last-reviewed pointer from
+// the checks API, and measure the commit range with git. `resolveReviewMode` then
+// makes the decision, purely, from those facts.
+//
+// Usage:
+//   node review-scope.mjs <pr> --head <sha> --lenses <lenses.json>
+//                              --changed-files <f> [--repo <dir>]
+//                              [--fingerprint <patch-id>]
+//                              [--full-every N] [--max-delta-lines N]
+//
+// Outputs (appended to $GITHUB_OUTPUT when set, always logged):
+//   mode=full|incremental|carry|reuse   since=<sha40 or empty>   reason=<why>
+//   rounds=<n>   source=<sha40 or empty>   carry=<n>
+//
+// `carry` and `reuse` mean NO lens runs this round: the workflow re-stamps the
+// verdicts recorded on `source` (see carry-verdicts.mjs). `since` stays empty
+// for both, so nothing keyed on it can mistake them for a narrowed review.
+//
+// FAIL DIRECTION — the whole file. This ALWAYS exits 0 with a usable mode, and
+// EVERY failure path resolves to `mode=full`. Unlike the rest of the pipeline,
+// failing closed here would be wrong: a full review is always correct, merely more
+// expensive, so there is no reason for a cost optimiser to be able to take the
+// panel down. A bad argument, an unreachable API, a shallow clone and an outright
+// crash all produce the same safe answer, distinguished only by `reason`.
+//
+// TWO-PHASE, because the inputs are circular: the git facts must be measured over
+// `since..head`, and `since` is only knowable after reading the pointers. So we ask
+// `agreedReviewedSha` first, and only measure git when there is a range to measure.
+//
+// Requires the `gh` CLI authenticated via GH_TOKEN / GITHUB_TOKEN, and a checkout
+// with enough history for `merge-base --is-ancestor` (the panel job uses
+// `fetch-depth: 0`).
+
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { appendFileSync, readFileSync } from "node:fs";
+import { agreedReviewedSha, resolveReviewMode, latestLensRuns } from "./review-state.mjs";
+import { gh, prCommitsWithCheckRuns, commitCheckRuns, allCheckRuns, parseArgs, permissionResolver } from "./gh-checks.mjs";
+import { lensApplies } from "./review-panel.mjs";
+import { groupReviewRounds, isRerunCommand } from "./rounds.mjs";
+import { parseCommand } from "./command.mjs";
+
+const execFileAsync = promisify(execFile);
+const SHA = /^[0-9a-fA-F]{40}$/;
+// Same ceiling as novelty.mjs's git probes. These four commands are cheap; a
+// repository state that makes one hang is one we should stop waiting for and
+// review in full.
+const GIT_TIMEOUT_MS = 10_000;
+
+/**
+ * One git command. `status` is carried out separately from `ok` because git uses
+ * the exit code as an ANSWER for some commands (`--is-ancestor` 1 = "no") and as
+ * an ERROR for the rest. Collapsing them would record a broken lookup as a
+ * confident answer — the same distinction novelty.mjs draws, for the same reason.
+ *
+ * Deliberately a local copy rather than an import from novelty.mjs: that module is
+ * a gate (it decides whether a finding blocks), and widening its exports for an
+ * unrelated consumer couples the two. The shared `gh` calls in gh-checks.mjs are
+ * deduplicated because getting those wrong is SILENT; getting this wrong yields
+ * `null`, which resolves to `full`.
+ */
+async function git(args, repo) {
+  try {
+    const { stdout } = await execFileAsync("git", args, {
+      cwd: repo,
+      timeout: GIT_TIMEOUT_MS,
+      maxBuffer: 32 * 1024 * 1024,
+      encoding: "utf8",
+    });
+    return { ok: true, status: 0, stdout };
+  } catch (e) {
+    return { ok: false, status: typeof e?.code === "number" ? e.code : null, stdout: "" };
+  }
+}
+
+/**
+ * The three git facts `resolveReviewMode` needs about `since..head`.
+ *
+ * Any fact this cannot establish comes back `null`, which `resolveReviewMode`
+ * reads as `git-facts-unavailable` and resolves to `full`. `run` is injected so
+ * every branch below is testable without building repositories.
+ *
+ * `deltaLines` is `null` — not 0 — when a numstat row is non-numeric (a binary
+ * file). Counting binary changes as zero lines would UNDER-count the delta, and
+ * since the delta size is an upper bound that permits narrowing, under-counting is
+ * the fail-open direction.
+ */
+export async function gitFacts({ since, head, repo, run = git }) {
+  const unknown = { isAncestor: null, hasMergeInRange: null, deltaLines: null };
+  if (typeof since !== "string" || !SHA.test(since)) return unknown;
+  if (typeof head !== "string" || !SHA.test(head)) return unknown;
+
+  // Does the pointer still name a commit here? A pointer that does not resolve is
+  // a rewritten or garbage-collected history, and every fact below would be
+  // meaningless.
+  if (!(await run(["cat-file", "-e", `${since}^{commit}`], repo)).ok) return unknown;
+
+  const anc = await run(["merge-base", "--is-ancestor", since, head], repo);
+  // 0 = yes, 1 = git's ANSWER ("no", i.e. force-push/rebase/amend), anything else
+  // = the lookup broke and must not read as a confident "no".
+  const isAncestor = anc.status === 0 ? true : anc.status === 1 ? false : null;
+  if (isAncestor === null) return unknown;
+
+  const merges = await run(["rev-list", "--merges", `${since}..${head}`], repo);
+  if (!merges.ok) return unknown;
+  const hasMergeInRange = merges.stdout.trim() !== "";
+
+  const stat = await run(["diff", "--numstat", since, head], repo);
+  if (!stat.ok) return unknown;
+  let deltaLines = 0;
+  for (const line of stat.stdout.split("\n")) {
+    if (line.trim() === "") continue;
+    const [added, deleted] = line.split("\t");
+    const a = Number(added), d = Number(deleted);
+    if (!Number.isFinite(a) || !Number.isFinite(d)) return { isAncestor, hasMergeInRange, deltaLines: null };
+    deltaLines += a + d;
+  }
+  return { isAncestor, hasMergeInRange, deltaLines };
+}
+
+/**
+ * Lens ids that will actually review this round, from the manifest and the
+ * CUMULATIVE changed-file list.
+ *
+ * Only these are required to have a pointer. Including a lens that is not running
+ * would demand state it never wrote, so every round would report `lens-state-gap`
+ * and nothing would ever narrow. Applicability is monotonic in the cumulative list,
+ * and a lens that becomes applicable later has no pointer — which forces `full`,
+ * so it reads a whole diff before it can ever narrow.
+ *
+ * Advisory (non-blocking) lenses are included: gating is not the question here.
+ * They read the same reviewed artifact, so narrowing hides code from them too.
+ */
+export function reviewingLensIds(manifest, changedFiles) {
+  return (Array.isArray(manifest) ? manifest : [])
+    .filter((l) => l && typeof l.id === "string" && l.id !== "")
+    .filter((l) => lensApplies(l, Array.isArray(changedFiles) ? changedFiles : []))
+    .map((l) => l.id);
+}
+
+/**
+ * Did a maintainer ask for a FRESH review after the verdicts on record?
+ *
+ * `@claude rerun review` is the opt-out from `reuse`: a rerun on the same head
+ * otherwise re-stamps its verdicts rather than drawing a new sample. Only reruns
+ * newer than `after` — the newest lens run's START — are read. A verdict from a
+ * round already in flight when the request was made finishes after it but did
+ * not answer it.
+ *
+ * Among those, the LATEST TRUSTED rerun speaks: a maintainer's plain `@claude
+ * rerun` after their own `rerun review` withdraws the request. Trust is resolved
+ * newest first and the walk stops at the first rerun that decides, so a PR with
+ * a long comment history costs one permission lookup per distinct newer
+ * commenter at most, not one per rerun ever posted.
+ *
+ * FAILS TOWARD REVIEWING, and ONLY toward reviewing, where a fact is missing:
+ *   - `comments === null` is "could not read them", and an unread request may
+ *     have been exactly this one;
+ *   - a commenter whose permission lookup FAILED (`trusts` → null) may FORCE a
+ *     review with `rerun review`, but their plain `rerun` is skipped: it cannot
+ *     cancel an earlier trusted request. Nobody unresolved can cause anything
+ *     but a review, and a review costs only tokens.
+ *   - a definite "no" (`false`: no write access, or not a collaborator at all;
+ *     see `notFoundIsNoAccess`) and a bot are ignored outright.
+ */
+export function reviewRequested(comments, { trusts, after } = {}) {
+  if (comments === null) return true;
+  const a = Date.parse(String(after ?? ""));
+  // Everything that needs no API call first: bots, non-commands, and reruns the
+  // recorded round already answered.
+  const reruns = (Array.isArray(comments) ? comments : [])
+    .filter((c) => c?.user?.type !== "Bot")
+    .map((c) => ({ c, cmd: parseCommand(String(c?.body ?? ""), { surface: "pr" }) }))
+    .filter((x) => x.cmd.command === "rerun")
+    .map((x) => ({ ...x, at: Date.parse(String(x.c?.created_at ?? "")) }))
+    .filter((x) => Number.isFinite(x.at) && (!Number.isFinite(a) || x.at > a))
+    .sort((x, y) => y.at - x.at);
+  for (const { c, cmd } of reruns) {
+    const wantsReview = /^review\b/i.test(cmd.rest);
+    // The resolver, when there is one, is the only authority; the pure,
+    // resolver-less form falls back to `isRerunCommand`'s association test.
+    const t = typeof trusts === "function" ? trusts(String(c?.user?.login ?? "")) : isRerunCommand(c);
+    if (t === true) return wantsReview;
+    if (t === null && wantsReview) return true;
+  }
+  return false;
+}
+
+/**
+ * Wrap a `gh api` caller so a 404 from the collaborator-permission endpoint reads
+ * as "no access", for `permissionResolver`.
+ *
+ * GitHub answers 404 for a login that is not a user or cannot be a collaborator,
+ * and 200 with `read`/`none` for an outside account on a public repository.
+ * Either is a definite "no". Only a failure to ASK (403, 5xx, a network error)
+ * should stay unknown (`null`), because `reviewRequested` lets an unknown push
+ * toward a review. The resolver itself cannot tell a 404 apart from those, since
+ * it sees only that `gh` failed, so the distinction is drawn here, from the
+ * status `gh` prints.
+ */
+export function notFoundIsNoAccess(api) {
+  return (args) => {
+    try {
+      return api(args);
+    } catch (err) {
+      if (/\(HTTP 404\)/.test(`${err?.stderr ?? ""}\n${err?.message ?? ""}`)) return { permission: "none", role_name: "" };
+      throw err;
+    }
+  };
+}
+
+/** How many of the latest force-pushes `replacedHeads` looks behind. */
+const MAX_REPLACED_HEADS = 10;
+
+/**
+ * The heads that force-pushes to this PR replaced, newest first, and none of the
+ * commits still on it.
+ *
+ * WHY: a rebase rewrites every commit of the PR, so `pulls/{pr}/commits` no
+ * longer lists the head the lenses approved, and its check runs — the review
+ * state carry compares against — would be invisible. GitHub keeps both: the
+ * timeline's force-push events name the replaced head, and that SHA's check runs
+ * stay readable. Only GraphQL exposes the replaced head (`beforeCommit`); the
+ * REST timeline event carries the new one alone.
+ *
+ * Who pushed is irrelevant. A carry from a replaced head still needs that head's
+ * own recorded fingerprint to equal this head's, every lens's approval, and green
+ * CI on this head before promote. The runs pass the same `latestLensRuns`
+ * filters as any other.
+ *
+ * Fails to `[]`, which is today's answer: no carry across the rewrite.
+ */
+export function replacedHeads(pr, { api = gh, log = console.error, onBranch = new Set() } = {}) {
+  let d;
+  try {
+    d = api([
+      "api", "graphql",
+      "-F", "owner={owner}", "-F", "repo={repo}", "-F", `pr=${pr}`,
+      "-f", `query=query($owner: String!, $repo: String!, $pr: Int!) {
+  repository(owner: $owner, name: $repo) { pullRequest(number: $pr) {
+    timelineItems(itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT], last: ${MAX_REPLACED_HEADS}) {
+      nodes { ... on HeadRefForcePushedEvent { beforeCommit { oid } } }
+    }
+  } }
+}`,
+    ]);
+  } catch (err) {
+    log(`review-scope: could not read the force-push history (${err.message}); no carry across a rewrite.`);
+    return [];
+  }
+  const nodes = d?.data?.repository?.pullRequest?.timelineItems?.nodes;
+  const out = [];
+  for (const n of (Array.isArray(nodes) ? nodes : []).slice().reverse()) {
+    const oid = n?.beforeCommit?.oid;
+    if (typeof oid !== "string" || !SHA.test(oid)) continue;
+    const s = oid.toLowerCase();
+    if (!onBranch.has(s) && !out.includes(s)) out.push(s);
+  }
+  return out;
+}
+
+/**
+ * The whole decision, with the API and git injected. Exported so the TWO-PHASE
+ * composition is executed by tests, not just its parts: the hazard this shape
+ * exists to avoid is measuring git over one range and narrowing to another, and
+ * `resolveReviewMode` cannot detect that — it is handed the facts.
+ *
+ * Never throws; every failure is a `full` decision with a naming `reason`.
+ */
+export async function decideScope(opts) {
+  const {
+    pr, head, manifest, changedFiles, repo,
+    fullEvery = 3, maxDeltaLines = 400,
+    fingerprint = "", comments = [], trusts,
+    api = gh, run = git, log = console.error,
+  } = opts && typeof opts === "object" ? opts : {};
+  const full = (reason, rounds = 0) => ({ mode: "full", sinceSha: "", reason, rounds });
+
+  if (!/^\d+$/.test(String(pr ?? "")) || typeof head !== "string" || !SHA.test(head)) {
+    log(`review-scope: need a PR number and a 40-hex head (got pr=${JSON.stringify(pr)}, head=${JSON.stringify(head)}).`);
+    return full("invalid-input");
+  }
+  const lensIds = reviewingLensIds(manifest, changedFiles);
+  const lensCheckNames = lensIds.map((id) => `agent-review-${id}`);
+
+  const commits = prCommitsWithCheckRuns(pr, { api, log });
+  // The round count drives the periodic full rebaseline. `groupReviewRounds` needs
+  // no `output.text` to COUNT rounds (a commit with any lens run is a round,
+  // `partial` or not), so no per-run back-fill is paid for here.
+  const rounds = groupReviewRounds(commits, lensCheckNames).length;
+  // The pointer lives in `external_id`; `resolveReviewMode` parses and validates it.
+  const onBranchRuns = allCheckRuns(commits);
+  const latest = latestLensRuns(onBranchRuns, lensCheckNames);
+  const states = new Map([...latest].map(([name, r]) => [name, r?.external_id]));
+  // From the SAME runs the pointers come from, so a verdict and the state it is
+  // read beside cannot belong to different rounds.
+  const priorConclusions = new Map([...latest].map(([name, r]) => [name, r?.conclusion]));
+
+  // The same, with the runs on heads a force-push replaced (see `replacedHeads`).
+  // Used only to decide a carry, and only when such a head holds the NEWEST
+  // verdicts: an older approval there must not outvote a newer verdict here.
+  const onBranch = new Set(commits.map((c) => String(c.sha).toLowerCase()));
+  const replacedRuns = [];
+  for (const sha of lensIds.length ? replacedHeads(pr, { api, log, onBranch }) : []) {
+    try {
+      replacedRuns.push(...commitCheckRuns(sha, { api }));
+    } catch (err) {
+      log(`review-scope: could not read check runs on replaced head ${sha.slice(0, 12)} (${err.message}).`);
+    }
+  }
+  const latestAll = replacedRuns.length ? latestLensRuns([...onBranchRuns, ...replacedRuns], lensCheckNames) : latest;
+
+  // STARTED, not completed: see `reviewRequested`. Over every run read, so a
+  // request a round on a replaced head already answered is not asked again.
+  const newest = [...latestAll.values()]
+    .map((r) => Date.parse(String(r?.started_at ?? r?.completed_at ?? "")))
+    .filter((n) => Number.isFinite(n));
+  const forceReview = reviewRequested(comments, {
+    trusts,
+    after: newest.length ? new Date(Math.max(...newest)).toISOString() : null,
+  });
+
+  // A rewrite (rebase, amend) left the newest verdicts on a head no longer on
+  // the branch. No range to measure from there, so no git facts: the answer is a
+  // carry, or one of the overrides that already beat a carry. Anything else
+  // falls through to the branch's own state, exactly as before this existed.
+  if (latestAll !== latest) {
+    const statesAll = new Map([...latestAll].map(([name, r]) => [name, r?.external_id]));
+    const agreedAll = agreedReviewedSha(lensIds, statesAll);
+    if (agreedAll.sha && !onBranch.has(agreedAll.sha)) {
+      const d = resolveReviewMode({
+        lensIds, states: statesAll, headSha: head, roundIndex: rounds, fullEvery, maxDeltaLines,
+        isAncestor: null, hasMergeInRange: null, deltaLines: null,
+        fingerprint, forceReview,
+        priorConclusions: new Map([...latestAll].map(([name, r]) => [name, r?.conclusion])),
+      });
+      if (d.mode === "carry" || d.reason === "carry-cap" || d.reason === "review-requested") {
+        log(`review-scope: ${d.mode} (${d.reason}) from replaced head ${agreedAll.sha.slice(0, 12)} — round ${rounds}`);
+        return { ...d, rounds };
+      }
+    }
+  }
+
+  // Phase 1: is there a range at all? Measuring git before knowing `since` would
+  // measure the wrong range — see the caller contract on `resolveReviewMode`.
+  const agreed = agreedReviewedSha(lensIds, states);
+  if (!agreed.sha) {
+    log(`review-scope: no usable prior pointer (${agreed.reason}).`);
+    return full(agreed.reason, rounds);
+  }
+
+  // Phase 2: measure exactly `agreed.sha..head`, then decide.
+  const facts = await gitFacts({ since: agreed.sha, head, repo, run });
+  const decision = resolveReviewMode({
+    lensIds, states, headSha: head, roundIndex: rounds, fullEvery, maxDeltaLines, ...facts,
+    fingerprint, priorConclusions, forceReview,
+  });
+  log(
+    `review-scope: ${decision.mode} (${decision.reason}) — round ${rounds}, ${lensIds.length} lens(es), ` +
+      `delta ${facts.deltaLines ?? "?"} lines since ${agreed.sha.slice(0, 12)}`,
+  );
+  return { ...decision, rounds };
+}
+
+function readLines(file) {
+  try {
+    return readFileSync(file, "utf8").split("\n").map((s) => s.trim()).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function setOutput(name, value) {
+  const line = `${name}=${value}`;
+  console.error(`  ${line}`);
+  if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `${line}\n`);
+}
+
+function emit({ mode, sinceSha, reason, rounds, sourceSha = "", carry = 0 }) {
+  // `since` is only ever non-empty for `incremental`, and the workflow keys the
+  // narrowed `git diff` off `mode`. Emitting both keeps the pair inseparable:
+  // review-panel.mjs REFUSES `--since-sha` without `--review-mode incremental`
+  // and vice versa, so a half-passed pair fails the panel loudly rather than
+  // reviewing a fragment as if it were the whole PR.
+  setOutput("mode", mode);
+  setOutput("since", mode === "incremental" ? sinceSha : "");
+  setOutput("reason", reason);
+  setOutput("rounds", String(rounds ?? 0));
+  // Only for the two modes that run no lens; empty otherwise, so a workflow
+  // condition on `source != ''` cannot fire on an ordinary review.
+  const reused = mode === "carry" || mode === "reuse";
+  setOutput("source", reused ? sourceSha : "");
+  setOutput("carry", String(mode === "carry" ? carry : 0));
+}
+
+async function main() {
+  const args = parseArgs(process.argv);
+  const num = (v, dflt) => {
+    const n = Number(v);
+    return Number.isFinite(n) && n > 0 ? n : dflt;
+  };
+  let manifest = null;
+  try {
+    manifest = JSON.parse(readFileSync(args.lenses, "utf8"));
+  } catch (err) {
+    // Left null, so `reviewingLensIds` yields no lenses and the decision is
+    // `invalid-input` → full. Logged, because "we never narrowed" and "we narrowed
+    // and it saved nothing" look identical from the outside otherwise.
+    console.error(`review-scope: could not read --lenses '${args.lenses}' (${err.message}).`);
+  }
+  // `null` (unreadable), never `[]`, on failure: see `reviewRequested`.
+  let comments = null;
+  try {
+    comments = gh(["api", "--paginate", `repos/{owner}/{repo}/issues/${args._[0]}/comments?per_page=100`]);
+  } catch (err) {
+    console.error(`review-scope: could not read PR comments (${err.message}); a requested review cannot be ruled out.`);
+  }
+  emit(
+    await decideScope({
+      pr: args._[0],
+      fingerprint: typeof args.fingerprint === "string" ? args.fingerprint.trim() : "",
+      comments: Array.isArray(comments) ? comments : null,
+      trusts: permissionResolver({ api: notFoundIsNoAccess(gh) }),
+      head: typeof args.head === "string" ? args.head.trim() : "",
+      manifest,
+      changedFiles: readLines(args["changed-files"]),
+      repo: args.repo || process.cwd(),
+      fullEvery: num(args["full-every"], 3),
+      maxDeltaLines: num(args["max-delta-lines"], 400),
+    }),
+  );
+}
+
+// A crash must not take the panel down: report `full` and exit 0. There is no
+// failure of this script that a full review does not correctly absorb.
+if (process.argv[1] && process.argv[1].endsWith("review-scope.mjs")) {
+  main().catch((err) => {
+    console.error(`review-scope: crashed (${err.message}) — reviewing in full.`);
+    emit({ mode: "full", sinceSha: "", reason: "scope-error", rounds: 0 });
+  });
+}

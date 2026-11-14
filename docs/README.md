@@ -17,3 +17,7 @@ This directory captures the development contract for the Rust SDK.
 - [Porting from the JS SDK](porting-from-js-sdk.md): source-of-truth rules,
   Go SDK cross-check policy, naming policy, and the test-driven porting
   workflow.
+- [Design Documents](design/README.md): design documents for changes to the
+  architecture, and their template.
+- [Tasks](tasks/README.md): the plan and lessons of each task, in progress and
+  archived.
