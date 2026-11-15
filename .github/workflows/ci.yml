@@ -5,8 +5,9 @@ on:
     branches: [main]
   pull_request:
 
-permissions:
-  contents: read
+# Nothing at the workflow level: each job names what its own steps need, so a
+# job added later starts with no token rather than inheriting one.
+permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,6 +16,8 @@ jobs:
   check:
     name: fmt, clippy, unit tests
     runs-on: ubuntu-latest
+    permissions:
+      contents: read # actions/checkout
     steps:
       - uses: actions/checkout@v4
       # Version pinned to rust-toolchain.toml; keep the two in step.
@@ -34,6 +37,8 @@ jobs:
   integration:
     name: integration tests
     runs-on: ubuntu-latest
+    permissions:
+      contents: read # actions/checkout
     env:
       YORKIE_TEST_RPC_ADDR: http://localhost:8080
       # Tag without a "v" prefix, as published to Docker Hub by `make docker`.
